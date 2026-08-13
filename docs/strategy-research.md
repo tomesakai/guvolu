@@ -184,8 +184,9 @@ readiness 命令不创建、不消费 vintage，也不登记自适应研究暴�
 `2f90a2f05f96c1920a77c06ce4e211d633d123f3a2baf241642b7301efcd8822`。
 Windows 计划任务 `guvolu-frozen-forward-61c0c4cab6c5` 已登记为从 2026-08-21 09:10 JST
 开始每小时运行，重复实例采用 `IgnoreNew`，每次退出码和输出追加到
-`logs/research/frozen-forward/task.jsonl`。promotion 当前只等待封存段与预测历史完整到达；区间
-结束前不得运行新的重叠 `DEV_ADAPTIVE` 研究。
+`logs/research/frozen-forward/task.jsonl`。任务以仅访问本机资源的 `S4U` 后台身份运行，不依赖
+交互登录会话。promotion 当前只等待封存段与预测历史完整到达；区间结束前不得运行新的重叠
+`DEV_ADAPTIVE` 研究。
 
 主要输出为：
 

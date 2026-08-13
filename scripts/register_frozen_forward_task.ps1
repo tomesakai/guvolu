@@ -46,7 +46,7 @@ $Trigger = New-ScheduledTaskTrigger -Once -At $FirstRunLocal `
     -RepetitionInterval (New-TimeSpan -Hours 1) `
     -RepetitionDuration $Duration
 $Principal = New-ScheduledTaskPrincipal -UserId ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name) `
-    -LogonType Interactive -RunLevel Limited
+    -LogonType S4U -RunLevel Limited
 $Settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew `
     -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 45) `
     -Hidden
