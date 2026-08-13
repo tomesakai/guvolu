@@ -11,7 +11,7 @@ param(
 $ErrorActionPreference = "Stop"
 $Repository = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $Python = Join-Path $Repository ".venv\Scripts\python.exe"
-$Runner = Join-Path $Repository "scripts\manage_frozen_forward.py"
+$TaskRunner = Join-Path $Repository "scripts\run_frozen_forward_task.ps1"
 $RegistryPath = if ([System.IO.Path]::IsPathRooted($Registry)) {
     $Registry
 } else {
@@ -20,8 +20,8 @@ $RegistryPath = if ([System.IO.Path]::IsPathRooted($Registry)) {
 if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) {
     throw "Python 运行环境不存在: $Python"
 }
-if (-not (Test-Path -LiteralPath $Runner -PathType Leaf)) {
-    throw "冻结前向脚本不存在: $Runner"
+if (-not (Test-Path -LiteralPath $TaskRunner -PathType Leaf)) {
+    throw "冻结前向任务脚本不存在: $TaskRunner"
 }
 $Start = $StartUtc.ToUniversalTime()
 $End = $EndUtc.ToUniversalTime()
@@ -37,9 +37,10 @@ $LocalZone = [System.TimeZoneInfo]::Local
 $FirstRunLocal = [System.TimeZoneInfo]::ConvertTimeFromUtc($FirstRunUtc, $LocalZone)
 $TaskSuffix = $PlanId.Substring([Math]::Max(0, $PlanId.Length - 12))
 $TaskName = "guvolu-frozen-forward-$TaskSuffix"
-$Arguments = '"{0}" --root "{1}" predict "{2}" --registry "{3}"' -f `
-    $Runner, $Repository, $PlanId, $RegistryPath
-$Action = New-ScheduledTaskAction -Execute $Python -Argument $Arguments `
+$Arguments = '-NoProfile -WindowStyle Hidden -File "{0}" -PlanId "{1}" ' + `
+    '-Repository "{2}" -Registry "{3}"'
+$Arguments = $Arguments -f $TaskRunner, $PlanId, $Repository, $RegistryPath
+$Action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $Arguments `
     -WorkingDirectory $Repository
 $Trigger = New-ScheduledTaskTrigger -Once -At $FirstRunLocal `
     -RepetitionInterval (New-TimeSpan -Hours 1) `

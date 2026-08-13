@@ -175,8 +175,17 @@ readiness 命令不创建、不消费 vintage，也不登记自适应研究暴�
 活动 head、冻结面板和治理注册表。2026-08-14 的当前结果为：研究来源与 clean tree 完全匹配；
 最长特征需要 169 根连续观测柱，最新结构性断点后只有 11 根，尚差 158 根。如果之后每根
 小时柱均正常到达，最早成熟时点约为 2026-08-20 18:00（项目时区）；这只是条件估算，新的
-超限断点会重新计数。治理库当前没有 sealed vintage，因此 promotion 下一步是由负责人在
-区间开始前明确选择并封存未来区间，而不是反复运行开发回测。
+超限断点会重新计数。治理库已经在 `2026-08-13T20:12:07Z` 封存
+`2026-08-21T00:00:00Z` 至 `2026-11-29T00:00:00Z` 的 100 日 future vintage：
+`holdout-vintage-b1ed13e18f28ea64b430bd9dbcff1f41eb473c6542bbf83ab139502b1eb38ae8`。
+对应冻结计划为
+`frozen-forward-plan-b1f4d9bdd9d68226f281b3a3613d3e0a35eb62e74936e76fd75e61c0c4cab6c5`，
+计划制品 SHA-256 为
+`2f90a2f05f96c1920a77c06ce4e211d633d123f3a2baf241642b7301efcd8822`。
+Windows 计划任务 `guvolu-frozen-forward-61c0c4cab6c5` 已登记为从 2026-08-21 09:10 JST
+开始每小时运行，重复实例采用 `IgnoreNew`，每次退出码和输出追加到
+`logs/research/frozen-forward/task.jsonl`。promotion 当前只等待封存段与预测历史完整到达；区间
+结束前不得运行新的重叠 `DEV_ADAPTIVE` 研究。
 
 主要输出为：
 
