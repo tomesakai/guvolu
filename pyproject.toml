@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "guvolu"
+version = "0.1.0"
+description = "GMO Coin 量化自动交易体系"
+requires-python = ">=3.12"
+dependencies = [
+    "requests==2.34.2",
+    "websockets==16.0",
+    "fastapi==0.136.3",
+    "uvicorn==0.40.0",
+    "duckdb==1.4.5",
+    "pytz==2026.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "mypy==1.20.2",
+    "pytest==9.1.1",
+    "types-requests",
+    "httpx==0.28.1",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+guvolu = ["py.typed"]
+
+[tool.mypy]
+strict = true
+python_version = "3.12"
+mypy_path = "src"
+packages = ["guvolu"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-q"

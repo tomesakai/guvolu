@@ -1,0 +1,41 @@
+# T-01 密钥绝不入库
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets/
+
+# 运行时产物
+logs/
+*.log
+/data/
+/reports/
+state/
+*.db
+*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+
+# Node
+node_modules/
+dist/
+.vite/
+
+# 本地代理与机器配置
+.codex-tmp/
+.claude/launch.json
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
