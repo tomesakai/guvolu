@@ -8,7 +8,7 @@ from pathlib import Path
 
 from guvolu.research.provenance import stable_identifier
 
-GOVERNANCE_SCHEMA_VERSION = 2
+GOVERNANCE_SCHEMA_VERSION = 3
 GOVERNANCE_METHOD_VERSION = "research-data-governance-v2"
 _VINTAGE_STATUSES = ("sealed", "consumed")
 
@@ -40,6 +40,22 @@ class HoldoutVintage:
     evaluation_id: str | None
     verdict: str | None
     verdict_recorded_at: datetime | None
+
+
+@dataclass(frozen=True)
+class HoldoutEvaluationAttempt:
+    """一次烧毁 vintage 后不可重跑的评估尝试状态。"""
+
+    evaluation_id: str
+    vintage_id: str
+    candidate_set_hash: str
+    status: str
+    stage: str
+    started_at: datetime
+    updated_at: datetime
+    completed_at: datetime | None
+    result_manifest_path: str | None
+    result_manifest_sha256: str | None
 
 
 @dataclass(frozen=True)
@@ -154,6 +170,29 @@ def _connect(path: Path) -> sqlite3.Connection:
           frozen_at TEXT NOT NULL,
           FOREIGN KEY(vintage_id) REFERENCES holdout_vintage(vintage_id)
         );
+        CREATE TABLE IF NOT EXISTS holdout_evaluation_attempt (
+          evaluation_id TEXT PRIMARY KEY,
+          vintage_id TEXT NOT NULL UNIQUE,
+          candidate_set_hash TEXT NOT NULL,
+          status TEXT NOT NULL CHECK(status IN ('incomplete','completed')),
+          stage TEXT NOT NULL,
+          started_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          completed_at TEXT,
+          result_manifest_path TEXT,
+          result_manifest_sha256 TEXT,
+          CHECK(
+            (status='incomplete' AND completed_at IS NULL
+             AND result_manifest_path IS NULL
+             AND result_manifest_sha256 IS NULL)
+            OR
+            (status='completed' AND completed_at IS NOT NULL
+             AND result_manifest_path IS NOT NULL
+             AND result_manifest_sha256 IS NOT NULL
+             AND length(result_manifest_sha256)=64)
+          ),
+          FOREIGN KEY(vintage_id) REFERENCES holdout_vintage(vintage_id)
+        );
         CREATE TABLE IF NOT EXISTS frozen_forward_prediction (
           prediction_id TEXT PRIMARY KEY,
           plan_id TEXT NOT NULL,
@@ -178,7 +217,7 @@ def _connect(path: Path) -> sqlite3.Connection:
             "INSERT INTO governance_meta(key,value) VALUES('schema_version',?)",
             (str(GOVERNANCE_SCHEMA_VERSION),),
         )
-    elif existing["value"] == "1":
+    elif existing["value"] in ("1", "2"):
         connection.execute(
             "UPDATE governance_meta SET value=? WHERE key='schema_version'",
             (str(GOVERNANCE_SCHEMA_VERSION),),
@@ -396,6 +435,172 @@ def consume_holdout_vintage(
     if updated is None:
         raise RuntimeError("消费后封存段不可见")
     return _vintage_from_row(updated)
+
+
+def start_holdout_evaluation_attempt(
+    registry_path: Path,
+    vintage_id: str,
+    candidate_set_hash: str,
+    evaluation_id: str,
+    *,
+    started_at: datetime | None = None,
+) -> HoldoutEvaluationAttempt:
+    """原子烧毁 vintage 并登记不可重跑的评估尝试。"""
+    started = _utc(started_at or datetime.now(UTC))
+    connection = _connect(registry_path)
+    try:
+        _begin(connection)
+        vintage = connection.execute(
+            "SELECT * FROM holdout_vintage WHERE vintage_id=?", (vintage_id,),
+        ).fetchone()
+        if vintage is None:
+            raise LookupError(f"封存段不存在: {vintage_id}")
+        if vintage["status"] != "sealed":
+            raise ValueError(f"封存段已经消费: {vintage_id}")
+        connection.execute(
+            "UPDATE holdout_vintage SET status='consumed',consumed_at=?,"
+            "candidate_set_hash=?,evaluation_id=? WHERE vintage_id=? AND status='sealed'",
+            (_timestamp(started), candidate_set_hash, evaluation_id, vintage_id),
+        )
+        connection.execute(
+            "INSERT INTO holdout_evaluation_attempt("
+            "evaluation_id,vintage_id,candidate_set_hash,status,stage,started_at,updated_at"
+            ") VALUES(?,?,?,'incomplete','vintage_consumed',?,?)",
+            (
+                evaluation_id,
+                vintage_id,
+                candidate_set_hash,
+                _timestamp(started),
+                _timestamp(started),
+            ),
+        )
+        row = connection.execute(
+            "SELECT * FROM holdout_evaluation_attempt WHERE evaluation_id=?",
+            (evaluation_id,),
+        ).fetchone()
+        connection.execute("COMMIT")
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+    finally:
+        connection.close()
+    if row is None:
+        raise RuntimeError("holdout 评估尝试写入后不可见")
+    return _attempt_from_row(row)
+
+
+def update_holdout_evaluation_attempt(
+    registry_path: Path,
+    evaluation_id: str,
+    stage: str,
+    *,
+    updated_at: datetime | None = None,
+) -> HoldoutEvaluationAttempt:
+    """持久化 incomplete 尝试最后到达的评估阶段。"""
+    normalized = stage.strip()
+    if not normalized:
+        raise ValueError("holdout 评估阶段不得为空")
+    updated = _utc(updated_at or datetime.now(UTC))
+    connection = _connect(registry_path)
+    try:
+        _begin(connection)
+        row = connection.execute(
+            "SELECT * FROM holdout_evaluation_attempt WHERE evaluation_id=?",
+            (evaluation_id,),
+        ).fetchone()
+        if row is None:
+            raise LookupError(f"holdout 评估尝试不存在: {evaluation_id}")
+        if row["status"] != "incomplete":
+            raise ValueError("已完成 holdout 评估尝试不可修改")
+        connection.execute(
+            "UPDATE holdout_evaluation_attempt SET stage=?,updated_at=? "
+            "WHERE evaluation_id=? AND status='incomplete'",
+            (normalized, _timestamp(updated), evaluation_id),
+        )
+        current = connection.execute(
+            "SELECT * FROM holdout_evaluation_attempt WHERE evaluation_id=?",
+            (evaluation_id,),
+        ).fetchone()
+        connection.execute("COMMIT")
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+    finally:
+        connection.close()
+    if current is None:
+        raise RuntimeError("holdout 评估阶段更新后不可见")
+    return _attempt_from_row(current)
+
+
+def complete_holdout_evaluation_attempt(
+    registry_path: Path,
+    evaluation_id: str,
+    result_manifest_path: str,
+    result_manifest_sha256: str,
+    *,
+    completed_at: datetime | None = None,
+) -> HoldoutEvaluationAttempt:
+    """把评估尝试终结为带 manifest 身份的 completed。"""
+    if not result_manifest_path or len(result_manifest_sha256) != 64:
+        raise ValueError("完成 holdout 尝试必须绑定 manifest 路径与 SHA-256")
+    completed = _utc(completed_at or datetime.now(UTC))
+    connection = _connect(registry_path)
+    try:
+        _begin(connection)
+        row = connection.execute(
+            "SELECT * FROM holdout_evaluation_attempt WHERE evaluation_id=?",
+            (evaluation_id,),
+        ).fetchone()
+        if row is None:
+            raise LookupError(f"holdout 评估尝试不存在: {evaluation_id}")
+        if row["status"] != "incomplete":
+            raise ValueError("holdout 评估尝试已经完成")
+        connection.execute(
+            "UPDATE holdout_evaluation_attempt SET status='completed',stage='completed',"
+            "updated_at=?,completed_at=?,result_manifest_path=?,"
+            "result_manifest_sha256=? WHERE evaluation_id=? AND status='incomplete'",
+            (
+                _timestamp(completed),
+                _timestamp(completed),
+                result_manifest_path,
+                result_manifest_sha256,
+                evaluation_id,
+            ),
+        )
+        current = connection.execute(
+            "SELECT * FROM holdout_evaluation_attempt WHERE evaluation_id=?",
+            (evaluation_id,),
+        ).fetchone()
+        connection.execute("COMMIT")
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+    finally:
+        connection.close()
+    if current is None:
+        raise RuntimeError("holdout 评估完成后不可见")
+    return _attempt_from_row(current)
+
+
+def get_holdout_evaluation_attempt(
+    registry_path: Path,
+    evaluation_id: str,
+) -> HoldoutEvaluationAttempt:
+    """读取评估尝试，包括永久 incomplete 状态。"""
+    connection = _connect(registry_path)
+    try:
+        row = connection.execute(
+            "SELECT * FROM holdout_evaluation_attempt WHERE evaluation_id=?",
+            (evaluation_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+    if row is None:
+        raise LookupError(f"holdout 评估尝试不存在: {evaluation_id}")
+    return _attempt_from_row(row)
 
 
 def record_holdout_verdict(
@@ -749,6 +954,25 @@ def _vintage_from_row(row: sqlite3.Row) -> HoldoutVintage:
         evaluation_id=_optional_text(row["evaluation_id"]),
         verdict=_optional_text(row["verdict"]),
         verdict_recorded_at=_optional_time(row["verdict_recorded_at"]),
+    )
+
+
+def _attempt_from_row(row: sqlite3.Row) -> HoldoutEvaluationAttempt:
+    """把 SQLite 行转换为 holdout 评估尝试合同。"""
+    status = str(row["status"])
+    if status not in ("incomplete", "completed"):
+        raise ValueError(f"未知 holdout 评估尝试状态: {status}")
+    return HoldoutEvaluationAttempt(
+        evaluation_id=str(row["evaluation_id"]),
+        vintage_id=str(row["vintage_id"]),
+        candidate_set_hash=str(row["candidate_set_hash"]),
+        status=status,
+        stage=str(row["stage"]),
+        started_at=_parse_timestamp(str(row["started_at"])),
+        updated_at=_parse_timestamp(str(row["updated_at"])),
+        completed_at=_optional_time(row["completed_at"]),
+        result_manifest_path=_optional_text(row["result_manifest_path"]),
+        result_manifest_sha256=_optional_text(row["result_manifest_sha256"]),
     )
 
 

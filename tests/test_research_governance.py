@@ -9,6 +9,7 @@ import pytest
 
 from guvolu.research.governance import (
     consume_holdout_vintage,
+    get_holdout_evaluation_attempt,
     get_frozen_forward_plan_for_vintage,
     list_frozen_forward_predictions,
     list_holdout_vintages,
@@ -443,3 +444,9 @@ def test_holdout_is_consumed_before_market_data_is_opened(
     assert consumed.status == "consumed"
     assert consumed.evaluation_id is not None
     assert consumed.verdict is None
+    attempt = get_holdout_evaluation_attempt(
+        registry_path, consumed.evaluation_id,
+    )
+    assert attempt.status == "incomplete"
+    assert attempt.stage == "building_panel"
+    assert attempt.result_manifest_path is None

@@ -190,6 +190,12 @@ Windows 计划任务 `guvolu-frozen-forward-61c0c4cab6c5` 已登记为从 2026-0
 promotion 当前只等待封存段与预测历史完整到达；区间结束前不得运行新的重叠
 `DEV_ADAPTIVE` 研究。
 
+封存段评估开始时会在同一 SQLite 写事务内完成 `sealed → consumed` 与
+`holdout_evaluation_attempt=incomplete/vintage_consumed`。后续面板构建、候选评分会更新持久化
+阶段；只有结果 manifest 和最终 verdict 均写入后才转为 `completed`。进程异常仍永久烧毁
+vintage，防止失败重跑窥视，但注册表会保留最后成功阶段，不再留下不可解释的 `verdict=NULL`
+半终态。
+
 主要输出为：
 
 | 制品 | 位置 | 用途 |
@@ -289,7 +295,6 @@ summary 后，五个流派均没有可计入的时间历史：每个流派排除
 切断损益路径，并按版本化压力成本将段末库存恢复到中性。输出同时记录 maker 费用、固定持有
 基准、库存上下界、段末恢复成本、5/30/60 秒 markout 与逆向选择。它始终是 shadow，
 `capital_weight=0`；没有私有委托与成交生命周期时，触价上界也不得解释为真实成交率。
-
 5 秒 tile 的价格行宽为 2 tick；tile 的价格点是行下界，不是未经分桶的逐 tick 报价。因此候选
 偏移以 `quote_offset_rows` 表示，并同时披露精确的 tick 等价值；成交记录保留
 `[price_row_lower, price_row_upper_exclusive)`，防止把一行误解释为一个 tick。

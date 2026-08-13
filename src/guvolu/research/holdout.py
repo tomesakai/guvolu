@@ -12,10 +12,12 @@ from guvolu.research.features import compute_features
 from guvolu.research.governance import (
     GOVERNANCE_METHOD_VERSION,
     HoldoutVintage,
-    consume_holdout_vintage,
+    complete_holdout_evaluation_attempt,
     get_frozen_forward_plan_for_vintage,
     get_holdout_vintage,
     record_holdout_verdict,
+    start_holdout_evaluation_attempt,
+    update_holdout_evaluation_attempt,
 )
 from guvolu.research.panel import build_panel_snapshot, freeze_trade_inputs, parse_time
 from guvolu.research.provenance import (
@@ -36,7 +38,7 @@ from guvolu.strategy.expression import (
     strategy_expression,
 )
 
-HOLDOUT_METHOD_VERSION = "frozen-candidate-holdout-v2"
+HOLDOUT_METHOD_VERSION = "frozen-candidate-holdout-v3"
 SECONDS_PER_YEAR = 365.0 * 24.0 * 60.0 * 60.0
 _INTERVAL_SECONDS = {
     "5min": 300.0,
@@ -363,7 +365,7 @@ def run_holdout_validation(
         "input_head_generation": inputs.head_generation,
         "input_artifact_ids": inputs.artifact_ids,
     })
-    consume_holdout_vintage(
+    start_holdout_evaluation_attempt(
         registry_path,
         vintage_id,
         candidate_set_hash,
@@ -375,6 +377,9 @@ def run_holdout_validation(
         "holdout output",
     )
     run_directory = output_base / evaluation_id
+    update_holdout_evaluation_attempt(
+        registry_path, evaluation_id, "building_panel",
+    )
     panel = build_panel_snapshot(
         inputs,
         repository / "data" / "research" / "holdout" / vintage_id,
@@ -471,6 +476,9 @@ def run_holdout_validation(
             "metrics": metrics_payload(metrics),
         })
     q_values = _fdr(p_values)
+    update_holdout_evaluation_attempt(
+        registry_path, evaluation_id, "scored_candidates",
+    )
     passed_families: list[str] = []
     candidate_results: list[dict[str, object]] = []
     for result in raw_results:
@@ -526,16 +534,6 @@ def run_holdout_validation(
     }
     result_path = run_directory / "result.json"
     atomic_write_text(result_path, canonical_json(result_payload) + "\n")
-    record_holdout_verdict(
-        registry_path,
-        vintage_id,
-        canonical_json({
-            "evaluation_id": evaluation_id,
-            "verdict": verdict,
-            "passed_families": sorted(passed_families),
-            "result_sha256": sha256_file(result_path),
-        }),
-    )
     manifest = {
         "schema_version": 1,
         "holdout_method_version": HOLDOUT_METHOD_VERSION,
@@ -555,11 +553,29 @@ def run_holdout_validation(
     }
     manifest_path = run_directory / "manifest.json"
     atomic_write_text(manifest_path, canonical_json(manifest) + "\n")
+    manifest_sha256 = sha256_file(manifest_path)
+    record_holdout_verdict(
+        registry_path,
+        vintage_id,
+        canonical_json({
+            "evaluation_id": evaluation_id,
+            "verdict": verdict,
+            "passed_families": sorted(passed_families),
+            "result_sha256": sha256_file(result_path),
+            "manifest_sha256": manifest_sha256,
+        }),
+    )
+    complete_holdout_evaluation_attempt(
+        registry_path,
+        evaluation_id,
+        manifest_path.resolve().relative_to(repository).as_posix(),
+        manifest_sha256,
+    )
     return HoldoutRunResult(
         evaluation_id=evaluation_id,
         run_directory=run_directory,
         manifest_path=manifest_path,
         result_path=result_path,
-        manifest_sha256=sha256_file(manifest_path),
+        manifest_sha256=manifest_sha256,
         verdict=verdict,
     )
