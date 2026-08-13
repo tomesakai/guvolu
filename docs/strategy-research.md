@@ -295,6 +295,9 @@ summary 后，五个流派均没有可计入的时间历史：每个流派排除
 切断损益路径，并按版本化压力成本将段末库存恢复到中性。输出同时记录 maker 费用、固定持有
 基准、库存上下界、段末恢复成本、5/30/60 秒 markout 与逆向选择。它始终是 shadow，
 `capital_weight=0`；没有私有委托与成交生命周期时，触价上界也不得解释为真实成交率。
+冻结输入 manifest 逐文件记录外部数据根相对路径、字节数和 SHA-256；运行身份绑定完整输入
+文件集合，verifier 同时重算 tile、逐笔、summary 与 fills 字节散列，因此原地损坏或替换任何
+Parquet 都会使复核失败。
 5 秒 tile 的价格行宽为 2 tick；tile 的价格点是行下界，不是未经分桶的逐 tick 报价。因此候选
 偏移以 `quote_offset_rows` 表示，并同时披露精确的 tick 等价值；成交记录保留
 `[price_row_lower, price_row_upper_exclusive)`，防止把一行误解释为一个 tick。
@@ -313,7 +316,8 @@ python scripts/run_passive_grid_shadow.py `
 
 python scripts/run_passive_grid_shadow.py `
   --repository . `
-  --verify passive-grid-shadow-359fbd578f63353b5786dfcc40029736ca3ddebfd6ffa1295cc4ceec2715be07
+  --data-root C:\Users\wu_zh\dev\guvolu\data `
+  --verify <run_id>
 ```
 
 方法选择与边界依据：GMO 官方成交 WS 支持 `TAKER_ONLY`，因此新采集显式启用该选项；历史

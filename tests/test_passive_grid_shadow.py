@@ -169,7 +169,26 @@ def test_verifier_recomputes_run_identity_and_checks_latest_hash(
     tmp_path: Path,
 ) -> None:
     """重写 manifest 与活动指针散列也不能绕过输入身份复算。"""
-    input_identity = {"method_version": "test", "artifact": "a"}
+    data_root = tmp_path / "data"
+    data_root.mkdir()
+    frozen_input = data_root / "input.parquet"
+    frozen_bytes = b"frozen-parquet-bytes"
+    frozen_input.write_bytes(frozen_bytes)
+    frozen_sha256 = hashlib.sha256(frozen_bytes).hexdigest()
+    frozen_record = {
+        "attempt_id": "attempt-one",
+        "artifact_id": f"sha256-{frozen_sha256}",
+        "dataset": "orderflow_tile_column",
+        "path": "input.parquet",
+        "sha256": frozen_sha256,
+        "bytes": len(frozen_bytes),
+    }
+    input_files = {"tiles": [frozen_record], "trades": [frozen_record]}
+    input_identity = {
+        "method_version": "test",
+        "artifact": "a",
+        "input_file_set_id": stable_identifier("sha256", input_files),
+    }
     run_id = stable_identifier("passive-grid-shadow", input_identity)
     output = tmp_path / "reports/passive-grid-shadow" / run_id
     output.mkdir(parents=True)
@@ -197,6 +216,7 @@ def test_verifier_recomputes_run_identity_and_checks_latest_hash(
         "run_id": run_id,
         "status": "complete",
         "input_identity": input_identity,
+        "input_files": input_files,
         "summary": record(summary, "passive_grid_summary"),
         "fills": fills_record,
     }
@@ -207,7 +227,14 @@ def test_verifier_recomputes_run_identity_and_checks_latest_hash(
         "manifest": manifest.relative_to(tmp_path).as_posix(),
         "manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest(),
     }) + "\n", encoding="utf-8")
-    assert verify_passive_grid_shadow(tmp_path, run_id)["verified"] is True
+    assert verify_passive_grid_shadow(
+        tmp_path, run_id, data_root,
+    )["verified"] is True
+
+    frozen_input.write_bytes(b"corrupted")
+    with pytest.raises(ValueError, match="(字节数|散列)不匹配"):
+        verify_passive_grid_shadow(tmp_path, run_id, data_root)
+    frozen_input.write_bytes(frozen_bytes)
 
     body["input_identity"] = {"method_version": "tampered"}
     manifest.write_text(canonical_json(body) + "\n", encoding="utf-8")
@@ -215,4 +242,4 @@ def test_verifier_recomputes_run_identity_and_checks_latest_hash(
     latest_body["manifest_sha256"] = hashlib.sha256(manifest.read_bytes()).hexdigest()
     latest.write_text(canonical_json(latest_body) + "\n", encoding="utf-8")
     with pytest.raises(ValueError, match="运行身份"):
-        verify_passive_grid_shadow(tmp_path, run_id)
+        verify_passive_grid_shadow(tmp_path, run_id, data_root)

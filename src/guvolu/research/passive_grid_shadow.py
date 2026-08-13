@@ -24,7 +24,7 @@ from guvolu.research.provenance import (
 )
 from guvolu.ui.query_catalog import ActiveOutput, ActiveOutputSnapshot, QueryCatalog
 
-METHOD_VERSION = "passive-grid-snapshot-bounds-v2"
+METHOD_VERSION = "passive-grid-snapshot-bounds-v3"
 ORDERFLOW_TILE_METHOD_VERSION = "orderflow-tile-sparse-v8"
 SCHEMA_VERSION = 1
 
@@ -149,6 +149,70 @@ def _artifact(
     record = dict(artifact_record(path, kind))
     record["path"] = _relative(repository, path)
     return record
+
+
+def _verified_input_files(
+    data_root: Path,
+    snapshot: ActiveOutputSnapshot,
+) -> tuple[Mapping[str, object], ...]:
+    """把登记 artifact 身份闭合到实际文件字节。"""
+    root = data_root.resolve()
+    records: dict[tuple[str, str, str], Mapping[str, object]] = {}
+    for output in snapshot.outputs:
+        path = output.path.resolve()
+        try:
+            relative = path.relative_to(root).as_posix()
+        except ValueError as error:
+            raise ValueError(f"冻结输入路径越出数据根目录: {path}") from error
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        if not output.artifact_id.startswith("sha256-"):
+            raise ValueError(f"冻结输入不是规范 SHA-256 artifact: {output.artifact_id}")
+        expected = output.artifact_id.removeprefix("sha256-")
+        actual = sha256_file(path)
+        if actual != expected:
+            raise ValueError(f"冻结输入文件散列不匹配: {relative}")
+        records[(output.attempt_id, output.artifact_id, relative)] = {
+            "attempt_id": output.attempt_id,
+            "artifact_id": output.artifact_id,
+            "dataset": output.dataset,
+            "path": relative,
+            "sha256": actual,
+            "bytes": path.stat().st_size,
+        }
+    return tuple(records[key] for key in sorted(records))
+
+
+def _verify_recorded_input_files(
+    data_root: Path,
+    raw_records: object,
+) -> tuple[Mapping[str, object], ...]:
+    """复核 manifest 冻结的输入路径、字节数和散列。"""
+    if not isinstance(raw_records, list) or not raw_records:
+        raise ValueError("被动网格 manifest 缺少冻结输入文件")
+    root = data_root.resolve()
+    verified: list[Mapping[str, object]] = []
+    for index, raw in enumerate(raw_records):
+        record = _mapping(raw, f"input_files.{index}")
+        relative = str(record.get("path"))
+        path = (root / relative).resolve()
+        try:
+            path.relative_to(root)
+        except ValueError as error:
+            raise ValueError(f"冻结输入路径越出数据根目录: {relative}") from error
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        expected_hash = str(record.get("sha256"))
+        artifact_id = str(record.get("artifact_id"))
+        if artifact_id != f"sha256-{expected_hash}":
+            raise ValueError(f"冻结输入 artifact 与散列不一致: {relative}")
+        expected_bytes = _integer(record.get("bytes"), f"input_files.{index}.bytes")
+        if path.stat().st_size != expected_bytes:
+            raise ValueError(f"冻结输入文件字节数不匹配: {relative}")
+        if sha256_file(path) != expected_hash:
+            raise ValueError(f"冻结输入文件散列不匹配: {relative}")
+        verified.append(record)
+    return tuple(verified)
 
 
 def _paths(snapshot: ActiveOutputSnapshot, dataset: str) -> list[str]:
@@ -751,6 +815,10 @@ def run_passive_grid_shadow(
         )
     )
     identity = code_identity(repository, (selected_config,))
+    input_files = {
+        "tiles": list(_verified_input_files(selected_data, tile_snapshot)),
+        "trades": list(_verified_input_files(selected_data, trade_snapshot)),
+    }
     input_body = {
         "tile_head_generation": tile_snapshot.head_generation,
         "tile_artifacts": sorted(row.artifact_id for row in tile_snapshot.outputs),
@@ -759,6 +827,7 @@ def run_passive_grid_shadow(
         "config_sha256": sha256_file(selected_config),
         "method_version": METHOD_VERSION,
         "code_tree_digest": identity.tree_digest,
+        "input_file_set_id": stable_identifier("sha256", input_files),
     }
     run_id = stable_identifier("passive-grid-shadow", input_body)
     output = repository / "reports/passive-grid-shadow" / run_id
@@ -934,6 +1003,7 @@ def run_passive_grid_shadow(
         "summary": _artifact(repository, summary_path, "passive_grid_summary"),
         "fills": _artifact(repository, fills_path, "passive_grid_fills"),
         "input_identity": input_body,
+        "input_files": input_files,
     }
     manifest_path = output / "manifest.json"
     atomic_write_text(manifest_path, canonical_json(manifest) + "\n")
@@ -949,7 +1019,11 @@ def run_passive_grid_shadow(
     return summary
 
 
-def verify_passive_grid_shadow(repository: Path, run_id: str) -> Mapping[str, object]:
+def verify_passive_grid_shadow(
+    repository: Path,
+    run_id: str,
+    data_root: Path | None = None,
+) -> Mapping[str, object]:
     """复核独立 shadow manifest 和内容寻址制品。"""
     root = repository.resolve()
     manifest_path = root / "reports/passive-grid-shadow" / run_id / "manifest.json"
@@ -959,6 +1033,19 @@ def verify_passive_grid_shadow(repository: Path, run_id: str) -> Mapping[str, ob
     input_identity = _mapping(manifest.get("input_identity"), "input_identity")
     if stable_identifier("passive-grid-shadow", input_identity) != run_id:
         raise ValueError("被动网格运行身份不能由输入身份复算")
+    raw_input_files = _mapping(manifest.get("input_files"), "input_files")
+    input_files = {
+        "tiles": list(_verify_recorded_input_files(
+            data_root or root / "data", raw_input_files.get("tiles"),
+        )),
+        "trades": list(_verify_recorded_input_files(
+            data_root or root / "data", raw_input_files.get("trades"),
+        )),
+    }
+    if input_identity.get("input_file_set_id") != stable_identifier(
+        "sha256", input_files,
+    ):
+        raise ValueError("被动网格冻结输入文件集合身份不一致")
 
     def verified_path(record: Mapping[str, object], name: str) -> Path:
         path = (root / str(record["path"])).resolve()

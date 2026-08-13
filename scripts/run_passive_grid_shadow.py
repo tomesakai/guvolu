@@ -24,7 +24,11 @@ def main() -> None:
     )
     args = parser.parse_args()
     result = (
-        verify_passive_grid_shadow(args.repository, args.verify)
+        verify_passive_grid_shadow(
+            args.repository,
+            args.verify,
+            data_root=args.data_root,
+        )
         if args.verify
         else run_passive_grid_shadow(
             args.repository,
