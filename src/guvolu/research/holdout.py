@@ -12,10 +12,9 @@ from guvolu.research.features import compute_features
 from guvolu.research.governance import (
     GOVERNANCE_METHOD_VERSION,
     HoldoutVintage,
-    complete_holdout_evaluation_attempt,
+    finalize_holdout_evaluation,
     get_frozen_forward_plan_for_vintage,
     get_holdout_vintage,
-    record_holdout_verdict,
     start_holdout_evaluation_attempt,
     update_holdout_evaluation_attempt,
 )
@@ -554,20 +553,18 @@ def run_holdout_validation(
     manifest_path = run_directory / "manifest.json"
     atomic_write_text(manifest_path, canonical_json(manifest) + "\n")
     manifest_sha256 = sha256_file(manifest_path)
-    record_holdout_verdict(
-        registry_path,
-        vintage_id,
-        canonical_json({
+    final_verdict = canonical_json({
             "evaluation_id": evaluation_id,
             "verdict": verdict,
             "passed_families": sorted(passed_families),
             "result_sha256": sha256_file(result_path),
             "manifest_sha256": manifest_sha256,
-        }),
-    )
-    complete_holdout_evaluation_attempt(
+        })
+    finalize_holdout_evaluation(
         registry_path,
+        vintage_id,
         evaluation_id,
+        final_verdict,
         manifest_path.resolve().relative_to(repository).as_posix(),
         manifest_sha256,
     )

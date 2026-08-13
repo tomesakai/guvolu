@@ -597,6 +597,75 @@ def complete_holdout_evaluation_attempt(
     return _attempt_from_row(current)
 
 
+def finalize_holdout_evaluation(
+    registry_path: Path,
+    vintage_id: str,
+    evaluation_id: str,
+    verdict: str,
+    result_manifest_path: str,
+    result_manifest_sha256: str,
+    *,
+    completed_at: datetime | None = None,
+) -> tuple[HoldoutVintage, HoldoutEvaluationAttempt]:
+    """在一个事务中写入 verdict 并把尝试终结为 completed。"""
+    normalized = verdict.strip()
+    if not normalized or not result_manifest_path or len(result_manifest_sha256) != 64:
+        raise ValueError("完成 holdout 必须绑定 verdict 与 manifest 身份")
+    completed = _utc(completed_at or datetime.now(UTC))
+    connection = _connect(registry_path)
+    try:
+        _begin(connection)
+        vintage = connection.execute(
+            "SELECT * FROM holdout_vintage WHERE vintage_id=?", (vintage_id,),
+        ).fetchone()
+        attempt = connection.execute(
+            "SELECT * FROM holdout_evaluation_attempt WHERE evaluation_id=?",
+            (evaluation_id,),
+        ).fetchone()
+        if vintage is None or attempt is None:
+            raise LookupError("holdout vintage 或评估尝试不存在")
+        if vintage["status"] != "consumed" or vintage["evaluation_id"] != evaluation_id:
+            raise ValueError("holdout vintage 与评估尝试身份不一致")
+        if attempt["vintage_id"] != vintage_id:
+            raise ValueError("holdout 评估尝试绑定了不同 vintage")
+        if vintage["verdict"] is not None or attempt["status"] != "incomplete":
+            raise ValueError("holdout 已经终结且不可改写")
+        connection.execute(
+            "UPDATE holdout_vintage SET verdict=?,verdict_recorded_at=? "
+            "WHERE vintage_id=? AND verdict IS NULL",
+            (normalized, _timestamp(completed), vintage_id),
+        )
+        connection.execute(
+            "UPDATE holdout_evaluation_attempt SET status='completed',stage='completed',"
+            "updated_at=?,completed_at=?,result_manifest_path=?,"
+            "result_manifest_sha256=? WHERE evaluation_id=? AND status='incomplete'",
+            (
+                _timestamp(completed),
+                _timestamp(completed),
+                result_manifest_path,
+                result_manifest_sha256,
+                evaluation_id,
+            ),
+        )
+        final_vintage = connection.execute(
+            "SELECT * FROM holdout_vintage WHERE vintage_id=?", (vintage_id,),
+        ).fetchone()
+        final_attempt = connection.execute(
+            "SELECT * FROM holdout_evaluation_attempt WHERE evaluation_id=?",
+            (evaluation_id,),
+        ).fetchone()
+        connection.execute("COMMIT")
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+    finally:
+        connection.close()
+    if final_vintage is None or final_attempt is None:
+        raise RuntimeError("holdout 终态写入后不可见")
+    return _vintage_from_row(final_vintage), _attempt_from_row(final_attempt)
+
+
 def get_holdout_evaluation_attempt(
     registry_path: Path,
     evaluation_id: str,

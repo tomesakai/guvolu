@@ -9,6 +9,7 @@ import pytest
 
 from guvolu.research.governance import (
     consume_holdout_vintage,
+    finalize_holdout_evaluation,
     get_holdout_evaluation_attempt,
     get_frozen_forward_plan_for_vintage,
     list_frozen_forward_predictions,
@@ -18,6 +19,7 @@ from guvolu.research.governance import (
     register_frozen_forward_prediction,
     register_research_exposure,
     seal_holdout_vintage,
+    start_holdout_evaluation_attempt,
 )
 from guvolu.research.holdout import run_holdout_validation
 from guvolu.research.contracts import CodeIdentity, FrozenPanelInputs
@@ -165,6 +167,44 @@ def test_consumed_vintage_can_become_adaptive_but_never_holdout_again(
         )
 
 
+def test_holdout_verdict_and_completed_attempt_are_atomic(tmp_path: Path) -> None:
+    """成功结论与 completed 尝试必须在同一事务中出现。"""
+    registry = tmp_path / "governance.sqlite3"
+    vintage = seal_holdout_vintage(
+        registry,
+        "market-one",
+        _time("2027-01-01T00:00:00"),
+        _time("2027-02-01T00:00:00"),
+        sealed_at=_time("2026-12-01T00:00:00"),
+    )
+    start_holdout_evaluation_attempt(
+        registry,
+        vintage.vintage_id,
+        "candidate-set",
+        "evaluation-one",
+        started_at=_time("2027-02-02T00:00:00"),
+    )
+    finalized_vintage, finalized_attempt = finalize_holdout_evaluation(
+        registry,
+        vintage.vintage_id,
+        "evaluation-one",
+        '{"verdict":"passed"}',
+        "reports/holdout/manifest.json",
+        "a" * 64,
+        completed_at=_time("2027-02-02T01:00:00"),
+    )
+    assert finalized_vintage.verdict == '{"verdict":"passed"}'
+    assert finalized_attempt.status == "completed"
+    assert finalized_attempt.result_manifest_sha256 == "a" * 64
+    with pytest.raises(ValueError, match="已经终结"):
+        finalize_holdout_evaluation(
+            registry,
+            vintage.vintage_id,
+            "evaluation-one",
+            '{"verdict":"failed"}',
+            "reports/holdout/manifest.json",
+            "b" * 64,
+        )
 def test_holdout_cannot_be_selected_retroactively(tmp_path: Path) -> None:
     """区间开始后才登记的所谓 holdout 必须被拒绝。"""
     with pytest.raises(ValueError, match="禁止事后挑选"):
