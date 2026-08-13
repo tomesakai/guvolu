@@ -159,14 +159,18 @@ paper 分配遵守以下长期边界：趋势、量价确认趋势和突破合�
 | manifest | `reports/strategy-research/<run_id>/manifest.json` | 代码、配置、输入和输出散列 |
 | 活动指针 | `reports/strategy-research/latest.json` | 原子更新的最近完成运行位置 |
 
-`run_id` 绑定输入 head、attempt、artifact、配置散列、研究源码、脚本和测试树散列。
-有 Git commit 时另记 Git hash 和 dirty digest；仓库没有首个 commit 时仍可复现文件内容，
+`research_identity` 绑定输入 head、attempt、artifact、配置散列、研究源码、脚本、测试树、
+流派范围和全部候选身份；相同内容重复执行只计一个演进历史。`run_id` 是带
+`execution_evaluated_at` 的运行实例身份，允许同一研究内容产生多个运营快照，但不增加独立
+研究证据。有 Git commit 时另记 Git hash 和 dirty digest；仓库没有首个 commit 时仍可复现文件内容，
 但 `decision_grade=false`，目标不得进入决策级使用（D-09）。
 
 ## 7. 当前策略生成方式
 
 当前版本是可解释的 CPU 小网格，不是自动发现系统。版本化 JSON 展开趋势、量价确认趋势、
-突破、均值回归和网格候选；候选身份由家族、模式和完整参数确定。所有候选共享同一 PIT
+突破、均值回归和网格候选；每个流派的规则已表示为带 shape、unit、frequency、availability、
+missing policy 与 numeric domain 的规范 AST。`expression_id` 绑定公式，`candidate_id` 再绑定
+规范化完整参数；AND 子句和必要字段集合换序不会制造重复身份。所有候选共享同一 PIT
 特征纯函数、完整主动成交成本和 walk-forward 验证，再由质量门禁和受约束分配器生成目标。
 
 这种方式适合当前阶段：候选少、每条规则可解释、失败原因可以审计，也能为未来 CPU/GPU
@@ -177,7 +181,7 @@ walk-forward 折；开发段已被反复
 一次性封存段。因此 `paper eligible` 只表示通过本配置的开发回放门禁，不表示可直接实盘，
 也不表示完成 G-08 的最终封存验证。
 
-同一实现支持组合运行与单流派运行。单流派 `run_id` 绑定 `family_scope`、生成器版本和候选
+同一实现支持组合运行与单流派运行。单流派 `research_identity` 绑定 `family_scope`、生成器版本和候选
 身份，输出独立的候选注册表、试验台账、目标仓位与活动指针。监视器只读取完整候选网格的
 聚合样本外事实：对每个数值轴给出关联方向，并跨运行标记 improving、stable 或 decaying。
 自动提案最多扩展一个已配置边界轴，同时同步特征依赖、候选预算和 parent config hash；
@@ -209,12 +213,14 @@ adaptive 历史，不自动改写基准配置。每个流派当前只有两个�
 
 CPU 阶段应先于 GPU 完成以下收敛：
 
-1. 把候选由家族专用循环升级为有类型、单位、有效性和 PIT 约束的表达式注册表；相同表达式
-   规范化为同一候选身份，公共子表达式只计算一次。
+1. 类型化表达式注册表、规范身份和 CPU reference 已完成；下一步是把当前模板展开器升级为
+   公共子表达式 DAG 和有界 typed mutation/crossover，同时保持公式身份与参数身份分离。
 2. 增加 5 分钟、1 小时和 4 小时多节拍，但每个候选只使用预先登记的决策节拍与成本模型；
    不把同一参数在所有节拍无边界复制。
-3. 在现有非正态 Probabilistic Sharpe、循环折块 percentile bootstrap 和折块 CSCV/PBO 之上
-   增加 studentized bootstrap、Deflated Sharpe、参数邻域稳定性和 regime attribution；开发
+3. 现有门禁已包括非正态 Probabilistic Sharpe、循环折块 percentile bootstrap、折块
+   CSCV/PBO、Deflated Sharpe 和单轴最近参数邻域稳定性。DSR 同时发布全量候选原始试验数与
+   基于折级得分相关矩阵参与率的有效试验数，硬门禁使用更保守的原始数。下一步增加
+   studentized bootstrap 和 regime attribution；开发
    回放与已经实现的一次性封存段状态机分开登记；积累未来 vintage 后再形成 G-08 结论。
 4. 均值回归和网格在当前主动成交成本下失败时保持拒绝。只有建立 snapshot-bounded 被动成交
    上下界、库存路径、逆向选择和撤单失败模拟后，才重新评估网格，不以较低费用假设直接放行。
@@ -230,7 +236,7 @@ CPU 阶段应先于 GPU 完成以下收敛：
 | [强类型 Vectorial GP（2025）](https://arxiv.org/abs/2504.05418) | 强类型 GP 在该实验中优于普通 GP | GPU/进化搜索只接受 typed DSL，不允许无类型表达式 |
 | [Warm-start GP（2024）](https://arxiv.org/abs/2412.00896) | 结构约束和有依据的初始化可减少随机搜索浪费 | 以已验证流派为 seed，每个流派独立预算和繁殖池 |
 | [CPCV 比较研究（2024）](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=4686376) | 合成控制实验中 CPCV 比普通 walk-forward 更能抑制过拟合 | 已加入折块 CSCV/PBO；完整 CPCV 作为进入封存段前的 challenger |
-| [Deflated Sharpe Ratio](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=2460551) | 选择偏差、非正态与试验次数会抬高 Sharpe | 试验台账已全计数；下一步加入 DSR，不只依赖 BH-FDR |
+| [Deflated Sharpe Ratio](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=2460551) | 选择偏差、非正态与试验次数会抬高 Sharpe | 已加入 raw/effective trial DSR；准入采用 raw count，effective count 只作敏感性诊断 |
 | [Ledoit-Wolf Sharpe 检验](https://www.ledoit.net/Robust_Sharpe_2008.pdf) | 肥尾或序列相关下应使用 time-series bootstrap | 已加入循环折块 percentile 门禁；studentized 区间列为下一步 |
 
 ## 9. GPU 策略生成方式
@@ -256,6 +262,14 @@ E2/E3 截面后端。SearchFast 可用 float32 和近似排序，但最终候选
 CPU reference 在登记容差内复算。遗传搜索、NSGA-II 或 MAP-Elites 只在 typed DSL 上运行，
 fitness 同时惩罚成本、换手、容量、复杂度、相关冗余和跨时期不稳定；所有失败候选仍计入
 试验台账。GPU worker 独立进程、只读挂载上游制品、永不持有 `TRADE` 密钥（G-01、T-13）。
+
+2026-08-14 已在 RTX 5070 12 GB（compute capability 12.0）、驱动 580.88、PyTorch 2.11.0
+cu128 的隔离环境运行首个 `typed-searchfast-threshold-grid-v1` 微基准。4,096 个阈值候选乘
+32,768 个时点，共 134,217,728 次比较/归约；CUDA f32 中位数 8.15 ms，Python 有序 f64
+reference 中位数 7.80 s，微内核加速 956×，最大绝对差 `3.77e-8`，低于预登记容差
+`3.44e-6`。该结果只覆盖信号判断与收益归约，不含 I/O、特征、walk-forward、成本、统计门禁
+或制品写入，不能外推为全管线加速比。可重复脚本为
+`scripts/benchmark_strategy_search.py`；GPU 依赖保留在隔离环境，生产研究环境仍为零额外数值依赖。
 
 ## 10. 多流派管线区分与聚合架构
 
@@ -313,7 +327,7 @@ flowchart TB
     registry --> exact
     exact --> cost["流派专属成本/成交模型<br/>taker / passive bounds / leg risk"]
     cost --> wf["统一 walk-forward<br/>embargo + champion switching cost"]
-    wf --> robust["稳健门禁<br/>BH-FDR + positive folds + CSCV/PBO<br/>non-normal PSR + circular block bootstrap"]
+    wf --> robust["稳健门禁<br/>BH-FDR + positive folds + CSCV/PBO<br/>PSR + block bootstrap + DSR + parameter neighbors"]
     robust --> ledger["不可变 trial ledger<br/>失败候选也计数"]
     ledger --> evolution["SelectionView<br/>仅反馈本流派下一代"]
     evolution --> monitors
@@ -325,7 +339,8 @@ flowchart TB
     contract --> quality{"实时质量与代码身份"}
     quality -- "失败" --> flat["aggregate target = 0<br/>100% reserve"]
     quality -- "通过" --> paper["paper target artifact<br/>冻结多流派部署候选"]
-    paper --> sealed["未来 vintage 预先封存<br/>不得与 adaptive exposure 重叠"]
+    paper --> sourceVerify["来源 manifest / config / code / AST<br/>消费前完整散列复核"]
+    sourceVerify --> sealed["未来 vintage 预先封存<br/>不得与 adaptive exposure 重叠"]
     sealed --> consume["原子 consumed<br/>崩溃也禁止重跑"]
     consume --> holdout["Holdout ValidationExact<br/>固定候选 / 固定政策 / 不重新选择"]
     holdout --> promotion["一次性 verdict<br/>人工 promotion"]
