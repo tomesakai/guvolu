@@ -143,6 +143,10 @@ paper 分配遵守以下长期边界：趋势、量价确认趋势和突破合�
 .\.venv\Scripts\python.exe scripts\manage_frozen_forward.py predict <plan_id>
 .\.venv\Scripts\python.exe scripts\manage_frozen_forward.py verify <plan_id>
 
+# Windows 本机可在区间开始后第 10 分钟起每小时幂等运行。
+.\scripts\register_frozen_forward_task.ps1 -PlanId <plan_id> `
+  -StartUtc 2026-08-21T00:00:00Z -EndUtc 2026-11-29T00:00:00Z
+
 # 区间完整到达后只消费一次，并评价已登记预测。
 .\.venv\Scripts\python.exe scripts\run_holdout_validation.py <vintage_id> `
   --source-summary <clean-combined-summary.json>
