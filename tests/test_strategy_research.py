@@ -10,7 +10,7 @@ from pathlib import Path
 import duckdb
 import pytest
 
-from guvolu.research.allocator import allocate
+from guvolu.research.allocator import _covariance, allocate
 from guvolu.research import provenance
 from guvolu.research.contracts import (
     AllocationResult,
@@ -20,7 +20,7 @@ from guvolu.research.contracts import (
     PerformanceMetrics,
     QualityVector,
 )
-from guvolu.research.features import MarketState, compute_features
+from guvolu.research.features import MarketState, classify_market_state, compute_features
 from guvolu.research.evolution import monitor_family_run
 from guvolu.research.panel import compact_trade_panel, load_panel_bars
 from guvolu.research.pipeline import _position_contract_payload
@@ -29,6 +29,9 @@ from guvolu.research.quality import gate_feature_snapshot, panel_quality
 from guvolu.research.validation import (
     ValidationResult,
     _circular_block_bootstrap_sharpe,
+    _deflated_sharpe_probability,
+    _effective_trial_count,
+    _parameter_neighbors,
     _probabilistic_sharpe_p_value,
     _probability_backtest_overfitting,
     strategy_returns,
@@ -154,6 +157,27 @@ def test_feature_windows_reject_large_gap_and_allow_structural_gap() -> None:
     assert all(row.as_of <= row.decision_time for row in bounded)
 
 
+def test_market_state_annualization_uses_configured_bar_periods() -> None:
+    """市场状态的同一每柱波动率必须按实际节拍年化。"""
+    _bar_value, feature = _bar(0, 100), FeatureRow(
+        decision_time=_time(1),
+        as_of=_time(1),
+        return_one=0.0,
+        trend_scores={2: 0.0},
+        volatility={2: 0.01},
+        price_scores={2: 0.0},
+        prior_highs={2: 100.0},
+        prior_lows={2: 100.0},
+        flow_imbalance=0.0,
+        volume_score=0.0,
+        jump_score=0.0,
+        contiguous=True,
+    )
+    hourly = classify_market_state(feature, 2, 0.0, 365.0 * 24.0)
+    four_hour = classify_market_state(feature, 2, 0.0, 365.0 * 6.0)
+    assert hourly.volatility == pytest.approx(four_hour.volatility * 2.0)
+
+
 def test_strategy_return_uses_prior_decision_and_cost() -> None:
     """下一期收益只能使用前一决策目标并扣换手成本。"""
     bars = (_bar(0, 100), _bar(1, 110))
@@ -192,6 +216,12 @@ def test_strategy_return_uses_prior_decision_and_cost() -> None:
     )
 
 
+def test_covariance_rejects_misaligned_oos_series() -> None:
+    """组合器不得把未对齐收益静默当成零相关。"""
+    with pytest.raises(ValueError, match="长度不一致"):
+        _covariance((0.1, 0.2), (0.1,))
+
+
 def test_nonnormal_sharpe_and_pbo_diagnostics_are_deterministic() -> None:
     """非正态 Sharpe 概率与折块 PBO 必须可复现。"""
     assert _probabilistic_sharpe_p_value((0.01, 0.01, 0.01)) == 0.0
@@ -208,6 +238,10 @@ def test_nonnormal_sharpe_and_pbo_diagnostics_are_deterministic() -> None:
         {"a": (1.0,) * 5, "b": (-1.0,) * 5}, 10, 7
     )
     assert odd[2] == 10
+    tied = _probability_backtest_overfitting(
+        {"a": (1.0,) * 4, "b": (1.0,) * 4}, 10, 7
+    )
+    assert tied == (1.0, 0.5, 3)
 
 
 def test_circular_block_bootstrap_sharpe_is_deterministic() -> None:
@@ -221,6 +255,63 @@ def test_circular_block_bootstrap_sharpe_is_deterministic() -> None:
     assert first[2] == 128
     with pytest.raises(ValueError, match="折块长度"):
         _circular_block_bootstrap_sharpe(values, 141, 10, 0.05, 19)
+
+
+def test_deflated_sharpe_penalizes_more_trials_and_reports_effective_count() -> None:
+    """DSR 须随试验空间扩大而收紧，并显式报告相关性折算。"""
+    values = tuple(0.00101 if index % 2 else -0.00099 for index in range(500))
+    trial_sharpes = (-0.01, 0.0, 0.01)
+    small_probability, small_benchmark = _deflated_sharpe_probability(
+        values,
+        trial_sharpes,
+        3.0,
+    )
+    large_probability, large_benchmark = _deflated_sharpe_probability(
+        values,
+        trial_sharpes,
+        100.0,
+    )
+    assert large_benchmark > small_benchmark > 0.0
+    assert large_probability < small_probability
+    assert _effective_trial_count({
+        "a": (1.0, -1.0, 1.0, -1.0),
+        "b": (1.0, 1.0, -1.0, -1.0),
+    }) == pytest.approx(2.0)
+    assert _effective_trial_count({
+        "a": (1.0, -1.0, 1.0, -1.0),
+        "b": (1.0, -1.0, 1.0, -1.0),
+    }) == pytest.approx(1.0)
+    negative_degenerate, _benchmark = _deflated_sharpe_probability(
+        (-2.0, -1.0, -1.0),
+        (0.0,),
+        1.0,
+    )
+    positive_degenerate, _benchmark = _deflated_sharpe_probability(
+        (2.0, 1.0, 1.0),
+        (0.0,),
+        1.0,
+    )
+    assert negative_degenerate == 0.0
+    assert positive_degenerate == 1.0
+
+
+def test_parameter_neighbors_select_only_nearest_one_axis_changes() -> None:
+    """参数稳定性只比较其他轴固定时最近的上下候选。"""
+    selected = CandidateSpec("selected", "trend", "paper", {"x": 2, "y": 10}, 2)
+    candidates = (
+        selected,
+        CandidateSpec("x-1", "trend", "paper", {"x": 1, "y": 10}, 2),
+        CandidateSpec("x-3", "trend", "paper", {"x": 3, "y": 10}, 2),
+        CandidateSpec("x-4", "trend", "paper", {"x": 4, "y": 10}, 2),
+        CandidateSpec("y-20", "trend", "paper", {"x": 2, "y": 20}, 2),
+        CandidateSpec("diagonal", "trend", "paper", {"x": 3, "y": 20}, 2),
+    )
+    assert {
+        candidate.candidate_id for candidate in _parameter_neighbors(
+            selected,
+            candidates,
+        )
+    } == {"x-1", "x-3", "y-20"}
 
 
 def test_large_gap_flattens_without_collecting_unobserved_return() -> None:
@@ -485,6 +576,24 @@ def test_family_monitor_reports_parameter_search_direction(tmp_path: Path) -> No
     }
     assert directions["lookback"] == "explore_higher_after_preregistration"
     assert directions["entry_score"] == "fixed"
+    prior_payload = json.loads(summary.read_text(encoding="utf-8"))
+    prior_payload["run_id"] = "prior-instance-one"
+    prior_payload["research_identity"] = "same-prior-research"
+    prior_payload["decision_time"] = "2025-12-01T00:00:00+00:00"
+    first_prior = tmp_path / "prior-one.json"
+    first_prior.write_text(json.dumps(prior_payload), encoding="utf-8")
+    prior_payload["run_id"] = "prior-instance-two"
+    second_prior = tmp_path / "prior-two.json"
+    second_prior.write_text(json.dumps(prior_payload), encoding="utf-8")
+    deduplicated = monitor_family_run(
+        tmp_path,
+        summary,
+        "trend",
+        config,
+        (first_prior, second_prior),
+    )
+    assert len(deduplicated["history"]) == 1
+    assert deduplicated["cross_run_direction"] == "insufficient_history"
 
 
 def test_evolution_proposal_updates_strategy_and_feature_dependencies() -> None:

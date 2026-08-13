@@ -38,7 +38,9 @@ def _strings(value: object, name: str) -> tuple[str, ...]:
 
 def _covariance(left: Sequence[float], right: Sequence[float]) -> float:
     """计算同长收益序列协方差。"""
-    if len(left) != len(right) or len(left) < 2:
+    if len(left) != len(right):
+        raise ValueError("协方差收益序列长度不一致")
+    if len(left) < 2:
         return 0.0
     left_mean = statistics.fmean(left)
     right_mean = statistics.fmean(right)

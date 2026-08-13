@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from guvolu.strategy.contracts import FeatureRow, ResearchBar
 
 FEATURE_METHOD_VERSION = "research-features-v1"
-HOURS_PER_YEAR = 365.0 * 24.0
 
 
 @dataclass(frozen=True)
@@ -195,13 +194,16 @@ def classify_market_state(
     feature: FeatureRow,
     state_lookback: int,
     quote_volume_score: float | None,
+    periods_per_year: float,
 ) -> MarketState:
     """以规则门构造第一版市场状态。"""
+    if periods_per_year <= 0.0:
+        raise ValueError("市场状态年化周期必须为正")
     trend = feature.trend_scores.get(state_lookback)
-    hourly_volatility = feature.volatility.get(state_lookback)
+    period_volatility = feature.volatility.get(state_lookback)
     annual_volatility = (
-        hourly_volatility * math.sqrt(HOURS_PER_YEAR)
-        if hourly_volatility is not None else None
+        period_volatility * math.sqrt(periods_per_year)
+        if period_volatility is not None else None
     )
     flow = feature.flow_imbalance
     jump = feature.jump_score

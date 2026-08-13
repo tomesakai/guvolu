@@ -133,7 +133,10 @@ def _verify_operational_gate(summary: Mapping[str, object]) -> None:
 
 def _verify_data_governance(root: Path, summary: Mapping[str, object]) -> None:
     """复核 v8 开发运行绑定的不可变数据暴露。"""
-    if summary.get("pipeline_method_version") != "strategy-research-pipeline-v8":
+    if summary.get("pipeline_method_version") not in (
+        "strategy-research-pipeline-v8",
+        "strategy-research-pipeline-v9",
+    ):
         return
     governance = _object(summary.get("data_governance"), "data_governance")
     if governance.get("scope") != "DEV_ADAPTIVE":

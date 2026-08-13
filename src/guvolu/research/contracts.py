@@ -131,6 +131,15 @@ class FamilyEvaluation:
     block_bootstrap_sharpe_lower_bound: float = 0.0
     block_bootstrap_p_value: float = 1.0
     block_bootstrap_sample_count: int = 0
+    deflated_sharpe_probability_raw: float = 0.0
+    deflated_sharpe_probability_effective: float = 0.0
+    deflated_sharpe_benchmark_raw: float = 0.0
+    deflated_sharpe_benchmark_effective: float = 0.0
+    raw_trial_count: int = 0
+    effective_trial_count: float = 0.0
+    parameter_neighbor_count: int = 0
+    positive_parameter_neighbor_ratio: float = 0.0
+    median_parameter_neighbor_sharpe_retention: float = 0.0
     fold_selected_candidate_ids: tuple[str, ...] = ()
     cscv_in_sample_fold_count: int = 0
     cscv_out_sample_fold_count: int = 0

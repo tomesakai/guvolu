@@ -23,6 +23,9 @@ SECONDS_PER_YEAR = 365.0 * 24.0 * 60.0 * 60.0
 P_VALUE_METHOD_VERSION = "probabilistic-sharpe-nonnormal-v1"
 PBO_METHOD_VERSION = "cscv-balanced-fold-block-v2"
 BLOCK_BOOTSTRAP_METHOD_VERSION = "circular-block-bootstrap-sharpe-v1"
+DEFLATED_SHARPE_METHOD_VERSION = "deflated-sharpe-raw-effective-v1"
+EFFECTIVE_TRIAL_METHOD_VERSION = "fold-score-correlation-participation-v1"
+PARAMETER_STABILITY_METHOD_VERSION = "one-axis-nearest-neighbor-v1"
 _INTERVAL_SECONDS = {
     "5min": 300.0,
     "15min": 900.0,
@@ -98,15 +101,22 @@ def _number(value: object, name: str) -> float:
     return float(value)
 
 
-def _probabilistic_sharpe_p_value(values: Sequence[float]) -> float:
-    """以偏度和峰度修正 Sharpe 大于零的单侧概率。"""
+def _probabilistic_sharpe_probability(
+    values: Sequence[float],
+    benchmark: float = 0.0,
+) -> float:
+    """返回非正态修正后 Sharpe 超过指定基准的概率。"""
     count = len(values)
     if count < 3:
-        return 1.0
+        return 0.0
     mean = statistics.fmean(values)
     standard = statistics.pstdev(values)
     if standard <= 0:
-        return 0.0 if mean > 0 else 1.0
+        if mean > benchmark:
+            return 1.0
+        if mean < benchmark:
+            return 0.0
+        return 0.5
     centered = [(value - mean) / standard for value in values]
     skewness = statistics.fmean(value ** 3 for value in centered)
     kurtosis = statistics.fmean(value ** 4 for value in centered)
@@ -117,9 +127,142 @@ def _probabilistic_sharpe_p_value(values: Sequence[float]) -> float:
         + ((kurtosis - 1.0) / 4.0) * period_sharpe * period_sharpe
     )
     if variance_term <= 0:
-        return 1.0
-    statistic = period_sharpe * math.sqrt(count - 1) / math.sqrt(variance_term)
-    return min(max(0.5 * math.erfc(statistic / math.sqrt(2.0)), 0.0), 1.0)
+        if period_sharpe > benchmark:
+            return 1.0
+        if period_sharpe < benchmark:
+            return 0.0
+        return 0.5
+    statistic = (
+        (period_sharpe - benchmark)
+        * math.sqrt(count - 1)
+        / math.sqrt(variance_term)
+    )
+    return min(max(0.5 * math.erfc(-statistic / math.sqrt(2.0)), 0.0), 1.0)
+
+
+def _probabilistic_sharpe_p_value(values: Sequence[float]) -> float:
+    """以偏度和峰度修正 Sharpe 大于零的单侧 p 值。"""
+    return 1.0 - _probabilistic_sharpe_probability(values)
+
+
+def _deflated_sharpe_probability(
+    values: Sequence[float],
+    trial_period_sharpes: Sequence[float],
+    trial_count: float,
+) -> tuple[float, float]:
+    """计算 Bailey--López de Prado DSR 与每期 Sharpe 基准。"""
+    if trial_count < 1.0:
+        raise ValueError("DSR 试验数不得小于一")
+    if not trial_period_sharpes:
+        raise ValueError("DSR 缺少试验 Sharpe")
+    dispersion = (
+        statistics.pstdev(trial_period_sharpes)
+        if len(trial_period_sharpes) > 1
+        else 0.0
+    )
+    benchmark = 0.0
+    if trial_count > 1.0 and dispersion > 0.0:
+        normal = statistics.NormalDist()
+        euler_mascheroni = 0.5772156649015329
+        expected_maximum = (
+            (1.0 - euler_mascheroni)
+            * normal.inv_cdf(1.0 - 1.0 / trial_count)
+            + euler_mascheroni
+            * normal.inv_cdf(1.0 - 1.0 / (trial_count * math.e))
+        )
+        benchmark = dispersion * expected_maximum
+    return _probabilistic_sharpe_probability(values, benchmark), benchmark
+
+
+def _effective_trial_count(
+    fold_scores: Mapping[str, Sequence[float]],
+) -> float:
+    """以折级得分相关矩阵参与率估计有效试验数。"""
+    identifiers = tuple(sorted(fold_scores))
+    count = len(identifiers)
+    if count <= 1:
+        return float(count)
+    lengths = {len(fold_scores[identifier]) for identifier in identifiers}
+    if len(lengths) != 1 or not lengths or next(iter(lengths)) < 2:
+        raise ValueError("有效试验数需要同长的至少两个折级得分")
+
+    def correlation(left: Sequence[float], right: Sequence[float]) -> float:
+        left_mean = statistics.fmean(left)
+        right_mean = statistics.fmean(right)
+        left_centered = [value - left_mean for value in left]
+        right_centered = [value - right_mean for value in right]
+        left_square = sum(value * value for value in left_centered)
+        right_square = sum(value * value for value in right_centered)
+        if left_square <= 0.0 or right_square <= 0.0:
+            return 1.0 if tuple(left) == tuple(right) else 0.0
+        value = sum(
+            left_value * right_value
+            for left_value, right_value in zip(
+                left_centered,
+                right_centered,
+                strict=True,
+            )
+        ) / math.sqrt(left_square * right_square)
+        return min(max(value, -1.0), 1.0)
+
+    squared_sum = 0.0
+    for left in identifiers:
+        for right in identifiers:
+            value = 1.0 if left == right else correlation(
+                fold_scores[left],
+                fold_scores[right],
+            )
+            squared_sum += value * value
+    return min(max(count * count / squared_sum, 1.0), float(count))
+
+
+def _parameter_neighbors(
+    selected: CandidateSpec,
+    candidates: Sequence[CandidateSpec],
+) -> tuple[CandidateSpec, ...]:
+    """返回其他参数不变时，每个数值轴最近的上下邻居。"""
+    selected_keys = set(selected.parameters)
+    neighbors: dict[str, CandidateSpec] = {}
+    for parameter in sorted(selected.parameters):
+        selected_value = float(selected.parameters[parameter])
+        axis_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate.candidate_id != selected.candidate_id
+            and set(candidate.parameters) == selected_keys
+            and all(
+                candidate.parameters[name] == selected.parameters[name]
+                for name in selected_keys
+                if name != parameter
+            )
+        ]
+        lower = [
+            candidate for candidate in axis_candidates
+            if float(candidate.parameters[parameter]) < selected_value
+        ]
+        upper = [
+            candidate for candidate in axis_candidates
+            if float(candidate.parameters[parameter]) > selected_value
+        ]
+        if lower:
+            candidate = max(
+                lower,
+                key=lambda item: (
+                    float(item.parameters[parameter]),
+                    item.candidate_id,
+                ),
+            )
+            neighbors[candidate.candidate_id] = candidate
+        if upper:
+            candidate = min(
+                upper,
+                key=lambda item: (
+                    float(item.parameters[parameter]),
+                    item.candidate_id,
+                ),
+            )
+            neighbors[candidate.candidate_id] = candidate
+    return tuple(neighbors[key] for key in sorted(neighbors))
 
 
 def _probability_backtest_overfitting(
@@ -615,6 +758,7 @@ def walk_forward_validate(
     families = sorted({candidate.family for candidate in candidates})
     trials: list[TrialRecord] = []
     family_validation_targets: dict[str, tuple[float, ...]] = {}
+    candidate_fold_scores: dict[str, tuple[float, ...]] = {}
     pending: list[_PendingFamily] = []
     for family in families:
         family_candidates = tuple(
@@ -768,6 +912,10 @@ def walk_forward_validate(
                 family_seed,
             )
         )
+        candidate_fold_scores.update({
+            candidate_id: tuple(scores)
+            for candidate_id, scores in fold_test_sharpes.items()
+        })
         bootstrap_seed = block_bootstrap_seed ^ int(
             hashlib.sha256(
                 f"{family}:{BLOCK_BOOTSTRAP_METHOD_VERSION}".encode("utf-8")
@@ -840,6 +988,13 @@ def walk_forward_validate(
         candidate_id: metrics.p_value
         for candidate_id, metrics in candidate_oos_metrics.items()
     }
+    raw_trial_count = len(candidate_oos_metrics)
+    effective_trial_count = _effective_trial_count(candidate_fold_scores)
+    annualization_scale = math.sqrt(periods_per_year)
+    candidate_period_sharpes = tuple(
+        metrics.sharpe / annualization_scale
+        for metrics in candidate_oos_metrics.values()
+    )
     for item in pending:
         p_values[f"family-walk-forward:{item.family}"] = item.metrics.p_value
     q_values = _fdr_q_values(p_values)
@@ -863,9 +1018,69 @@ def walk_forward_validate(
         validation.get("maximum_block_bootstrap_p_value"),
         "maximum_block_bootstrap_p_value",
     )
+    minimum_deflated_sharpe_probability = _number(
+        validation.get("minimum_deflated_sharpe_probability"),
+        "minimum_deflated_sharpe_probability",
+    )
+    if not 0.0 <= minimum_deflated_sharpe_probability <= 1.0:
+        raise ValueError("minimum_deflated_sharpe_probability 必须位于零到一")
+    minimum_parameter_neighbor_count = _integer(
+        validation.get("minimum_parameter_neighbor_count"),
+        "minimum_parameter_neighbor_count",
+    )
+    minimum_positive_parameter_neighbor_ratio = _number(
+        validation.get("minimum_positive_parameter_neighbor_ratio"),
+        "minimum_positive_parameter_neighbor_ratio",
+    )
+    minimum_neighbor_sharpe_retention = _number(
+        validation.get("minimum_median_parameter_neighbor_sharpe_retention"),
+        "minimum_median_parameter_neighbor_sharpe_retention",
+    )
+    if not 0.0 <= minimum_positive_parameter_neighbor_ratio <= 1.0:
+        raise ValueError("minimum_positive_parameter_neighbor_ratio 必须位于零到一")
     evaluations: list[FamilyEvaluation] = []
     for item in pending:
         q_value = q_values[f"family-walk-forward:{item.family}"]
+        raw_dsr, raw_benchmark = _deflated_sharpe_probability(
+            item.oos_returns,
+            candidate_period_sharpes,
+            float(raw_trial_count),
+        )
+        effective_dsr, effective_benchmark = _deflated_sharpe_probability(
+            item.oos_returns,
+            candidate_period_sharpes,
+            effective_trial_count,
+        )
+        neighbors = _parameter_neighbors(
+            item.deployment_candidate,
+            tuple(
+                candidate for candidate in candidates
+                if candidate.family == item.family
+            ),
+        )
+        neighbor_metrics = [
+            candidate_oos_metrics[candidate.candidate_id]
+            for candidate in neighbors
+        ]
+        positive_neighbor_ratio = (
+            sum(
+                metrics.sharpe > 0.0 and metrics.net_return > 0.0
+                for metrics in neighbor_metrics
+            ) / len(neighbor_metrics)
+            if neighbor_metrics
+            else 0.0
+        )
+        selected_fixed_sharpe = candidate_oos_metrics[
+            item.deployment_candidate.candidate_id
+        ].sharpe
+        median_neighbor_retention = (
+            statistics.median(
+                metrics.sharpe / selected_fixed_sharpe
+                for metrics in neighbor_metrics
+            )
+            if neighbor_metrics and selected_fixed_sharpe > 0.0
+            else 0.0
+        )
         reasons: list[str] = []
         if item.mode != "paper":
             reasons.append("shadow_only")
@@ -885,6 +1100,17 @@ def walk_forward_validate(
             reasons.append("probability_backtest_overfitting_failed")
         if item.bootstrap_p > maximum_bootstrap_p:
             reasons.append("block_bootstrap_sharpe_failed")
+        if raw_dsr < minimum_deflated_sharpe_probability:
+            reasons.append("deflated_sharpe_probability_failed")
+        if len(neighbors) < minimum_parameter_neighbor_count:
+            reasons.append("parameter_neighbor_count_failed")
+        if (
+            positive_neighbor_ratio
+            < minimum_positive_parameter_neighbor_ratio
+        ):
+            reasons.append("positive_parameter_neighbor_ratio_failed")
+        if median_neighbor_retention < minimum_neighbor_sharpe_retention:
+            reasons.append("parameter_neighbor_sharpe_retention_failed")
         evaluations.append(FamilyEvaluation(
             family=item.family,
             mode=item.mode,
@@ -907,6 +1133,19 @@ def walk_forward_validate(
             block_bootstrap_sharpe_lower_bound=item.bootstrap_lower,
             block_bootstrap_p_value=item.bootstrap_p,
             block_bootstrap_sample_count=item.bootstrap_count,
+            deflated_sharpe_probability_raw=raw_dsr,
+            deflated_sharpe_probability_effective=effective_dsr,
+            deflated_sharpe_benchmark_raw=raw_benchmark * annualization_scale,
+            deflated_sharpe_benchmark_effective=(
+                effective_benchmark * annualization_scale
+            ),
+            raw_trial_count=raw_trial_count,
+            effective_trial_count=effective_trial_count,
+            parameter_neighbor_count=len(neighbors),
+            positive_parameter_neighbor_ratio=positive_neighbor_ratio,
+            median_parameter_neighbor_sharpe_retention=(
+                median_neighbor_retention
+            ),
             fold_selected_candidate_ids=item.fold_selected_candidate_ids,
             cscv_in_sample_fold_count=len(folds) // 2,
             cscv_out_sample_fold_count=len(folds) - len(folds) // 2,

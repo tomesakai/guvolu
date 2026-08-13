@@ -47,6 +47,9 @@ from guvolu.research.shadow import (
 )
 from guvolu.research.validation import (
     BLOCK_BOOTSTRAP_METHOD_VERSION,
+    DEFLATED_SHARPE_METHOD_VERSION,
+    EFFECTIVE_TRIAL_METHOD_VERSION,
+    PARAMETER_STABILITY_METHOD_VERSION,
     PBO_METHOD_VERSION,
     P_VALUE_METHOD_VERSION,
     ValidationResult,
@@ -63,7 +66,7 @@ from guvolu.strategy.generation import (
 )
 
 PIPELINE_SCHEMA_VERSION = 1
-PIPELINE_METHOD_VERSION = "strategy-research-pipeline-v8"
+PIPELINE_METHOD_VERSION = "strategy-research-pipeline-v9"
 POSITION_CONTRACT_METHOD_VERSION = "risk-weighted-family-target-v1"
 SECONDS_PER_YEAR = 365.0 * 24.0 * 60.0 * 60.0
 _INTERVAL_SECONDS = {
@@ -386,6 +389,25 @@ def _family_payload(validation: ValidationResult) -> list[Mapping[str, object]]:
         ),
         "block_bootstrap_p_value": item.block_bootstrap_p_value,
         "block_bootstrap_sample_count": item.block_bootstrap_sample_count,
+        "deflated_sharpe_probability_raw": (
+            item.deflated_sharpe_probability_raw
+        ),
+        "deflated_sharpe_probability_effective": (
+            item.deflated_sharpe_probability_effective
+        ),
+        "deflated_sharpe_benchmark_raw": item.deflated_sharpe_benchmark_raw,
+        "deflated_sharpe_benchmark_effective": (
+            item.deflated_sharpe_benchmark_effective
+        ),
+        "raw_trial_count": item.raw_trial_count,
+        "effective_trial_count": item.effective_trial_count,
+        "parameter_neighbor_count": item.parameter_neighbor_count,
+        "positive_parameter_neighbor_ratio": (
+            item.positive_parameter_neighbor_ratio
+        ),
+        "median_parameter_neighbor_sharpe_retention": (
+            item.median_parameter_neighbor_sharpe_retention
+        ),
     } for item in validation.families]
 
 
@@ -531,6 +553,9 @@ def run_research(
         "p_value_method_version": P_VALUE_METHOD_VERSION,
         "pbo_method_version": PBO_METHOD_VERSION,
         "block_bootstrap_method_version": BLOCK_BOOTSTRAP_METHOD_VERSION,
+        "deflated_sharpe_method_version": DEFLATED_SHARPE_METHOD_VERSION,
+        "effective_trial_method_version": EFFECTIVE_TRIAL_METHOD_VERSION,
+        "parameter_stability_method_version": PARAMETER_STABILITY_METHOD_VERSION,
         "position_contract_method_version": POSITION_CONTRACT_METHOD_VERSION,
         "config_hash": config_hash,
         "head_generation": inputs.head_generation,
@@ -593,6 +618,11 @@ def run_research(
         raise ValueError("研究面板没有可用策略决策时点")
     decision_index = valid_indices[-1]
     strategy_decision_time = features[decision_index].decision_time
+    interval = _text(config.get("bar_interval"), "bar_interval")
+    interval_seconds = _INTERVAL_SECONDS.get(interval)
+    if interval_seconds is None:
+        raise ValueError("不支持的研究节拍")
+    periods_per_year = SECONDS_PER_YEAR / interval_seconds
     validation = walk_forward_validate(
         run_id,
         panel.bars,
@@ -643,6 +673,7 @@ def run_research(
         features[decision_index],
         state_lookback,
         features[decision_index].volume_score,
+        periods_per_year,
     )
     cross_config = _mapping(
         config.get("cross_venue_shadow"), "cross_venue_shadow",
@@ -720,9 +751,6 @@ def run_research(
         "slippage_bps_assumption",
         "impact_bps_assumption",
     )) / 10_000.0
-    interval_seconds = _INTERVAL_SECONDS[
-        _text(config.get("bar_interval"), "bar_interval")
-    ]
     maximum_gap = interval_seconds * _integer(
         feature_config.get("maximum_structural_gap_bars_assumption"),
         "maximum_structural_gap_bars_assumption",
@@ -738,7 +766,7 @@ def run_research(
             "capacity_notional_quote",
         ),
         maximum_gap,
-        SECONDS_PER_YEAR / interval_seconds,
+        periods_per_year,
     )
     ablations = {
         "fixed_long": metrics_payload(fixed_position_metrics),
@@ -849,6 +877,9 @@ def run_research(
         "p_value_method_version": P_VALUE_METHOD_VERSION,
         "pbo_method_version": PBO_METHOD_VERSION,
         "block_bootstrap_method_version": BLOCK_BOOTSTRAP_METHOD_VERSION,
+        "deflated_sharpe_method_version": DEFLATED_SHARPE_METHOD_VERSION,
+        "effective_trial_method_version": EFFECTIVE_TRIAL_METHOD_VERSION,
+        "parameter_stability_method_version": PARAMETER_STABILITY_METHOD_VERSION,
         "position_contract_method_version": POSITION_CONTRACT_METHOD_VERSION,
         "governance_method_version": GOVERNANCE_METHOD_VERSION,
         "run_id": run_id,
@@ -912,6 +943,9 @@ def run_research(
         "p_value_method_version": P_VALUE_METHOD_VERSION,
         "pbo_method_version": PBO_METHOD_VERSION,
         "block_bootstrap_method_version": BLOCK_BOOTSTRAP_METHOD_VERSION,
+        "deflated_sharpe_method_version": DEFLATED_SHARPE_METHOD_VERSION,
+        "effective_trial_method_version": EFFECTIVE_TRIAL_METHOD_VERSION,
+        "parameter_stability_method_version": PARAMETER_STABILITY_METHOD_VERSION,
         "position_contract_method_version": POSITION_CONTRACT_METHOD_VERSION,
         "governance_method_version": GOVERNANCE_METHOD_VERSION,
         "run_id": run_id,
