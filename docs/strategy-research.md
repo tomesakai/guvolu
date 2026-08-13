@@ -241,10 +241,10 @@ improving、stable 或 decaying。重复面板、未早于当前决策时点和�
 组合研究分配为量价趋势 `0.180456`、趋势 `0.219544`、风险储备 `0.60`；突破当期家族目标
 为零，因此不占组合风险，研究聚合目标为 `0.40`。运行时 `feature_snapshot_stale` 门禁把
 全部权重清零并将储备提高到 `1.00`。本次 decision-grade manifest 为
-`research-run-8b284dae08d7e2f47e18d557bffafbebc21d7719557767d7862825105c1d20ed`，
-SHA-256 为 `0f758983227dfc110aef614d1b3625d777c1eb24ea6d9a6535ab6431495a7f56`；
-来源提交为 `3cc87727f3dabd2062f903a26b842ce797a27a4d`，研究代码树散列为
-`adfbcf3ce4ab87b2853c1019a463b0587ccc0262128004ac929ff5e8149ddf49`。
+`research-run-9f96151cf7f82f7ba3a20480e99fa2fe6c397a288468cdbaaf7fd68aec705654`，
+SHA-256 为 `599c3ca3bc92e8ebc215ceec7fe445223584667883ceb4319a1d9e4dbee69e1f`；
+来源提交为 `90bad6bccadcab0f79feb717e6627423c6dec6eb`，研究代码树散列为
+`4a7211661c151a841134b8be784181ce64210118dc35d154e65e0e9bb3be113f`。
 
 监视器只允许突破与趋势各扩展一个预登记边界轴到 264 小时。趋势派生候选把拼接 OOS
 Sharpe 从 0.772 提高到 0.866、PBO 从 0.320 降到 0.121；突破则把 Sharpe 从 1.114 降到
