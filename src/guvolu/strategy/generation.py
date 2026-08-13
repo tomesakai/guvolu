@@ -10,8 +10,15 @@ from guvolu.strategy.baselines import (
     build_candidates,
 )
 from guvolu.strategy.contracts import CandidateSpec
+from guvolu.strategy.expression import (
+    EXPRESSION_METHOD_VERSION,
+    expression_complexity,
+    expression_id,
+    strategy_expression,
+    strategy_expression_payload,
+)
 
-GENERATOR_METHOD_VERSION = "scripted-family-grid-v2"
+GENERATOR_METHOD_VERSION = "scripted-typed-family-grid-v3"
 
 
 @dataclass(frozen=True)
@@ -79,6 +86,7 @@ def candidate_registry_payload(
         "schema_version": 1,
         "generator_method_version": GENERATOR_METHOD_VERSION,
         "strategy_method_version": STRATEGY_METHOD_VERSION,
+        "expression_method_version": EXPRESSION_METHOD_VERSION,
         "config_hash": config_hash,
         "family_scope": [batch.family for batch in batches],
         "candidate_count": sum(len(batch.candidates) for batch in batches),
@@ -89,6 +97,13 @@ def candidate_registry_payload(
             "candidate_ids": [
                 candidate.candidate_id for candidate in batch.candidates
             ],
+            "expression_id": expression_id(strategy_expression(batch.family)),
+            "expression_complexity": expression_complexity(
+                strategy_expression(batch.family),
+            ),
+            "expression": strategy_expression_payload(
+                strategy_expression(batch.family),
+            ),
         } for batch in batches],
         "candidates": [{
             "candidate_id": candidate.candidate_id,
@@ -96,5 +111,6 @@ def candidate_registry_payload(
             "mode": candidate.mode,
             "parameters": dict(candidate.parameters),
             "complexity": candidate.complexity,
+            "expression_id": candidate.expression_id,
         } for batch in batches for candidate in batch.candidates],
     }

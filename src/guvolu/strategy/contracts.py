@@ -50,3 +50,4 @@ class CandidateSpec:
     mode: str
     parameters: Mapping[str, int | float]
     complexity: int
+    expression_id: str | None = None

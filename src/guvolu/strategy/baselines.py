@@ -1,14 +1,18 @@
 """趋势、量价确认趋势、突破、均值回归与网格基线。"""
 from __future__ import annotations
 
-import hashlib
-import json
 import math
 from collections.abc import Mapping, Sequence
 
 from guvolu.strategy.contracts import CandidateSpec, FeatureRow, ResearchBar
+from guvolu.strategy.expression import (
+    candidate_identity,
+    evaluate_expression,
+    expression_id,
+    strategy_expression,
+)
 
-STRATEGY_METHOD_VERSION = "baseline-signal-rules-v2"
+STRATEGY_METHOD_VERSION = "typed-signal-rules-v3"
 SUPPORTED_FAMILIES = (
     "breakout",
     "flow_trend",
@@ -50,23 +54,16 @@ def _candidate(
     parameters: Mapping[str, int | float],
 ) -> CandidateSpec:
     """生成确定性候选身份。"""
-    body = json.dumps(
-        {
-            "strategy_method_version": STRATEGY_METHOD_VERSION,
-            "family": family,
-            "mode": mode,
-            "parameters": parameters,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    identifier = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    template = strategy_expression(family)
+    if template.mode != mode:
+        raise ValueError(f"策略表达式模式不一致: {family}")
     return CandidateSpec(
-        candidate_id=f"candidate-{identifier}",
+        candidate_id=candidate_identity(template, parameters),
         family=family,
         mode=mode,
         parameters=dict(parameters),
         complexity=len(parameters),
+        expression_id=expression_id(template),
     )
 
 
@@ -228,6 +225,13 @@ def generate_targets(
         raise ValueError("行情柱与特征数量不一致")
     if periods_per_year <= 0:
         raise ValueError("年化周期必须为正")
+    template = strategy_expression(candidate.family)
+    expected_expression_id = expression_id(template)
+    if candidate.expression_id is not None:
+        if candidate.expression_id != expected_expression_id:
+            raise ValueError("候选表达式身份与流派模板不一致")
+        if candidate.candidate_id != candidate_identity(template, candidate.parameters):
+            raise ValueError("候选身份与表达式及参数不一致")
     lookback = int(_parameter(candidate, "lookback"))
     position = 0.0
     targets: list[float] = []
@@ -236,97 +240,53 @@ def generate_targets(
             position = 0.0
             targets.append(position)
             continue
-        if candidate.family == "trend":
-            trend = feature.trend_scores.get(lookback)
-            if trend is None:
-                position = 0.0
-            elif position <= 0 and trend >= _parameter(candidate, "entry_score"):
-                position = _scaled_target(
-                    feature,
-                    lookback,
-                    _parameter(candidate, "annual_volatility_target"),
-                    _parameter(candidate, "maximum_target"),
-                    periods_per_year,
-                )
-            elif position > 0 and trend <= _parameter(candidate, "exit_score"):
-                position = 0.0
-        elif candidate.family == "flow_trend":
-            trend = feature.trend_scores.get(lookback)
-            flow = feature.flow_imbalance
-            volume = feature.volume_score
-            confirmed = (
-                flow is not None
-                and volume is not None
-                and flow >= _parameter(candidate, "flow_confirmation")
-                and volume >= _parameter(candidate, "minimum_volume_score")
+        required_valid = all(
+            evaluate_expression(node, candidate.parameters, bar, feature) is not None
+            for node in template.required
+        )
+        if not required_valid:
+            position = 0.0
+            targets.append(position)
+            continue
+        if template.sizing == "expression_target":
+            if template.target is None:
+                raise ValueError("表达式目标策略缺少 target AST")
+            target = evaluate_expression(
+                template.target,
+                candidate.parameters,
+                bar,
+                feature,
             )
-            if trend is None:
-                position = 0.0
-            elif (
-                position <= 0
-                and trend >= _parameter(candidate, "entry_score")
-                and confirmed
-            ):
-                position = _scaled_target(
-                    feature,
-                    lookback,
-                    _parameter(candidate, "annual_volatility_target"),
-                    _parameter(candidate, "maximum_target"),
-                    periods_per_year,
-                )
-            elif position > 0 and trend <= _parameter(candidate, "exit_score"):
-                position = 0.0
-        elif candidate.family == "breakout":
-            prior_high = feature.prior_highs.get(lookback)
-            price_score = feature.price_scores.get(lookback)
-            flow = feature.flow_imbalance
-            confirmed = flow is not None and flow >= _parameter(
-                candidate, "flow_confirmation",
+            position = (
+                float(target)
+                if isinstance(target, (int, float)) and not isinstance(target, bool)
+                else 0.0
             )
-            if prior_high is None or price_score is None:
-                position = 0.0
-            elif position <= 0 and bar.close > prior_high and confirmed:
-                position = _scaled_target(
-                    feature,
-                    lookback,
-                    _parameter(candidate, "annual_volatility_target"),
-                    _parameter(candidate, "maximum_target"),
-                    periods_per_year,
-                )
-            elif position > 0 and price_score <= 0:
-                position = 0.0
-        elif candidate.family == "mean_reversion":
-            score = feature.price_scores.get(lookback)
-            trend = feature.trend_scores.get(lookback)
-            jump = feature.jump_score
-            if score is None or trend is None:
-                position = 0.0
-            elif (
-                position <= 0
-                and score <= -_parameter(candidate, "entry_score")
-                and abs(trend) <= _parameter(candidate, "trend_limit")
-                and (jump is None or jump < 4.0)
-            ):
-                position = _scaled_target(
-                    feature,
-                    lookback,
-                    _parameter(candidate, "annual_volatility_target"),
-                    _parameter(candidate, "maximum_target"),
-                    periods_per_year,
-                )
-            elif position > 0 and score >= _parameter(candidate, "exit_score"):
-                position = 0.0
-        elif candidate.family == "grid_shadow":
-            score = feature.price_scores.get(lookback)
-            if score is None:
-                position = 0.0
-            else:
-                depth = max(-score / _parameter(candidate, "entry_score"), 0.0)
-                position = min(
-                    depth * _parameter(candidate, "maximum_target"),
-                    _parameter(candidate, "maximum_target"),
-                )
-        else:
-            raise ValueError(f"未知策略家族: {candidate.family}")
+            targets.append(position)
+            continue
+        if template.entry is None or template.exit is None:
+            raise ValueError("状态策略缺少 entry 或 exit AST")
+        entry = evaluate_expression(
+            template.entry,
+            candidate.parameters,
+            bar,
+            feature,
+        )
+        exit_signal = evaluate_expression(
+            template.exit,
+            candidate.parameters,
+            bar,
+            feature,
+        )
+        if position <= 0 and entry is True:
+            position = _scaled_target(
+                feature,
+                lookback,
+                _parameter(candidate, "annual_volatility_target"),
+                _parameter(candidate, "maximum_target"),
+                periods_per_year,
+            )
+        elif position > 0 and (exit_signal is True or exit_signal is None):
+            position = 0.0
         targets.append(position)
     return tuple(targets)
