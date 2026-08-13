@@ -526,6 +526,18 @@ def run_holdout_validation(
             "rejection_reasons": reasons,
         })
     verdict = "passed" if len(passed_families) == len(candidates) else "failed"
+    score_schedule = [
+        panel.bars[index - 1].decision_time.isoformat()
+        for index in range(start, end)
+    ]
+    schedule_path = run_directory / "score-schedule.json"
+    atomic_write_text(schedule_path, canonical_json({
+        "schema_version": HOLDOUT_MANIFEST_SCHEMA_VERSION,
+        "holdout_method_version": HOLDOUT_METHOD_VERSION,
+        "evaluation_id": evaluation_id,
+        "decision_times": score_schedule,
+    }) + "\n")
+    schedule_sha256 = sha256_file(schedule_path)
     result_payload = {
         "schema_version": HOLDOUT_MANIFEST_SCHEMA_VERSION,
         "holdout_method_version": HOLDOUT_METHOD_VERSION,
@@ -542,6 +554,7 @@ def run_holdout_validation(
         "config_hash": sha256_file(config_file),
         "code_identity": asdict(identity),
         "panel_sha256": panel.panel_sha256,
+        "score_schedule_sha256": schedule_sha256,
         "score_start": panel.bars[start - 1].decision_time.isoformat(),
         "score_end": panel.bars[end - 1].decision_time.isoformat(),
         "score_bars": end - start,
@@ -570,6 +583,10 @@ def run_holdout_validation(
             "panel": {
                 **artifact_record(panel.panel_path, "holdout_panel"),
                 "path": panel.panel_path.resolve().relative_to(repository).as_posix(),
+            },
+            "score_schedule": {
+                **artifact_record(schedule_path, "holdout_score_schedule"),
+                "path": schedule_path.resolve().relative_to(repository).as_posix(),
             },
             "result": {
                 **artifact_record(result_path, "holdout_result"),

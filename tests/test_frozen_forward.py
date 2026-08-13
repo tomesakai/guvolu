@@ -71,8 +71,12 @@ def test_frozen_forward_uses_fixed_weight_and_is_idempotent(
     })
     plan_payload = {
         "schema_version": 1,
+        "method_version": "frozen-forward-v1",
+        "governance_method_version": GOVERNANCE_METHOD_VERSION,
         "scope": "FROZEN_FORWARD",
         "plan_id": plan_id,
+        "vintage": {"vintage_id": vintage.vintage_id},
+        "source": {"manifest_sha256": "manifest-hash"},
         "candidate_set_hash": "candidate-set-hash",
         "config_hash": config_hash,
         "code_identity": {"git_hash": "commit-one", "tree_digest": "tree-one"},
@@ -98,6 +102,7 @@ def test_frozen_forward_uses_fixed_weight_and_is_idempotent(
         "tree-one",
         plan_path.relative_to(tmp_path).as_posix(),
         sha256_file(plan_path),
+        repository_root=tmp_path,
         frozen_at=_time("2026-12-15T00:00:00"),
     )
     assert plan.plan_id == plan_id

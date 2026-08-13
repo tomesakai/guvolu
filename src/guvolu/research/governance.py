@@ -9,6 +9,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from guvolu.research.contracts import (
+    FROZEN_FORWARD_METHOD_VERSION,
+    FROZEN_FORWARD_SCHEMA_VERSION,
     HOLDOUT_MANIFEST_SCHEMA_VERSION,
     HOLDOUT_METHOD_VERSION,
 )
@@ -107,6 +109,7 @@ class _TerminalEvidence:
     score_start: datetime
     score_end: datetime
     score_bars: int
+    score_decision_times: tuple[datetime, ...]
 
 
 def _utc(value: datetime) -> datetime:
@@ -188,6 +191,94 @@ def _validated_artifact(
     if sha256_file(path) != sha256:
         raise ValueError(f"holdout {name} 现场 SHA-256 不匹配")
     return path, sha256
+
+
+def _validated_forward_plan_artifact(
+    repository_root: Path,
+    plan_id: str,
+    vintage_id: str,
+    source_manifest_sha256: str,
+    candidate_set_hash: str,
+    config_hash: str,
+    code_tree_digest: str,
+    artifact_path: str,
+    artifact_sha256: str,
+) -> tuple[Path, str]:
+    """现场复核冻结前向计划制品与注册身份。"""
+    if not _canonical_sha256(artifact_sha256):
+        raise ValueError("冻结前向计划 SHA-256 无效")
+    path, normalized = _evidence_file(
+        repository_root, artifact_path, "frozen forward plan",
+    )
+    if sha256_file(path) != artifact_sha256:
+        raise ValueError("冻结前向计划现场 SHA-256 不匹配")
+    payload = _json_file(path, "frozen forward plan")
+    expected = {
+        "schema_version": FROZEN_FORWARD_SCHEMA_VERSION,
+        "method_version": FROZEN_FORWARD_METHOD_VERSION,
+        "governance_method_version": GOVERNANCE_METHOD_VERSION,
+        "scope": "FROZEN_FORWARD",
+        "plan_id": plan_id,
+        "config_hash": config_hash,
+        "code_tree_digest": code_tree_digest,
+        "candidate_set_hash": candidate_set_hash,
+    }
+    for field, value in expected.items():
+        if payload.get(field) != value:
+            raise ValueError(f"冻结前向计划 {field} 与注册身份不一致")
+    vintage = payload.get("vintage")
+    if not isinstance(vintage, dict) or vintage.get("vintage_id") != vintage_id:
+        raise ValueError("冻结前向计划 vintage_id 与注册身份不一致")
+    source = payload.get("source")
+    if (
+        not isinstance(source, dict)
+        or source.get("manifest_sha256") != source_manifest_sha256
+    ):
+        raise ValueError("冻结前向计划来源 manifest 与注册身份不一致")
+    return path, normalized
+
+
+def _validated_forward_prediction_artifact(
+    repository_root: Path,
+    prediction_id: str,
+    plan_id: str,
+    vintage_id: str,
+    decision_time: datetime,
+    input_head_generation: str,
+    panel_sha256: str,
+    config_hash: str,
+    code_tree_digest: str,
+    artifact_path: str,
+    artifact_sha256: str,
+) -> tuple[Path, str]:
+    """现场复核冻结预测制品的计划、时点、输入和代码身份。"""
+    if not _canonical_sha256(artifact_sha256):
+        raise ValueError("冻结前向预测 SHA-256 无效")
+    path, normalized = _evidence_file(
+        repository_root, artifact_path, "frozen forward prediction",
+    )
+    if sha256_file(path) != artifact_sha256:
+        raise ValueError("冻结前向预测现场 SHA-256 不匹配")
+    payload = _json_file(path, "frozen forward prediction")
+    expected = {
+        "schema_version": FROZEN_FORWARD_SCHEMA_VERSION,
+        "method_version": FROZEN_FORWARD_METHOD_VERSION,
+        "scope": "FROZEN_FORWARD",
+        "prediction_id": prediction_id,
+        "plan_id": plan_id,
+        "vintage_id": vintage_id,
+        "decision_time": decision_time.isoformat(),
+        "input_head_generation": input_head_generation,
+        "panel_sha256": panel_sha256,
+        "config_hash": config_hash,
+    }
+    for field, value in expected.items():
+        if payload.get(field) != value:
+            raise ValueError(f"冻结前向预测 {field} 与注册身份不一致")
+    code = payload.get("code_identity")
+    if not isinstance(code, dict) or code.get("tree_digest") != code_tree_digest:
+        raise ValueError("冻结前向预测代码树与计划不一致")
+    return path, normalized
 
 
 def _validated_candidate_set_identity(
@@ -370,6 +461,12 @@ def _validated_terminal_evidence(
     _, panel_sha256 = _validated_artifact(
         repository_root, artifacts, "panel", "holdout_panel",
     )
+    schedule_path, schedule_sha256 = _validated_artifact(
+        repository_root,
+        artifacts,
+        "score_schedule",
+        "holdout_score_schedule",
+    )
     result_path, result_sha256 = _validated_artifact(
         repository_root, artifacts, "result", "holdout_result",
     )
@@ -391,6 +488,8 @@ def _validated_terminal_evidence(
         raise ValueError("holdout result 的 config_hash 不匹配")
     if result.get("panel_sha256") != panel_sha256:
         raise ValueError("holdout result 未绑定现场 panel SHA-256")
+    if result.get("score_schedule_sha256") != schedule_sha256:
+        raise ValueError("holdout result 未绑定现场 score schedule")
     if result.get("verdict") != terminal_verdict:
         raise ValueError("holdout result 与最终 verdict 不匹配")
     candidate_results = result.get("candidate_results")
@@ -430,6 +529,29 @@ def _validated_terminal_evidence(
     score_end = _parse_timestamp(score_end_value)
     if score_start > score_end:
         raise ValueError("holdout score 时间范围倒置")
+    schedule = _json_file(schedule_path, "holdout score schedule")
+    if schedule.get("schema_version") != HOLDOUT_MANIFEST_SCHEMA_VERSION:
+        raise ValueError("holdout score schedule schema_version 不受支持")
+    if schedule.get("holdout_method_version") != HOLDOUT_METHOD_VERSION:
+        raise ValueError("holdout score schedule method version 不匹配")
+    if schedule.get("evaluation_id") != evaluation_id:
+        raise ValueError("holdout score schedule evaluation_id 不匹配")
+    raw_decision_times = schedule.get("decision_times")
+    if (
+        not isinstance(raw_decision_times, list)
+        or len(raw_decision_times) != score_bars
+        or any(not isinstance(item, str) for item in raw_decision_times)
+    ):
+        raise ValueError("holdout score schedule 未完整覆盖评分柱")
+    decision_times = tuple(
+        _parse_timestamp(str(item)) for item in raw_decision_times
+    )
+    if (
+        decision_times != tuple(sorted(set(decision_times)))
+        or decision_times[0] != score_start
+        or decision_times[-1] != score_end
+    ):
+        raise ValueError("holdout score schedule 时点无序、重复或边界不一致")
     require_forward_predictions = policy.get("require_frozen_forward_predictions")
     if not isinstance(require_forward_predictions, bool):
         raise ValueError("holdout policy 必须明确冻结前向预测要求")
@@ -547,6 +669,7 @@ def _validated_terminal_evidence(
         score_start=score_start,
         score_end=score_end,
         score_bars=score_bars,
+        score_decision_times=decision_times,
     )
 
 
@@ -1161,23 +1284,43 @@ def finalize_holdout_evaluation(
                 or plan["config_hash"] != evidence.config_hash
             ):
                 raise ValueError("holdout 冻结前向 plan 身份不匹配")
-            registered_predictions = int(connection.execute(
-                "SELECT COUNT(*) FROM frozen_forward_prediction WHERE plan_id=?",
+            _validated_forward_plan_artifact(
+                repository_root,
+                str(plan["plan_id"]),
+                vintage_id,
+                str(plan["source_manifest_sha256"]),
+                str(plan["candidate_set_hash"]),
+                str(plan["config_hash"]),
+                str(plan["code_tree_digest"]),
+                str(plan["plan_artifact_path"]),
+                str(plan["plan_artifact_sha256"]),
+            )
+            prediction_rows = connection.execute(
+                "SELECT * FROM frozen_forward_prediction WHERE plan_id=? "
+                "ORDER BY decision_time",
                 (evidence.forward_plan_id,),
-            ).fetchone()[0])
-            covered_predictions = int(connection.execute(
-                "SELECT COUNT(*) FROM frozen_forward_prediction "
-                "WHERE plan_id=? AND decision_time>=? AND decision_time<=?",
-                (
-                    evidence.forward_plan_id,
-                    _timestamp(evidence.score_start),
-                    _timestamp(evidence.score_end),
-                ),
-            ).fetchone()[0])
-            if registered_predictions != evidence.forward_prediction_count:
+            ).fetchall()
+            if len(prediction_rows) != evidence.forward_prediction_count:
                 raise ValueError("holdout 冻结预测数量与注册表不一致")
-            if covered_predictions != evidence.score_bars:
-                raise ValueError("holdout 冻结预测未完整覆盖评分区间")
+            prediction_times: list[datetime] = []
+            for prediction in prediction_rows:
+                decision_time = _parse_timestamp(str(prediction["decision_time"]))
+                prediction_times.append(decision_time)
+                _validated_forward_prediction_artifact(
+                    repository_root,
+                    str(prediction["prediction_id"]),
+                    str(prediction["plan_id"]),
+                    str(prediction["vintage_id"]),
+                    decision_time,
+                    str(prediction["input_head_generation"]),
+                    str(prediction["panel_sha256"]),
+                    evidence.config_hash,
+                    str(plan["code_tree_digest"]),
+                    str(prediction["prediction_artifact_path"]),
+                    str(prediction["prediction_artifact_sha256"]),
+                )
+            if tuple(prediction_times) != evidence.score_decision_times:
+                raise ValueError("holdout 冻结预测时点未逐柱匹配评分面板")
         elif evidence.require_forward_predictions:
             raise ValueError("holdout 要求冻结前向预测但注册表没有 plan")
         if vintage["verdict"] is not None or attempt["status"] != "incomplete":
@@ -1294,6 +1437,7 @@ def register_frozen_forward_plan(
     plan_artifact_path: str,
     plan_artifact_sha256: str,
     *,
+    repository_root: Path,
     frozen_at: datetime | None = None,
 ) -> FrozenForwardPlan:
     """在 vintage 开始前原子登记唯一冻结前向计划。"""
@@ -1316,6 +1460,25 @@ def register_frozen_forward_plan(
         "config_hash": config_hash,
         "code_tree_digest": code_tree_digest,
     })
+    _, normalized_artifact_path = _validated_forward_plan_artifact(
+        repository_root,
+        plan_id,
+        vintage_id,
+        source_manifest_sha256,
+        candidate_set_hash,
+        config_hash,
+        code_tree_digest,
+        plan_artifact_path,
+        plan_artifact_sha256,
+    )
+    values = (
+        source_manifest_sha256,
+        candidate_set_hash,
+        config_hash,
+        code_tree_digest,
+        normalized_artifact_path,
+        plan_artifact_sha256,
+    )
     connection = _connect(registry_path)
     try:
         _begin(connection)
@@ -1375,16 +1538,14 @@ def register_frozen_forward_prediction(
     prediction_artifact_sha256: str,
     maximum_recording_lag_seconds: int,
     *,
+    repository_root: Path,
     recorded_at: datetime | None = None,
 ) -> FrozenForwardPrediction:
     """原子追加一个及时生成的预测；同一时点内容永久不可改写。"""
     if maximum_recording_lag_seconds <= 0:
         raise ValueError("预测登记时效阈值必须为正数")
-    values = (
-        input_head_generation, panel_sha256,
-        prediction_artifact_path, prediction_artifact_sha256,
-    )
-    if any(not value.strip() for value in values):
+    identity_values = (input_head_generation, panel_sha256, prediction_artifact_path)
+    if any(not value.strip() for value in identity_values):
         raise ValueError("冻结前向预测身份字段不得为空")
     decision = _utc(decision_time)
     recorded = _utc(recorded_at or datetime.now(UTC))
@@ -1414,6 +1575,25 @@ def register_frozen_forward_prediction(
             "plan_id": plan_id,
             "decision_time": decision.isoformat(),
         })
+        _, normalized_artifact_path = _validated_forward_prediction_artifact(
+            repository_root,
+            prediction_id,
+            plan_id,
+            vintage_id,
+            decision,
+            input_head_generation,
+            panel_sha256,
+            str(plan["config_hash"]),
+            str(plan["code_tree_digest"]),
+            prediction_artifact_path,
+            prediction_artifact_sha256,
+        )
+        values = (
+            input_head_generation,
+            panel_sha256,
+            normalized_artifact_path,
+            prediction_artifact_sha256,
+        )
         existing = connection.execute(
             "SELECT * FROM frozen_forward_prediction "
             "WHERE plan_id=? AND decision_time=?",

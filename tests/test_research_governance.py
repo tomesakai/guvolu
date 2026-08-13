@@ -24,6 +24,8 @@ from guvolu.research.governance import (
 )
 from guvolu.research.holdout import run_holdout_validation
 from guvolu.research.contracts import (
+    FROZEN_FORWARD_METHOD_VERSION,
+    FROZEN_FORWARD_SCHEMA_VERSION,
     HOLDOUT_MANIFEST_SCHEMA_VERSION,
     HOLDOUT_METHOD_VERSION,
     CodeIdentity,
@@ -89,6 +91,74 @@ def _test_evaluation_identity(
     return identity, stable_identifier("holdout-evaluation", identity)
 
 
+def _write_forward_plan_artifact(
+    root: Path,
+    vintage_id: str,
+    source_manifest_sha256: str,
+    candidate_set_hash: str,
+    config_hash: str,
+    code_tree_digest: str,
+) -> tuple[str, str, str]:
+    """写入与注册合同一致的冻结前向计划制品。"""
+    plan_id = stable_identifier("frozen-forward-plan", {
+        "governance_method_version": GOVERNANCE_METHOD_VERSION,
+        "vintage_id": vintage_id,
+        "source_manifest_sha256": source_manifest_sha256,
+        "candidate_set_hash": candidate_set_hash,
+        "config_hash": config_hash,
+        "code_tree_digest": code_tree_digest,
+    })
+    path = root / "reports" / plan_id / "plan.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "schema_version": FROZEN_FORWARD_SCHEMA_VERSION,
+        "method_version": FROZEN_FORWARD_METHOD_VERSION,
+        "governance_method_version": GOVERNANCE_METHOD_VERSION,
+        "scope": "FROZEN_FORWARD",
+        "plan_id": plan_id,
+        "vintage": {"vintage_id": vintage_id},
+        "source": {"manifest_sha256": source_manifest_sha256},
+        "candidate_set_hash": candidate_set_hash,
+        "config_hash": config_hash,
+        "code_tree_digest": code_tree_digest,
+    }, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+    return plan_id, path.relative_to(root).as_posix(), sha256_file(path)
+
+
+def _write_forward_prediction_artifact(
+    root: Path,
+    plan_id: str,
+    vintage_id: str,
+    decision_time: datetime,
+    input_head_generation: str,
+    panel_sha256: str,
+    config_hash: str,
+    code_tree_digest: str,
+) -> tuple[str, str]:
+    """写入与注册合同一致的冻结前向预测制品。"""
+    prediction_id = stable_identifier("frozen-forward-prediction", {
+        "governance_method_version": GOVERNANCE_METHOD_VERSION,
+        "plan_id": plan_id,
+        "decision_time": decision_time.isoformat(),
+    })
+    path = root / "reports" / plan_id / "predictions" / "prediction.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "schema_version": FROZEN_FORWARD_SCHEMA_VERSION,
+        "method_version": FROZEN_FORWARD_METHOD_VERSION,
+        "scope": "FROZEN_FORWARD",
+        "prediction_id": prediction_id,
+        "plan_id": plan_id,
+        "vintage_id": vintage_id,
+        "decision_time": decision_time.isoformat(),
+        "input_head_generation": input_head_generation,
+        "panel_sha256": panel_sha256,
+        "config_hash": config_hash,
+        "code_identity": {"tree_digest": code_tree_digest},
+    }, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+    return path.relative_to(root).as_posix(), sha256_file(path)
+
+
 def _write_holdout_evidence(
     root: Path,
     vintage_id: str,
@@ -107,6 +177,14 @@ def _write_holdout_evidence(
     panel_path = run_directory / "panel.parquet"
     panel_path.write_bytes(b"PAR1holdout-test-panelPAR1")
     panel_sha256 = sha256_file(panel_path)
+    schedule_path = run_directory / "score-schedule.json"
+    schedule_path.write_text(json.dumps({
+        "schema_version": HOLDOUT_MANIFEST_SCHEMA_VERSION,
+        "holdout_method_version": HOLDOUT_METHOD_VERSION,
+        "evaluation_id": evaluation_id,
+        "decision_times": [score_start.isoformat()],
+    }, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+    schedule_sha256 = sha256_file(schedule_path)
     raw_candidate_ids = candidate_set_identity["candidate_ids"]
     if not isinstance(raw_candidate_ids, list):
         raise AssertionError("测试 candidate_ids 必须为列表")
@@ -142,6 +220,7 @@ def _write_holdout_evidence(
         "candidate_set_hash": candidate_set_hash,
         "config_hash": config_hash,
         "panel_sha256": panel_sha256,
+        "score_schedule_sha256": schedule_sha256,
         "candidate_results": [{
             "candidate_id": candidate_ids[0],
             "family": "trend",
@@ -188,6 +267,12 @@ def _write_holdout_evidence(
                 "path": panel_path.relative_to(root).as_posix(),
                 "sha256": panel_sha256,
                 "bytes": panel_path.stat().st_size,
+            },
+            "score_schedule": {
+                "kind": "holdout_score_schedule",
+                "path": schedule_path.relative_to(root).as_posix(),
+                "sha256": schedule_sha256,
+                "bytes": schedule_path.stat().st_size,
             },
             "result": {
                 "kind": "holdout_result",
@@ -635,6 +720,14 @@ def test_registered_forward_plan_prevents_relaxed_policy_finalize(
     )
     config_hash = evaluation_identity["config_hash"]
     assert isinstance(config_hash, str)
+    _, plan_path, plan_sha256 = _write_forward_plan_artifact(
+        tmp_path,
+        vintage.vintage_id,
+        "1" * 64,
+        candidate_set_hash,
+        config_hash,
+        "tree-one",
+    )
     register_frozen_forward_plan(
         registry,
         vintage.vintage_id,
@@ -642,8 +735,9 @@ def test_registered_forward_plan_prevents_relaxed_policy_finalize(
         candidate_set_hash,
         config_hash,
         "tree-one",
-        "reports/plan.json",
-        "2" * 64,
+        plan_path,
+        plan_sha256,
+        repository_root=tmp_path,
         frozen_at=_time("2026-12-15T00:00:00"),
     )
     start_holdout_evaluation_attempt(
@@ -697,6 +791,14 @@ def test_forward_required_finalize_matches_registered_prediction_coverage(
     )
     config_hash = evaluation_identity["config_hash"]
     assert isinstance(config_hash, str)
+    _, plan_path, plan_sha256 = _write_forward_plan_artifact(
+        tmp_path,
+        vintage.vintage_id,
+        "1" * 64,
+        candidate_set_hash,
+        config_hash,
+        "tree-one",
+    )
     plan = register_frozen_forward_plan(
         registry,
         vintage.vintage_id,
@@ -704,9 +806,20 @@ def test_forward_required_finalize_matches_registered_prediction_coverage(
         candidate_set_hash,
         config_hash,
         "tree-one",
-        "reports/plan.json",
-        "2" * 64,
+        plan_path,
+        plan_sha256,
+        repository_root=tmp_path,
         frozen_at=_time("2026-12-15T00:00:00"),
+    )
+    prediction_path, prediction_sha256 = _write_forward_prediction_artifact(
+        tmp_path,
+        plan.plan_id,
+        vintage.vintage_id,
+        vintage.start_time,
+        "head-one",
+        "panel-one",
+        config_hash,
+        "tree-one",
     )
     register_frozen_forward_prediction(
         registry,
@@ -714,9 +827,10 @@ def test_forward_required_finalize_matches_registered_prediction_coverage(
         vintage.start_time,
         "head-one",
         "panel-one",
-        "reports/prediction.json",
-        "prediction-one",
+        prediction_path,
+        prediction_sha256,
         3900,
+        repository_root=tmp_path,
         recorded_at=_time("2027-01-01T00:01:00"),
     )
     start_holdout_evaluation_attempt(
@@ -773,6 +887,14 @@ def test_frozen_forward_plan_and_predictions_are_precommitted_and_append_only(
         _time("2027-02-01T00:00:00"),
         sealed_at=_time("2026-12-01T00:00:00"),
     )
+    _, plan_path, plan_sha256 = _write_forward_plan_artifact(
+        tmp_path,
+        vintage.vintage_id,
+        "manifest-hash",
+        "candidate-set-hash",
+        "config-hash",
+        "tree-hash",
+    )
     plan = register_frozen_forward_plan(
         registry,
         vintage.vintage_id,
@@ -780,8 +902,9 @@ def test_frozen_forward_plan_and_predictions_are_precommitted_and_append_only(
         "candidate-set-hash",
         "config-hash",
         "tree-hash",
-        "reports/plan.json",
-        "plan-artifact-hash",
+        plan_path,
+        plan_sha256,
+        repository_root=tmp_path,
         frozen_at=_time("2026-12-15T00:00:00"),
     )
     assert get_frozen_forward_plan_for_vintage(registry, vintage.vintage_id) == plan
@@ -792,11 +915,20 @@ def test_frozen_forward_plan_and_predictions_are_precommitted_and_append_only(
         "candidate-set-hash",
         "config-hash",
         "tree-hash",
-        "reports/plan.json",
-        "plan-artifact-hash",
+        plan_path,
+        plan_sha256,
+        repository_root=tmp_path,
         frozen_at=_time("2026-12-16T00:00:00"),
     )
     assert repeated == plan
+    _, different_path, different_sha256 = _write_forward_plan_artifact(
+        tmp_path,
+        vintage.vintage_id,
+        "different-manifest",
+        "candidate-set-hash",
+        "config-hash",
+        "tree-hash",
+    )
     with pytest.raises(ValueError, match="不同的冻结前向计划"):
         register_frozen_forward_plan(
             registry,
@@ -805,8 +937,9 @@ def test_frozen_forward_plan_and_predictions_are_precommitted_and_append_only(
             "candidate-set-hash",
             "config-hash",
             "tree-hash",
-            "reports/plan.json",
-            "plan-artifact-hash",
+            different_path,
+            different_sha256,
+            repository_root=tmp_path,
             frozen_at=_time("2026-12-16T00:00:00"),
         )
     with pytest.raises(ValueError, match="开始前"):
@@ -817,44 +950,69 @@ def test_frozen_forward_plan_and_predictions_are_precommitted_and_append_only(
             "candidate-set-hash",
             "config-hash",
             "tree-hash",
-            "reports/plan.json",
-            "plan-artifact-hash",
+            plan_path,
+            plan_sha256,
+            repository_root=tmp_path,
             frozen_at=_time("2027-01-01T00:00:01"),
         )
 
+    decision = _time("2027-01-02T01:00:00")
+    prediction_path, prediction_sha256 = _write_forward_prediction_artifact(
+        tmp_path,
+        plan.plan_id,
+        vintage.vintage_id,
+        decision,
+        "sha256-head",
+        "panel-hash",
+        "config-hash",
+        "tree-hash",
+    )
     prediction = register_frozen_forward_prediction(
         registry,
         plan.plan_id,
-        _time("2027-01-02T01:00:00"),
+        decision,
         "sha256-head",
         "panel-hash",
-        "reports/prediction.json",
-        "prediction-hash",
+        prediction_path,
+        prediction_sha256,
         3900,
+        repository_root=tmp_path,
         recorded_at=_time("2027-01-02T01:01:00"),
     )
     assert list_frozen_forward_predictions(registry, plan.plan_id) == (prediction,)
     assert register_frozen_forward_prediction(
         registry,
         plan.plan_id,
-        _time("2027-01-02T01:00:00"),
+        decision,
         "sha256-head",
         "panel-hash",
-        "reports/prediction.json",
-        "prediction-hash",
+        prediction_path,
+        prediction_sha256,
         3900,
+        repository_root=tmp_path,
         recorded_at=_time("2027-01-02T01:02:00"),
     ) == prediction
+    changed_path, changed_sha256 = _write_forward_prediction_artifact(
+        tmp_path,
+        plan.plan_id,
+        vintage.vintage_id,
+        decision,
+        "sha256-different-head",
+        "panel-hash",
+        "config-hash",
+        "tree-hash",
+    )
     with pytest.raises(ValueError, match="不可改写"):
         register_frozen_forward_prediction(
             registry,
             plan.plan_id,
-            _time("2027-01-02T01:00:00"),
+            decision,
             "sha256-different-head",
             "panel-hash",
-            "reports/prediction.json",
-            "different-prediction-hash",
+            changed_path,
+            changed_sha256,
             3900,
+            repository_root=tmp_path,
             recorded_at=_time("2027-01-02T01:02:00"),
         )
     with pytest.raises(ValueError, match="时效窗口"):
@@ -867,6 +1025,7 @@ def test_frozen_forward_plan_and_predictions_are_precommitted_and_append_only(
             "reports/late.json",
             "late-hash",
             3900,
+            repository_root=tmp_path,
             recorded_at=_time("2027-01-03T03:00:00"),
         )
     with pytest.raises(ValueError, match="不在绑定 vintage"):
@@ -879,6 +1038,7 @@ def test_frozen_forward_plan_and_predictions_are_precommitted_and_append_only(
             "reports/outside.json",
             "outside-hash",
             3900,
+            repository_root=tmp_path,
             recorded_at=_time("2027-02-02T01:01:00"),
         )
 

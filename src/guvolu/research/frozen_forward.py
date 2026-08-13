@@ -8,7 +8,11 @@ from pathlib import Path
 from typing import Mapping
 
 from guvolu.data.durable_io import atomic_write_text
-from guvolu.research.contracts import QualityVector
+from guvolu.research.contracts import (
+    FROZEN_FORWARD_METHOD_VERSION,
+    FROZEN_FORWARD_SCHEMA_VERSION,
+    QualityVector,
+)
 from guvolu.research.features import compute_features
 from guvolu.research.governance import (
     GOVERNANCE_METHOD_VERSION,
@@ -36,7 +40,6 @@ from guvolu.research.quality import gate_feature_snapshot, panel_quality, qualit
 from guvolu.strategy.baselines import generate_targets
 from guvolu.strategy.contracts import CandidateSpec
 
-FROZEN_FORWARD_METHOD_VERSION = "frozen-forward-v1"
 SECONDS_PER_YEAR = 365.0 * 24.0 * 60.0 * 60.0
 _INTERVAL_SECONDS = {
     "5min": 300.0,
@@ -219,7 +222,7 @@ def freeze_forward_plan(
         / vintage_id / plan_id / "plan.json"
     )
     payload = {
-        "schema_version": 1,
+        "schema_version": FROZEN_FORWARD_SCHEMA_VERSION,
         "method_version": FROZEN_FORWARD_METHOD_VERSION,
         "governance_method_version": GOVERNANCE_METHOD_VERSION,
         "scope": "FROZEN_FORWARD",
@@ -259,6 +262,7 @@ def freeze_forward_plan(
         identity.tree_digest,
         _relative(repository, plan_path),
         plan_hash,
+        repository_root=repository,
         frozen_at=timestamp,
     )
     if registered.plan_id != plan_id:
@@ -445,7 +449,7 @@ def run_frozen_forward_prediction(
         "decision_time": decision_time.isoformat(),
     })
     prediction = {
-        "schema_version": 1,
+        "schema_version": FROZEN_FORWARD_SCHEMA_VERSION,
         "method_version": FROZEN_FORWARD_METHOD_VERSION,
         "scope": "FROZEN_FORWARD",
         "prediction_id": prediction_id,
@@ -479,6 +483,7 @@ def run_frozen_forward_prediction(
         _relative(repository, prediction_path),
         prediction_hash,
         maximum_age,
+        repository_root=repository,
         recorded_at=now,
     )
     return FrozenPredictionResult(
