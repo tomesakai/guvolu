@@ -13,7 +13,8 @@
       "minimum_bars": 2160,
       "minimum_sharpe": 0.0,
       "maximum_drawdown": 0.45,
-      "maximum_fdr_q": 0.2
+      "maximum_fdr_q": 0.2,
+      "require_frozen_forward_predictions": true
     }
   },
   "cost_model": {

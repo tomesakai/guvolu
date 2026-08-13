@@ -8,8 +8,8 @@ from pathlib import Path
 
 from guvolu.research.provenance import stable_identifier
 
-GOVERNANCE_SCHEMA_VERSION = 1
-GOVERNANCE_METHOD_VERSION = "research-data-governance-v1"
+GOVERNANCE_SCHEMA_VERSION = 2
+GOVERNANCE_METHOD_VERSION = "research-data-governance-v2"
 _VINTAGE_STATUSES = ("sealed", "consumed")
 
 
@@ -40,6 +40,36 @@ class HoldoutVintage:
     evaluation_id: str | None
     verdict: str | None
     verdict_recorded_at: datetime | None
+
+
+@dataclass(frozen=True)
+class FrozenForwardPlan:
+    """在 vintage 开始前冻结的候选、公式与资金权重计划。"""
+
+    plan_id: str
+    vintage_id: str
+    source_manifest_sha256: str
+    candidate_set_hash: str
+    config_hash: str
+    code_tree_digest: str
+    plan_artifact_path: str
+    plan_artifact_sha256: str
+    frozen_at: datetime
+
+
+@dataclass(frozen=True)
+class FrozenForwardPrediction:
+    """按决策时间追加且不可改写的冻结计划预测。"""
+
+    prediction_id: str
+    plan_id: str
+    vintage_id: str
+    decision_time: datetime
+    input_head_generation: str
+    panel_sha256: str
+    prediction_artifact_path: str
+    prediction_artifact_sha256: str
+    recorded_at: datetime
 
 
 def _utc(value: datetime) -> datetime:
@@ -112,6 +142,32 @@ def _connect(path: Path) -> sqlite3.Connection:
         );
         CREATE UNIQUE INDEX IF NOT EXISTS holdout_vintage_range
           ON holdout_vintage(market_id,start_time,end_time);
+        CREATE TABLE IF NOT EXISTS frozen_forward_plan (
+          plan_id TEXT PRIMARY KEY,
+          vintage_id TEXT NOT NULL UNIQUE,
+          source_manifest_sha256 TEXT NOT NULL,
+          candidate_set_hash TEXT NOT NULL,
+          config_hash TEXT NOT NULL,
+          code_tree_digest TEXT NOT NULL,
+          plan_artifact_path TEXT NOT NULL,
+          plan_artifact_sha256 TEXT NOT NULL,
+          frozen_at TEXT NOT NULL,
+          FOREIGN KEY(vintage_id) REFERENCES holdout_vintage(vintage_id)
+        );
+        CREATE TABLE IF NOT EXISTS frozen_forward_prediction (
+          prediction_id TEXT PRIMARY KEY,
+          plan_id TEXT NOT NULL,
+          vintage_id TEXT NOT NULL,
+          decision_time TEXT NOT NULL,
+          input_head_generation TEXT NOT NULL,
+          panel_sha256 TEXT NOT NULL,
+          prediction_artifact_path TEXT NOT NULL,
+          prediction_artifact_sha256 TEXT NOT NULL,
+          recorded_at TEXT NOT NULL,
+          FOREIGN KEY(plan_id) REFERENCES frozen_forward_plan(plan_id),
+          FOREIGN KEY(vintage_id) REFERENCES holdout_vintage(vintage_id),
+          UNIQUE(plan_id,decision_time)
+        );
         """
     )
     existing = connection.execute(
@@ -120,6 +176,11 @@ def _connect(path: Path) -> sqlite3.Connection:
     if existing is None:
         connection.execute(
             "INSERT INTO governance_meta(key,value) VALUES('schema_version',?)",
+            (str(GOVERNANCE_SCHEMA_VERSION),),
+        )
+    elif existing["value"] == "1":
+        connection.execute(
+            "UPDATE governance_meta SET value=? WHERE key='schema_version'",
             (str(GOVERNANCE_SCHEMA_VERSION),),
         )
     elif existing["value"] != str(GOVERNANCE_SCHEMA_VERSION):
@@ -434,6 +495,221 @@ def get_research_exposure(
     return _exposure_from_row(row)
 
 
+def register_frozen_forward_plan(
+    registry_path: Path,
+    vintage_id: str,
+    source_manifest_sha256: str,
+    candidate_set_hash: str,
+    config_hash: str,
+    code_tree_digest: str,
+    plan_artifact_path: str,
+    plan_artifact_sha256: str,
+    *,
+    frozen_at: datetime | None = None,
+) -> FrozenForwardPlan:
+    """在 vintage 开始前原子登记唯一冻结前向计划。"""
+    values = (
+        source_manifest_sha256,
+        candidate_set_hash,
+        config_hash,
+        code_tree_digest,
+        plan_artifact_path,
+        plan_artifact_sha256,
+    )
+    if any(not value.strip() for value in values):
+        raise ValueError("冻结前向计划身份字段不得为空")
+    frozen = _utc(frozen_at or datetime.now(UTC))
+    plan_id = stable_identifier("frozen-forward-plan", {
+        "governance_method_version": GOVERNANCE_METHOD_VERSION,
+        "vintage_id": vintage_id,
+        "source_manifest_sha256": source_manifest_sha256,
+        "candidate_set_hash": candidate_set_hash,
+        "config_hash": config_hash,
+        "code_tree_digest": code_tree_digest,
+    })
+    connection = _connect(registry_path)
+    try:
+        _begin(connection)
+        vintage = connection.execute(
+            "SELECT * FROM holdout_vintage WHERE vintage_id=?", (vintage_id,),
+        ).fetchone()
+        if vintage is None:
+            raise LookupError(f"封存段不存在: {vintage_id}")
+        if vintage["status"] != "sealed":
+            raise ValueError("冻结前向计划只能绑定未消费 vintage")
+        if frozen > _parse_timestamp(str(vintage["start_time"])):
+            raise ValueError("冻结前向计划必须在 vintage 开始前登记")
+        existing = connection.execute(
+            "SELECT * FROM frozen_forward_plan WHERE vintage_id=?", (vintage_id,),
+        ).fetchone()
+        if existing is not None:
+            expected = (plan_id, *values)
+            actual = (
+                existing["plan_id"], existing["source_manifest_sha256"],
+                existing["candidate_set_hash"], existing["config_hash"],
+                existing["code_tree_digest"], existing["plan_artifact_path"],
+                existing["plan_artifact_sha256"],
+            )
+            if actual != expected:
+                raise ValueError("vintage 已绑定不同的冻结前向计划")
+            connection.execute("COMMIT")
+            return _plan_from_row(existing)
+        connection.execute(
+            "INSERT INTO frozen_forward_plan("
+            "plan_id,vintage_id,source_manifest_sha256,candidate_set_hash,"
+            "config_hash,code_tree_digest,plan_artifact_path,"
+            "plan_artifact_sha256,frozen_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            (plan_id, vintage_id, *values, _timestamp(frozen)),
+        )
+        row = connection.execute(
+            "SELECT * FROM frozen_forward_plan WHERE plan_id=?", (plan_id,),
+        ).fetchone()
+        connection.execute("COMMIT")
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+    finally:
+        connection.close()
+    if row is None:
+        raise RuntimeError("冻结前向计划写入后不可见")
+    return _plan_from_row(row)
+
+
+def register_frozen_forward_prediction(
+    registry_path: Path,
+    plan_id: str,
+    decision_time: datetime,
+    input_head_generation: str,
+    panel_sha256: str,
+    prediction_artifact_path: str,
+    prediction_artifact_sha256: str,
+    maximum_recording_lag_seconds: int,
+    *,
+    recorded_at: datetime | None = None,
+) -> FrozenForwardPrediction:
+    """原子追加一个及时生成的预测；同一时点内容永久不可改写。"""
+    if maximum_recording_lag_seconds <= 0:
+        raise ValueError("预测登记时效阈值必须为正数")
+    values = (
+        input_head_generation, panel_sha256,
+        prediction_artifact_path, prediction_artifact_sha256,
+    )
+    if any(not value.strip() for value in values):
+        raise ValueError("冻结前向预测身份字段不得为空")
+    decision = _utc(decision_time)
+    recorded = _utc(recorded_at or datetime.now(UTC))
+    lag = (recorded - decision).total_seconds()
+    if lag < 0 or lag > maximum_recording_lag_seconds:
+        raise ValueError("冻结前向预测未在预登记时效窗口内生成")
+    connection = _connect(registry_path)
+    try:
+        _begin(connection)
+        plan = connection.execute(
+            "SELECT * FROM frozen_forward_plan WHERE plan_id=?", (plan_id,),
+        ).fetchone()
+        if plan is None:
+            raise LookupError(f"冻结前向计划不存在: {plan_id}")
+        vintage_id = str(plan["vintage_id"])
+        vintage = connection.execute(
+            "SELECT * FROM holdout_vintage WHERE vintage_id=?", (vintage_id,),
+        ).fetchone()
+        if vintage is None or vintage["status"] != "sealed":
+            raise ValueError("冻结前向预测只能写入未消费 vintage")
+        start = _parse_timestamp(str(vintage["start_time"]))
+        end = _parse_timestamp(str(vintage["end_time"]))
+        if not start <= decision < end:
+            raise ValueError("预测决策时间不在绑定 vintage 内")
+        prediction_id = stable_identifier("frozen-forward-prediction", {
+            "governance_method_version": GOVERNANCE_METHOD_VERSION,
+            "plan_id": plan_id,
+            "decision_time": decision.isoformat(),
+        })
+        existing = connection.execute(
+            "SELECT * FROM frozen_forward_prediction "
+            "WHERE plan_id=? AND decision_time=?",
+            (plan_id, _timestamp(decision)),
+        ).fetchone()
+        if existing is not None:
+            expected = (prediction_id, *values)
+            actual = (
+                existing["prediction_id"], existing["input_head_generation"],
+                existing["panel_sha256"], existing["prediction_artifact_path"],
+                existing["prediction_artifact_sha256"],
+            )
+            if actual != expected:
+                raise ValueError("该决策时间的冻结前向预测不可改写")
+            connection.execute("COMMIT")
+            return _prediction_from_row(existing)
+        connection.execute(
+            "INSERT INTO frozen_forward_prediction("
+            "prediction_id,plan_id,vintage_id,decision_time,"
+            "input_head_generation,panel_sha256,prediction_artifact_path,"
+            "prediction_artifact_sha256,recorded_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            (prediction_id, plan_id, vintage_id, _timestamp(decision),
+             *values, _timestamp(recorded)),
+        )
+        row = connection.execute(
+            "SELECT * FROM frozen_forward_prediction WHERE prediction_id=?",
+            (prediction_id,),
+        ).fetchone()
+        connection.execute("COMMIT")
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+    finally:
+        connection.close()
+    if row is None:
+        raise RuntimeError("冻结前向预测写入后不可见")
+    return _prediction_from_row(row)
+
+
+def get_frozen_forward_plan(
+    registry_path: Path, plan_id: str,
+) -> FrozenForwardPlan:
+    """读取一个冻结前向计划。"""
+    connection = _connect(registry_path)
+    try:
+        row = connection.execute(
+            "SELECT * FROM frozen_forward_plan WHERE plan_id=?", (plan_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+    if row is None:
+        raise LookupError(f"冻结前向计划不存在: {plan_id}")
+    return _plan_from_row(row)
+
+
+def get_frozen_forward_plan_for_vintage(
+    registry_path: Path, vintage_id: str,
+) -> FrozenForwardPlan | None:
+    """读取 vintage 的唯一冻结前向计划。"""
+    connection = _connect(registry_path)
+    try:
+        row = connection.execute(
+            "SELECT * FROM frozen_forward_plan WHERE vintage_id=?", (vintage_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+    return None if row is None else _plan_from_row(row)
+
+
+def list_frozen_forward_predictions(
+    registry_path: Path, plan_id: str,
+) -> tuple[FrozenForwardPrediction, ...]:
+    """按决策时间读取计划的不可变预测历史。"""
+    connection = _connect(registry_path)
+    try:
+        rows = connection.execute(
+            "SELECT * FROM frozen_forward_prediction WHERE plan_id=? "
+            "ORDER BY decision_time", (plan_id,),
+        ).fetchall()
+    finally:
+        connection.close()
+    return tuple(_prediction_from_row(row) for row in rows)
+
+
 def _exposure_from_row(row: sqlite3.Row) -> ResearchExposure:
     """把 SQLite 行转换为暴露合同。"""
     return ResearchExposure(
@@ -473,4 +749,34 @@ def _vintage_from_row(row: sqlite3.Row) -> HoldoutVintage:
         evaluation_id=_optional_text(row["evaluation_id"]),
         verdict=_optional_text(row["verdict"]),
         verdict_recorded_at=_optional_time(row["verdict_recorded_at"]),
+    )
+
+
+def _plan_from_row(row: sqlite3.Row) -> FrozenForwardPlan:
+    """把 SQLite 行转换为冻结计划合同。"""
+    return FrozenForwardPlan(
+        plan_id=str(row["plan_id"]),
+        vintage_id=str(row["vintage_id"]),
+        source_manifest_sha256=str(row["source_manifest_sha256"]),
+        candidate_set_hash=str(row["candidate_set_hash"]),
+        config_hash=str(row["config_hash"]),
+        code_tree_digest=str(row["code_tree_digest"]),
+        plan_artifact_path=str(row["plan_artifact_path"]),
+        plan_artifact_sha256=str(row["plan_artifact_sha256"]),
+        frozen_at=_parse_timestamp(str(row["frozen_at"])),
+    )
+
+
+def _prediction_from_row(row: sqlite3.Row) -> FrozenForwardPrediction:
+    """把 SQLite 行转换为冻结预测合同。"""
+    return FrozenForwardPrediction(
+        prediction_id=str(row["prediction_id"]),
+        plan_id=str(row["plan_id"]),
+        vintage_id=str(row["vintage_id"]),
+        decision_time=_parse_timestamp(str(row["decision_time"])),
+        input_head_generation=str(row["input_head_generation"]),
+        panel_sha256=str(row["panel_sha256"]),
+        prediction_artifact_path=str(row["prediction_artifact_path"]),
+        prediction_artifact_sha256=str(row["prediction_artifact_sha256"]),
+        recorded_at=_parse_timestamp(str(row["recorded_at"])),
     )

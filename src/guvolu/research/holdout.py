@@ -13,6 +13,7 @@ from guvolu.research.governance import (
     GOVERNANCE_METHOD_VERSION,
     HoldoutVintage,
     consume_holdout_vintage,
+    get_frozen_forward_plan_for_vintage,
     get_holdout_vintage,
     record_holdout_verdict,
 )
@@ -100,7 +101,7 @@ def _project_path(root: Path, value: Path, name: str) -> Path:
     return path
 
 
-def _verified_source_manifest(
+def verified_source_manifest(
     root: Path,
     summary_file: Path,
 ) -> tuple[Mapping[str, object], Path]:
@@ -122,7 +123,7 @@ def _verified_source_manifest(
     return manifest, manifest_file
 
 
-def _candidate_set(
+def load_frozen_candidates(
     root: Path,
     source_summary: Mapping[str, object],
     source_manifest: Mapping[str, object],
@@ -226,6 +227,22 @@ def _candidate_set(
     return tuple(sorted(candidates, key=lambda item: item.candidate_id)), registry_path
 
 
+def frozen_candidate_set_hash(
+    source_manifest_path: Path,
+    source_summary_path: Path,
+    candidate_registry_path: Path,
+    candidates: Sequence[CandidateSpec],
+) -> str:
+    """生成由完整来源制品和执行候选共同决定的冻结集合身份。"""
+    return stable_identifier("candidate-set", {
+        "holdout_method_version": HOLDOUT_METHOD_VERSION,
+        "source_manifest_sha256": sha256_file(source_manifest_path),
+        "source_summary_sha256": sha256_file(source_summary_path),
+        "candidate_registry_sha256": sha256_file(candidate_registry_path),
+        "candidate_ids": [candidate.candidate_id for candidate in candidates],
+    })
+
+
 def _fdr(p_values: Mapping[str, float]) -> Mapping[str, float]:
     """对固定候选集执行 Benjamini-Hochberg 校正。"""
     ordered = sorted(p_values.items(), key=lambda item: (item[1], item[0]))
@@ -261,14 +278,14 @@ def run_holdout_validation(
     summary_file = _project_path(repository, source_summary_path, "source summary")
     config = _load(config_file)
     config_hash = sha256_file(config_file)
-    source_manifest, source_manifest_path = _verified_source_manifest(
+    source_manifest, source_manifest_path = verified_source_manifest(
         repository,
         summary_file,
     )
     source_summary = _load(summary_file)
     if source_summary.get("config_hash") != config_hash:
         raise ValueError("holdout 配置与来源研究冻结配置不一致")
-    candidates, candidate_registry_path = _candidate_set(
+    candidates, candidate_registry_path = load_frozen_candidates(
         repository,
         source_summary,
         source_manifest,
@@ -297,13 +314,45 @@ def run_holdout_validation(
     )
     if source_code_identity.get("tree_digest") != identity.tree_digest:
         raise ValueError("holdout 必须使用来源运行冻结的同一研究代码树身份")
-    candidate_set_hash = stable_identifier("candidate-set", {
-        "holdout_method_version": HOLDOUT_METHOD_VERSION,
-        "source_manifest_sha256": sha256_file(source_manifest_path),
-        "source_summary_sha256": sha256_file(summary_file),
-        "candidate_registry_sha256": sha256_file(candidate_registry_path),
-        "candidate_ids": [candidate.candidate_id for candidate in candidates],
-    })
+    candidate_set_hash = frozen_candidate_set_hash(
+        source_manifest_path,
+        summary_file,
+        candidate_registry_path,
+        candidates,
+    )
+    raw_policy = governance.get("holdout_policy")
+    require_forward_predictions = (
+        isinstance(raw_policy, Mapping)
+        and raw_policy.get("require_frozen_forward_predictions") is True
+    )
+    frozen_targets: Mapping[datetime, Mapping[str, float]] | None = None
+    forward_plan_id: str | None = None
+    forward_prediction_count = 0
+    if require_forward_predictions:
+        from guvolu.research.frozen_forward import (
+            load_verified_prediction_targets,
+            verify_frozen_forward,
+        )
+
+        plan = get_frozen_forward_plan_for_vintage(registry_path, vintage_id)
+        if plan is None:
+            raise ValueError("holdout 要求预冻结前向计划")
+        forward_plan_id = plan.plan_id
+        if plan.source_manifest_sha256 != sha256_file(source_manifest_path):
+            raise ValueError("前向计划与 holdout 来源 manifest 不一致")
+        if plan.candidate_set_hash != candidate_set_hash:
+            raise ValueError("前向计划与 holdout 候选集合不一致")
+        if plan.config_hash != config_hash or plan.code_tree_digest != identity.tree_digest:
+            raise ValueError("前向计划与 holdout 配置或代码树不一致")
+        verification = verify_frozen_forward(
+            repository, plan.plan_id, registry_path=registry_path,
+        )
+        if verification.prediction_count == 0:
+            raise ValueError("holdout 没有预先记录的冻结前向预测")
+        forward_prediction_count = verification.prediction_count
+        frozen_targets = load_verified_prediction_targets(
+            repository, plan.plan_id, registry_path=registry_path,
+        )
     evaluation_id = stable_identifier("holdout-evaluation", {
         "holdout_method_version": HOLDOUT_METHOD_VERSION,
         "governance_method_version": GOVERNANCE_METHOD_VERSION,
@@ -382,7 +431,28 @@ def run_holdout_validation(
     raw_results: list[dict[str, object]] = []
     p_values: dict[str, float] = {}
     for candidate in candidates:
-        targets = generate_targets(candidate, panel.bars, features, periods_per_year)
+        if frozen_targets is None:
+            targets = generate_targets(candidate, panel.bars, features, periods_per_year)
+        else:
+            missing = [
+                panel.bars[index - 1].decision_time
+                for index in range(start, end)
+                if candidate.candidate_id not in frozen_targets.get(
+                    panel.bars[index - 1].decision_time, {},
+                )
+            ]
+            if missing:
+                raise ValueError(
+                    "holdout 冻结前向预测覆盖不完整: "
+                    f"{candidate.candidate_id} missing={len(missing)}"
+                )
+            mutable_targets = [0.0] * len(panel.bars)
+            for index in range(start, end):
+                target_time = panel.bars[index - 1].decision_time
+                mutable_targets[index - 1] = frozen_targets[target_time][
+                    candidate.candidate_id
+                ]
+            targets = tuple(mutable_targets)
         metrics = evaluate_targets(
             panel.bars,
             targets,
@@ -435,6 +505,12 @@ def run_holdout_validation(
         "evaluation_id": evaluation_id,
         "vintage": _vintage_payload(vintage),
         "candidate_set_hash": candidate_set_hash,
+        "target_source": (
+            "recorded_frozen_forward" if frozen_targets is not None
+            else "end_of_vintage_recompute"
+        ),
+        "frozen_forward_plan_id": forward_plan_id,
+        "frozen_forward_prediction_count": forward_prediction_count,
         "source_summary_sha256": sha256_file(summary_file),
         "config_hash": sha256_file(config_file),
         "code_identity": asdict(identity),

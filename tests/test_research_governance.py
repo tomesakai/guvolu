@@ -9,8 +9,12 @@ import pytest
 
 from guvolu.research.governance import (
     consume_holdout_vintage,
+    get_frozen_forward_plan_for_vintage,
+    list_frozen_forward_predictions,
     list_holdout_vintages,
     record_holdout_verdict,
+    register_frozen_forward_plan,
+    register_frozen_forward_prediction,
     register_research_exposure,
     seal_holdout_vintage,
 )
@@ -164,6 +168,128 @@ def test_holdout_cannot_be_selected_retroactively(tmp_path: Path) -> None:
             _time("2025-01-01T00:00:00"),
             _time("2025-02-01T00:00:00"),
             sealed_at=_time("2025-01-02T00:00:00"),
+        )
+
+
+def test_frozen_forward_plan_and_predictions_are_precommitted_and_append_only(
+    tmp_path: Path,
+) -> None:
+    """冻结计划必须先于数据，预测必须及时且同一决策不可改写。"""
+    registry = tmp_path / "governance.sqlite3"
+    vintage = seal_holdout_vintage(
+        registry,
+        "market-one",
+        _time("2027-01-01T00:00:00"),
+        _time("2027-02-01T00:00:00"),
+        sealed_at=_time("2026-12-01T00:00:00"),
+    )
+    plan = register_frozen_forward_plan(
+        registry,
+        vintage.vintage_id,
+        "manifest-hash",
+        "candidate-set-hash",
+        "config-hash",
+        "tree-hash",
+        "reports/plan.json",
+        "plan-artifact-hash",
+        frozen_at=_time("2026-12-15T00:00:00"),
+    )
+    assert get_frozen_forward_plan_for_vintage(registry, vintage.vintage_id) == plan
+    repeated = register_frozen_forward_plan(
+        registry,
+        vintage.vintage_id,
+        "manifest-hash",
+        "candidate-set-hash",
+        "config-hash",
+        "tree-hash",
+        "reports/plan.json",
+        "plan-artifact-hash",
+        frozen_at=_time("2026-12-16T00:00:00"),
+    )
+    assert repeated == plan
+    with pytest.raises(ValueError, match="不同的冻结前向计划"):
+        register_frozen_forward_plan(
+            registry,
+            vintage.vintage_id,
+            "different-manifest",
+            "candidate-set-hash",
+            "config-hash",
+            "tree-hash",
+            "reports/plan.json",
+            "plan-artifact-hash",
+            frozen_at=_time("2026-12-16T00:00:00"),
+        )
+    with pytest.raises(ValueError, match="开始前"):
+        register_frozen_forward_plan(
+            registry,
+            vintage.vintage_id,
+            "manifest-hash",
+            "candidate-set-hash",
+            "config-hash",
+            "tree-hash",
+            "reports/plan.json",
+            "plan-artifact-hash",
+            frozen_at=_time("2027-01-01T00:00:01"),
+        )
+
+    prediction = register_frozen_forward_prediction(
+        registry,
+        plan.plan_id,
+        _time("2027-01-02T01:00:00"),
+        "sha256-head",
+        "panel-hash",
+        "reports/prediction.json",
+        "prediction-hash",
+        3900,
+        recorded_at=_time("2027-01-02T01:01:00"),
+    )
+    assert list_frozen_forward_predictions(registry, plan.plan_id) == (prediction,)
+    assert register_frozen_forward_prediction(
+        registry,
+        plan.plan_id,
+        _time("2027-01-02T01:00:00"),
+        "sha256-head",
+        "panel-hash",
+        "reports/prediction.json",
+        "prediction-hash",
+        3900,
+        recorded_at=_time("2027-01-02T01:02:00"),
+    ) == prediction
+    with pytest.raises(ValueError, match="不可改写"):
+        register_frozen_forward_prediction(
+            registry,
+            plan.plan_id,
+            _time("2027-01-02T01:00:00"),
+            "sha256-different-head",
+            "panel-hash",
+            "reports/prediction.json",
+            "different-prediction-hash",
+            3900,
+            recorded_at=_time("2027-01-02T01:02:00"),
+        )
+    with pytest.raises(ValueError, match="时效窗口"):
+        register_frozen_forward_prediction(
+            registry,
+            plan.plan_id,
+            _time("2027-01-03T01:00:00"),
+            "sha256-head",
+            "panel-hash",
+            "reports/late.json",
+            "late-hash",
+            3900,
+            recorded_at=_time("2027-01-03T03:00:00"),
+        )
+    with pytest.raises(ValueError, match="不在绑定 vintage"):
+        register_frozen_forward_prediction(
+            registry,
+            plan.plan_id,
+            _time("2027-02-02T01:00:00"),
+            "sha256-head",
+            "panel-hash",
+            "reports/outside.json",
+            "outside-hash",
+            3900,
+            recorded_at=_time("2027-02-02T01:01:00"),
         )
 
 

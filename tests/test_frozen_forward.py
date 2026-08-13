@@ -1,0 +1,198 @@
+"""冻结候选前向预测的端到端合同测试。"""
+from __future__ import annotations
+
+import json
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import pytest
+
+from guvolu.research.contracts import CodeIdentity, FrozenPanelInputs, PanelSnapshot
+from guvolu.research.frozen_forward import (
+    run_frozen_forward_prediction,
+    verify_frozen_forward,
+)
+from guvolu.research.governance import (
+    GOVERNANCE_METHOD_VERSION,
+    register_frozen_forward_plan,
+    seal_holdout_vintage,
+)
+from guvolu.research.provenance import canonical_json, sha256_file, stable_identifier
+from guvolu.strategy.contracts import FeatureRow, ResearchBar
+
+
+def _time(value: str) -> datetime:
+    return datetime.fromisoformat(value).replace(tzinfo=UTC)
+
+
+def test_frozen_forward_uses_fixed_weight_and_is_idempotent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """前向预测只能计算候选目标乘预冻结资金权重。"""
+    registry = tmp_path / "data" / "research" / "governance.sqlite3"
+    vintage = seal_holdout_vintage(
+        registry,
+        "market-one",
+        _time("2027-01-01T00:00:00"),
+        _time("2027-02-01T00:00:00"),
+        sealed_at=_time("2026-12-01T00:00:00"),
+    )
+    config_path = tmp_path / "config" / "strategy.json"
+    config_path.parent.mkdir(parents=True)
+    config_path.write_text(canonical_json({
+        "market_id": "market-one",
+        "bar_interval": "1hour",
+        "from_time": "2026-01-01T00:00:00+00:00",
+        "notional_scale": 100_000_000,
+        "strategy_decision_max_age_seconds": 3900,
+        "data_governance": {"registry": "data/research/governance.sqlite3"},
+        "features": {
+            "lookbacks": [1],
+            "state_lookback": 1,
+            "volume_lookback": 1,
+            "maximum_structural_gap_bars_assumption": 1,
+        },
+        "validation": {"minimum_oos_bars": 1},
+    }) + "\n", encoding="utf-8")
+    plan_path = (
+        tmp_path / "reports" / "strategy-research" / "frozen-forward"
+        / vintage.vintage_id / "plan" / "plan.json"
+    )
+    plan_path.parent.mkdir(parents=True)
+    config_hash = sha256_file(config_path)
+    plan_id = stable_identifier("frozen-forward-plan", {
+        "governance_method_version": GOVERNANCE_METHOD_VERSION,
+        "vintage_id": vintage.vintage_id,
+        "source_manifest_sha256": "manifest-hash",
+        "candidate_set_hash": "candidate-set-hash",
+        "config_hash": config_hash,
+        "code_tree_digest": "tree-one",
+    })
+    plan_payload = {
+        "schema_version": 1,
+        "scope": "FROZEN_FORWARD",
+        "plan_id": plan_id,
+        "candidate_set_hash": "candidate-set-hash",
+        "config_hash": config_hash,
+        "code_identity": {"git_hash": "commit-one", "tree_digest": "tree-one"},
+        "code_tree_digest": "tree-one",
+        "config_path": "config/strategy.json",
+        "candidates": [{
+            "candidate_id": "candidate-one",
+            "family": "trend",
+            "mode": "paper",
+            "parameters": {"lookback": 1},
+            "complexity": 1,
+            "expression_id": "expression-one",
+        }],
+        "allocation": {"weights": {"trend": 0.4}, "reserve": 0.6},
+    }
+    plan_path.write_text(canonical_json(plan_payload) + "\n", encoding="utf-8")
+    plan = register_frozen_forward_plan(
+        registry,
+        vintage.vintage_id,
+        "manifest-hash",
+        "candidate-set-hash",
+        config_hash,
+        "tree-one",
+        plan_path.relative_to(tmp_path).as_posix(),
+        sha256_file(plan_path),
+        frozen_at=_time("2026-12-15T00:00:00"),
+    )
+    assert plan.plan_id == plan_id
+    decision = _time("2027-01-02T01:00:00")
+    bar = ResearchBar(
+        open_time=decision - timedelta(hours=1),
+        decision_time=decision,
+        latest_available_time=decision,
+        open=100.0,
+        high=101.0,
+        low=99.0,
+        close=100.5,
+        base_volume=1.0,
+        quote_volume=100.0,
+        signed_base_volume=0.2,
+        trade_count=1,
+    )
+    panel_file = tmp_path / "panel.parquet"
+    panel_file.write_bytes(b"panel")
+    panel = PanelSnapshot(
+        market={"market_id": "market-one"},
+        bars=(bar,),
+        head_generation="sha256-head",
+        attempt_ids=("attempt-one",),
+        artifact_ids=("artifact-one",),
+        normalization_versions=("normalization-one",),
+        panel_path=panel_file,
+        panel_sha256="a" * 64,
+        decision_time=decision,
+        latest_available_time=decision,
+    )
+    feature = FeatureRow(
+        decision_time=decision,
+        as_of=decision,
+        return_one=0.01,
+        trend_scores={1: 1.0},
+        volatility={1: 0.1},
+        price_scores={1: 0.0},
+        prior_highs={1: 101.0},
+        prior_lows={1: 99.0},
+        flow_imbalance=0.2,
+        volume_score=0.1,
+        jump_score=0.0,
+        contiguous=True,
+    )
+    monkeypatch.setattr(
+        "guvolu.research.frozen_forward.code_identity",
+        lambda *_args: CodeIdentity(
+            git_hash="commit-one", tree_digest="tree-one", dirty_digest="",
+            dirty=False, decision_grade=True, reason=None,
+        ),
+    )
+    monkeypatch.setattr(
+        "guvolu.research.frozen_forward.freeze_trade_inputs",
+        lambda *_args: FrozenPanelInputs(
+            market={"market_id": "market-one"}, paths=(),
+            head_generation="sha256-head", attempt_ids=("attempt-one",),
+            artifact_ids=("artifact-one",),
+            normalization_versions=("normalization-one",),
+            maximum_event_time=decision,
+        ),
+    )
+    monkeypatch.setattr(
+        "guvolu.research.frozen_forward.build_panel_snapshot",
+        lambda *_args: panel,
+    )
+    monkeypatch.setattr(
+        "guvolu.research.frozen_forward.compute_features",
+        lambda *_args: (feature,),
+    )
+    monkeypatch.setattr(
+        "guvolu.research.frozen_forward.generate_targets",
+        lambda *_args: (0.5,),
+    )
+
+    result = run_frozen_forward_prediction(
+        tmp_path,
+        plan.plan_id,
+        recorded_at=decision + timedelta(minutes=1),
+    )
+    assert result.aggregate_target == pytest.approx(0.2)
+    content = json.loads(result.prediction_path.read_text(encoding="utf-8"))
+    assert content["families"][0]["family_target"] == 0.5
+    assert content["families"][0]["frozen_allocation_weight"] == 0.4
+    assert run_frozen_forward_prediction(
+        tmp_path,
+        plan.plan_id,
+        recorded_at=decision + timedelta(minutes=2),
+    ) == result
+    verification = verify_frozen_forward(tmp_path, plan.plan_id)
+    assert verification.prediction_count == 1
+
+    content["aggregate_target"] = 0.3
+    result.prediction_path.write_text(
+        canonical_json(content) + "\n", encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="预测制品散列"):
+        verify_frozen_forward(tmp_path, plan.plan_id)

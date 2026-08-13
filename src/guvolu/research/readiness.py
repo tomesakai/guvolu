@@ -7,13 +7,17 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from guvolu.research.features import compute_features
-from guvolu.research.governance import HoldoutVintage, list_holdout_vintages
+from guvolu.research.governance import (
+    HoldoutVintage,
+    get_frozen_forward_plan_for_vintage,
+    list_holdout_vintages,
+)
 from guvolu.research.panel import freeze_trade_inputs, load_panel_bars
 from guvolu.research.provenance import code_identity, sha256_file
 from guvolu.research.verification import verify_research_run
 from guvolu.strategy.contracts import ResearchBar
 
-READINESS_METHOD_VERSION = "strategy-readiness-v1"
+READINESS_METHOD_VERSION = "strategy-readiness-v2"
 _INTERVAL_SECONDS = {
     "5min": 300,
     "15min": 900,
@@ -206,6 +210,12 @@ def strategy_readiness(
     completed_vintages = tuple(
         item for item in sealed_payloads if item["data_complete"] is True
     )
+    unplanned_vintage_ids = tuple(
+        item.vintage_id for item in sealed
+        if get_frozen_forward_plan_for_vintage(
+            registry_path, item.vintage_id,
+        ) is None
+    )
     raw_evaluations = summary.get("family_evaluations")
     if not isinstance(raw_evaluations, list):
         raise ValueError("summary.family_evaluations 必须为数组")
@@ -229,11 +239,15 @@ def strategy_readiness(
         promotion_blockers.append("no_frozen_paper_eligible_family")
     if not sealed:
         promotion_blockers.append("no_sealed_holdout_vintage")
+    elif unplanned_vintage_ids:
+        promotion_blockers.append("sealed_vintage_has_no_frozen_forward_plan")
     elif not completed_vintages:
         promotion_blockers.append("sealed_holdout_vintage_incomplete")
 
     if "no_sealed_holdout_vintage" in promotion_blockers:
         promotion_next_action = "seal_future_vintage_before_its_start"
+    elif "sealed_vintage_has_no_frozen_forward_plan" in promotion_blockers:
+        promotion_next_action = "freeze_forward_plan_before_vintage_start"
     elif "sealed_holdout_vintage_incomplete" in promotion_blockers:
         promotion_next_action = "wait_for_sealed_vintage_end"
     elif promotion_blockers:
@@ -305,6 +319,7 @@ def strategy_readiness(
             "completed_vintage_ids": [
                 str(item["vintage_id"]) for item in completed_vintages
             ],
+            "unplanned_vintage_ids": list(unplanned_vintage_ids),
             "consumed_vintage_count": sum(
                 item.status == "consumed" for item in market_vintages
             ),
