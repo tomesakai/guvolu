@@ -23,7 +23,7 @@ SECONDS_PER_YEAR = 365.0 * 24.0 * 60.0 * 60.0
 P_VALUE_METHOD_VERSION = "probabilistic-sharpe-nonnormal-v1"
 PBO_METHOD_VERSION = "cscv-balanced-fold-block-v2"
 BLOCK_BOOTSTRAP_METHOD_VERSION = "circular-block-bootstrap-sharpe-v1"
-DEFLATED_SHARPE_METHOD_VERSION = "deflated-sharpe-raw-effective-v1"
+DEFLATED_SHARPE_METHOD_VERSION = "deflated-sharpe-family-raw-effective-v2"
 EFFECTIVE_TRIAL_METHOD_VERSION = "fold-score-correlation-participation-v1"
 PARAMETER_STABILITY_METHOD_VERSION = "one-axis-nearest-neighbor-v1"
 _INTERVAL_SECONDS = {
@@ -988,13 +988,7 @@ def walk_forward_validate(
         candidate_id: metrics.p_value
         for candidate_id, metrics in candidate_oos_metrics.items()
     }
-    raw_trial_count = len(candidate_oos_metrics)
-    effective_trial_count = _effective_trial_count(candidate_fold_scores)
     annualization_scale = math.sqrt(periods_per_year)
-    candidate_period_sharpes = tuple(
-        metrics.sharpe / annualization_scale
-        for metrics in candidate_oos_metrics.values()
-    )
     for item in pending:
         p_values[f"family-walk-forward:{item.family}"] = item.metrics.p_value
     q_values = _fdr_q_values(p_values)
@@ -1041,6 +1035,20 @@ def walk_forward_validate(
     evaluations: list[FamilyEvaluation] = []
     for item in pending:
         q_value = q_values[f"family-walk-forward:{item.family}"]
+        family_candidate_ids = tuple(sorted(
+            candidate.candidate_id
+            for candidate in candidates
+            if candidate.family == item.family
+        ))
+        raw_trial_count = len(family_candidate_ids)
+        effective_trial_count = _effective_trial_count({
+            candidate_id: candidate_fold_scores[candidate_id]
+            for candidate_id in family_candidate_ids
+        })
+        candidate_period_sharpes = tuple(
+            candidate_oos_metrics[candidate_id].sharpe / annualization_scale
+            for candidate_id in family_candidate_ids
+        )
         raw_dsr, raw_benchmark = _deflated_sharpe_probability(
             item.oos_returns,
             candidate_period_sharpes,

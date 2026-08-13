@@ -219,7 +219,8 @@ CPU 阶段应先于 GPU 完成以下收敛：
    不把同一参数在所有节拍无边界复制。
 3. 现有门禁已包括非正态 Probabilistic Sharpe、循环折块 percentile bootstrap、折块
    CSCV/PBO、Deflated Sharpe 和单轴最近参数邻域稳定性。DSR 同时发布全量候选原始试验数与
-   基于折级得分相关矩阵参与率的有效试验数，硬门禁使用更保守的原始数。下一步增加
+   基于折级得分相关矩阵参与率的有效试验数。DSR 的试验域是实际参与该流派冠军选择的候选，
+   硬门禁使用更保守的原始数；跨流派比较继续由全局 BH-FDR 约束。下一步增加
    studentized bootstrap 和 regime attribution；开发
    回放与已经实现的一次性封存段状态机分开登记；积累未来 vintage 后再形成 G-08 结论。
 4. 均值回归和网格在当前主动成交成本下失败时保持拒绝。只有建立 snapshot-bounded 被动成交
