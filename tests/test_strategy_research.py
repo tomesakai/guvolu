@@ -537,8 +537,17 @@ def test_manifest_verifier_checks_hashes_and_flat_gate(tmp_path: Path) -> None:
         verify_research_run(tmp_path, manifest)
 
 
-def test_family_monitor_reports_parameter_search_direction(tmp_path: Path) -> None:
+def test_family_monitor_reports_parameter_search_direction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """监视器须从全候选事实给出独立参数轴方向。"""
+    monkeypatch.setattr(
+        "guvolu.research.evolution._verified_summary_source",
+        lambda _root, path: (
+            json.loads(path.read_text(encoding="utf-8")), "m" * 64,
+        ),
+    )
     ledger = tmp_path / "ledger.jsonl"
     records = []
     for lookback, sharpe in ((24, 0.1), (72, 0.6)):
@@ -576,7 +585,7 @@ def test_family_monitor_reports_parameter_search_direction(tmp_path: Path) -> No
         },
     }), encoding="utf-8")
     config = json.loads(Path("config/strategy_research.json").read_text())
-    payload = monitor_family_run(tmp_path, summary, "trend", config)
+    payload = monitor_family_run(tmp_path, summary, "trend", config, "c" * 64)
     directions = {
         item["parameter"]: item["direction"]
         for item in payload["parameter_directions"]
@@ -597,9 +606,10 @@ def test_family_monitor_reports_parameter_search_direction(tmp_path: Path) -> No
         summary,
         "trend",
         config,
+        "c" * 64,
         (first_prior, second_prior),
     )
-    assert deduplicated["monitor_method_version"] == "family-direction-monitor-v2"
+    assert deduplicated["monitor_method_version"] == "family-direction-monitor-v3"
     assert len(deduplicated["history"]) == 0
     assert {
         item["reason"] for item in deduplicated["excluded_history"]
@@ -627,23 +637,35 @@ def test_family_monitor_reports_parameter_search_direction(tmp_path: Path) -> No
         summary,
         "trend",
         config,
+        "c" * 64,
         (recent_path, older_path),
     )
     assert len(time_separated["history"]) == 2
     assert time_separated["excluded_history"] == []
     assert time_separated["cross_run_direction"] == "improving"
 
+    ledger.write_text(ledger.read_text(encoding="utf-8") + "{}\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="trial ledger 散列"):
+        monitor_family_run(tmp_path, summary, "trend", config, "c" * 64)
 
-def test_evolution_proposal_updates_strategy_and_feature_dependencies() -> None:
+
+def test_evolution_proposal_updates_strategy_and_feature_dependencies(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """扩展回看轴时必须同步共享特征并遵守候选预算。"""
+    monkeypatch.setattr(
+        "guvolu.research.tuning.verify_monitor_sources",
+        lambda *_args: None,
+    )
     config = json.loads(Path("config/strategy_research.json").read_text())
     monitor = {
         "family": "trend",
         "run_id": "run",
-        "monitor_method_version": "family-direction-monitor-v2",
+        "monitor_method_version": "family-direction-monitor-v3",
         "source": {
             "summary_sha256": "a" * 64,
             "trial_ledger_sha256": "b" * 64,
+            "config_hash": "c" * 64,
         },
         "evolution_action": "eligible_axis_refinement",
         "parameter_directions": [{
@@ -652,9 +674,14 @@ def test_evolution_proposal_updates_strategy_and_feature_dependencies() -> None:
             "association": 0.8,
         }],
     }
-    proposal, proposed = propose_family_evolution(config, monitor, "hash")
+    proposal, proposed = propose_family_evolution(
+        Path.cwd(), config, monitor, "c" * 64,
+    )
     assert proposal["status"] == "proposed"
     assert proposed is not None
     assert 264 in proposed["strategies"]["trend"]["lookbacks"]
     assert 264 in proposed["features"]["lookbacks"]
     assert len(build_family_batches(proposed, ("trend",))[0].candidates) == 8
+
+    with pytest.raises(ValueError, match="来源配置"):
+        propose_family_evolution(Path.cwd(), config, monitor, "d" * 64)

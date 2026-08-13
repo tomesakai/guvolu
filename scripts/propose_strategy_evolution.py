@@ -44,6 +44,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     monitor = _load_object(monitor_path)
     parent_hash = sha256_file(config_path)
     proposal, proposed_config = propose_family_evolution(
+        root,
         config,
         monitor,
         parent_hash,

@@ -9,7 +9,7 @@ from typing import Sequence
 
 from guvolu.data.durable_io import atomic_write_text
 from guvolu.research.evolution import monitor_family_run
-from guvolu.research.provenance import canonical_json, sha256_text
+from guvolu.research.provenance import canonical_json, sha256_file, sha256_text
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -58,6 +58,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         summary_path,
         arguments.family,
         config,
+        sha256_file(config_path),
         prior_paths,
     )
     content = canonical_json(payload) + "\n"

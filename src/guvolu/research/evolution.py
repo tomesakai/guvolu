@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 from guvolu.research.provenance import sha256_file, stable_identifier
+from guvolu.research.verification import verify_research_run
 
 _INTERVAL_SECONDS = {
     "5min": 300.0,
@@ -63,6 +64,32 @@ def _data_vintage(summary: Mapping[str, object]) -> tuple[str, str]:
         "market_id": market_id,
         "panel_sha256": panel_sha256,
     }), panel_sha256
+
+
+def _verified_summary_source(
+    root: Path,
+    summary_path: Path,
+) -> tuple[Mapping[str, object], str]:
+    """验证 summary 是完整 research manifest 保护的制品。"""
+    path = summary_path.resolve()
+    try:
+        path.relative_to(root)
+    except ValueError as error:
+        raise ValueError("监视来源 summary 必须位于项目目录内") from error
+    manifest_path = path.parent / "manifest.json"
+    verified = verify_research_run(root, manifest_path)
+    manifest = _object(
+        json.loads(manifest_path.read_text(encoding="utf-8")), "manifest",
+    )
+    artifacts = _object(manifest.get("artifacts"), "manifest.artifacts")
+    summary_record = _object(artifacts.get("summary_json"), "summary_json")
+    protected = (root / _text(summary_record.get("path"), "summary_json.path")).resolve()
+    if protected != path:
+        raise ValueError("监视来源 summary 不是 manifest 保护的制品")
+    summary = _object(json.loads(path.read_text(encoding="utf-8")), "summary")
+    if summary.get("run_id") != verified.run_id:
+        raise ValueError("监视来源 summary 与 manifest 运行身份不一致")
+    return summary, verified.manifest_sha256
 
 
 def _history_entry(
@@ -199,18 +226,32 @@ def monitor_family_run(
     summary_path: Path,
     family: str,
     config: Mapping[str, object],
+    config_hash: str,
     prior_summary_paths: Sequence[Path] = (),
 ) -> Mapping[str, object]:
     """生成单流派参数方向与跨运行健康监视制品。"""
     root = repository_root.resolve()
-    summary = _object(
-        json.loads(summary_path.read_text(encoding="utf-8")),
-        "summary",
-    )
+    summary_path = summary_path.resolve()
+    try:
+        summary_relative = summary_path.relative_to(root).as_posix()
+    except ValueError as error:
+        raise ValueError("监视来源 summary 必须位于项目目录内") from error
+    summary, manifest_sha256 = _verified_summary_source(root, summary_path)
     evaluation = _family_evaluation(summary, family)
     artifacts = _object(summary.get("artifacts"), "summary.artifacts")
     ledger = _object(artifacts.get("trial_ledger"), "artifacts.trial_ledger")
-    ledger_path = root / str(ledger.get("path"))
+    ledger_path = (root / str(ledger.get("path"))).resolve()
+    try:
+        ledger_relative = ledger_path.relative_to(root).as_posix()
+    except ValueError as error:
+        raise ValueError("监视来源 trial ledger 必须位于项目目录内") from error
+    expected_ledger_hash = _text(
+        ledger.get("sha256"), "artifacts.trial_ledger.sha256",
+    )
+    if sha256_file(ledger_path) != expected_ledger_hash:
+        raise ValueError("监视来源 trial ledger 散列不匹配")
+    if summary.get("config_hash") != config_hash:
+        raise ValueError("监视来源 summary 与当前配置散列不一致")
     monitor_config = _object(
         config.get("evolution_monitor"), "evolution_monitor",
     )
@@ -254,7 +295,7 @@ def monitor_family_run(
     history_by_identity: dict[str, Mapping[str, object]] = {}
     excluded_history: list[Mapping[str, object]] = []
     for path in prior_summary_paths:
-        prior = _object(json.loads(path.read_text(encoding="utf-8")), "prior_summary")
+        prior, _prior_manifest_sha256 = _verified_summary_source(root, path)
         identity = _text(
             prior.get("research_identity") or prior.get("run_id"),
             "prior.research_identity",
@@ -333,7 +374,7 @@ def monitor_family_run(
             direction = "stable"
     return {
         "schema_version": 1,
-        "monitor_method_version": "family-direction-monitor-v2",
+        "monitor_method_version": "family-direction-monitor-v3",
         "run_id": summary.get("run_id"),
         "research_identity": current_identity,
         "data_vintage_id": current_vintage_id,
@@ -359,10 +400,13 @@ def monitor_family_run(
         },
         "source": {
             "summary_sha256": sha256_file(summary_path),
-            "config_hash": summary.get("config_hash"),
+            "summary_path": summary_relative,
+            "manifest_sha256": manifest_sha256,
+            "config_hash": config_hash,
             "panel_sha256": current_panel_sha256,
             "code_identity": summary.get("code_identity"),
-            "trial_ledger_sha256": ledger.get("sha256"),
+            "trial_ledger_path": ledger_relative,
+            "trial_ledger_sha256": expected_ledger_hash,
         },
         "parameter_directions": _parameter_directions(
             rows,

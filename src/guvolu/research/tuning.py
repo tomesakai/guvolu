@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from pathlib import Path
 
-from guvolu.research.provenance import canonical_json, sha256_text
+from guvolu.research.provenance import canonical_json, sha256_file, sha256_text
+from guvolu.research.verification import verify_research_run
 from guvolu.strategy.generation import build_family_batches
 
 
@@ -20,6 +22,62 @@ def _number(value: object, name: str) -> float:
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         raise ValueError(f"{name} 必须为数值")
     return float(value)
+
+
+def _text(value: object, name: str) -> str:
+    """验证非空文本。"""
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{name} 必须为非空文本")
+    return value
+
+
+def _source_path(root: Path, value: object, name: str) -> Path:
+    """解析并限制监视来源路径位于项目目录。"""
+    path = (root / _text(value, name)).resolve()
+    try:
+        path.relative_to(root)
+    except ValueError as error:
+        raise ValueError(f"{name} 越出项目目录") from error
+    return path
+
+
+def verify_monitor_sources(
+    repository_root: Path,
+    monitor: Mapping[str, object],
+    parent_config_hash: str,
+) -> None:
+    """验证监视制品绑定的受保护 summary、ledger 和父配置。"""
+    root = repository_root.resolve()
+    source = _object(monitor.get("source"), "monitor.source")
+    if source.get("config_hash") != parent_config_hash:
+        raise ValueError("monitor 来源配置与父配置散列不一致")
+    summary_path = _source_path(
+        root, source.get("summary_path"), "monitor.source.summary_path",
+    )
+    ledger_path = _source_path(
+        root, source.get("trial_ledger_path"),
+        "monitor.source.trial_ledger_path",
+    )
+    if sha256_file(summary_path) != source.get("summary_sha256"):
+        raise ValueError("monitor 来源 summary 散列不匹配")
+    if sha256_file(ledger_path) != source.get("trial_ledger_sha256"):
+        raise ValueError("monitor 来源 trial ledger 散列不匹配")
+    verify_research_run(root, summary_path.parent / "manifest.json")
+    summary = _object(
+        json.loads(summary_path.read_text(encoding="utf-8")), "source summary",
+    )
+    if summary.get("config_hash") != parent_config_hash:
+        raise ValueError("monitor 来源 summary 未绑定父配置")
+    if summary.get("run_id") != monitor.get("run_id"):
+        raise ValueError("monitor 与来源 summary 的 run_id 不一致")
+    if summary.get("research_identity") != monitor.get("research_identity"):
+        raise ValueError("monitor 与来源 summary 的研究身份不一致")
+    artifacts = _object(summary.get("artifacts"), "summary.artifacts")
+    ledger = _object(artifacts.get("trial_ledger"), "summary.trial_ledger")
+    if ledger.get("path") != ledger_path.relative_to(root).as_posix():
+        raise ValueError("monitor trial ledger 路径与 summary 不一致")
+    if ledger.get("sha256") != source.get("trial_ledger_sha256"):
+        raise ValueError("monitor trial ledger 身份与 summary 不一致")
 
 
 def _singular(name: str) -> str:
@@ -44,16 +102,22 @@ def _axis_map(strategy: Mapping[str, object]) -> Mapping[str, str]:
 
 
 def propose_family_evolution(
+    repository_root: Path,
     config: Mapping[str, object],
     monitor: Mapping[str, object],
     parent_config_hash: str,
 ) -> tuple[Mapping[str, object], Mapping[str, object] | None]:
     """扩展一个预登记数值轴，不直接覆盖基准配置。"""
+    verify_monitor_sources(repository_root, monitor, parent_config_hash)
     family = str(monitor.get("family"))
     monitor_hash = sha256_text(canonical_json(monitor))
     source = _object(monitor.get("source"), "monitor.source")
     source_summary_hash = source.get("summary_sha256")
     source_ledger_hash = source.get("trial_ledger_sha256")
+    if not isinstance(parent_config_hash, str) or len(parent_config_hash) != 64:
+        raise ValueError("父配置散列必须是 SHA-256")
+    if source.get("config_hash") != parent_config_hash:
+        raise ValueError("monitor 来源配置与父配置散列不一致")
     if not isinstance(source_summary_hash, str) or len(source_summary_hash) != 64:
         raise ValueError("monitor 缺少合法 source summary hash")
     if not isinstance(source_ledger_hash, str) or len(source_ledger_hash) != 64:

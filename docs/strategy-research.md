@@ -269,6 +269,11 @@ summary 后，五个流派均没有可计入的时间历史：每个流派排除
 两个没有早于当前策略决策时点的累计面板。当前数据只能支持参数轴诊断，不能支持跨时期
 稳定、改善或衰减结论，因此跨运行状态保持 `insufficient_history`。
 
+隔离开发分支的 `family-direction-monitor-v3` 进一步要求在监视时实际复核 trial ledger 散列，
+并把 summary 与 ledger 的项目内路径写入监视制品；生成下一代提案前还会完整复核来源 manifest，
+同时证明 monitor、summary、ledger 与父配置散列一致。该增强只收紧证据链，不改变上述历史不足
+结论，也不进入已经冻结的前向执行器代码树。
+
 ## 8. 下一版 CPU 生成方式
 
 CPU 阶段应先于 GPU 完成以下收敛：
