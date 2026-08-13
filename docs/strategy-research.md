@@ -112,6 +112,9 @@ paper 分配遵守以下长期边界：趋势、量价确认趋势和突破合�
 .\.venv\Scripts\python.exe scripts\propose_strategy_evolution.py --monitor <monitor.json>
 ```
 
+两条命令的 `--output` 都表示输出目录；制品文件名由内容散列生成，不能把
+`--output` 直接指定成 `.json` 文件。
+
 派生配置是新制品，不覆盖基准配置。使用派生配置再次运行时仍属于开发回放；只有明确登记的
 一次性封存段才允许形成最终 promotion 证据（G-08）。
 
@@ -162,6 +165,24 @@ walk-forward 折；开发段已被反复
 组合运行必须重新包含所有拟分配流派及其候选，形成全局试验计数和共享方向风险上限。独立
 流派运行用于生成、诊断和演进；组合运行用于比较相关性、竞争风险预算和最终 paper 准入。
 
+2026-08-14 的 `cpu-v7` 独立运行均通过九类制品复核。基准配置下，突破、量价趋势和趋势
+通过开发回放门禁；均值回归与网格在完整主动成交成本下被拒绝。所有运行的实时质量均因
+特征快照过期而失败，所以运行仓位和组合目标保持为零：
+
+| 流派 | OOS Sharpe | 净收益 | 最大回撤 | FDR q | PBO | 折块 p | 结论 |
+|---|---:|---:|---:|---:|---:|---:|---|
+| 突破 | 1.114 | 1.672 | 0.276 | 0.006 | 0.066 | 0.004 | development paper eligible |
+| 量价趋势 | 0.741 | 1.234 | 0.353 | 0.033 | 0.330 | 0.043 | development paper eligible |
+| 趋势 | 0.772 | 1.274 | 0.432 | 0.036 | 0.320 | 0.034 | development paper eligible |
+| 均值回归 | -0.523 | -0.697 | 0.548 | 1.000 | 0.002 | 0.928 | rejected；修订假设或成本逻辑 |
+| 网格 shadow | -1.495 | -1.953 | 0.865 | 1.000 | 0.000 | 1.000 | rejected；先补被动成交模型 |
+
+监视器只允许突破与趋势各扩展一个预登记边界轴到 264 小时。趋势派生候选把拼接 OOS
+Sharpe 从 0.772 提高到 0.866、PBO 从 0.320 降到 0.121；突破则把 Sharpe 从 1.114 降到
+1.081、PBO 从 0.066 升到 0.188。两者部署冠军都仍是原 168 小时候选，因此这些结果只进入
+adaptive 历史，不自动改写基准配置。每个流派当前只有两个独立研究身份，低于三个历史运行
+的方向判定门槛，跨运行状态诚实保持 `insufficient_history`。
+
 ## 8. 下一版 CPU 生成方式
 
 CPU 阶段应先于 GPU 完成以下收敛：
@@ -170,8 +191,9 @@ CPU 阶段应先于 GPU 完成以下收敛：
    规范化为同一候选身份，公共子表达式只计算一次。
 2. 增加 5 分钟、1 小时和 4 小时多节拍，但每个候选只使用预先登记的决策节拍与成本模型；
    不把同一参数在所有节拍无边界复制。
-3. 在现有非正态 Probabilistic Sharpe 和折块 CSCV/PBO 之上增加 block bootstrap、deflated
-   Sharpe、参数邻域稳定性和 regime attribution；开发回放与一次性封存段分开登记并执行 G-08。
+3. 在现有非正态 Probabilistic Sharpe、循环折块 percentile bootstrap 和折块 CSCV/PBO 之上
+   增加 studentized bootstrap、Deflated Sharpe、参数邻域稳定性和 regime attribution；开发
+   回放与一次性封存段分开登记并执行 G-08。
 4. 均值回归和网格在当前主动成交成本下失败时保持拒绝。只有建立 snapshot-bounded 被动成交
    上下界、库存路径、逆向选择和撤单失败模拟后，才重新评估网格，不以较低费用假设直接放行。
 5. 建立多市场 PIT universe、共同 quote/FX、上市生命周期和流动性过滤后，再生成横截面与
@@ -186,7 +208,7 @@ CPU 阶段应先于 GPU 完成以下收敛：
 | [强类型 Vectorial GP（2025）](https://arxiv.org/abs/2504.05418) | 强类型 GP 在该实验中优于普通 GP | GPU/进化搜索只接受 typed DSL，不允许无类型表达式 |
 | [Warm-start GP（2024）](https://arxiv.org/abs/2412.00896) | 结构约束和有依据的初始化可减少随机搜索浪费 | 以已验证流派为 seed，每个流派独立预算和繁殖池 |
 | [CPCV 比较研究（2024）](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=4686376) | 合成控制实验中 CPCV 比普通 walk-forward 更能抑制过拟合 | 已加入折块 CSCV/PBO；完整 CPCV 作为进入封存段前的 challenger |
-| [Deflated Sharpe Ratio](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=2460551) | 选择偏差、非正态与试验次数会抬高 Sharpe | 试验台账全计数并加入 DSR，不只使用 BH-FDR |
+| [Deflated Sharpe Ratio](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=2460551) | 选择偏差、非正态与试验次数会抬高 Sharpe | 试验台账已全计数；下一步加入 DSR，不只依赖 BH-FDR |
 | [Ledoit-Wolf Sharpe 检验](https://www.ledoit.net/Robust_Sharpe_2008.pdf) | 肥尾或序列相关下应使用 time-series bootstrap | 已加入循环折块 percentile 门禁；studentized 区间列为下一步 |
 
 ## 9. GPU 策略生成方式

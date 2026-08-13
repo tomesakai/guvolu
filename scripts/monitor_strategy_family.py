@@ -24,7 +24,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=Path("config/strategy_research.json"),
     )
     parser.add_argument("--prior-summary", action="append", type=Path, default=[])
-    parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--output",
+        type=Path,
+        metavar="DIRECTORY",
+        help="内容寻址监视制品的输出目录（不是 JSON 文件路径）",
+    )
     arguments = parser.parse_args(argv)
     root = arguments.root.resolve()
     config_path = arguments.config
