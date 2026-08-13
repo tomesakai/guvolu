@@ -146,6 +146,19 @@ paper 分配遵守以下长期边界：趋势、量价确认趋势和突破合�
 .\.venv\Scripts\python.exe scripts\verify_strategy_research.py
 ```
 
+在完整搜索前只读检查当前代码树、活动输入、连续特征成熟度和 holdout 状态：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\check_strategy_readiness.py
+```
+
+readiness 命令不创建、不消费 vintage，也不登记自适应研究暴露。它只读取已验证 manifest、
+活动 head、冻结面板和治理注册表。2026-08-14 的当前结果为：研究来源与 clean tree 完全匹配；
+最长特征需要 169 根连续观测柱，最新结构性断点后只有 11 根，尚差 158 根。如果之后每根
+小时柱均正常到达，最早成熟时点约为 2026-08-20 18:00（项目时区）；这只是条件估算，新的
+超限断点会重新计数。治理库当前没有 sealed vintage，因此 promotion 下一步是由负责人在
+区间开始前明确选择并封存未来区间，而不是反复运行开发回测。
+
 主要输出为：
 
 | 制品 | 位置 | 用途 |
@@ -211,10 +224,10 @@ improving、stable 或 decaying。重复面板、未早于当前决策时点和�
 组合研究分配为量价趋势 `0.180456`、趋势 `0.219544`、风险储备 `0.60`；突破当期家族目标
 为零，因此不占组合风险，研究聚合目标为 `0.40`。运行时 `feature_snapshot_stale` 门禁把
 全部权重清零并将储备提高到 `1.00`。本次 decision-grade manifest 为
-`research-run-4f6ee313299de1bfdc1a4fa255f7f48c03e48a62a8dd56aad0bdacde5aad2c3c`，
-SHA-256 为 `e402fa1310b2658bec9e2cbbbd5ceb9f10f654c1c53b8d4527905c13e12a7f95`；
-来源提交为 `8a20ff59a1c45005c289cd6aa4329f6ff28d2cbd`，研究代码树散列为
-`5c3c8e8413109f04db6b750ae63f7a18f310473a8be8939b5e07739903f331f0`。
+`research-run-8b284dae08d7e2f47e18d557bffafbebc21d7719557767d7862825105c1d20ed`，
+SHA-256 为 `0f758983227dfc110aef614d1b3625d777c1eb24ea6d9a6535ab6431495a7f56`；
+来源提交为 `3cc87727f3dabd2062f903a26b842ce797a27a4d`，研究代码树散列为
+`adfbcf3ce4ab87b2853c1019a463b0587ccc0262128004ac929ff5e8149ddf49`。
 
 监视器只允许突破与趋势各扩展一个预登记边界轴到 264 小时。趋势派生候选把拼接 OOS
 Sharpe 从 0.772 提高到 0.866、PBO 从 0.320 降到 0.121；突破则把 Sharpe 从 1.114 降到
