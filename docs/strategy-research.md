@@ -211,16 +211,16 @@ improving、stable 或 decaying。重复面板、未早于当前决策时点和�
 组合研究分配为量价趋势 `0.180456`、趋势 `0.219544`、风险储备 `0.60`；突破当期家族目标
 为零，因此不占组合风险，研究聚合目标为 `0.40`。运行时 `feature_snapshot_stale` 门禁把
 全部权重清零并将储备提高到 `1.00`。本次 decision-grade manifest 为
-`research-run-5fde0b697809dd290e02486b2e21f984bcc426e53ecf13040b95589927dd27dd`，
-SHA-256 为 `77c52f7c34426d021e853dd92992c0c0aef3992898b4dba429e8003bca14add7`；
-来源提交为 `a02fdfdfefcea04ff6b48cfd67ee09b56ba21a3d`，研究代码树散列为
-`c45b764ca372eae1e21dd9f86ceb8fc3d99406d02be161accccbe1d33358a4ba`。
+`research-run-4f6ee313299de1bfdc1a4fa255f7f48c03e48a62a8dd56aad0bdacde5aad2c3c`，
+SHA-256 为 `e402fa1310b2658bec9e2cbbbd5ceb9f10f654c1c53b8d4527905c13e12a7f95`；
+来源提交为 `8a20ff59a1c45005c289cd6aa4329f6ff28d2cbd`，研究代码树散列为
+`5c3c8e8413109f04db6b750ae63f7a18f310473a8be8939b5e07739903f331f0`。
 
 监视器只允许突破与趋势各扩展一个预登记边界轴到 264 小时。趋势派生候选把拼接 OOS
 Sharpe 从 0.772 提高到 0.866、PBO 从 0.320 降到 0.121；突破则把 Sharpe 从 1.114 降到
 1.081、PBO 从 0.066 升到 0.188。两者部署冠军都仍是原 168 小时候选，因此这些结果只进入
-adaptive 比较，不自动改写基准配置。`family-direction-monitor-v2` 用当前运行回放四个既有
-summary 后，五个流派均没有可计入的时间历史：每个流派排除两个重复面板 vintage，并排除
+adaptive 比较，不自动改写基准配置。`family-direction-monitor-v2` 用当前运行回放五个既有
+summary 后，五个流派均没有可计入的时间历史：每个流派排除三个重复面板 vintage，并排除
 两个没有早于当前策略决策时点的累计面板。当前数据只能支持参数轴诊断，不能支持跨时期
 稳定、改善或衰减结论，因此跨运行状态保持 `insufficient_history`。
 
