@@ -1,0 +1,168 @@
+syntax = "proto3";
+
+package factor.research.v1;
+
+import "common.proto";
+import "domain.proto";
+
+message FieldSpec {
+  uint32 field_id = 1;
+  string name = 2;
+  string shape = 3;
+  string unit = 4;
+  string frequency = 5;
+  string availability = 6;
+  string missing_policy = 7;
+  string physical_dtype = 8;
+}
+
+message PanelManifest {
+  factor.common.v1.ContractMeta meta = 1;
+  factor.common.v1.Hash256 panel_id = 2;
+  uint32 time_count = 3;
+  uint32 decision_count = 4;
+  uint32 asset_count = 5;
+  uint32 padded_asset_count = 6;
+  repeated FieldSpec fields = 7;
+  repeated factor.common.v1.ArtifactRef field_artifacts = 8;
+  repeated factor.common.v1.ArtifactRef validity_artifacts = 9;
+  factor.common.v1.ArtifactRef decision_index = 10;
+  factor.common.v1.Hash256 universe_policy_hash = 11;
+  factor.common.v1.ArtifactRef label_values = 12;
+  factor.common.v1.ArtifactRef label_order = 13;
+  factor.common.v1.Hash256 source_manifest_hash = 14;
+  factor.common.v1.ArtifactRef universe_snapshot_series = 15;
+}
+
+message ParameterValue {
+  string name = 1;
+  oneof value {
+    float f32_value = 2;
+    double f64_value = 3;
+    uint32 u32_value = 4;
+    int64 duration_ns = 5;
+    string enum_value = 6;
+  }
+}
+
+message ExpressionSpec {
+  factor.common.v1.ContractMeta meta = 1;
+  factor.common.v1.Hash256 expression_id = 2;
+  factor.common.v1.Hash256 candidate_id = 3;
+  bytes canonical_ast = 4;
+  string display_expression = 5;
+  repeated ParameterValue parameters = 6;
+  uint32 operator_semantics_version = 7;
+}
+
+message ResourceEstimate {
+  uint64 state_bytes_per_asset = 1;
+  uint64 scratch_bytes_per_candidate = 2;
+  uint64 materialized_bytes = 3;
+  uint32 estimated_barriers = 4;
+  uint32 estimated_sort_stages = 5;
+  uint64 estimated_fp64_ops = 6;
+}
+
+message StagePlan {
+  uint32 stage_index = 1;
+  string stage_kind = 2;       // E0/E1/E2/E3/M
+  factor.common.v1.ArtifactRef bytecode_or_source = 3;
+  repeated uint32 input_stage_indices = 4;
+  repeated uint32 materialized_node_ids = 5;
+}
+
+message CompiledPlan {
+  factor.common.v1.ContractMeta meta = 1;
+  factor.common.v1.Hash256 plan_id = 2;
+  factor.common.v1.Hash256 candidate_id = 3;
+  repeated StagePlan stages = 4;
+  ResourceEstimate estimate = 5;
+  string target_profile = 6;
+}
+
+message EvaluationRequest {
+  factor.common.v1.ContractMeta meta = 1;
+  factor.common.v1.Hash256 evaluation_id = 2;
+  CompiledPlan plan = 3;               // self-contained control plane
+  PanelManifest panel = 4;             // contains only ArtifactRefs, not arrays
+  string data_scope = 5;
+  string numeric_mode = 6;
+  factor.common.v1.Hash256 label_spec_hash = 7;
+  factor.common.v1.Hash256 cost_policy_hash = 8;
+  factor.common.v1.Hash256 perturbation_hash = 9;
+  repeated string requested_outputs = 10;
+}
+
+enum MetricStatus {
+  METRIC_STATUS_UNSPECIFIED = 0;
+  METRIC_VALID = 1;
+  METRIC_INVALID_INSUFFICIENT_SAMPLE = 2;
+  METRIC_INVALID_NUMERIC = 3;
+  METRIC_NOT_COMPUTED = 4;
+}
+
+message MetricValue {
+  string name = 1;
+  double value = 2;
+  string unit = 3;
+  uint64 sample_count = 4;
+  string definition_version = 5;
+  string tier = 6;
+  MetricStatus status = 7;
+  string status_reason = 8;
+}
+
+message GpuResourceReport {
+  factor.common.v1.Hash256 binary_hash = 1;
+  uint32 registers_per_thread = 2;
+  uint32 local_bytes_per_thread = 3;
+  uint32 static_shared_bytes_per_block = 4;
+  uint32 dynamic_shared_bytes_per_block = 5;
+  uint32 active_blocks_per_sm = 6;
+  uint64 spill_load_bytes = 7;
+  uint64 spill_store_bytes = 8;
+  string gpu_uuid = 9;
+  string compute_capability = 10;
+  string cuda_driver_version = 11;
+  string cuda_runtime_version = 12;
+}
+
+message EvaluationResult {
+  factor.common.v1.ContractMeta meta = 1;
+  factor.common.v1.Hash256 evaluation_id = 2;
+  string stage_reached = 3;
+  string status = 4;
+  repeated MetricValue metrics = 5;
+  repeated factor.common.v1.ArtifactRef artifacts = 6;
+  repeated factor.common.v1.ContractError errors = 7;
+  repeated GpuResourceReport resource_reports = 8;
+}
+
+message TrialRecord {
+  factor.common.v1.ContractMeta meta = 1;
+  factor.common.v1.Hash256 trial_id = 2;
+  factor.common.v1.Hash256 hypothesis_id = 3;
+  factor.common.v1.Hash256 evaluation_id = 4;
+  string trial_kind = 5;
+  string data_scope = 6;
+  factor.common.v1.Hash256 reused_from = 7;
+  uint32 generation = 8;
+  repeated factor.common.v1.Hash256 parent_ids = 9;
+  string source_commit = 10;
+  string compiler_version = 11;
+  factor.common.v1.Hash256 binary_hash = 12;
+  string gpu_uuid = 13;
+  string cuda_driver_version = 14;
+  string cuda_runtime_version = 15;
+  uint32 registers_per_thread = 16;
+  uint32 local_bytes_per_thread = 17;
+  uint32 shared_bytes_per_block = 18;
+  uint32 active_blocks_per_sm = 19;
+  string invalidation_reason = 20;
+  factor.common.v1.Hash256 panel_id = 21;
+  factor.common.v1.Hash256 universe_policy_hash = 22;
+  factor.common.v1.Hash256 label_spec_hash = 23;
+  factor.common.v1.Hash256 cost_policy_hash = 24;
+  factor.common.v1.Hash256 perturbation_hash = 25;
+}

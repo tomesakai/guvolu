@@ -1,0 +1,268 @@
+syntax = "proto3";
+
+package factor.execution.v1;
+
+import "common.proto";
+
+enum ExecutionMode {
+  EXECUTION_MODE_UNSPECIFIED = 0;
+  SIMULATION = 1;
+  PAPER = 2;
+  LIVE = 3;
+}
+
+message SignalPoint {
+  uint64 instrument_id = 1;
+  double raw_score = 2;
+  double normalized_score = 3;
+  bool valid = 4;
+}
+
+message SignalFrame {
+  factor.common.v1.ContractMeta meta = 1;
+  factor.common.v1.Hash256 factor_version_id = 2;
+  int64 decision_time_ns = 3;
+  repeated SignalPoint points = 4;
+  factor.common.v1.Hash256 universe_snapshot_id = 5;
+  string normalization_version = 6;
+  factor.common.v1.Hash256 signal_frame_id = 7;
+}
+
+message TargetPosition {
+  uint64 instrument_id = 1;
+  factor.common.v1.FixedDecimal target_quantity = 2;
+  double target_weight = 3;
+  repeated string constraint_flags = 4;
+}
+
+message TargetPortfolio {
+  factor.common.v1.ContractMeta meta = 1;
+  factor.common.v1.Hash256 portfolio_id = 2;
+  int64 decision_time_ns = 3;
+  repeated TargetPosition positions = 4;
+  double target_gross = 5;
+  double target_net = 6;
+  string policy_version = 7;
+  factor.common.v1.Hash256 signal_frame_id = 8;
+}
+
+enum RiskVerdict {
+  RISK_VERDICT_UNSPECIFIED = 0;
+  RISK_ACCEPT = 1;
+  RISK_CLIP = 2;
+  RISK_REJECT = 3;
+  RISK_KILL_SWITCH = 4;
+}
+
+message RiskDecision {
+  factor.common.v1.ContractMeta meta = 1;
+  RiskVerdict verdict = 2;
+  repeated string rule_codes = 3;
+  repeated TargetPosition approved_positions = 4;
+  factor.common.v1.Hash256 requested_portfolio_id = 5;
+  factor.common.v1.Hash256 approved_portfolio_id = 6;
+}
+
+enum OrderSide {
+  ORDER_SIDE_UNSPECIFIED = 0;
+  BUY = 1;
+  SELL = 2;
+}
+
+enum OrderType {
+  ORDER_TYPE_UNSPECIFIED = 0;
+  MARKET = 1;
+  LIMIT = 2;
+  STOP = 3;
+  STOP_LIMIT = 4;
+}
+
+enum TimeInForce {
+  TIF_UNSPECIFIED = 0;
+  DAY = 1;
+  GTC = 2;
+  IOC = 3;
+  FOK = 4;
+  GTD = 5;
+}
+
+message OrderIntent {
+  factor.common.v1.ContractMeta meta = 1;
+  string client_order_id = 2;
+  factor.common.v1.Hash256 execution_run_id = 3;
+  factor.common.v1.Hash256 portfolio_id = 4;
+  uint64 instrument_id = 5;
+  OrderSide side = 6;
+  factor.common.v1.FixedDecimal quantity = 7;
+  OrderType order_type = 8;
+  factor.common.v1.FixedDecimal limit_price = 9;
+  TimeInForce time_in_force = 10;
+  int64 expire_time_ns = 11;
+  string algo_policy = 12;
+  string venue_id = 13;
+}
+
+enum OrderStatus {
+  ORDER_STATUS_UNSPECIFIED = 0;
+  PENDING_NEW = 1;
+  WORKING = 2;
+  PARTIALLY_FILLED = 3;
+  FILLED = 4;
+  PENDING_CANCEL = 5;
+  CANCELLED = 6;
+  REJECTED = 7;
+  EXPIRED = 8;
+  REPLACED = 9;
+  SUSPENDED = 10;
+  UNKNOWN = 11;
+}
+
+enum ExecutionEventType {
+  EXEC_EVENT_UNSPECIFIED = 0;
+  PENDING_NEW_EVENT = 1;
+  NEW_ACK = 2;
+  TRADE = 3;
+  PENDING_CANCEL_EVENT = 4;
+  CANCEL_ACK = 5;
+  CANCEL_REJECT = 6;
+  REPLACE_ACK = 7;
+  REJECT = 8;
+  EXPIRE = 9;
+  RESTATE = 10;
+}
+
+message OrderEvent {
+  factor.common.v1.ContractMeta meta = 1;
+  factor.common.v1.Hash256 execution_run_id = 2;
+  string client_order_id = 3;
+  string venue_order_id = 4;
+  uint64 venue_sequence = 5;
+  ExecutionEventType event_type = 6;
+  OrderStatus resulting_status = 7;
+  factor.common.v1.FixedDecimal cumulative_filled_qty = 8;
+  factor.common.v1.FixedDecimal leaves_qty = 9;
+  factor.common.v1.FixedDecimal average_fill_price = 10;
+  string reason_code = 11;
+  int64 event_time_ns = 12;
+  int64 receive_time_ns = 13;
+}
+
+message FillEvent {
+  factor.common.v1.ContractMeta meta = 1;
+  factor.common.v1.Hash256 execution_run_id = 2;
+  string fill_id = 3;
+  string client_order_id = 4;
+  string venue_order_id = 5;
+  uint64 instrument_id = 6;
+  OrderSide side = 7;
+  factor.common.v1.FixedDecimal quantity = 8;
+  factor.common.v1.FixedDecimal price = 9;
+  factor.common.v1.FixedDecimal fee = 10;
+  string fee_currency = 11;
+  int64 event_time_ns = 12;
+  int64 receive_time_ns = 13;
+  string liquidity_flag = 14;
+}
+
+enum AccountingEventType {
+  ACCOUNTING_EVENT_UNSPECIFIED = 0;
+  ACCOUNTING_TRADE = 1;
+  ACCOUNTING_FEE = 2;
+  ACCOUNTING_FUNDING = 3;
+  ACCOUNTING_INTEREST = 4;
+  ACCOUNTING_DIVIDEND = 5;
+  ACCOUNTING_SPLIT = 6;
+  ACCOUNTING_CASH_TRANSFER = 7;
+  ACCOUNTING_SETTLEMENT = 8;
+  ACCOUNTING_MARK_TO_MARKET = 9;
+}
+
+message AccountingEvent {
+  factor.common.v1.ContractMeta meta = 1;
+  factor.common.v1.Hash256 execution_run_id = 2;
+  AccountingEventType event_type = 3;
+  uint64 instrument_id = 4;
+  factor.common.v1.FixedDecimal quantity_delta = 5;
+  factor.common.v1.FixedDecimal cash_delta = 6;
+  string currency = 7;
+  factor.common.v1.FixedDecimal reference_price = 8;
+  int64 event_time_ns = 9;
+  string source_event_id = 10;
+}
+
+message PositionLine {
+  uint64 instrument_id = 1;
+  factor.common.v1.FixedDecimal quantity = 2;
+  factor.common.v1.FixedDecimal average_cost = 3;
+  factor.common.v1.FixedDecimal mark_price = 4;
+  factor.common.v1.FixedDecimal market_value = 5;
+  factor.common.v1.FixedDecimal realized_pnl = 6;
+  factor.common.v1.FixedDecimal unrealized_pnl = 7;
+}
+
+message CashLine {
+  string currency = 1;
+  factor.common.v1.FixedDecimal settled = 2;
+  factor.common.v1.FixedDecimal unsettled = 3;
+  factor.common.v1.FixedDecimal available = 4;
+}
+
+message PortfolioSnapshot {
+  factor.common.v1.ContractMeta meta = 1;
+  factor.common.v1.Hash256 snapshot_id = 2;
+  factor.common.v1.Hash256 execution_run_id = 3;
+  int64 as_of_ns = 4;
+  repeated PositionLine positions = 5;
+  repeated CashLine cash = 6;
+  factor.common.v1.FixedDecimal nav = 7;
+  string base_currency = 8;
+}
+
+message CostBreakdown {
+  factor.common.v1.FixedDecimal exchange_fee = 1;
+  factor.common.v1.FixedDecimal spread_cost = 2;
+  factor.common.v1.FixedDecimal impact_cost = 3;
+  factor.common.v1.FixedDecimal borrow_cost = 4;
+  factor.common.v1.FixedDecimal funding_cost = 5;
+  factor.common.v1.FixedDecimal financing_cost = 6;
+  factor.common.v1.FixedDecimal fx_cost = 7;
+  factor.common.v1.FixedDecimal taxes = 8;
+  factor.common.v1.FixedDecimal opportunity_cost = 9;
+}
+
+message TcaRecord {
+  factor.common.v1.ContractMeta meta = 1;
+  factor.common.v1.Hash256 execution_run_id = 2;
+  string client_order_id = 3;
+  factor.common.v1.FixedDecimal decision_price = 4;
+  factor.common.v1.FixedDecimal arrival_price = 5;
+  factor.common.v1.FixedDecimal average_fill_price = 6;
+  double implementation_shortfall_bps = 7;
+  double spread_component_bps = 8;
+  double impact_component_bps = 9;
+  double market_timing_bps = 10;
+  double opportunity_cost_bps = 11;
+  double fill_rate = 12;
+  double participation_rate = 13;
+  int64 arrival_to_ack_ns = 14;
+  int64 ack_to_last_fill_ns = 15;
+  CostBreakdown costs = 16;
+  string benchmark_version = 17;
+}
+
+message ReconciliationDifference {
+  string difference_type = 1;
+  uint64 instrument_id = 2;
+  string currency = 3;
+  factor.common.v1.FixedDecimal internal_value = 4;
+  factor.common.v1.FixedDecimal venue_value = 5;
+  string severity = 6;
+}
+
+message ReconciliationReport {
+  factor.common.v1.ContractMeta meta = 1;
+  factor.common.v1.Hash256 execution_run_id = 2;
+  int64 as_of_ns = 3;
+  bool matched = 4;
+  repeated ReconciliationDifference differences = 5;
+}

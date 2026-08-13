@@ -1,0 +1,92 @@
+syntax = "proto3";
+
+package factor.registry.v1;
+
+import "common.proto";
+
+enum DecisionVerdict {
+  DECISION_VERDICT_UNSPECIFIED = 0;
+  DECISION_PASS = 1;
+  DECISION_FAIL = 2;
+  DECISION_INCONCLUSIVE = 3;
+  DECISION_INVALIDATED = 4;
+}
+
+message StatDecision {
+  factor.common.v1.ContractMeta meta = 1;
+  factor.common.v1.Hash256 decision_id = 2;
+  factor.common.v1.Hash256 evaluation_id = 3;
+  DecisionVerdict verdict = 4;
+  string policy_version = 5;
+  repeated string rule_codes = 6;
+  repeated factor.common.v1.ArtifactRef evidence = 7;
+}
+
+enum FactorState {
+  FACTOR_STATE_UNSPECIFIED = 0;
+  PROPOSED = 1;
+  STATIC_REJECTED = 2;
+  EVALUATED_F1 = 3;
+  EVALUATED_F2 = 4;
+  EVALUATED_F3 = 5;
+  FROZEN_GATE = 6;
+  TRIAL = 7;
+  ACTIVE = 8;
+  WATCH = 9;
+  SUSPENDED = 10;
+  RETIRED = 11;
+  REJECTED = 12;
+}
+
+message FactorVersion {
+  factor.common.v1.ContractMeta meta = 1;
+  factor.common.v1.Hash256 factor_version_id = 2;
+  factor.common.v1.Hash256 expression_id = 3;
+  factor.common.v1.Hash256 candidate_id = 4;
+  factor.common.v1.Hash256 evaluation_id = 5;
+  factor.common.v1.Hash256 compiled_plan_id = 6;
+  FactorState state = 7;
+  string market_scope = 8;
+  factor.common.v1.Hash256 portfolio_policy_hash = 9;
+  factor.common.v1.Hash256 execution_policy_hash = 10;
+  factor.common.v1.Hash256 statistics_policy_hash = 11;
+  repeated factor.common.v1.ArtifactRef release_artifacts = 12;
+  bytes release_signature = 13;
+  string owner = 14;
+}
+
+message StateTransition {
+  factor.common.v1.ContractMeta meta = 1;
+  factor.common.v1.Hash256 factor_version_id = 2;
+  FactorState from_state = 3;
+  FactorState to_state = 4;
+  factor.common.v1.Hash256 decision_id = 5;
+  string reason_code = 6;
+}
+
+message SelectionEntry {
+  factor.common.v1.Hash256 candidate_id = 1;
+  string policy_version = 2;
+  factor.common.v1.ArtifactRef metric_summary = 3;
+  string stage_reached = 4;
+  uint32 selection_rank = 5;
+  string novelty_cell = 6;
+}
+
+message SelectionView {
+  factor.common.v1.ContractMeta meta = 1;
+  factor.common.v1.Hash256 view_id = 2;
+  uint32 generation = 3;
+  repeated SelectionEntry entries = 4;
+}
+
+message VintageConsumption {
+  factor.common.v1.ContractMeta meta = 1;
+  factor.common.v1.Hash256 vintage_id = 2;
+  factor.common.v1.TimeRange time_range = 3;
+  factor.common.v1.Hash256 factor_version_id = 4;
+  factor.common.v1.Hash256 evaluation_id = 5;
+  bool consumed = 6;
+  int64 consumed_at_ns = 7;
+  string verdict = 8;
+}

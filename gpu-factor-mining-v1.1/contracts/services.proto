@@ -1,0 +1,141 @@
+syntax = "proto3";
+
+package factor.services.v1;
+
+import "common.proto";
+import "research.proto";
+import "execution.proto";
+import "registry.proto";
+
+message Empty {}
+
+message GetOperationRequest {
+  factor.common.v1.Hash256 operation_id = 1;
+}
+
+message CancelOperationRequest {
+  factor.common.v1.ContractMeta meta = 1;
+  factor.common.v1.Hash256 operation_id = 2;
+  string reason_code = 3;
+}
+
+message WorkerCapabilities {
+  factor.common.v1.ContractMeta meta = 1;
+  string worker_id = 2;
+  string gpu_uuid = 3;
+  string gpu_name = 4;
+  string compute_capability = 5;
+  uint64 total_memory_bytes = 6;
+  uint64 free_memory_bytes = 7;
+  string cuda_driver_version = 8;
+  string cuda_runtime_version = 9;
+  repeated string supported_stage_kinds = 10;
+  repeated string supported_numeric_modes = 11;
+}
+
+service GpuWorkerService {
+  rpc GetCapabilities(Empty) returns (WorkerCapabilities);
+  rpc Evaluate(factor.research.v1.EvaluationRequest) returns (factor.common.v1.OperationRef);
+  rpc GetOperation(GetOperationRequest) returns (factor.common.v1.OperationRef);
+  rpc CancelOperation(CancelOperationRequest) returns (factor.common.v1.CommandAck);
+}
+
+message ConstructPortfolioRequest {
+  factor.common.v1.ContractMeta meta = 1;
+  factor.execution.v1.SignalFrame signal = 2;
+  factor.execution.v1.PortfolioSnapshot current = 3;
+  factor.common.v1.Hash256 portfolio_policy_hash = 4;
+}
+
+message AssessRiskRequest {
+  factor.common.v1.ContractMeta meta = 1;
+  factor.execution.v1.TargetPortfolio requested = 2;
+  factor.execution.v1.PortfolioSnapshot current = 3;
+  factor.common.v1.Hash256 risk_policy_hash = 4;
+  factor.execution.v1.ExecutionMode mode = 5;
+}
+
+message RunExecutionRequest {
+  factor.common.v1.ContractMeta meta = 1;
+  factor.common.v1.Hash256 execution_run_id = 2;
+  factor.execution.v1.ExecutionMode mode = 3;
+  factor.execution.v1.RiskDecision risk_decision = 4;
+  factor.common.v1.Hash256 execution_policy_hash = 5;
+  repeated factor.common.v1.ArtifactRef market_data = 6;
+}
+
+message CancelOrderRequest {
+  factor.common.v1.ContractMeta meta = 1;
+  factor.common.v1.Hash256 execution_run_id = 2;
+  string client_order_id = 3;
+  string venue_order_id = 4;
+  string reason_code = 5;
+}
+
+message ReplaceOrderRequest {
+  factor.common.v1.ContractMeta meta = 1;
+  factor.common.v1.Hash256 execution_run_id = 2;
+  string original_client_order_id = 3;
+  factor.execution.v1.OrderIntent replacement = 4;
+}
+
+message ExecutionStreamRequest {
+  factor.common.v1.Hash256 execution_run_id = 1;
+  uint64 after_sequence = 2;
+  repeated string event_types = 3;
+}
+
+message ExecutionEnvelope {
+  uint64 stream_sequence = 1;
+  oneof payload {
+    factor.execution.v1.OrderEvent order_event = 2;
+    factor.execution.v1.FillEvent fill_event = 3;
+    factor.execution.v1.AccountingEvent accounting_event = 4;
+    factor.execution.v1.PortfolioSnapshot portfolio_snapshot = 5;
+    factor.execution.v1.TcaRecord tca = 6;
+    factor.execution.v1.ReconciliationReport reconciliation = 7;
+    factor.common.v1.ContractError error = 8;
+  }
+}
+
+service ExecutionService {
+  rpc ConstructPortfolio(ConstructPortfolioRequest) returns (factor.execution.v1.TargetPortfolio);
+  rpc AssessRisk(AssessRiskRequest) returns (factor.execution.v1.RiskDecision);
+  rpc RunExecution(RunExecutionRequest) returns (factor.common.v1.OperationRef);
+  rpc SubmitOrder(factor.execution.v1.OrderIntent) returns (factor.common.v1.CommandAck);
+  rpc CancelOrder(CancelOrderRequest) returns (factor.common.v1.CommandAck);
+  rpc ReplaceOrder(ReplaceOrderRequest) returns (factor.common.v1.CommandAck);
+  rpc StreamEvents(ExecutionStreamRequest) returns (stream ExecutionEnvelope);
+  rpc GetOperation(GetOperationRequest) returns (factor.common.v1.OperationRef);
+  rpc CancelOperation(CancelOperationRequest) returns (factor.common.v1.CommandAck);
+}
+
+message RecordTrialRequest {
+  factor.research.v1.TrialRecord trial = 1;
+}
+
+message RecordEvaluationRequest {
+  factor.research.v1.EvaluationResult result = 1;
+}
+
+message PublishFactorRequest {
+  factor.registry.v1.FactorVersion factor = 1;
+  factor.registry.v1.StatDecision decision = 2;
+}
+
+message TransitionFactorRequest {
+  factor.registry.v1.StateTransition transition = 1;
+}
+
+message GetSelectionViewRequest {
+  uint32 generation = 1;
+  string policy_version = 2;
+}
+
+service RegistryService {
+  rpc RecordTrial(RecordTrialRequest) returns (factor.common.v1.CommandAck);
+  rpc RecordEvaluation(RecordEvaluationRequest) returns (factor.common.v1.CommandAck);
+  rpc PublishFactor(PublishFactorRequest) returns (factor.common.v1.CommandAck);
+  rpc TransitionFactor(TransitionFactorRequest) returns (factor.common.v1.CommandAck);
+  rpc GetSelectionView(GetSelectionViewRequest) returns (factor.registry.v1.SelectionView);
+}

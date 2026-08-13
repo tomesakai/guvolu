@@ -1,0 +1,72 @@
+syntax = "proto3";
+
+package factor.domain.v1;
+
+import "common.proto";
+
+enum ProductType {
+  PRODUCT_TYPE_UNSPECIFIED = 0;
+  CRYPTO_SPOT = 1;
+  CRYPTO_LINEAR_PERPETUAL = 2;
+  CRYPTO_INVERSE_PERPETUAL = 3;
+  ETF = 4;
+  EQUITY = 5;
+  FX_SPOT = 6;
+}
+
+message InstrumentSpec {
+  factor.common.v1.ContractMeta meta = 1;
+  uint64 instrument_id = 2;
+  string venue_id = 3;
+  string venue_symbol = 4;
+  ProductType product_type = 5;
+  string base_currency = 6;
+  string quote_currency = 7;
+  string settlement_currency = 8;
+  factor.common.v1.FixedDecimal contract_multiplier = 9;
+  factor.common.v1.FixedDecimal price_tick = 10;
+  factor.common.v1.FixedDecimal quantity_step = 11;
+  factor.common.v1.FixedDecimal min_quantity = 12;
+  factor.common.v1.FixedDecimal min_notional = 13;
+  string pnl_formula = 14;
+  int64 effective_from_ns = 15;
+  int64 effective_to_ns = 16;       // 0 means open-ended
+  factor.common.v1.ArtifactRef source_rule = 17;
+}
+
+message UniverseMember {
+  uint64 instrument_id = 1;
+  bool eligible = 2;
+  bool tradable = 3;
+  bool shortable = 4;
+  repeated string reason_codes = 5;
+}
+
+message UniverseSnapshot {
+  factor.common.v1.ContractMeta meta = 1;
+  factor.common.v1.Hash256 universe_snapshot_id = 2;
+  int64 decision_time_ns = 3;
+  factor.common.v1.Hash256 policy_hash = 4;
+  repeated UniverseMember members = 5;
+  factor.common.v1.ArtifactRef bitset_artifact = 6; // canonical bulk representation
+}
+
+message DecisionClock {
+  factor.common.v1.ContractMeta meta = 1;
+  factor.common.v1.Hash256 decision_clock_id = 2;
+  string timezone = 3;
+  string schedule_kind = 4;
+  factor.common.v1.ArtifactRef calendar_artifact = 5;
+  string version = 6;
+}
+
+message MetricDefinition {
+  factor.common.v1.ContractMeta meta = 1;
+  string name = 2;
+  string definition_version = 3;
+  string unit = 4;
+  string annualization_clock = 5;
+  string valid_set_policy = 6;
+  string aggregation_policy = 7;
+  string description = 8;
+}

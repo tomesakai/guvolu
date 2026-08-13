@@ -1,0 +1,126 @@
+{
+  "00_master_spec_v1.1.md": {
+    "sha256": "50ffea48858a2cdeff1e3411104737811b2531535ae860313e94ff46c133fca0",
+    "bytes": 100586
+  },
+  "01_system_boundaries.md": {
+    "sha256": "cb1f885786070b1dd86f71a830e9343bad1a5d1c7bf5a984b85c390816bec4a1",
+    "bytes": 9695
+  },
+  "02_domain_semantics.md": {
+    "sha256": "3cddba6158e961b5bc635f103d901ab267d757b1775ac0dabffc7eb44619b2a1",
+    "bytes": 7193
+  },
+  "03_data_platform.md": {
+    "sha256": "08978f11728ecc3d236d5b826537860870adea9ff448c8f64939e4708a769fd5",
+    "bytes": 6226
+  },
+  "04_expression_compiler.md": {
+    "sha256": "7cc64ed231fb6b4cfd87cc6b9a54442ed6843c3077c66eaeea787aa25070cb5a",
+    "bytes": 6411
+  },
+  "05_gpu_runtime.md": {
+    "sha256": "246ff26d69010b57d6c9e1e2b988f6f356efd6f8f0f8adf1067732cf0f9f41ec",
+    "bytes": 7286
+  },
+  "06_evaluation_pipeline.md": {
+    "sha256": "67ec255378fec96933faf06166d12cad22802f0e6bfeec8b99ac350f8bc9c278",
+    "bytes": 5240
+  },
+  "07_statistics_governance.md": {
+    "sha256": "3cee0be4efd874d8890c16c7137d85bff171463a2ea602181ca522a0eee26cb5",
+    "bytes": 5910
+  },
+  "08_portfolio_execution.md": {
+    "sha256": "4abf3b788f5995606eb96913161b7c1cc5459bc6b489d5290f69aef766f9ad3b",
+    "bytes": 8250
+  },
+  "09_search_evolution.md": {
+    "sha256": "87c178122005827c52ae6491919ff70555bf6cff8c145c5912eea162bdf1d054",
+    "bytes": 3991
+  },
+  "10_registry_lifecycle.md": {
+    "sha256": "7f2749720d3d41f965fc9f7872f3854fb510e2d7673572e2a6f203fe80de8e1d",
+    "bytes": 4459
+  },
+  "11_visualization_observability.md": {
+    "sha256": "c79f7ef96d3f2275739a1c16d61254d53de6d165c70d018514a731a32aa8f0c9",
+    "bytes": 8198
+  },
+  "12_testing_benchmark.md": {
+    "sha256": "6889184a4d27bcf50a20d852264b5be937654ec4f7b85eb092ac5a6adf459dd6",
+    "bytes": 4595
+  },
+  "13_engineering_work_packages.md": {
+    "sha256": "92d13610287b31e6ef95bad7046c5ce5470ac84d8fb6baa49f1382ebcf0b577f",
+    "bytes": 6422
+  },
+  "14_research_backlog.md": {
+    "sha256": "4af0d433845b6aa3dc40c89d31114664a2218389d829d3a959ff67af067d3ac6",
+    "bytes": 3698
+  },
+  "15_change_log.md": {
+    "sha256": "e357c117067a40f61dba0ca9b9fddb5d0e1dbb4a74fa1507e1fcab8e20ecd0b9",
+    "bytes": 4179
+  },
+  "16_references.md": {
+    "sha256": "49c7132d7e207eeeda3206541da3a041d895cf1e8aeb8868e7e454e455afac88",
+    "bytes": 5572
+  },
+  "README.md": {
+    "sha256": "9cc7640c11524c68fa40eec159dde56dc41dcd2c6342b739e4897c14230a210c",
+    "bytes": 5080
+  },
+  "adr/ADR-0001-modular-monolith.md": {
+    "sha256": "eaae6a8bc4503d45f18214ad85330c4dc129b511cec3081a271a88781721432b",
+    "bytes": 565
+  },
+  "adr/ADR-0002-non-overlapping-daily-decisions.md": {
+    "sha256": "7de1f9e44141eead838011d84ddca8c0796e68159fd97bf136a56484062ec91c",
+    "bytes": 428
+  },
+  "adr/ADR-0003-dual-gpu-backends.md": {
+    "sha256": "0bfa70306e9e5f8681491e1eec4d4c6aca3fbb6be552ccbb2352cc4fe625dac8",
+    "bytes": 468
+  },
+  "adr/ADR-0004-execution-safety-boundary.md": {
+    "sha256": "1d3ab1b5a0567012468f1b2bb4faf775c8fe6f59a6afb1d0a590c0afe112c9bc",
+    "bytes": 445
+  },
+  "adr/ADR-0005-visualization-stack.md": {
+    "sha256": "1c08a79cd6aa1660f569df3ae71ca8c6437aa767671367aee565a646c3ac56c6",
+    "bytes": 546
+  },
+  "contracts/README.md": {
+    "sha256": "6c80abeaefdb2734f9393b357eedad12bc36047811a7bad772271bb2ea7cfea8",
+    "bytes": 2105
+  },
+  "contracts/api_contracts.md": {
+    "sha256": "354691d571a0920cce43e3073d1dee3cddbe682345fa721bad2b1b7bda8c4412",
+    "bytes": 5207
+  },
+  "contracts/common.proto": {
+    "sha256": "3c4b04ae44c371057a816927e5313dcc3034e00c454a7b237715aabcd9c48f71",
+    "bytes": 1928
+  },
+  "contracts/domain.proto": {
+    "sha256": "fd618ec94dc0a15d95b9a08b35fd49144435b4d07f8ca8abb12660031cfd3fb9",
+    "bytes": 1935
+  },
+  "contracts/execution.proto": {
+    "sha256": "4e27fb5a3448ae9a37f379af33820308078a27e9573318eb9ba53660c1aa9d4a",
+    "bytes": 6988
+  },
+  "contracts/registry.proto": {
+    "sha256": "36a4825830a7cbd6d4df3a90fbe25e536527f6ed745d285a3b01698eb5ecf271",
+    "bytes": 2429
+  },
+  "contracts/research.proto": {
+    "sha256": "559ef57a63c87b2f10f565c6acc2ec801429ed2d9e10818091e0f2b100af8d2a",
+    "bytes": 4973
+  },
+  "contracts/services.proto": {
+    "sha256": "74a2d775165a46d2eab4367e96993f34271d8c4f7a34a189e411f8c2f8dc410a",
+    "bytes": 4735
+  }
+}
