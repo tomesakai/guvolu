@@ -1,6 +1,7 @@
 """研究数据暴露与一次性封存段治理测试。"""
 from __future__ import annotations
 
+import inspect
 import json
 import sqlite3
 from dataclasses import dataclass
@@ -9,9 +10,21 @@ from pathlib import Path
 
 import pytest
 
+from guvolu.research import clock
+from guvolu.research.contracts import (
+    FROZEN_FORWARD_METHOD_VERSION,
+    FROZEN_FORWARD_SCHEMA_VERSION,
+    HOLDOUT_MANIFEST_SCHEMA_VERSION,
+    HOLDOUT_METHOD_VERSION,
+    CodeIdentity,
+    FrozenPanelInputs,
+)
+from guvolu.research.frozen_forward import (
+    freeze_forward_plan,
+    run_frozen_forward_prediction,
+)
 from guvolu.research.governance import (
     GOVERNANCE_METHOD_VERSION,
-    consume_holdout_vintage,
     finalize_holdout_evaluation,
     get_holdout_evaluation_attempt,
     get_frozen_forward_plan_for_vintage,
@@ -24,14 +37,6 @@ from guvolu.research.governance import (
     start_holdout_evaluation_attempt,
 )
 from guvolu.research.holdout import _score_decision_times, run_holdout_validation
-from guvolu.research.contracts import (
-    FROZEN_FORWARD_METHOD_VERSION,
-    FROZEN_FORWARD_SCHEMA_VERSION,
-    HOLDOUT_MANIFEST_SCHEMA_VERSION,
-    HOLDOUT_METHOD_VERSION,
-    CodeIdentity,
-    FrozenPanelInputs,
-)
 from guvolu.research.provenance import sha256_file, stable_identifier
 from guvolu.research.verification import VerificationResult
 from guvolu.strategy.expression import (
@@ -62,6 +67,22 @@ class _DecisionBar:
 def _time(value: str) -> datetime:
     """构造测试 UTC 时间。"""
     return datetime.fromisoformat(value).replace(tzinfo=UTC)
+
+
+_TEST_NOW = _time("2026-08-14T00:00:00")
+
+
+@pytest.fixture(autouse=True)
+def _authoritative_test_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """测试通过替换内部壁钟推进时间，生产 API 不接受时间覆盖。"""
+    global _TEST_NOW
+    _TEST_NOW = _time("2026-08-14T00:00:00")
+    monkeypatch.setattr(clock, "utc_now", lambda: _TEST_NOW)
+
+
+def _set_now(value: datetime) -> None:
+    global _TEST_NOW
+    _TEST_NOW = value
 
 
 def test_score_schedule_uses_the_same_previous_bar_indices_as_returns() -> None:
@@ -369,28 +390,27 @@ def test_holdout_vintage_is_unexposed_nonoverlapping_and_single_use(
         recorded_at=_time("2025-06-02T00:00:00"),
     )
     assert exposure.market_id == "market-one"
+    _set_now(_time("2025-04-01T00:00:00"))
     with pytest.raises(ValueError, match="已被自适应研究读取"):
         seal_holdout_vintage(
             registry,
             "market-one",
             _time("2025-05-01T00:00:00"),
             _time("2025-07-01T00:00:00"),
-            sealed_at=_time("2025-04-01T00:00:00"),
         )
 
+    _set_now(_time("2025-06-03T00:00:00"))
     vintage = seal_holdout_vintage(
         registry,
         "market-one",
         _time("2025-07-01T00:00:00"),
         _time("2025-08-01T00:00:00"),
-        sealed_at=_time("2025-06-03T00:00:00"),
     )
     repeated = seal_holdout_vintage(
         registry,
         "market-one",
         _time("2025-07-01T00:00:00"),
         _time("2025-08-01T00:00:00"),
-        sealed_at=_time("2025-06-04T00:00:00"),
     )
     assert repeated == vintage
     with pytest.raises(ValueError, match="既有 vintage 重叠"):
@@ -399,7 +419,6 @@ def test_holdout_vintage_is_unexposed_nonoverlapping_and_single_use(
             "market-one",
             _time("2025-07-15T00:00:00"),
             _time("2025-08-15T00:00:00"),
-            sealed_at=_time("2025-06-01T00:00:00"),
         )
     with pytest.raises(ValueError, match="未消费封存段重叠"):
         register_research_exposure(
@@ -416,22 +435,20 @@ def test_holdout_vintage_is_unexposed_nonoverlapping_and_single_use(
     evaluation_identity, evaluation_id = _test_evaluation_identity(
         tmp_path, vintage.vintage_id, candidate_set_hash,
     )
-    consumed = consume_holdout_vintage(
+    _set_now(_time("2025-08-02T00:00:00"))
+    manual_attempt = start_holdout_evaluation_attempt(
         registry,
         vintage.vintage_id,
         candidate_set_hash,
         evaluation_id,
-        consumed_at=_time("2025-08-02T00:00:00"),
     )
+    consumed = list_holdout_vintages(registry)[0]
     assert consumed.status == "consumed"
     assert consumed.consumed_at == _time("2025-08-02T00:00:00")
-    manual_attempt = get_holdout_evaluation_attempt(
-        registry, evaluation_id,
-    )
     assert manual_attempt.status == "incomplete"
-    assert manual_attempt.stage == "manually_consumed"
+    assert manual_attempt.stage == "vintage_consumed"
     with pytest.raises(ValueError, match="已经消费"):
-        consume_holdout_vintage(
+        start_holdout_evaluation_attempt(
             registry,
             vintage.vintage_id,
             "different-candidate-set",
@@ -446,6 +463,7 @@ def test_holdout_vintage_is_unexposed_nonoverlapping_and_single_use(
         "failed",
         vintage.start_time,
     )
+    _set_now(_time("2025-08-03T00:00:00"))
     decided, completed_attempt = finalize_holdout_evaluation(
         registry,
         vintage.vintage_id,
@@ -454,7 +472,6 @@ def test_holdout_vintage_is_unexposed_nonoverlapping_and_single_use(
         manifest_path,
         manifest_sha256,
         repository_root=tmp_path,
-        completed_at=_time("2025-08-03T00:00:00"),
     )
     assert decided.verdict == terminal
     assert completed_attempt.status == "completed"
@@ -477,14 +494,15 @@ def test_consumed_vintage_can_become_adaptive_but_never_holdout_again(
 ) -> None:
     """消费后的数据可进入开发史，但同一段不能再声称为新 holdout。"""
     registry = tmp_path / "governance.sqlite3"
+    _set_now(_time("2024-12-01T00:00:00"))
     vintage = seal_holdout_vintage(
         registry,
         "market-one",
         _time("2025-01-01T00:00:00"),
         _time("2025-02-01T00:00:00"),
-        sealed_at=_time("2024-12-01T00:00:00"),
     )
-    consume_holdout_vintage(
+    _set_now(_time("2025-02-02T00:00:00"))
+    start_holdout_evaluation_attempt(
         registry,
         vintage.vintage_id,
         "candidate-set-hash",
@@ -497,13 +515,13 @@ def test_consumed_vintage_can_become_adaptive_but_never_holdout_again(
         _time("2025-01-01T00:00:00"),
         _time("2025-02-01T00:00:00"),
     )
+    _set_now(_time("2024-12-01T00:00:00"))
     with pytest.raises(ValueError, match="已被自适应研究读取"):
         seal_holdout_vintage(
             registry,
             "market-one",
             _time("2025-01-01T00:00:00"),
             _time("2025-02-01T00:00:00"),
-            sealed_at=_time("2024-12-01T00:00:00"),
         )
 
 
@@ -517,14 +535,13 @@ def test_legacy_consumed_vintage_is_migrated_to_incomplete_attempt(
         "market-one",
         _time("2027-01-01T00:00:00"),
         _time("2027-02-01T00:00:00"),
-        sealed_at=_time("2026-12-01T00:00:00"),
     )
-    consume_holdout_vintage(
+    _set_now(_time("2027-02-02T00:00:00"))
+    start_holdout_evaluation_attempt(
         registry,
         vintage.vintage_id,
         "candidate-set-hash",
         "legacy-evaluation",
-        consumed_at=_time("2027-02-02T00:00:00"),
     )
     with sqlite3.connect(registry) as connection:
         connection.execute("DELETE FROM holdout_evaluation_attempt")
@@ -550,9 +567,9 @@ def test_legacy_verdict_without_manifest_attempt_is_rejected(tmp_path: Path) -> 
         "market-one",
         _time("2027-01-01T00:00:00"),
         _time("2027-02-01T00:00:00"),
-        sealed_at=_time("2026-12-01T00:00:00"),
     )
-    consume_holdout_vintage(
+    _set_now(_time("2027-02-02T00:00:00"))
+    start_holdout_evaluation_attempt(
         registry,
         vintage.vintage_id,
         "candidate-set-hash",
@@ -579,7 +596,6 @@ def test_holdout_verdict_and_completed_attempt_are_atomic(tmp_path: Path) -> Non
         "market-one",
         _time("2027-01-01T00:00:00"),
         _time("2027-02-01T00:00:00"),
-        sealed_at=_time("2026-12-01T00:00:00"),
     )
     candidate_set_identity, candidate_set_hash = _test_candidate_set(
         [_TEST_CANDIDATE_ID]
@@ -587,12 +603,12 @@ def test_holdout_verdict_and_completed_attempt_are_atomic(tmp_path: Path) -> Non
     evaluation_identity, evaluation_id = _test_evaluation_identity(
         tmp_path, vintage.vintage_id, candidate_set_hash,
     )
+    _set_now(_time("2027-02-02T00:00:00"))
     start_holdout_evaluation_attempt(
         registry,
         vintage.vintage_id,
         candidate_set_hash,
         evaluation_id,
-        started_at=_time("2027-02-02T00:00:00"),
     )
     wrong_terminal, wrong_manifest, wrong_sha256 = _write_holdout_evidence(
         tmp_path,
@@ -741,7 +757,6 @@ def test_holdout_verdict_and_completed_attempt_are_atomic(tmp_path: Path) -> Non
         manifest_path,
         manifest_sha256,
         repository_root=tmp_path,
-        completed_at=_time("2027-02-02T01:00:00"),
     )
     assert finalized_vintage.verdict == terminal
     assert finalized_attempt.status == "completed"
@@ -768,7 +783,6 @@ def test_registered_forward_plan_prevents_relaxed_policy_finalize(
         "market-one",
         _time("2027-01-01T00:00:00"),
         _time("2027-02-01T00:00:00"),
-        sealed_at=_time("2026-12-01T00:00:00"),
     )
     candidate_set_identity, candidate_set_hash = _test_candidate_set(
         [_TEST_CANDIDATE_ID]
@@ -799,14 +813,13 @@ def test_registered_forward_plan_prevents_relaxed_policy_finalize(
         plan_path,
         plan_sha256,
         repository_root=tmp_path,
-        frozen_at=_time("2026-12-15T00:00:00"),
     )
+    _set_now(_time("2027-02-02T00:00:00"))
     start_holdout_evaluation_attempt(
         registry,
         vintage.vintage_id,
         candidate_set_hash,
         evaluation_id,
-        started_at=_time("2027-02-02T00:00:00"),
     )
     terminal, manifest_path, manifest_sha256 = _write_holdout_evidence(
         tmp_path,
@@ -837,7 +850,6 @@ def test_forward_plan_recomputes_candidate_formula_identity(tmp_path: Path) -> N
         "market-one",
         _time("2027-01-01T00:00:00"),
         _time("2027-02-01T00:00:00"),
-        sealed_at=_time("2026-12-01T00:00:00"),
     )
     _, plan_path, _ = _write_forward_plan_artifact(
         tmp_path,
@@ -865,7 +877,6 @@ def test_forward_plan_recomputes_candidate_formula_identity(tmp_path: Path) -> N
             plan_path,
             sha256_file(artifact),
             repository_root=tmp_path,
-            frozen_at=_time("2026-12-15T00:00:00"),
         )
 
 
@@ -879,7 +890,6 @@ def test_forward_finalize_rejects_plan_candidate_set_substitution(
         "market-one",
         _time("2027-01-01T00:00:00"),
         _time("2027-02-01T00:00:00"),
-        sealed_at=_time("2026-12-01T00:00:00"),
     )
     candidate_set_identity, candidate_set_hash = _test_candidate_set(
         ["candidate-substituted"]
@@ -910,7 +920,6 @@ def test_forward_finalize_rejects_plan_candidate_set_substitution(
         plan_path,
         plan_sha256,
         repository_root=tmp_path,
-        frozen_at=_time("2026-12-15T00:00:00"),
     )
     prediction_path, prediction_sha256 = _write_forward_prediction_artifact(
         tmp_path,
@@ -922,6 +931,7 @@ def test_forward_finalize_rejects_plan_candidate_set_substitution(
         config_hash,
         "tree-one",
     )
+    _set_now(vintage.start_time + timedelta(minutes=1))
     register_frozen_forward_prediction(
         registry,
         plan.plan_id,
@@ -932,14 +942,13 @@ def test_forward_finalize_rejects_plan_candidate_set_substitution(
         prediction_sha256,
         3900,
         repository_root=tmp_path,
-        recorded_at=_time("2027-01-01T00:01:00"),
     )
+    _set_now(_time("2027-02-02T00:00:00"))
     start_holdout_evaluation_attempt(
         registry,
         vintage.vintage_id,
         candidate_set_hash,
         evaluation_id,
-        started_at=_time("2027-02-02T00:00:00"),
     )
     terminal, manifest_path, manifest_sha256 = _write_holdout_evidence(
         tmp_path,
@@ -973,7 +982,6 @@ def test_forward_required_finalize_matches_registered_prediction_coverage(
         "market-one",
         _time("2027-01-01T00:00:00"),
         _time("2027-02-01T00:00:00"),
-        sealed_at=_time("2026-12-01T00:00:00"),
     )
     candidate_set_identity, candidate_set_hash = _test_candidate_set(
         [_TEST_CANDIDATE_ID]
@@ -1004,7 +1012,6 @@ def test_forward_required_finalize_matches_registered_prediction_coverage(
         plan_path,
         plan_sha256,
         repository_root=tmp_path,
-        frozen_at=_time("2026-12-15T00:00:00"),
     )
     prediction_path, prediction_sha256 = _write_forward_prediction_artifact(
         tmp_path,
@@ -1016,6 +1023,7 @@ def test_forward_required_finalize_matches_registered_prediction_coverage(
         config_hash,
         "tree-one",
     )
+    _set_now(vintage.start_time + timedelta(minutes=1))
     register_frozen_forward_prediction(
         registry,
         plan.plan_id,
@@ -1026,7 +1034,6 @@ def test_forward_required_finalize_matches_registered_prediction_coverage(
         prediction_sha256,
         3900,
         repository_root=tmp_path,
-        recorded_at=_time("2027-01-01T00:01:00"),
     )
     second_decision = vintage.start_time + timedelta(hours=1)
     second_path, second_sha256 = _write_forward_prediction_artifact(
@@ -1039,6 +1046,7 @@ def test_forward_required_finalize_matches_registered_prediction_coverage(
         config_hash,
         "tree-one",
     )
+    _set_now(second_decision + timedelta(minutes=1))
     register_frozen_forward_prediction(
         registry,
         plan.plan_id,
@@ -1049,14 +1057,13 @@ def test_forward_required_finalize_matches_registered_prediction_coverage(
         second_sha256,
         3900,
         repository_root=tmp_path,
-        recorded_at=second_decision + timedelta(minutes=1),
     )
+    _set_now(_time("2027-02-02T00:00:00"))
     start_holdout_evaluation_attempt(
         registry,
         vintage.vintage_id,
         candidate_set_hash,
         evaluation_id,
-        started_at=_time("2027-02-02T00:00:00"),
     )
     terminal, manifest_path, manifest_sha256 = _write_holdout_evidence(
         tmp_path,
@@ -1114,7 +1121,35 @@ def test_holdout_cannot_be_selected_retroactively(tmp_path: Path) -> None:
             "market-one",
             _time("2025-01-01T00:00:00"),
             _time("2025-02-01T00:00:00"),
-            sealed_at=_time("2025-01-02T00:00:00"),
+        )
+
+
+def test_governance_timestamps_are_not_caller_controlled(tmp_path: Path) -> None:
+    """封存、计划、预测和消费时刻只能来自进程壁钟。"""
+    assert "sealed_at" not in inspect.signature(seal_holdout_vintage).parameters
+    assert "frozen_at" not in inspect.signature(freeze_forward_plan).parameters
+    assert "frozen_at" not in inspect.signature(register_frozen_forward_plan).parameters
+    assert "recorded_at" not in inspect.signature(run_frozen_forward_prediction).parameters
+    assert "recorded_at" not in inspect.signature(
+        register_frozen_forward_prediction
+    ).parameters
+    assert "started_at" not in inspect.signature(
+        start_holdout_evaluation_attempt
+    ).parameters
+
+    registry = tmp_path / "governance.sqlite3"
+    vintage = seal_holdout_vintage(
+        registry,
+        "market-one",
+        _time("2027-01-01T00:00:00"),
+        _time("2027-02-01T00:00:00"),
+    )
+    with pytest.raises(ValueError, match="完整结束后"):
+        start_holdout_evaluation_attempt(
+            registry,
+            vintage.vintage_id,
+            "candidate-set-hash",
+            "evaluation-id",
         )
 
 
@@ -1128,7 +1163,6 @@ def test_frozen_forward_plan_and_predictions_are_precommitted_and_append_only(
         "market-one",
         _time("2027-01-01T00:00:00"),
         _time("2027-02-01T00:00:00"),
-        sealed_at=_time("2026-12-01T00:00:00"),
     )
     _, plan_path, plan_sha256 = _write_forward_plan_artifact(
         tmp_path,
@@ -1148,7 +1182,6 @@ def test_frozen_forward_plan_and_predictions_are_precommitted_and_append_only(
         plan_path,
         plan_sha256,
         repository_root=tmp_path,
-        frozen_at=_time("2026-12-15T00:00:00"),
     )
     assert get_frozen_forward_plan_for_vintage(registry, vintage.vintage_id) == plan
     repeated = register_frozen_forward_plan(
@@ -1161,7 +1194,6 @@ def test_frozen_forward_plan_and_predictions_are_precommitted_and_append_only(
         plan_path,
         plan_sha256,
         repository_root=tmp_path,
-        frozen_at=_time("2026-12-16T00:00:00"),
     )
     assert repeated == plan
     _, different_path, different_sha256 = _write_forward_plan_artifact(
@@ -1183,8 +1215,8 @@ def test_frozen_forward_plan_and_predictions_are_precommitted_and_append_only(
             different_path,
             different_sha256,
             repository_root=tmp_path,
-            frozen_at=_time("2026-12-16T00:00:00"),
         )
+    _set_now(_time("2027-01-01T00:00:01"))
     with pytest.raises(ValueError, match="开始前"):
         register_frozen_forward_plan(
             registry,
@@ -1196,7 +1228,6 @@ def test_frozen_forward_plan_and_predictions_are_precommitted_and_append_only(
             plan_path,
             plan_sha256,
             repository_root=tmp_path,
-            frozen_at=_time("2027-01-01T00:00:01"),
         )
 
     decision = _time("2027-01-02T01:00:00")
@@ -1210,6 +1241,7 @@ def test_frozen_forward_plan_and_predictions_are_precommitted_and_append_only(
         "config-hash",
         "tree-hash",
     )
+    _set_now(decision + timedelta(minutes=1))
     prediction = register_frozen_forward_prediction(
         registry,
         plan.plan_id,
@@ -1220,9 +1252,9 @@ def test_frozen_forward_plan_and_predictions_are_precommitted_and_append_only(
         prediction_sha256,
         3900,
         repository_root=tmp_path,
-        recorded_at=_time("2027-01-02T01:01:00"),
     )
     assert list_frozen_forward_predictions(registry, plan.plan_id) == (prediction,)
+    _set_now(decision + timedelta(minutes=2))
     assert register_frozen_forward_prediction(
         registry,
         plan.plan_id,
@@ -1233,7 +1265,6 @@ def test_frozen_forward_plan_and_predictions_are_precommitted_and_append_only(
         prediction_sha256,
         3900,
         repository_root=tmp_path,
-        recorded_at=_time("2027-01-02T01:02:00"),
     ) == prediction
     changed_path, changed_sha256 = _write_forward_prediction_artifact(
         tmp_path,
@@ -1245,6 +1276,7 @@ def test_frozen_forward_plan_and_predictions_are_precommitted_and_append_only(
         "config-hash",
         "tree-hash",
     )
+    _set_now(decision + timedelta(minutes=2))
     with pytest.raises(ValueError, match="不可改写"):
         register_frozen_forward_prediction(
             registry,
@@ -1256,8 +1288,8 @@ def test_frozen_forward_plan_and_predictions_are_precommitted_and_append_only(
             changed_sha256,
             3900,
             repository_root=tmp_path,
-            recorded_at=_time("2027-01-02T01:02:00"),
         )
+    _set_now(_time("2027-01-03T03:00:00"))
     with pytest.raises(ValueError, match="时效窗口"):
         register_frozen_forward_prediction(
             registry,
@@ -1269,8 +1301,8 @@ def test_frozen_forward_plan_and_predictions_are_precommitted_and_append_only(
             "late-hash",
             3900,
             repository_root=tmp_path,
-            recorded_at=_time("2027-01-03T03:00:00"),
         )
+    _set_now(_time("2027-02-02T01:01:00"))
     with pytest.raises(ValueError, match="不在绑定 vintage"):
         register_frozen_forward_prediction(
             registry,
@@ -1282,7 +1314,6 @@ def test_frozen_forward_plan_and_predictions_are_precommitted_and_append_only(
             "outside-hash",
             3900,
             repository_root=tmp_path,
-            recorded_at=_time("2027-02-02T01:01:00"),
         )
 
 
@@ -1297,7 +1328,6 @@ def test_holdout_is_consumed_before_market_data_is_opened(
         "market-one",
         _time("2027-01-01T00:00:00"),
         _time("2027-02-01T00:00:00"),
-        sealed_at=_time("2026-12-01T00:00:00"),
     )
     config = tmp_path / "config.json"
     config.write_text(
@@ -1408,6 +1438,7 @@ def test_holdout_is_consumed_before_market_data_is_opened(
     )
 
     candidate_registry.write_text(registry_text + "\n", encoding="utf-8")
+    _set_now(_time("2027-02-02T00:00:00"))
     with pytest.raises(ValueError, match="candidate registry (散列|字节数)"):
         run_holdout_validation(
             tmp_path,

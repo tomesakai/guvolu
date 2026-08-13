@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Sequence
 
 from guvolu.research.governance import (
-    consume_holdout_vintage,
     finalize_holdout_evaluation,
     list_holdout_vintages,
     seal_holdout_vintage,
@@ -28,7 +27,7 @@ def _payload(value: object) -> object:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """执行封存、消费、原子终结或只读列表。"""
+    """执行封存、原子终结或只读列表。"""
     parser = argparse.ArgumentParser(description="管理 G-08 一次性封存段")
     parser.add_argument(
         "--registry",
@@ -46,10 +45,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     seal.add_argument("market_id")
     seal.add_argument("start_time")
     seal.add_argument("end_time")
-    consume = subparsers.add_parser("consume", help="原子且永久地消费一次封存段")
-    consume.add_argument("vintage_id")
-    consume.add_argument("candidate_set_hash")
-    consume.add_argument("evaluation_id")
     finalize = subparsers.add_parser(
         "finalize",
         help="在同一事务内登记结论并完成评估尝试",
@@ -69,13 +64,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             arguments.market_id,
             parse_time(arguments.start_time, "start_time"),
             parse_time(arguments.end_time, "end_time"),
-        )
-    elif arguments.action == "consume":
-        result = consume_holdout_vintage(
-            registry,
-            arguments.vintage_id,
-            arguments.candidate_set_hash,
-            arguments.evaluation_id,
         )
     elif arguments.action == "finalize":
         result = finalize_holdout_evaluation(

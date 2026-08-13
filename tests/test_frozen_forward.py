@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from guvolu.research import clock
 from guvolu.research.contracts import CodeIdentity, FrozenPanelInputs, PanelSnapshot
 from guvolu.research.frozen_forward import (
     run_frozen_forward_prediction,
@@ -26,6 +27,22 @@ def _time(value: str) -> datetime:
     return datetime.fromisoformat(value).replace(tzinfo=UTC)
 
 
+_TEST_NOW = _time("2026-08-14T00:00:00")
+
+
+@pytest.fixture(autouse=True)
+def _authoritative_test_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """测试通过替换内部壁钟推进时间，生产 API 不接受时间覆盖。"""
+    global _TEST_NOW
+    _TEST_NOW = _time("2026-08-14T00:00:00")
+    monkeypatch.setattr(clock, "utc_now", lambda: _TEST_NOW)
+
+
+def _set_now(value: datetime) -> None:
+    global _TEST_NOW
+    _TEST_NOW = value
+
+
 def test_frozen_forward_uses_fixed_weight_and_is_idempotent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -37,7 +54,6 @@ def test_frozen_forward_uses_fixed_weight_and_is_idempotent(
         "market-one",
         _time("2027-01-01T00:00:00"),
         _time("2027-02-01T00:00:00"),
-        sealed_at=_time("2026-12-01T00:00:00"),
     )
     config_path = tmp_path / "config" / "strategy.json"
     config_path.parent.mkdir(parents=True)
@@ -112,7 +128,6 @@ def test_frozen_forward_uses_fixed_weight_and_is_idempotent(
         plan_path.relative_to(tmp_path).as_posix(),
         sha256_file(plan_path),
         repository_root=tmp_path,
-        frozen_at=_time("2026-12-15T00:00:00"),
     )
     assert plan.plan_id == plan_id
     decision = _time("2027-01-02T01:00:00")
@@ -187,20 +202,14 @@ def test_frozen_forward_uses_fixed_weight_and_is_idempotent(
         lambda *_args: (0.5,),
     )
 
-    result = run_frozen_forward_prediction(
-        tmp_path,
-        plan.plan_id,
-        recorded_at=decision + timedelta(minutes=1),
-    )
+    _set_now(decision + timedelta(minutes=1))
+    result = run_frozen_forward_prediction(tmp_path, plan.plan_id)
     assert result.aggregate_target == pytest.approx(0.2)
     content = json.loads(result.prediction_path.read_text(encoding="utf-8"))
     assert content["families"][0]["family_target"] == 0.5
     assert content["families"][0]["frozen_allocation_weight"] == 0.4
-    assert run_frozen_forward_prediction(
-        tmp_path,
-        plan.plan_id,
-        recorded_at=decision + timedelta(minutes=2),
-    ) == result
+    _set_now(decision + timedelta(minutes=2))
+    assert run_frozen_forward_prediction(tmp_path, plan.plan_id) == result
     verification = verify_frozen_forward(tmp_path, plan.plan_id)
     assert verification.prediction_count == 1
 

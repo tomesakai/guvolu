@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Mapping
 
 from guvolu.data.durable_io import atomic_write_text
+from guvolu.research import clock
 from guvolu.research.contracts import (
     FROZEN_FORWARD_METHOD_VERSION,
     FROZEN_FORWARD_SCHEMA_VERSION,
@@ -167,8 +168,6 @@ def freeze_forward_plan(
     config_path: Path,
     source_summary_path: Path,
     vintage_id: str,
-    *,
-    frozen_at: datetime | None = None,
 ) -> FrozenPlanResult:
     """在 vintage 开始前冻结来源、公式、参数和资金权重。"""
     repository = root.resolve()
@@ -200,7 +199,7 @@ def freeze_forward_plan(
         raise ValueError("vintage 与配置市场不一致")
     if vintage.status != "sealed":
         raise ValueError("冻结前向计划只能绑定未消费 vintage")
-    timestamp = (frozen_at or datetime.now(UTC)).astimezone(UTC)
+    timestamp = clock.utc_now()
     if timestamp > vintage.start_time:
         raise ValueError("冻结前向计划必须在 vintage 开始前创建")
     candidate_set_hash = frozen_candidate_set_hash(
@@ -263,7 +262,6 @@ def freeze_forward_plan(
         _relative(repository, plan_path),
         plan_hash,
         repository_root=repository,
-        frozen_at=timestamp,
     )
     if registered.plan_id != plan_id:
         raise RuntimeError("治理注册表返回了不同的冻结计划身份")
@@ -307,11 +305,10 @@ def run_frozen_forward_prediction(
     plan_id: str,
     *,
     registry_path: Path | None = None,
-    recorded_at: datetime | None = None,
 ) -> FrozenPredictionResult:
     """用固定候选和固定权重为 sealed vintage 的最新决策时点生成预测。"""
     repository = root.resolve()
-    now = (recorded_at or datetime.now(UTC)).astimezone(UTC)
+    now = clock.utc_now()
     selected_registry = _project_path(
         repository,
         registry_path or Path("data/research/governance.sqlite3"),
@@ -484,7 +481,6 @@ def run_frozen_forward_prediction(
         prediction_hash,
         maximum_age,
         repository_root=repository,
-        recorded_at=now,
     )
     return FrozenPredictionResult(
         registered.prediction_id,

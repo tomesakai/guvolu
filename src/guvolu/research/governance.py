@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from guvolu.research import clock
 from guvolu.research.contracts import (
     FROZEN_FORWARD_METHOD_VERSION,
     FROZEN_FORWARD_SCHEMA_VERSION,
@@ -1170,12 +1171,10 @@ def seal_holdout_vintage(
     market_id: str,
     start_time: datetime,
     end_time: datetime,
-    *,
-    sealed_at: datetime | None = None,
 ) -> HoldoutVintage:
     """封存尚未被任何自适应研究读取且不重叠的新数据段。"""
     start, end = _validate_range(start_time, end_time)
-    sealed = _utc(sealed_at or datetime.now(UTC))
+    sealed = clock.utc_now()
     if sealed > start:
         raise ValueError("封存段必须在区间开始前登记，禁止事后挑选 holdout")
     vintage_id = stable_identifier("holdout-vintage", {
@@ -1238,72 +1237,16 @@ def seal_holdout_vintage(
     return _vintage_from_row(row)
 
 
-def consume_holdout_vintage(
-    registry_path: Path,
-    vintage_id: str,
-    candidate_set_hash: str,
-    evaluation_id: str,
-    *,
-    consumed_at: datetime | None = None,
-) -> HoldoutVintage:
-    """原子消费封存段；事务提交后永久禁止第二次消费。"""
-    if not candidate_set_hash or not evaluation_id:
-        raise ValueError("消费封存段必须绑定 candidate_set_hash 与 evaluation_id")
-    consumed = _utc(consumed_at or datetime.now(UTC))
-    connection = _connect(registry_path)
-    try:
-        _begin(connection)
-        row = connection.execute(
-            "SELECT * FROM holdout_vintage WHERE vintage_id=?",
-            (vintage_id,),
-        ).fetchone()
-        if row is None:
-            raise LookupError(f"封存段不存在: {vintage_id}")
-        if row["status"] != "sealed":
-            raise ValueError(f"封存段已经消费: {vintage_id}")
-        connection.execute(
-            "UPDATE holdout_vintage SET status='consumed',consumed_at=?,"
-            "candidate_set_hash=?,evaluation_id=? WHERE vintage_id=? AND status='sealed'",
-            (_timestamp(consumed), candidate_set_hash, evaluation_id, vintage_id),
-        )
-        connection.execute(
-            "INSERT INTO holdout_evaluation_attempt("
-            "evaluation_id,vintage_id,candidate_set_hash,status,stage,started_at,updated_at"
-            ") VALUES(?,?,?,'incomplete','manually_consumed',?,?)",
-            (
-                evaluation_id,
-                vintage_id,
-                candidate_set_hash,
-                _timestamp(consumed),
-                _timestamp(consumed),
-            ),
-        )
-        updated = connection.execute(
-            "SELECT * FROM holdout_vintage WHERE vintage_id=?",
-            (vintage_id,),
-        ).fetchone()
-        connection.execute("COMMIT")
-    except BaseException:
-        if connection.in_transaction:
-            connection.execute("ROLLBACK")
-        raise
-    finally:
-        connection.close()
-    if updated is None:
-        raise RuntimeError("消费后封存段不可见")
-    return _vintage_from_row(updated)
-
-
 def start_holdout_evaluation_attempt(
     registry_path: Path,
     vintage_id: str,
     candidate_set_hash: str,
     evaluation_id: str,
-    *,
-    started_at: datetime | None = None,
 ) -> HoldoutEvaluationAttempt:
     """原子烧毁 vintage 并登记不可重跑的评估尝试。"""
-    started = _utc(started_at or datetime.now(UTC))
+    if not candidate_set_hash or not evaluation_id:
+        raise ValueError("评估封存段必须绑定 candidate_set_hash 与 evaluation_id")
+    started = clock.utc_now()
     connection = _connect(registry_path)
     try:
         _begin(connection)
@@ -1314,6 +1257,8 @@ def start_holdout_evaluation_attempt(
             raise LookupError(f"封存段不存在: {vintage_id}")
         if vintage["status"] != "sealed":
             raise ValueError(f"封存段已经消费: {vintage_id}")
+        if started < _parse_timestamp(str(vintage["end_time"])):
+            raise ValueError("封存段必须完整结束后才能开始评估")
         connection.execute(
             "UPDATE holdout_vintage SET status='consumed',consumed_at=?,"
             "candidate_set_hash=?,evaluation_id=? WHERE vintage_id=? AND status='sealed'",
@@ -1351,14 +1296,12 @@ def update_holdout_evaluation_attempt(
     registry_path: Path,
     evaluation_id: str,
     stage: str,
-    *,
-    updated_at: datetime | None = None,
 ) -> HoldoutEvaluationAttempt:
     """持久化 incomplete 尝试最后到达的评估阶段。"""
     normalized = stage.strip()
     if not normalized:
         raise ValueError("holdout 评估阶段不得为空")
-    updated = _utc(updated_at or datetime.now(UTC))
+    updated = clock.utc_now()
     connection = _connect(registry_path)
     try:
         _begin(connection)
@@ -1400,7 +1343,6 @@ def finalize_holdout_evaluation(
     result_manifest_sha256: str,
     *,
     repository_root: Path,
-    completed_at: datetime | None = None,
 ) -> tuple[HoldoutVintage, HoldoutEvaluationAttempt]:
     """现场复核终态证据，再原子写入 verdict 与 completed attempt。"""
     normalized = verdict.strip()
@@ -1414,7 +1356,7 @@ def finalize_holdout_evaluation(
         result_manifest_path,
         result_manifest_sha256,
     )
-    completed = _utc(completed_at or datetime.now(UTC))
+    completed = clock.utc_now()
     connection = _connect(registry_path)
     try:
         _begin(connection)
@@ -1611,7 +1553,6 @@ def register_frozen_forward_plan(
     plan_artifact_sha256: str,
     *,
     repository_root: Path,
-    frozen_at: datetime | None = None,
 ) -> FrozenForwardPlan:
     """在 vintage 开始前原子登记唯一冻结前向计划。"""
     values = (
@@ -1624,7 +1565,7 @@ def register_frozen_forward_plan(
     )
     if any(not value.strip() for value in values):
         raise ValueError("冻结前向计划身份字段不得为空")
-    frozen = _utc(frozen_at or datetime.now(UTC))
+    frozen = clock.utc_now()
     plan_id = stable_identifier("frozen-forward-plan", {
         "governance_method_version": GOVERNANCE_METHOD_VERSION,
         "vintage_id": vintage_id,
@@ -1712,7 +1653,6 @@ def register_frozen_forward_prediction(
     maximum_recording_lag_seconds: int,
     *,
     repository_root: Path,
-    recorded_at: datetime | None = None,
 ) -> FrozenForwardPrediction:
     """原子追加一个及时生成的预测；同一时点内容永久不可改写。"""
     if maximum_recording_lag_seconds <= 0:
@@ -1721,7 +1661,7 @@ def register_frozen_forward_prediction(
     if any(not value.strip() for value in identity_values):
         raise ValueError("冻结前向预测身份字段不得为空")
     decision = _utc(decision_time)
-    recorded = _utc(recorded_at or datetime.now(UTC))
+    recorded = clock.utc_now()
     lag = (recorded - decision).total_seconds()
     if lag < 0 or lag > maximum_recording_lag_seconds:
         raise ValueError("冻结前向预测未在预登记时效窗口内生成")
