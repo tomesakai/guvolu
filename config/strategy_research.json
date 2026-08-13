@@ -87,6 +87,7 @@
     "block_bootstrap_one_sided_alpha": 0.05,
     "maximum_block_bootstrap_p_value": 0.05,
     "minimum_deflated_sharpe_probability": 0.95,
+    "deflated_sharpe_gate_trial_count": "effective",
     "minimum_parameter_neighbor_count": 1,
     "minimum_positive_parameter_neighbor_ratio": 0.5,
     "minimum_median_parameter_neighbor_sharpe_retention": 0.5,

@@ -273,6 +273,12 @@ def test_deflated_sharpe_penalizes_more_trials_and_reports_effective_count() -> 
     )
     assert large_benchmark > small_benchmark > 0.0
     assert large_probability < small_probability
+    _fractional_probability, fractional_benchmark = _deflated_sharpe_probability(
+        values,
+        trial_sharpes,
+        1.25,
+    )
+    assert fractional_benchmark >= 0.0
     assert _effective_trial_count({
         "a": (1.0, -1.0, 1.0, -1.0),
         "b": (1.0, 1.0, -1.0, -1.0),

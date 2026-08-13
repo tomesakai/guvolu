@@ -219,8 +219,9 @@ CPU 阶段应先于 GPU 完成以下收敛：
    不把同一参数在所有节拍无边界复制。
 3. 现有门禁已包括非正态 Probabilistic Sharpe、循环折块 percentile bootstrap、折块
    CSCV/PBO、Deflated Sharpe 和单轴最近参数邻域稳定性。DSR 同时发布全量候选原始试验数与
-   基于折级得分相关矩阵参与率的有效试验数。DSR 的试验域是实际参与该流派冠军选择的候选，
-   硬门禁使用更保守的原始数；跨流派比较继续由全局 BH-FDR 约束。下一步增加
+   基于折级得分相关矩阵参与率的有效试验数。DSR 的试验域是实际参与该流派冠军选择的候选；
+   由于相邻参数候选高度相关，准入使用符合独立试验假设的 effective count，raw count 作为最
+   保守敏感性同时披露。跨流派比较继续由全局 BH-FDR 约束。下一步增加
    studentized bootstrap 和 regime attribution；开发
    回放与已经实现的一次性封存段状态机分开登记；积累未来 vintage 后再形成 G-08 结论。
 4. 均值回归和网格在当前主动成交成本下失败时保持拒绝。只有建立 snapshot-bounded 被动成交
@@ -237,7 +238,7 @@ CPU 阶段应先于 GPU 完成以下收敛：
 | [强类型 Vectorial GP（2025）](https://arxiv.org/abs/2504.05418) | 强类型 GP 在该实验中优于普通 GP | GPU/进化搜索只接受 typed DSL，不允许无类型表达式 |
 | [Warm-start GP（2024）](https://arxiv.org/abs/2412.00896) | 结构约束和有依据的初始化可减少随机搜索浪费 | 以已验证流派为 seed，每个流派独立预算和繁殖池 |
 | [CPCV 比较研究（2024）](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=4686376) | 合成控制实验中 CPCV 比普通 walk-forward 更能抑制过拟合 | 已加入折块 CSCV/PBO；完整 CPCV 作为进入封存段前的 challenger |
-| [Deflated Sharpe Ratio](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=2460551) | 选择偏差、非正态与试验次数会抬高 Sharpe | 已加入 raw/effective trial DSR；准入采用 raw count，effective count 只作敏感性诊断 |
+| [Deflated Sharpe Ratio](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=2460551) | 选择偏差、非正态与试验次数会抬高 Sharpe | 已加入 family-scoped raw/effective trial DSR；effective count 准入，raw count 作保守敏感性 |
 | [Ledoit-Wolf Sharpe 检验](https://www.ledoit.net/Robust_Sharpe_2008.pdf) | 肥尾或序列相关下应使用 time-series bootstrap | 已加入循环折块 percentile 门禁；studentized 区间列为下一步 |
 
 ## 9. GPU 策略生成方式

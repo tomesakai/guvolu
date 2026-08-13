@@ -23,7 +23,7 @@ SECONDS_PER_YEAR = 365.0 * 24.0 * 60.0 * 60.0
 P_VALUE_METHOD_VERSION = "probabilistic-sharpe-nonnormal-v1"
 PBO_METHOD_VERSION = "cscv-balanced-fold-block-v2"
 BLOCK_BOOTSTRAP_METHOD_VERSION = "circular-block-bootstrap-sharpe-v1"
-DEFLATED_SHARPE_METHOD_VERSION = "deflated-sharpe-family-raw-effective-v2"
+DEFLATED_SHARPE_METHOD_VERSION = "deflated-sharpe-family-effective-gate-v3"
 EFFECTIVE_TRIAL_METHOD_VERSION = "fold-score-correlation-participation-v1"
 PARAMETER_STABILITY_METHOD_VERSION = "one-axis-nearest-neighbor-v1"
 _INTERVAL_SECONDS = {
@@ -170,7 +170,7 @@ def _deflated_sharpe_probability(
             + euler_mascheroni
             * normal.inv_cdf(1.0 - 1.0 / (trial_count * math.e))
         )
-        benchmark = dispersion * expected_maximum
+        benchmark = dispersion * max(expected_maximum, 0.0)
     return _probabilistic_sharpe_probability(values, benchmark), benchmark
 
 
@@ -1018,6 +1018,11 @@ def walk_forward_validate(
     )
     if not 0.0 <= minimum_deflated_sharpe_probability <= 1.0:
         raise ValueError("minimum_deflated_sharpe_probability 必须位于零到一")
+    deflated_sharpe_gate_trial_count = validation.get(
+        "deflated_sharpe_gate_trial_count"
+    )
+    if deflated_sharpe_gate_trial_count != "effective":
+        raise ValueError("deflated_sharpe_gate_trial_count 必须为 effective")
     minimum_parameter_neighbor_count = _integer(
         validation.get("minimum_parameter_neighbor_count"),
         "minimum_parameter_neighbor_count",
@@ -1108,7 +1113,7 @@ def walk_forward_validate(
             reasons.append("probability_backtest_overfitting_failed")
         if item.bootstrap_p > maximum_bootstrap_p:
             reasons.append("block_bootstrap_sharpe_failed")
-        if raw_dsr < minimum_deflated_sharpe_probability:
+        if effective_dsr < minimum_deflated_sharpe_probability:
             reasons.append("deflated_sharpe_probability_failed")
         if len(neighbors) < minimum_parameter_neighbor_count:
             reasons.append("parameter_neighbor_count_failed")
