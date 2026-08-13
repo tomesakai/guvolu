@@ -231,20 +231,35 @@ def load_frozen_candidates(
     return tuple(sorted(candidates, key=lambda item: item.candidate_id)), registry_path
 
 
+def frozen_candidate_set_identity(
+    source_manifest_path: Path,
+    source_summary_path: Path,
+    candidate_registry_path: Path,
+    candidates: Sequence[CandidateSpec],
+) -> Mapping[str, object]:
+    """生成可由终态 manifest 复核的冻结候选集合身份载荷。"""
+    return {
+        "holdout_method_version": HOLDOUT_METHOD_VERSION,
+        "source_manifest_sha256": sha256_file(source_manifest_path),
+        "source_summary_sha256": sha256_file(source_summary_path),
+        "candidate_registry_sha256": sha256_file(candidate_registry_path),
+        "candidate_ids": [candidate.candidate_id for candidate in candidates],
+    }
+
+
 def frozen_candidate_set_hash(
     source_manifest_path: Path,
     source_summary_path: Path,
     candidate_registry_path: Path,
     candidates: Sequence[CandidateSpec],
 ) -> str:
-    """生成由完整来源制品和执行候选共同决定的冻结集合身份。"""
-    return stable_identifier("candidate-set", {
-        "holdout_method_version": HOLDOUT_METHOD_VERSION,
-        "source_manifest_sha256": sha256_file(source_manifest_path),
-        "source_summary_sha256": sha256_file(source_summary_path),
-        "candidate_registry_sha256": sha256_file(candidate_registry_path),
-        "candidate_ids": [candidate.candidate_id for candidate in candidates],
-    })
+    """生成由完整来源制品和执行候选共同决定的冻结集合散列。"""
+    return stable_identifier("candidate-set", frozen_candidate_set_identity(
+        source_manifest_path,
+        source_summary_path,
+        candidate_registry_path,
+        candidates,
+    ))
 
 
 def _fdr(p_values: Mapping[str, float]) -> Mapping[str, float]:
@@ -318,12 +333,13 @@ def run_holdout_validation(
     )
     if source_code_identity.get("tree_digest") != identity.tree_digest:
         raise ValueError("holdout 必须使用来源运行冻结的同一研究代码树身份")
-    candidate_set_hash = frozen_candidate_set_hash(
+    candidate_set_identity = frozen_candidate_set_identity(
         source_manifest_path,
         summary_file,
         candidate_registry_path,
         candidates,
     )
+    candidate_set_hash = stable_identifier("candidate-set", candidate_set_identity)
     raw_policy = governance.get("holdout_policy")
     require_forward_predictions = (
         isinstance(raw_policy, Mapping)
@@ -542,6 +558,7 @@ def run_holdout_validation(
         "evaluation_id": evaluation_id,
         "vintage_id": vintage_id,
         "candidate_set_hash": candidate_set_hash,
+        "candidate_set_identity": candidate_set_identity,
         "verdict": verdict,
         "artifacts": {
             "panel": {
@@ -560,6 +577,7 @@ def run_holdout_validation(
     final_verdict = canonical_json({
             "evaluation_id": evaluation_id,
             "verdict": verdict,
+            "candidate_ids": [candidate.candidate_id for candidate in candidates],
             "passed_families": sorted(passed_families),
             "result_sha256": sha256_file(result_path),
             "manifest_sha256": manifest_sha256,

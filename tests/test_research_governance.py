@@ -28,7 +28,7 @@ from guvolu.research.contracts import (
     CodeIdentity,
     FrozenPanelInputs,
 )
-from guvolu.research.provenance import sha256_file
+from guvolu.research.provenance import sha256_file, stable_identifier
 from guvolu.research.verification import VerificationResult
 from guvolu.strategy.expression import (
     EXPRESSION_METHOD_VERSION,
@@ -43,11 +43,23 @@ def _time(value: str) -> datetime:
     return datetime.fromisoformat(value).replace(tzinfo=UTC)
 
 
+def _test_candidate_set(candidate_ids: list[str]) -> tuple[dict[str, object], str]:
+    """构造与生产散列合同一致的冻结候选集合身份。"""
+    identity: dict[str, object] = {
+        "holdout_method_version": HOLDOUT_METHOD_VERSION,
+        "source_manifest_sha256": "1" * 64,
+        "source_summary_sha256": "2" * 64,
+        "candidate_registry_sha256": "3" * 64,
+        "candidate_ids": sorted(candidate_ids),
+    }
+    return identity, stable_identifier("candidate-set", identity)
+
+
 def _write_holdout_evidence(
     root: Path,
     vintage_id: str,
     evaluation_id: str,
-    candidate_set_hash: str,
+    candidate_set_identity: dict[str, object],
     verdict: str,
 ) -> tuple[str, str, str]:
     """写入彼此绑定的完整 holdout panel、result、manifest 与 verdict。"""
@@ -56,7 +68,27 @@ def _write_holdout_evidence(
     panel_path = run_directory / "panel.parquet"
     panel_path.write_bytes(b"PAR1holdout-test-panelPAR1")
     panel_sha256 = sha256_file(panel_path)
-    passed_families = ["trend"] if verdict == "passed" else []
+    raw_candidate_ids = candidate_set_identity["candidate_ids"]
+    if not isinstance(raw_candidate_ids, list):
+        raise AssertionError("测试 candidate_ids 必须为列表")
+    candidate_ids = [str(item) for item in raw_candidate_ids]
+    candidate_set_hash = stable_identifier(
+        "candidate-set", candidate_set_identity,
+    )
+    passed = verdict == "passed"
+    passed_families = ["trend"] if passed else []
+    metrics = {
+        "net_return": 0.1 if passed else -0.1,
+        "sharpe": 1.0 if passed else -1.0,
+        "maximum_drawdown": 0.1 if passed else 0.5,
+        "p_value": 0.01 if passed else 0.9,
+    }
+    rejection_reasons = [] if passed else [
+        "non_positive_holdout_net_return",
+        "holdout_sharpe_failed",
+        "holdout_drawdown_failed",
+        "holdout_fdr_failed",
+    ]
     result_path = run_directory / "result.json"
     result_path.write_text(json.dumps({
         "schema_version": HOLDOUT_MANIFEST_SCHEMA_VERSION,
@@ -66,9 +98,18 @@ def _write_holdout_evidence(
         "candidate_set_hash": candidate_set_hash,
         "panel_sha256": panel_sha256,
         "candidate_results": [{
+            "candidate_id": candidate_ids[0],
             "family": "trend",
-            "passed": verdict == "passed",
+            "metrics": metrics,
+            "fdr_q": metrics["p_value"],
+            "passed": passed,
+            "rejection_reasons": rejection_reasons,
         }],
+        "policy": {
+            "minimum_sharpe": 0.0,
+            "maximum_drawdown": 0.45,
+            "maximum_fdr_q": 0.2,
+        },
         "passed_families": passed_families,
         "verdict": verdict,
     }, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
@@ -80,6 +121,7 @@ def _write_holdout_evidence(
         "evaluation_id": evaluation_id,
         "vintage_id": vintage_id,
         "candidate_set_hash": candidate_set_hash,
+        "candidate_set_identity": candidate_set_identity,
         "verdict": verdict,
         "artifacts": {
             "panel": {
@@ -100,6 +142,7 @@ def _write_holdout_evidence(
     terminal = json.dumps({
         "evaluation_id": evaluation_id,
         "verdict": verdict,
+        "candidate_ids": candidate_ids,
         "passed_families": passed_families,
         "result_sha256": result_sha256,
         "manifest_sha256": manifest_sha256,
@@ -162,10 +205,13 @@ def test_holdout_vintage_is_unexposed_nonoverlapping_and_single_use(
             _time("2025-07-20T00:00:00"),
         )
 
+    candidate_set_identity, candidate_set_hash = _test_candidate_set(
+        ["candidate-one"]
+    )
     consumed = consume_holdout_vintage(
         registry,
         vintage.vintage_id,
-        "candidate-set-hash",
+        candidate_set_hash,
         "evaluation-id",
         consumed_at=_time("2025-08-02T00:00:00"),
     )
@@ -188,7 +234,7 @@ def test_holdout_vintage_is_unexposed_nonoverlapping_and_single_use(
         tmp_path,
         vintage.vintage_id,
         "evaluation-id",
-        "candidate-set-hash",
+        candidate_set_identity,
         "failed",
     )
     decided, completed_attempt = finalize_holdout_evaluation(
@@ -326,10 +372,13 @@ def test_holdout_verdict_and_completed_attempt_are_atomic(tmp_path: Path) -> Non
         _time("2027-02-01T00:00:00"),
         sealed_at=_time("2026-12-01T00:00:00"),
     )
+    candidate_set_identity, candidate_set_hash = _test_candidate_set(
+        ["candidate-one"]
+    )
     start_holdout_evaluation_attempt(
         registry,
         vintage.vintage_id,
-        "candidate-set",
+        candidate_set_hash,
         "evaluation-one",
         started_at=_time("2027-02-02T00:00:00"),
     )
@@ -337,7 +386,7 @@ def test_holdout_verdict_and_completed_attempt_are_atomic(tmp_path: Path) -> Non
         tmp_path,
         "different-vintage",
         "evaluation-one",
-        "candidate-set",
+        candidate_set_identity,
         "passed",
     )
     with pytest.raises(ValueError, match="manifest 的 vintage_id 不匹配"):
@@ -355,7 +404,7 @@ def test_holdout_verdict_and_completed_attempt_are_atomic(tmp_path: Path) -> Non
             tmp_path,
             vintage.vintage_id,
             "evaluation-one",
-            "candidate-set",
+            candidate_set_identity,
             "skipped",
         )
     )
@@ -369,11 +418,33 @@ def test_holdout_verdict_and_completed_attempt_are_atomic(tmp_path: Path) -> Non
             unsupported_sha256,
             repository_root=tmp_path,
         )
+    truncated_identity, _ = _test_candidate_set(
+        ["candidate-one", "candidate-two"]
+    )
+    truncated_terminal, truncated_manifest, truncated_sha256 = (
+        _write_holdout_evidence(
+            tmp_path,
+            vintage.vintage_id,
+            "evaluation-one",
+            truncated_identity,
+            "passed",
+        )
+    )
+    with pytest.raises(ValueError, match="未覆盖冻结候选全集"):
+        finalize_holdout_evaluation(
+            registry,
+            vintage.vintage_id,
+            "evaluation-one",
+            truncated_terminal,
+            truncated_manifest,
+            truncated_sha256,
+            repository_root=tmp_path,
+        )
     terminal, manifest_path, manifest_sha256 = _write_holdout_evidence(
         tmp_path,
         vintage.vintage_id,
         "evaluation-one",
-        "candidate-set",
+        candidate_set_identity,
         "passed",
     )
     manifest_file = tmp_path / manifest_path
@@ -404,7 +475,7 @@ def test_holdout_verdict_and_completed_attempt_are_atomic(tmp_path: Path) -> Non
         tmp_path,
         vintage.vintage_id,
         "evaluation-one",
-        "candidate-set",
+        candidate_set_identity,
         "passed",
     )
     with pytest.raises(ValueError, match="超出仓库范围"):

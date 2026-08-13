@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -174,6 +175,73 @@ def _validated_artifact(
     return path, sha256
 
 
+def _validated_candidate_set_identity(
+    manifest: dict[str, object],
+    candidate_set_hash: str,
+) -> list[str]:
+    """复算冻结候选全集身份并返回规范有序 candidate IDs。"""
+    value = manifest.get("candidate_set_identity")
+    if not isinstance(value, dict):
+        raise ValueError("holdout manifest 缺少 candidate_set_identity")
+    identity = {str(key): item for key, item in value.items()}
+    required = {
+        "holdout_method_version",
+        "source_manifest_sha256",
+        "source_summary_sha256",
+        "candidate_registry_sha256",
+        "candidate_ids",
+    }
+    if set(identity) != required:
+        raise ValueError("holdout candidate_set_identity 字段不完整")
+    if identity.get("holdout_method_version") != HOLDOUT_METHOD_VERSION:
+        raise ValueError("holdout candidate_set_identity 方法版本不匹配")
+    for name in (
+        "source_manifest_sha256",
+        "source_summary_sha256",
+        "candidate_registry_sha256",
+    ):
+        sha256 = identity.get(name)
+        if not isinstance(sha256, str) or not _canonical_sha256(sha256):
+            raise ValueError(f"holdout candidate_set_identity.{name} 无效")
+    raw_ids = identity.get("candidate_ids")
+    if (
+        not isinstance(raw_ids, list)
+        or not raw_ids
+        or any(not isinstance(item, str) or not item for item in raw_ids)
+    ):
+        raise ValueError("holdout candidate_set_identity.candidate_ids 无效")
+    candidate_ids = [str(item) for item in raw_ids]
+    if candidate_ids != sorted(candidate_ids) or len(set(candidate_ids)) != len(candidate_ids):
+        raise ValueError("holdout candidate IDs 必须有序且不重复")
+    if stable_identifier("candidate-set", identity) != candidate_set_hash:
+        raise ValueError("holdout candidate_set_hash 现场复算不匹配")
+    return candidate_ids
+
+
+def _finite_number(value: object, label: str) -> float:
+    """读取可复核政策和指标中的有限数值。"""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError(f"{label} 必须为数值")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"{label} 必须为有限数值")
+    return number
+
+
+def _holdout_fdr(p_values: dict[str, float]) -> dict[str, float]:
+    """按冻结候选全集重算 Benjamini-Hochberg q 值。"""
+    ordered = sorted(p_values.items(), key=lambda item: (item[1], item[0]))
+    result: dict[str, float] = {}
+    running = 1.0
+    count = len(ordered)
+    for index in range(count - 1, -1, -1):
+        candidate_id, p_value = ordered[index]
+        rank = index + 1
+        running = min(running, p_value * count / rank)
+        result[candidate_id] = min(max(running, 0.0), 1.0)
+    return result
+
+
 def _validated_terminal_evidence(
     repository_root: Path,
     vintage_id: str,
@@ -218,6 +286,9 @@ def _validated_terminal_evidence(
     candidate_set_hash = manifest.get("candidate_set_hash")
     if not isinstance(candidate_set_hash, str) or not candidate_set_hash:
         raise ValueError("holdout manifest 缺少 candidate_set_hash")
+    candidate_ids = _validated_candidate_set_identity(manifest, candidate_set_hash)
+    if terminal.get("candidate_ids") != candidate_ids:
+        raise ValueError("holdout verdict 未绑定冻结 candidate IDs")
     artifacts = manifest.get("artifacts")
     if not isinstance(artifacts, dict):
         raise ValueError("holdout manifest 缺少 artifacts")
@@ -248,21 +319,88 @@ def _validated_terminal_evidence(
     candidate_results = result.get("candidate_results")
     if not isinstance(candidate_results, list) or not candidate_results:
         raise ValueError("holdout result 缺少候选评估结果")
-    candidate_outcomes: list[tuple[str, bool]] = []
+    if len(candidate_results) != len(candidate_ids):
+        raise ValueError("holdout candidate_results 未覆盖冻结候选全集")
+    policy = result.get("policy")
+    if not isinstance(policy, dict):
+        raise ValueError("holdout result 缺少固定 policy")
+    minimum_sharpe = _finite_number(
+        policy.get("minimum_sharpe"), "holdout policy.minimum_sharpe",
+    )
+    maximum_drawdown = _finite_number(
+        policy.get("maximum_drawdown"), "holdout policy.maximum_drawdown",
+    )
+    maximum_fdr_q = _finite_number(
+        policy.get("maximum_fdr_q"), "holdout policy.maximum_fdr_q",
+    )
+    if maximum_drawdown < 0.0 or not 0.0 <= maximum_fdr_q <= 1.0:
+        raise ValueError("holdout policy 阈值范围无效")
+    records: list[tuple[str, str, dict[str, object], dict[str, object]]] = []
+    p_values: dict[str, float] = {}
     for item in candidate_results:
         if not isinstance(item, dict):
             raise ValueError("holdout candidate_results 合同无效")
-        family = item.get("family")
-        passed = item.get("passed")
-        if not isinstance(family, str) or not isinstance(passed, bool):
+        record = {str(key): value for key, value in item.items()}
+        candidate_id = record.get("candidate_id")
+        family = record.get("family")
+        metrics_value = record.get("metrics")
+        if (
+            not isinstance(candidate_id, str)
+            or not isinstance(family, str)
+            or not family
+            or not isinstance(metrics_value, dict)
+        ):
             raise ValueError("holdout candidate_results 合同无效")
+        metrics = {str(key): value for key, value in metrics_value.items()}
+        p_value = _finite_number(
+            metrics.get("p_value"), f"holdout {candidate_id}.p_value",
+        )
+        if not 0.0 <= p_value <= 1.0:
+            raise ValueError("holdout candidate p_value 范围无效")
+        if candidate_id in p_values:
+            raise ValueError("holdout candidate_results 包含重复 candidate_id")
+        p_values[candidate_id] = p_value
+        records.append((candidate_id, family, metrics, record))
+    if [record[0] for record in records] != candidate_ids:
+        raise ValueError("holdout candidate_results 与冻结候选全集不一致")
+    q_values = _holdout_fdr(p_values)
+    candidate_outcomes: list[tuple[str, bool]] = []
+    for candidate_id, family, metrics, record in records:
+        reasons: list[str] = []
+        if _finite_number(
+            metrics.get("net_return"), f"holdout {candidate_id}.net_return",
+        ) <= 0.0:
+            reasons.append("non_positive_holdout_net_return")
+        if _finite_number(
+            metrics.get("sharpe"), f"holdout {candidate_id}.sharpe",
+        ) < minimum_sharpe:
+            reasons.append("holdout_sharpe_failed")
+        if _finite_number(
+            metrics.get("maximum_drawdown"),
+            f"holdout {candidate_id}.maximum_drawdown",
+        ) > maximum_drawdown:
+            reasons.append("holdout_drawdown_failed")
+        if q_values[candidate_id] > maximum_fdr_q:
+            reasons.append("holdout_fdr_failed")
+        stored_q = _finite_number(
+            record.get("fdr_q"), f"holdout {candidate_id}.fdr_q",
+        )
+        if not math.isclose(
+            stored_q, q_values[candidate_id], rel_tol=1e-12, abs_tol=1e-12,
+        ):
+            raise ValueError("holdout candidate fdr_q 现场重算不匹配")
+        passed = not reasons
+        if record.get("passed") is not passed:
+            raise ValueError("holdout candidate passed 现场重算不匹配")
+        if record.get("rejection_reasons") != reasons:
+            raise ValueError("holdout candidate rejection_reasons 不匹配")
         candidate_outcomes.append((family, passed))
-    passed_families = sorted({
+    passed_families = sorted(
         family for family, passed in candidate_outcomes if passed
-    })
-    expected_verdict = (
-        "passed" if len(passed_families) == len(candidate_results) else "failed"
     )
+    expected_verdict = "passed" if all(
+        passed for _, passed in candidate_outcomes
+    ) else "failed"
     if expected_verdict != terminal_verdict:
         raise ValueError("holdout verdict 与候选评估结果不一致")
     if result.get("passed_families") != passed_families:
