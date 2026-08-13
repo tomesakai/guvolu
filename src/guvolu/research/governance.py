@@ -7,6 +7,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
+from guvolu.research.contracts import (
+    HOLDOUT_MANIFEST_SCHEMA_VERSION,
+    HOLDOUT_METHOD_VERSION,
+)
 from guvolu.research.provenance import sha256_file, stable_identifier
 
 GOVERNANCE_SCHEMA_VERSION = 4
@@ -140,6 +144,36 @@ def _json_file(path: Path, label: str) -> dict[str, object]:
     return {str(key): item for key, item in value.items()}
 
 
+def _validated_artifact(
+    repository_root: Path,
+    artifacts: dict[object, object],
+    name: str,
+    expected_kind: str,
+) -> tuple[Path, str]:
+    """现场复核 manifest 中一个必需制品的完整内容身份。"""
+    value = artifacts.get(name)
+    if not isinstance(value, dict):
+        raise ValueError(f"holdout manifest 缺少 {name} 制品")
+    record = {str(key): item for key, item in value.items()}
+    path_value = record.get("path")
+    sha256 = record.get("sha256")
+    byte_count = record.get("bytes")
+    if record.get("kind") != expected_kind:
+        raise ValueError(f"holdout {name} 制品 kind 不匹配")
+    if not isinstance(path_value, str) or not isinstance(sha256, str):
+        raise ValueError(f"holdout {name} 制品身份不完整")
+    if not isinstance(byte_count, int) or isinstance(byte_count, bool) or byte_count <= 0:
+        raise ValueError(f"holdout {name} 制品字节数无效")
+    if not _canonical_sha256(sha256):
+        raise ValueError(f"holdout {name} SHA-256 必须是规范小写十六进制")
+    path, _ = _evidence_file(repository_root, path_value, f"holdout {name}")
+    if path.stat().st_size != byte_count:
+        raise ValueError(f"holdout {name} 现场字节数不匹配")
+    if sha256_file(path) != sha256:
+        raise ValueError(f"holdout {name} 现场 SHA-256 不匹配")
+    return path, sha256
+
+
 def _validated_terminal_evidence(
     repository_root: Path,
     vintage_id: str,
@@ -157,6 +191,10 @@ def _validated_terminal_evidence(
     if sha256_file(manifest_path) != result_manifest_sha256:
         raise ValueError("holdout manifest 现场 SHA-256 不匹配")
     manifest = _json_file(manifest_path, "holdout manifest")
+    if manifest.get("schema_version") != HOLDOUT_MANIFEST_SCHEMA_VERSION:
+        raise ValueError("holdout manifest schema_version 不受支持")
+    if manifest.get("holdout_method_version") != HOLDOUT_METHOD_VERSION:
+        raise ValueError("holdout manifest method version 不匹配")
     try:
         verdict_value = json.loads(verdict)
     except json.JSONDecodeError as error:
@@ -173,29 +211,29 @@ def _validated_terminal_evidence(
     if terminal.get("manifest_sha256") != result_manifest_sha256:
         raise ValueError("holdout verdict 未绑定现场 manifest SHA-256")
     terminal_verdict = terminal.get("verdict")
-    if not isinstance(terminal_verdict, str) or not terminal_verdict:
-        raise ValueError("holdout verdict 缺少最终 verdict 值")
+    if terminal_verdict not in ("passed", "failed"):
+        raise ValueError("holdout verdict 只能是 passed 或 failed")
     if manifest.get("verdict") != terminal_verdict:
         raise ValueError("holdout manifest 与最终 verdict 不匹配")
     candidate_set_hash = manifest.get("candidate_set_hash")
     if not isinstance(candidate_set_hash, str) or not candidate_set_hash:
         raise ValueError("holdout manifest 缺少 candidate_set_hash")
     artifacts = manifest.get("artifacts")
-    if not isinstance(artifacts, dict) or not isinstance(artifacts.get("result"), dict):
-        raise ValueError("holdout manifest 缺少 result 制品")
-    result_record = artifacts["result"]
-    result_path_value = result_record.get("path")
-    result_sha256 = result_record.get("sha256")
-    if not isinstance(result_path_value, str) or not isinstance(result_sha256, str):
-        raise ValueError("holdout result 制品身份不完整")
-    if not _canonical_sha256(result_sha256):
-        raise ValueError("holdout result SHA-256 必须是规范小写十六进制")
-    result_path, _ = _evidence_file(repository_root, result_path_value, "holdout result")
-    if sha256_file(result_path) != result_sha256:
-        raise ValueError("holdout result 现场 SHA-256 不匹配")
+    if not isinstance(artifacts, dict):
+        raise ValueError("holdout manifest 缺少 artifacts")
+    _, panel_sha256 = _validated_artifact(
+        repository_root, artifacts, "panel", "holdout_panel",
+    )
+    result_path, result_sha256 = _validated_artifact(
+        repository_root, artifacts, "result", "holdout_result",
+    )
     if terminal.get("result_sha256") != result_sha256:
         raise ValueError("holdout verdict 未绑定现场 result SHA-256")
     result = _json_file(result_path, "holdout result")
+    if result.get("schema_version") != HOLDOUT_MANIFEST_SCHEMA_VERSION:
+        raise ValueError("holdout result schema_version 不受支持")
+    if result.get("holdout_method_version") != HOLDOUT_METHOD_VERSION:
+        raise ValueError("holdout result method version 不匹配")
     vintage = result.get("vintage")
     if not isinstance(vintage, dict) or vintage.get("vintage_id") != vintage_id:
         raise ValueError("holdout result 的 vintage_id 不匹配")
@@ -203,8 +241,34 @@ def _validated_terminal_evidence(
         raise ValueError("holdout result 的 evaluation_id 不匹配")
     if result.get("candidate_set_hash") != candidate_set_hash:
         raise ValueError("holdout result 的 candidate_set_hash 不匹配")
+    if result.get("panel_sha256") != panel_sha256:
+        raise ValueError("holdout result 未绑定现场 panel SHA-256")
     if result.get("verdict") != terminal_verdict:
         raise ValueError("holdout result 与最终 verdict 不匹配")
+    candidate_results = result.get("candidate_results")
+    if not isinstance(candidate_results, list) or not candidate_results:
+        raise ValueError("holdout result 缺少候选评估结果")
+    candidate_outcomes: list[tuple[str, bool]] = []
+    for item in candidate_results:
+        if not isinstance(item, dict):
+            raise ValueError("holdout candidate_results 合同无效")
+        family = item.get("family")
+        passed = item.get("passed")
+        if not isinstance(family, str) or not isinstance(passed, bool):
+            raise ValueError("holdout candidate_results 合同无效")
+        candidate_outcomes.append((family, passed))
+    passed_families = sorted({
+        family for family, passed in candidate_outcomes if passed
+    })
+    expected_verdict = (
+        "passed" if len(passed_families) == len(candidate_results) else "failed"
+    )
+    if expected_verdict != terminal_verdict:
+        raise ValueError("holdout verdict 与候选评估结果不一致")
+    if result.get("passed_families") != passed_families:
+        raise ValueError("holdout result 的 passed_families 不一致")
+    if terminal.get("passed_families") != passed_families:
+        raise ValueError("holdout verdict 的 passed_families 不一致")
     return normalized_path, candidate_set_hash
 
 

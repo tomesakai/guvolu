@@ -22,7 +22,12 @@ from guvolu.research.governance import (
     start_holdout_evaluation_attempt,
 )
 from guvolu.research.holdout import run_holdout_validation
-from guvolu.research.contracts import CodeIdentity, FrozenPanelInputs
+from guvolu.research.contracts import (
+    HOLDOUT_MANIFEST_SCHEMA_VERSION,
+    HOLDOUT_METHOD_VERSION,
+    CodeIdentity,
+    FrozenPanelInputs,
+)
 from guvolu.research.provenance import sha256_file
 from guvolu.research.verification import VerificationResult
 from guvolu.strategy.expression import (
@@ -45,33 +50,57 @@ def _write_holdout_evidence(
     candidate_set_hash: str,
     verdict: str,
 ) -> tuple[str, str, str]:
-    """写入彼此绑定的最小 holdout result、manifest 与终态 verdict。"""
+    """写入彼此绑定的完整 holdout panel、result、manifest 与 verdict。"""
     run_directory = root / "reports" / "holdout" / evaluation_id
     run_directory.mkdir(parents=True, exist_ok=True)
+    panel_path = run_directory / "panel.parquet"
+    panel_path.write_bytes(b"PAR1holdout-test-panelPAR1")
+    panel_sha256 = sha256_file(panel_path)
+    passed_families = ["trend"] if verdict == "passed" else []
     result_path = run_directory / "result.json"
     result_path.write_text(json.dumps({
+        "schema_version": HOLDOUT_MANIFEST_SCHEMA_VERSION,
+        "holdout_method_version": HOLDOUT_METHOD_VERSION,
         "evaluation_id": evaluation_id,
         "vintage": {"vintage_id": vintage_id},
         "candidate_set_hash": candidate_set_hash,
+        "panel_sha256": panel_sha256,
+        "candidate_results": [{
+            "family": "trend",
+            "passed": verdict == "passed",
+        }],
+        "passed_families": passed_families,
         "verdict": verdict,
     }, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
     result_sha256 = sha256_file(result_path)
     manifest_path = run_directory / "manifest.json"
     manifest_path.write_text(json.dumps({
+        "schema_version": HOLDOUT_MANIFEST_SCHEMA_VERSION,
+        "holdout_method_version": HOLDOUT_METHOD_VERSION,
         "evaluation_id": evaluation_id,
         "vintage_id": vintage_id,
         "candidate_set_hash": candidate_set_hash,
         "verdict": verdict,
-        "artifacts": {"result": {
-            "path": result_path.relative_to(root).as_posix(),
-            "sha256": result_sha256,
-            "bytes": result_path.stat().st_size,
-        }},
+        "artifacts": {
+            "panel": {
+                "kind": "holdout_panel",
+                "path": panel_path.relative_to(root).as_posix(),
+                "sha256": panel_sha256,
+                "bytes": panel_path.stat().st_size,
+            },
+            "result": {
+                "kind": "holdout_result",
+                "path": result_path.relative_to(root).as_posix(),
+                "sha256": result_sha256,
+                "bytes": result_path.stat().st_size,
+            },
+        },
     }, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
     manifest_sha256 = sha256_file(manifest_path)
     terminal = json.dumps({
         "evaluation_id": evaluation_id,
         "verdict": verdict,
+        "passed_families": passed_families,
         "result_sha256": result_sha256,
         "manifest_sha256": manifest_sha256,
     }, sort_keys=True, separators=(",", ":"))
@@ -319,6 +348,56 @@ def test_holdout_verdict_and_completed_attempt_are_atomic(tmp_path: Path) -> Non
             wrong_terminal,
             wrong_manifest,
             wrong_sha256,
+            repository_root=tmp_path,
+        )
+    unsupported_terminal, unsupported_manifest, unsupported_sha256 = (
+        _write_holdout_evidence(
+            tmp_path,
+            vintage.vintage_id,
+            "evaluation-one",
+            "candidate-set",
+            "skipped",
+        )
+    )
+    with pytest.raises(ValueError, match="只能是 passed 或 failed"):
+        finalize_holdout_evaluation(
+            registry,
+            vintage.vintage_id,
+            "evaluation-one",
+            unsupported_terminal,
+            unsupported_manifest,
+            unsupported_sha256,
+            repository_root=tmp_path,
+        )
+    terminal, manifest_path, manifest_sha256 = _write_holdout_evidence(
+        tmp_path,
+        vintage.vintage_id,
+        "evaluation-one",
+        "candidate-set",
+        "passed",
+    )
+    manifest_file = tmp_path / manifest_path
+    missing_panel = json.loads(manifest_file.read_text(encoding="utf-8"))
+    del missing_panel["artifacts"]["panel"]
+    manifest_file.write_text(
+        json.dumps(missing_panel, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    missing_panel_sha256 = sha256_file(manifest_file)
+    missing_panel_terminal = json.loads(terminal)
+    missing_panel_terminal["manifest_sha256"] = missing_panel_sha256
+    with pytest.raises(ValueError, match="缺少 panel 制品"):
+        finalize_holdout_evaluation(
+            registry,
+            vintage.vintage_id,
+            "evaluation-one",
+            json.dumps(
+                missing_panel_terminal,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            manifest_path,
+            missing_panel_sha256,
             repository_root=tmp_path,
         )
     terminal, manifest_path, manifest_sha256 = _write_holdout_evidence(

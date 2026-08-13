@@ -8,6 +8,9 @@ from typing import Mapping
 
 from guvolu.strategy.contracts import CandidateSpec, ResearchBar
 
+HOLDOUT_MANIFEST_SCHEMA_VERSION = 1
+HOLDOUT_METHOD_VERSION = "frozen-candidate-holdout-v3"
+
 
 @dataclass(frozen=True)
 class CodeIdentity:

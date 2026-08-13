@@ -8,6 +8,10 @@ from pathlib import Path
 from typing import Mapping, Sequence
 
 from guvolu.data.durable_io import atomic_write_text
+from guvolu.research.contracts import (
+    HOLDOUT_MANIFEST_SCHEMA_VERSION,
+    HOLDOUT_METHOD_VERSION,
+)
 from guvolu.research.features import compute_features
 from guvolu.research.governance import (
     GOVERNANCE_METHOD_VERSION,
@@ -37,7 +41,6 @@ from guvolu.strategy.expression import (
     strategy_expression,
 )
 
-HOLDOUT_METHOD_VERSION = "frozen-candidate-holdout-v3"
 SECONDS_PER_YEAR = 365.0 * 24.0 * 60.0 * 60.0
 _INTERVAL_SECONDS = {
     "5min": 300.0,
@@ -507,7 +510,7 @@ def run_holdout_validation(
         })
     verdict = "passed" if len(passed_families) == len(candidates) else "failed"
     result_payload = {
-        "schema_version": 1,
+        "schema_version": HOLDOUT_MANIFEST_SCHEMA_VERSION,
         "holdout_method_version": HOLDOUT_METHOD_VERSION,
         "evaluation_id": evaluation_id,
         "vintage": _vintage_payload(vintage),
@@ -534,7 +537,7 @@ def run_holdout_validation(
     result_path = run_directory / "result.json"
     atomic_write_text(result_path, canonical_json(result_payload) + "\n")
     manifest = {
-        "schema_version": 1,
+        "schema_version": HOLDOUT_MANIFEST_SCHEMA_VERSION,
         "holdout_method_version": HOLDOUT_METHOD_VERSION,
         "evaluation_id": evaluation_id,
         "vintage_id": vintage_id,
