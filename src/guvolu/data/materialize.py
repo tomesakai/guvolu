@@ -46,6 +46,7 @@ TRADE_SCHEMA_BY_NORMALIZATION = {
     "trade-realtime-normalization-v1": 2,
     "trade-realtime-normalization-v2": 2,
     "trade-realtime-normalization-v3": 3,
+    "trade-realtime-normalization-v4": 3,
 }
 DEFAULT_BACKFILL_MARKETS: tuple[tuple[str, str], ...] = (
     ("bitbank", "btc_jpy"),

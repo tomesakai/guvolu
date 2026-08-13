@@ -93,18 +93,19 @@ def test_compact_panel_enforces_pit_and_integer_projection(tmp_path: Path) -> No
             CREATE TABLE source(
               observation_id VARCHAR,event_time TIMESTAMPTZ,
               available_time TIMESTAMPTZ,ingest_time TIMESTAMPTZ,
-              side VARCHAR,price VARCHAR,size VARCHAR,
+              side VARCHAR,source_side_basis VARCHAR,price VARCHAR,size VARCHAR,
               source_artifact_id VARCHAR,source_row_index BIGINT,
               market_id VARCHAR
             )
         """)
         rows = [
-            ("a", _time(0, 10), _time(0, 10), _time(0, 11), "buy", "100", "1", "x", 0, "m"),
-            ("a", _time(0, 10), _time(0, 10), _time(0, 12), "buy", "100", "1", "y", 1, "m"),
-            ("b", _time(0, 20), _time(1, 5), _time(1, 6), "buy", "120", "1", "x", 2, "m"),
-            ("c", _time(1, 10), _time(1, 10), _time(1, 11), "sell", "110", "2", "x", 3, "m"),
+            ("a", _time(0, 10), _time(0, 10), _time(0, 11), "buy", "taker", "100", "1", "x", 0, "m"),
+            ("a", _time(0, 10), _time(0, 10), _time(0, 12), "buy", "taker", "100", "1", "y", 1, "m"),
+            ("b", _time(0, 20), _time(1, 5), _time(1, 6), "buy", "taker", "120", "1", "x", 2, "m"),
+            ("c", _time(1, 10), _time(1, 10), _time(1, 11), "sell", "taker", "110", "2", "x", 3, "m"),
+            ("d", _time(1, 20), _time(1, 20), _time(1, 21), "buy", "participant_side_unfiltered", "110", "3", "x", 4, "m"),
         ]
-        db.executemany("INSERT INTO source VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
+        db.executemany("INSERT INTO source VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows)
         escaped = str(source.resolve()).replace("'", "''")
         db.execute(f"COPY source TO '{escaped}' (FORMAT PARQUET)")
     finally:
@@ -135,6 +136,8 @@ def test_compact_panel_enforces_pit_and_integer_projection(tmp_path: Path) -> No
     assert len(bars) == 2
     assert bars[0].close == 100.0
     assert bars[0].trade_count == 1
+    assert bars[1].base_volume == 5.0
+    assert bars[1].signed_base_volume == -2.0
     check = duckdb.connect()
     try:
         row = check.execute(

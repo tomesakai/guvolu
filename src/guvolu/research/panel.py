@@ -97,7 +97,8 @@ def _panel_query(
     files = _path_list(inputs.paths)
     query = f"""
         WITH source AS (
-          SELECT observation_id,event_time,available_time,side,price,size,
+          SELECT observation_id,event_time,available_time,side,
+                 source_side_basis,price,size,
                  ROW_NUMBER() OVER (
                    PARTITION BY observation_id
                    ORDER BY ingest_time,source_artifact_id,source_row_index
@@ -107,6 +108,7 @@ def _panel_query(
             AND available_time<=?
         ), typed AS (
           SELECT observation_id,event_time,available_time,side,
+                 source_side_basis,
                  TRY_CAST(price AS DECIMAL(38,12)) AS price_decimal,
                  TRY_CAST(size AS DECIMAL(38,12)) AS size_decimal,
                  time_bucket(INTERVAL '{interval_sql}',event_time) AS bucket_start
@@ -126,8 +128,13 @@ def _panel_query(
                  LAST(price_decimal ORDER BY event_time,observation_id) AS close_price,
                  SUM(size_decimal) AS base_volume,
                  SUM(price_decimal*size_decimal) AS quote_volume,
-                 SUM(CASE WHEN side='buy' THEN size_decimal
-                          WHEN side='sell' THEN -size_decimal ELSE 0 END)
+                 SUM(CASE
+                       WHEN source_side_basis LIKE 'taker%' AND side='buy'
+                         THEN size_decimal
+                       WHEN source_side_basis LIKE 'taker%' AND side='sell'
+                         THEN -size_decimal
+                       ELSE 0
+                     END)
                    AS signed_base_volume,
                  COUNT(*) AS trade_count
           FROM eligible GROUP BY bucket_start

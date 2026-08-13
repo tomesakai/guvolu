@@ -48,8 +48,8 @@ from guvolu.data.watch_connection import connect_with_retry
 from guvolu.venues import registry
 
 TRADE_REALTIME_SCHEMA_VERSION = 3
-TRADE_REALTIME_NORMALIZATION_VERSION = "trade-realtime-normalization-v3"
-LEGACY_TRADE_REALTIME_NORMALIZATION_VERSION = "trade-realtime-normalization-v2"
+TRADE_REALTIME_NORMALIZATION_VERSION = "trade-realtime-normalization-v4"
+LEGACY_TRADE_REALTIME_NORMALIZATION_VERSION = "trade-realtime-normalization-v3"
 SUPPORTED_RAW_SCHEMA_VERSIONS = frozenset({1, 2, 3})
 FAILED_RETRY_SECONDS = 3600
 _ENDPOINT = {
@@ -58,9 +58,14 @@ _ENDPOINT = {
     "bitflyer": "lightning_executions",
 }
 _ENDPOINT_BINDINGS = {
-    "gmo": ("EP-0007", 0),
+    "gmo": ("EP-0007", 1),
     "bitbank": ("EP-0075", 0),
     "bitflyer": ("EP-0002", 0),
+}
+_ALLOWED_ENDPOINT_REVISIONS = {
+    "gmo": frozenset({0, 1}),
+    "bitbank": frozenset({0}),
+    "bitflyer": frozenset({0}),
 }
 _TIMESTAMP_UNIT = {
     "gmo": "iso8601",
@@ -262,7 +267,7 @@ def _sealed_inputs(root: Path) -> list[SegmentInput]:
                 raise ValueError(f"raw v2 端点身份或修订非法: {recorded}")
         elif (
             endpoint_id != binding[0]
-            or endpoint_revision != binding[1]
+            or endpoint_revision not in _ALLOWED_ENDPOINT_REVISIONS[venue_id]
             or body.get("artifact_id") != artifact_id(sha)
         ):
             raise ValueError(f"raw v3 manifest 端点绑定非法: {recorded}")
@@ -362,7 +367,7 @@ def _raw_metadata(
     raw_schema = int(str(envelope.get("schema_version", 1)))
     if raw_schema != item.raw_schema_version:
         raise ValueError("segment 行 schema_version 与 manifest 不一致")
-    endpoint, endpoint_revision = _ENDPOINT_BINDINGS[venue_id]
+    endpoint, _ = _ENDPOINT_BINDINGS[venue_id]
     if envelope.get("source_endpoint") != _ENDPOINT[venue_id]:
         raise ValueError("segment 行 source_endpoint 与端点契约不一致")
     ingest = _iso(envelope["ingest_time"])
@@ -410,7 +415,7 @@ def _raw_metadata(
             raise ValueError("raw v3 endpoint_revision 非法")
         row_revision = row_revision_raw
         if (
-            row_revision != endpoint_revision
+            row_revision not in _ALLOWED_ENDPOINT_REVISIONS[venue_id]
             or row_revision != item.endpoint_revision
         ):
             raise ValueError("raw v3 endpoint_revision 与端点契约不一致")
@@ -549,6 +554,14 @@ def _stage(
                     )
                     trade = normalize_trade(payload, context)
                     if venue_id == "gmo":
+                        trade = replace(
+                            trade,
+                            source_side_basis=(
+                                "taker"
+                                if raw.endpoint_revision == 1
+                                else "participant_side_unfiltered"
+                            ),
+                        )
                         trade = _source_scoped_gmo_id(
                             trade, item.artifact.artifact_id,
                             source_row, item_index,
@@ -1139,9 +1152,23 @@ def audit_realtime_trades(
                     errors.append(f"逐笔 v3 的 raw v2 绑定失败: {attempt}")
                 elif raw_schema == 3 and (
                     int(source[9]) != 1 or str(source[10]) != binding[0]
-                    or int(source[11]) != 1 or int(source[12]) != binding[1]
+                    or int(source[11]) != 1
+                    or int(source[12]) not in _ALLOWED_ENDPOINT_REVISIONS[venue_id]
                 ):
                     errors.append(f"逐笔 v3 的 raw v3 绑定失败: {attempt}")
+                elif venue_id == "gmo":
+                    expected_basis = (
+                        "taker"
+                        if raw_schema == 3 and int(source[12]) == 1
+                        else "participant_side_unfiltered"
+                    )
+                    invalid_basis = db.execute(
+                        "SELECT COUNT(*) FROM read_parquet(?) "
+                        "WHERE source_side_basis!=?",
+                        [parquet_path, expected_basis],
+                    ).fetchone()
+                    if invalid_basis is None or int(invalid_basis[0]) != 0:
+                        errors.append(f"GMO 逐笔方向口径失败: {attempt}")
     finally:
         db.close()
     return {

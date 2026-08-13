@@ -47,9 +47,10 @@ class _ConnectionContext:
 
 
 def _writer(root: Path, run_id: str) -> SegmentedRawWriter:
+    endpoint_id, endpoint_revision = trade_capture.ENDPOINT_BINDINGS["gmo"]
     return SegmentedRawWriter(
         root, "gmo", "BTC", domain="trade_realtime", run_id=run_id,
-        endpoint_id="EP-0007", endpoint_revision=0,
+        endpoint_id=endpoint_id, endpoint_revision=endpoint_revision,
         segment_seconds=3600, segment_max_bytes=1024 * 1024,
     )
 
@@ -99,6 +100,12 @@ def test_gmo_error_frame_is_persisted_before_reconnect(
     assert stats.data_frames == 0
     assert stats.disconnects == stats.reconnects == 1
     assert stats.consecutive_failures == 1
+    assert json.loads(connection.sent[0]) == {
+        "command": "subscribe",
+        "channel": "trades",
+        "symbol": "BTC",
+        "option": "TAKER_ONLY",
+    }
 
 
 def test_gmo_endless_capture_reconnects_after_silence(
@@ -129,6 +136,7 @@ def test_gmo_endless_capture_reconnects_after_silence(
     assert stats.wire_frames == stats.data_frames == 0
     assert stats.disconnects == stats.reconnects == 1
     assert stats.consecutive_failures == 1
+    assert json.loads(connection.sent[0])["option"] == "TAKER_ONLY"
 
 
 def test_gmo_trade_clears_consecutive_failure_after_persist(
@@ -155,3 +163,4 @@ def test_gmo_trade_clears_consecutive_failure_after_persist(
     assert stats.control_frames == 0
     assert stats.consecutive_failures == 0
     assert stats.last_data_time == rows[0]["recv_ts_utc"]
+    assert json.loads(connection.sent[0])["option"] == "TAKER_ONLY"

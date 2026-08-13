@@ -106,7 +106,7 @@ def test_capture_contract_uses_native_channels_and_stable_sessions(
         "bitflyer": ("EP-0002", 0),
     }
     assert trade_capture.ENDPOINT_BINDINGS == {
-        "gmo": ("EP-0007", 0),
+        "gmo": ("EP-0007", 1),
         "bitbank": ("EP-0075", 0),
         "bitflyer": ("EP-0002", 0),
     }

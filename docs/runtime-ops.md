@@ -5,7 +5,7 @@
 > [订单流数据事实契约](order-flow-data-contract.md)。
 > 控制面使用 SQLite schema v20；新采集段使用 raw v3，三所 L2 与实时逐笔
 > 分别物化为 L2 物理 schema v3 / `book-l2-normalization-v5` 与 trade schema v3 /
-> `trade-realtime-normalization-v3`；OKX 历史 L2 仍为 schema v2 /
+> `trade-realtime-normalization-v4`；OKX 历史 L2 仍为 schema v2 /
 > `book-l2-normalization-v2`；book-state 为 schema v1 /
 > `book-state-checkpoint-v3`，OFL 为 schema v2 /
 > `orderflow-tile-sparse-v8`。
