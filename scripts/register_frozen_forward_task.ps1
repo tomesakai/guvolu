@@ -46,15 +46,12 @@ $Trigger = New-ScheduledTaskTrigger -Once -At $FirstRunLocal `
     -RepetitionInterval (New-TimeSpan -Hours 1) `
     -RepetitionDuration $Duration
 $Principal = New-ScheduledTaskPrincipal -UserId ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name) `
-    -LogonType S4U -RunLevel Limited
+    -LogonType Interactive -RunLevel Limited
 $Settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew `
     -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 45) `
     -Hidden
-if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
-    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
-}
 Register-ScheduledTask -TaskName $TaskName -Action $Action -Trigger $Trigger `
-    -Principal $Principal -Settings $Settings | Out-Null
+    -Principal $Principal -Settings $Settings -Force | Out-Null
 Get-ScheduledTask -TaskName $TaskName | Select-Object `
     TaskName, State, @{Name = "FirstRunLocal"; Expression = { $FirstRunLocal }}, `
     @{Name = "EndUtc"; Expression = { $End.ToString("o") }}
