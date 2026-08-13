@@ -295,11 +295,8 @@ def run_holdout_validation(
         source_summary.get("code_identity"),
         "source_summary.code_identity",
     )
-    if (
-        source_code_identity.get("git_hash") != identity.git_hash
-        or source_code_identity.get("tree_digest") != identity.tree_digest
-    ):
-        raise ValueError("holdout 必须使用来源运行冻结的同一代码身份")
+    if source_code_identity.get("tree_digest") != identity.tree_digest:
+        raise ValueError("holdout 必须使用来源运行冻结的同一研究代码树身份")
     candidate_set_hash = stable_identifier("candidate-set", {
         "holdout_method_version": HOLDOUT_METHOD_VERSION,
         "source_manifest_sha256": sha256_file(source_manifest_path),

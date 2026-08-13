@@ -228,7 +228,7 @@ def test_holdout_is_consumed_before_market_data_is_opened(
         "research_identity": "research-one",
         "config_hash": config_hash,
         "decision_grade": True,
-        "code_identity": {"git_hash": "commit-one", "tree_digest": "tree-one"},
+        "code_identity": {"git_hash": "source-commit", "tree_digest": "tree-one"},
         "family_scope": ["trend", "breakout"],
         "family_evaluations": [{
             "deployment_candidate_id": candidate_id,
