@@ -1,0 +1,260 @@
+"""策略家族候选方向与跨运行衰减监视。"""
+from __future__ import annotations
+
+import json
+import statistics
+from collections import defaultdict
+from collections.abc import Mapping, Sequence
+from pathlib import Path
+
+from guvolu.research.provenance import sha256_file
+
+
+def _object(value: object, name: str) -> Mapping[str, object]:
+    """验证 JSON 对象。"""
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{name} 必须为对象")
+    return {str(key): item for key, item in value.items()}
+
+
+def _number(value: object, name: str) -> float:
+    """验证数值。"""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError(f"{name} 必须为数值")
+    return float(value)
+
+
+def _integer(value: object, name: str) -> int:
+    """验证正整数。"""
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ValueError(f"{name} 必须为正整数")
+    return value
+
+
+def _correlation(left: Sequence[float], right: Sequence[float]) -> float:
+    """计算候选参数与指标的线性关联，仅作为搜索方向证据。"""
+    if len(left) != len(right) or len(left) < 2:
+        return 0.0
+    left_mean = statistics.fmean(left)
+    right_mean = statistics.fmean(right)
+    covariance = statistics.fmean(
+        (x - left_mean) * (y - right_mean)
+        for x, y in zip(left, right, strict=True)
+    )
+    left_std = statistics.pstdev(left)
+    right_std = statistics.pstdev(right)
+    if left_std <= 0 or right_std <= 0:
+        return 0.0
+    return covariance / (left_std * right_std)
+
+
+def _aggregate_trials(path: Path, family: str) -> list[Mapping[str, object]]:
+    """读取一个流派的固定候选聚合样本外事实。"""
+    rows: list[Mapping[str, object]] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            item = _object(json.loads(line), "trial")
+            if (
+                item.get("record_type") == "trial"
+                and item.get("family") == family
+                and item.get("fold_id") == "walk-forward"
+                and item.get("segment") == "testing_aggregate"
+            ):
+                rows.append(item)
+    if not rows:
+        raise ValueError(f"试验台账没有流派聚合记录: {family}")
+    return rows
+
+
+def _parameter_directions(
+    rows: Sequence[Mapping[str, object]],
+    threshold: float,
+) -> list[Mapping[str, object]]:
+    """从完整候选网格估计每个数值轴的搜索方向。"""
+    values: dict[str, list[tuple[float, float]]] = defaultdict(list)
+    for row in rows:
+        parameters = _object(row.get("parameters"), "trial.parameters")
+        metrics = _object(row.get("metrics"), "trial.metrics")
+        sharpe = _number(metrics.get("sharpe"), "trial.metrics.sharpe")
+        for name, raw_value in parameters.items():
+            if isinstance(raw_value, (int, float)) and not isinstance(raw_value, bool):
+                values[name].append((float(raw_value), sharpe))
+    result: list[Mapping[str, object]] = []
+    for name, observations in sorted(values.items()):
+        distinct = sorted({value for value, _score in observations})
+        if len(distinct) < 2:
+            result.append({
+                "parameter": name,
+                "direction": "fixed",
+                "association": 0.0,
+                "best_value": distinct[0],
+                "observed_values": distinct,
+            })
+            continue
+        grouped: dict[float, list[float]] = defaultdict(list)
+        for value, score in observations:
+            grouped[value].append(score)
+        medians = {
+            value: statistics.median(scores) for value, scores in grouped.items()
+        }
+        best_value = max(sorted(medians), key=lambda value: (medians[value], -value))
+        association = _correlation(
+            [value for value, _score in observations],
+            [score for _value, score in observations],
+        )
+        if abs(association) < threshold:
+            direction = "hold_or_interaction"
+        elif best_value == distinct[-1] and association > 0:
+            direction = "explore_higher_after_preregistration"
+        elif best_value == distinct[0] and association < 0:
+            direction = "explore_lower_after_preregistration"
+        else:
+            direction = "refine_near_best_after_preregistration"
+        result.append({
+            "parameter": name,
+            "direction": direction,
+            "association": association,
+            "best_value": best_value,
+            "best_median_sharpe": medians[best_value],
+            "observed_values": distinct,
+        })
+    return result
+
+
+def _family_evaluation(
+    summary: Mapping[str, object],
+    family: str,
+) -> Mapping[str, object]:
+    """读取一个流派的家族级验证结果。"""
+    raw = summary.get("family_evaluations")
+    if not isinstance(raw, list):
+        raise ValueError("summary.family_evaluations 必须为数组")
+    matches = [
+        _object(item, "family_evaluation") for item in raw
+        if isinstance(item, Mapping) and item.get("family") == family
+    ]
+    if len(matches) != 1:
+        raise ValueError(f"流派验证结果不唯一: {family}")
+    return matches[0]
+
+
+def monitor_family_run(
+    repository_root: Path,
+    summary_path: Path,
+    family: str,
+    config: Mapping[str, object],
+    prior_summary_paths: Sequence[Path] = (),
+) -> Mapping[str, object]:
+    """生成单流派参数方向与跨运行健康监视制品。"""
+    root = repository_root.resolve()
+    summary = _object(
+        json.loads(summary_path.read_text(encoding="utf-8")),
+        "summary",
+    )
+    evaluation = _family_evaluation(summary, family)
+    artifacts = _object(summary.get("artifacts"), "summary.artifacts")
+    ledger = _object(artifacts.get("trial_ledger"), "artifacts.trial_ledger")
+    ledger_path = root / str(ledger.get("path"))
+    monitor_config = _object(
+        config.get("evolution_monitor"), "evolution_monitor",
+    )
+    association_threshold = _number(
+        monitor_config.get("parameter_association_threshold"),
+        "parameter_association_threshold",
+    )
+    rows = _aggregate_trials(ledger_path, family)
+    best_candidate_sharpe = max(
+        _number(
+            _object(row.get("metrics"), "trial.metrics").get("sharpe"),
+            "trial.metrics.sharpe",
+        )
+        for row in rows
+    )
+    raw_reasons = evaluation.get("rejection_reasons")
+    reasons = tuple(str(item) for item in raw_reasons) if isinstance(raw_reasons, list) else ()
+    if evaluation.get("eligible") is True:
+        evolution_action = "eligible_axis_refinement"
+    elif "shadow_only" in reasons:
+        evolution_action = "improve_fill_model_before_parameter_evolution"
+    elif "non_positive_oos_net_return" in reasons or best_candidate_sharpe <= 0:
+        evolution_action = "revise_hypothesis_or_cost_model"
+    else:
+        evolution_action = "stabilize_validation_before_parameter_evolution"
+    current_identity = str(summary.get("research_identity") or summary.get("run_id"))
+    history_by_identity: dict[str, Mapping[str, object]] = {}
+    for path in prior_summary_paths:
+        prior = _object(json.loads(path.read_text(encoding="utf-8")), "prior_summary")
+        identity = str(prior.get("research_identity") or prior.get("run_id"))
+        if identity == current_identity or identity in history_by_identity:
+            continue
+        prior_evaluation = _family_evaluation(prior, family)
+        history_by_identity[identity] = {
+            "research_identity": identity,
+            "run_id": prior.get("run_id"),
+            "decision_time": prior.get("decision_time"),
+            "adjusted_sharpe": prior_evaluation.get("adjusted_sharpe"),
+            "fdr_q": prior_evaluation.get("fdr_q"),
+            "eligible": prior_evaluation.get("eligible"),
+        }
+    history = sorted(
+        history_by_identity.values(),
+        key=lambda item: (str(item.get("decision_time")), str(item.get("run_id"))),
+    )
+    current_sharpe = _number(
+        evaluation.get("adjusted_sharpe"), "adjusted_sharpe",
+    )
+    current_q = _number(evaluation.get("fdr_q"), "fdr_q")
+    direction = "insufficient_history"
+    minimum_history = _integer(
+        monitor_config.get("minimum_history_runs"), "minimum_history_runs",
+    )
+    if len(history) + 1 >= minimum_history and history:
+        previous_sharpe = _number(history[-1]["adjusted_sharpe"], "prior.sharpe")
+        previous_q = _number(history[-1]["fdr_q"], "prior.fdr_q")
+        sharpe_decay = _number(
+            monitor_config.get("sharpe_decay_threshold"),
+            "sharpe_decay_threshold",
+        )
+        q_deterioration = _number(
+            monitor_config.get("fdr_q_deterioration_threshold"),
+            "fdr_q_deterioration_threshold",
+        )
+        if current_sharpe < previous_sharpe - sharpe_decay or current_q > previous_q + q_deterioration:
+            direction = "decaying"
+        elif current_sharpe > previous_sharpe + sharpe_decay and current_q <= previous_q:
+            direction = "improving"
+        else:
+            direction = "stable"
+    return {
+        "schema_version": 1,
+        "monitor_method_version": "family-direction-monitor-v1",
+        "run_id": summary.get("run_id"),
+        "research_identity": current_identity,
+        "decision_time": summary.get("decision_time"),
+        "family": family,
+        "eligible": evaluation.get("eligible"),
+        "rejection_reasons": evaluation.get("rejection_reasons"),
+        "adjusted_sharpe": current_sharpe,
+        "fdr_q": current_q,
+        "latest_unallocated_target": evaluation.get("latest_unallocated_target"),
+        "candidate_count": len(rows),
+        "best_fixed_candidate_sharpe": best_candidate_sharpe,
+        "evolution_action": evolution_action,
+        "cross_run_direction": direction,
+        "history": history,
+        "source": {
+            "summary_sha256": sha256_file(summary_path),
+            "config_hash": summary.get("config_hash"),
+            "panel_sha256": _object(summary.get("panel"), "summary.panel").get("sha256"),
+            "code_identity": summary.get("code_identity"),
+            "trial_ledger_sha256": ledger.get("sha256"),
+        },
+        "parameter_directions": _parameter_directions(
+            rows,
+            association_threshold,
+        ),
+        "interpretation": (
+            "参数方向是候选网格内的关联证据，不是因果结论；扩展轴必须先登记新版本，"
+            "不得复用一次性封存段。"
+        ),
+    }
