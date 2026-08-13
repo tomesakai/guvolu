@@ -373,7 +373,7 @@ def run_holdout_validation(
         frozen_targets = load_verified_prediction_targets(
             repository, plan.plan_id, registry_path=registry_path,
         )
-    evaluation_id = stable_identifier("holdout-evaluation", {
+    evaluation_identity = {
         "holdout_method_version": HOLDOUT_METHOD_VERSION,
         "governance_method_version": GOVERNANCE_METHOD_VERSION,
         "vintage_id": vintage_id,
@@ -382,7 +382,8 @@ def run_holdout_validation(
         "code_tree_digest": identity.tree_digest,
         "input_head_generation": inputs.head_generation,
         "input_artifact_ids": inputs.artifact_ids,
-    })
+    }
+    evaluation_id = stable_identifier("holdout-evaluation", evaluation_identity)
     start_holdout_evaluation_attempt(
         registry_path,
         vintage_id,
@@ -559,8 +560,13 @@ def run_holdout_validation(
         "vintage_id": vintage_id,
         "candidate_set_hash": candidate_set_hash,
         "candidate_set_identity": candidate_set_identity,
+        "evaluation_identity": evaluation_identity,
         "verdict": verdict,
         "artifacts": {
+            "config": {
+                **artifact_record(config_file, "holdout_config"),
+                "path": config_file.resolve().relative_to(repository).as_posix(),
+            },
             "panel": {
                 **artifact_record(panel.panel_path, "holdout_panel"),
                 "path": panel.panel_path.resolve().relative_to(repository).as_posix(),

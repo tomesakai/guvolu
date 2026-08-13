@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from guvolu.research.governance import (
+    GOVERNANCE_METHOD_VERSION,
     consume_holdout_vintage,
     finalize_holdout_evaluation,
     get_holdout_evaluation_attempt,
@@ -55,14 +56,52 @@ def _test_candidate_set(candidate_ids: list[str]) -> tuple[dict[str, object], st
     return identity, stable_identifier("candidate-set", identity)
 
 
+def _test_evaluation_identity(
+    root: Path,
+    vintage_id: str,
+    candidate_set_hash: str,
+    *,
+    require_forward_predictions: bool = False,
+) -> tuple[dict[str, object], str]:
+    """写入冻结 policy 配置并生成与生产一致的 evaluation 身份。"""
+    policy = {
+        "minimum_bars": 1,
+        "minimum_sharpe": 0.0,
+        "maximum_drawdown": 0.45,
+        "maximum_fdr_q": 0.2,
+        "require_frozen_forward_predictions": require_forward_predictions,
+    }
+    config_path = root / "config" / "holdout-test.json"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps({
+        "data_governance": {"holdout_policy": policy},
+    }, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+    identity: dict[str, object] = {
+        "holdout_method_version": HOLDOUT_METHOD_VERSION,
+        "governance_method_version": GOVERNANCE_METHOD_VERSION,
+        "vintage_id": vintage_id,
+        "candidate_set_hash": candidate_set_hash,
+        "config_hash": sha256_file(config_path),
+        "code_tree_digest": "tree-one",
+        "input_head_generation": "head-one",
+        "input_artifact_ids": ["artifact-one"],
+    }
+    return identity, stable_identifier("holdout-evaluation", identity)
+
+
 def _write_holdout_evidence(
     root: Path,
     vintage_id: str,
-    evaluation_id: str,
+    evaluation_identity: dict[str, object],
     candidate_set_identity: dict[str, object],
     verdict: str,
+    score_start: datetime,
+    *,
+    forward_plan_id: str | None = None,
+    forward_prediction_count: int = 0,
 ) -> tuple[str, str, str]:
     """写入彼此绑定的完整 holdout panel、result、manifest 与 verdict。"""
+    evaluation_id = stable_identifier("holdout-evaluation", evaluation_identity)
     run_directory = root / "reports" / "holdout" / evaluation_id
     run_directory.mkdir(parents=True, exist_ok=True)
     panel_path = run_directory / "panel.parquet"
@@ -75,6 +114,11 @@ def _write_holdout_evidence(
     candidate_set_hash = stable_identifier(
         "candidate-set", candidate_set_identity,
     )
+    config_path = root / "config" / "holdout-test.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    policy = config["data_governance"]["holdout_policy"]
+    config_hash = sha256_file(config_path)
+    require_forward = policy["require_frozen_forward_predictions"] is True
     passed = verdict == "passed"
     passed_families = ["trend"] if passed else []
     metrics = {
@@ -96,6 +140,7 @@ def _write_holdout_evidence(
         "evaluation_id": evaluation_id,
         "vintage": {"vintage_id": vintage_id},
         "candidate_set_hash": candidate_set_hash,
+        "config_hash": config_hash,
         "panel_sha256": panel_sha256,
         "candidate_results": [{
             "candidate_id": candidate_ids[0],
@@ -105,11 +150,18 @@ def _write_holdout_evidence(
             "passed": passed,
             "rejection_reasons": rejection_reasons,
         }],
-        "policy": {
-            "minimum_sharpe": 0.0,
-            "maximum_drawdown": 0.45,
-            "maximum_fdr_q": 0.2,
-        },
+        "score_start": score_start.isoformat(),
+        "score_end": score_start.isoformat(),
+        "score_bars": 1,
+        "target_source": (
+            "recorded_frozen_forward"
+            if require_forward else "end_of_vintage_recompute"
+        ),
+        "frozen_forward_plan_id": forward_plan_id if require_forward else None,
+        "frozen_forward_prediction_count": (
+            forward_prediction_count if require_forward else 0
+        ),
+        "policy": policy,
         "passed_families": passed_families,
         "verdict": verdict,
     }, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
@@ -122,8 +174,15 @@ def _write_holdout_evidence(
         "vintage_id": vintage_id,
         "candidate_set_hash": candidate_set_hash,
         "candidate_set_identity": candidate_set_identity,
+        "evaluation_identity": evaluation_identity,
         "verdict": verdict,
         "artifacts": {
+            "config": {
+                "kind": "holdout_config",
+                "path": config_path.relative_to(root).as_posix(),
+                "sha256": config_hash,
+                "bytes": config_path.stat().st_size,
+            },
             "panel": {
                 "kind": "holdout_panel",
                 "path": panel_path.relative_to(root).as_posix(),
@@ -208,17 +267,20 @@ def test_holdout_vintage_is_unexposed_nonoverlapping_and_single_use(
     candidate_set_identity, candidate_set_hash = _test_candidate_set(
         ["candidate-one"]
     )
+    evaluation_identity, evaluation_id = _test_evaluation_identity(
+        tmp_path, vintage.vintage_id, candidate_set_hash,
+    )
     consumed = consume_holdout_vintage(
         registry,
         vintage.vintage_id,
         candidate_set_hash,
-        "evaluation-id",
+        evaluation_id,
         consumed_at=_time("2025-08-02T00:00:00"),
     )
     assert consumed.status == "consumed"
     assert consumed.consumed_at == _time("2025-08-02T00:00:00")
     manual_attempt = get_holdout_evaluation_attempt(
-        registry, "evaluation-id",
+        registry, evaluation_id,
     )
     assert manual_attempt.status == "incomplete"
     assert manual_attempt.stage == "manually_consumed"
@@ -233,14 +295,15 @@ def test_holdout_vintage_is_unexposed_nonoverlapping_and_single_use(
     terminal, manifest_path, manifest_sha256 = _write_holdout_evidence(
         tmp_path,
         vintage.vintage_id,
-        "evaluation-id",
+        evaluation_identity,
         candidate_set_identity,
         "failed",
+        vintage.start_time,
     )
     decided, completed_attempt = finalize_holdout_evaluation(
         registry,
         vintage.vintage_id,
-        "evaluation-id",
+        evaluation_id,
         terminal,
         manifest_path,
         manifest_sha256,
@@ -254,7 +317,7 @@ def test_holdout_vintage_is_unexposed_nonoverlapping_and_single_use(
         finalize_holdout_evaluation(
             registry,
             vintage.vintage_id,
-            "evaluation-id",
+            evaluation_id,
             terminal,
             manifest_path,
             manifest_sha256,
@@ -375,25 +438,29 @@ def test_holdout_verdict_and_completed_attempt_are_atomic(tmp_path: Path) -> Non
     candidate_set_identity, candidate_set_hash = _test_candidate_set(
         ["candidate-one"]
     )
+    evaluation_identity, evaluation_id = _test_evaluation_identity(
+        tmp_path, vintage.vintage_id, candidate_set_hash,
+    )
     start_holdout_evaluation_attempt(
         registry,
         vintage.vintage_id,
         candidate_set_hash,
-        "evaluation-one",
+        evaluation_id,
         started_at=_time("2027-02-02T00:00:00"),
     )
     wrong_terminal, wrong_manifest, wrong_sha256 = _write_holdout_evidence(
         tmp_path,
         "different-vintage",
-        "evaluation-one",
+        evaluation_identity,
         candidate_set_identity,
         "passed",
+        vintage.start_time,
     )
     with pytest.raises(ValueError, match="manifest 的 vintage_id 不匹配"):
         finalize_holdout_evaluation(
             registry,
             vintage.vintage_id,
-            "evaluation-one",
+            evaluation_id,
             wrong_terminal,
             wrong_manifest,
             wrong_sha256,
@@ -403,38 +470,45 @@ def test_holdout_verdict_and_completed_attempt_are_atomic(tmp_path: Path) -> Non
         _write_holdout_evidence(
             tmp_path,
             vintage.vintage_id,
-            "evaluation-one",
+            evaluation_identity,
             candidate_set_identity,
             "skipped",
+            vintage.start_time,
         )
     )
     with pytest.raises(ValueError, match="只能是 passed 或 failed"):
         finalize_holdout_evaluation(
             registry,
             vintage.vintage_id,
-            "evaluation-one",
+            evaluation_id,
             unsupported_terminal,
             unsupported_manifest,
             unsupported_sha256,
             repository_root=tmp_path,
         )
-    truncated_identity, _ = _test_candidate_set(
+    truncated_identity, truncated_candidate_hash = _test_candidate_set(
         ["candidate-one", "candidate-two"]
+    )
+    truncated_evaluation_identity, truncated_evaluation_id = (
+        _test_evaluation_identity(
+            tmp_path, vintage.vintage_id, truncated_candidate_hash,
+        )
     )
     truncated_terminal, truncated_manifest, truncated_sha256 = (
         _write_holdout_evidence(
             tmp_path,
             vintage.vintage_id,
-            "evaluation-one",
+            truncated_evaluation_identity,
             truncated_identity,
             "passed",
+            vintage.start_time,
         )
     )
     with pytest.raises(ValueError, match="未覆盖冻结候选全集"):
         finalize_holdout_evaluation(
             registry,
             vintage.vintage_id,
-            "evaluation-one",
+            truncated_evaluation_id,
             truncated_terminal,
             truncated_manifest,
             truncated_sha256,
@@ -443,9 +517,10 @@ def test_holdout_verdict_and_completed_attempt_are_atomic(tmp_path: Path) -> Non
     terminal, manifest_path, manifest_sha256 = _write_holdout_evidence(
         tmp_path,
         vintage.vintage_id,
-        "evaluation-one",
+        evaluation_identity,
         candidate_set_identity,
         "passed",
+        vintage.start_time,
     )
     manifest_file = tmp_path / manifest_path
     missing_panel = json.loads(manifest_file.read_text(encoding="utf-8"))
@@ -461,7 +536,7 @@ def test_holdout_verdict_and_completed_attempt_are_atomic(tmp_path: Path) -> Non
         finalize_holdout_evaluation(
             registry,
             vintage.vintage_id,
-            "evaluation-one",
+            evaluation_id,
             json.dumps(
                 missing_panel_terminal,
                 sort_keys=True,
@@ -474,15 +549,16 @@ def test_holdout_verdict_and_completed_attempt_are_atomic(tmp_path: Path) -> Non
     terminal, manifest_path, manifest_sha256 = _write_holdout_evidence(
         tmp_path,
         vintage.vintage_id,
-        "evaluation-one",
+        evaluation_identity,
         candidate_set_identity,
         "passed",
+        vintage.start_time,
     )
     with pytest.raises(ValueError, match="超出仓库范围"):
         finalize_holdout_evaluation(
             registry,
             vintage.vintage_id,
-            "evaluation-one",
+            evaluation_id,
             terminal,
             "../outside-manifest.json",
             manifest_sha256,
@@ -492,7 +568,7 @@ def test_holdout_verdict_and_completed_attempt_are_atomic(tmp_path: Path) -> Non
         finalize_holdout_evaluation(
             registry,
             vintage.vintage_id,
-            "evaluation-one",
+            evaluation_id,
             terminal,
             manifest_path,
             "g" * 64,
@@ -502,19 +578,19 @@ def test_holdout_verdict_and_completed_attempt_are_atomic(tmp_path: Path) -> Non
         finalize_holdout_evaluation(
             registry,
             vintage.vintage_id,
-            "evaluation-one",
+            evaluation_id,
             terminal,
             manifest_path,
             "0" * 64,
             repository_root=tmp_path,
         )
     assert get_holdout_evaluation_attempt(
-        registry, "evaluation-one",
+        registry, evaluation_id,
     ).status == "incomplete"
     finalized_vintage, finalized_attempt = finalize_holdout_evaluation(
         registry,
         vintage.vintage_id,
-        "evaluation-one",
+        evaluation_id,
         terminal,
         manifest_path,
         manifest_sha256,
@@ -528,12 +604,149 @@ def test_holdout_verdict_and_completed_attempt_are_atomic(tmp_path: Path) -> Non
         finalize_holdout_evaluation(
             registry,
             vintage.vintage_id,
-            "evaluation-one",
+            evaluation_id,
             terminal,
             manifest_path,
             manifest_sha256,
             repository_root=tmp_path,
         )
+
+
+def test_registered_forward_plan_prevents_relaxed_policy_finalize(
+    tmp_path: Path,
+) -> None:
+    """已冻结 plan 的 vintage 不得改用关闭前向要求的宽松配置终结。"""
+    registry = tmp_path / "governance.sqlite3"
+    vintage = seal_holdout_vintage(
+        registry,
+        "market-one",
+        _time("2027-01-01T00:00:00"),
+        _time("2027-02-01T00:00:00"),
+        sealed_at=_time("2026-12-01T00:00:00"),
+    )
+    candidate_set_identity, candidate_set_hash = _test_candidate_set(
+        ["candidate-one"]
+    )
+    evaluation_identity, evaluation_id = _test_evaluation_identity(
+        tmp_path,
+        vintage.vintage_id,
+        candidate_set_hash,
+        require_forward_predictions=False,
+    )
+    config_hash = evaluation_identity["config_hash"]
+    assert isinstance(config_hash, str)
+    register_frozen_forward_plan(
+        registry,
+        vintage.vintage_id,
+        "1" * 64,
+        candidate_set_hash,
+        config_hash,
+        "tree-one",
+        "reports/plan.json",
+        "2" * 64,
+        frozen_at=_time("2026-12-15T00:00:00"),
+    )
+    start_holdout_evaluation_attempt(
+        registry,
+        vintage.vintage_id,
+        candidate_set_hash,
+        evaluation_id,
+        started_at=_time("2027-02-02T00:00:00"),
+    )
+    terminal, manifest_path, manifest_sha256 = _write_holdout_evidence(
+        tmp_path,
+        vintage.vintage_id,
+        evaluation_identity,
+        candidate_set_identity,
+        "passed",
+        vintage.start_time,
+    )
+    with pytest.raises(ValueError, match="冻结前向 plan 与注册表不一致"):
+        finalize_holdout_evaluation(
+            registry,
+            vintage.vintage_id,
+            evaluation_id,
+            terminal,
+            manifest_path,
+            manifest_sha256,
+            repository_root=tmp_path,
+        )
+    assert get_holdout_evaluation_attempt(registry, evaluation_id).status == "incomplete"
+
+
+def test_forward_required_finalize_matches_registered_prediction_coverage(
+    tmp_path: Path,
+) -> None:
+    """前向硬门必须把 plan、config 与评分区间预测逐项对齐后才可终结。"""
+    registry = tmp_path / "governance.sqlite3"
+    vintage = seal_holdout_vintage(
+        registry,
+        "market-one",
+        _time("2027-01-01T00:00:00"),
+        _time("2027-02-01T00:00:00"),
+        sealed_at=_time("2026-12-01T00:00:00"),
+    )
+    candidate_set_identity, candidate_set_hash = _test_candidate_set(
+        ["candidate-one"]
+    )
+    evaluation_identity, evaluation_id = _test_evaluation_identity(
+        tmp_path,
+        vintage.vintage_id,
+        candidate_set_hash,
+        require_forward_predictions=True,
+    )
+    config_hash = evaluation_identity["config_hash"]
+    assert isinstance(config_hash, str)
+    plan = register_frozen_forward_plan(
+        registry,
+        vintage.vintage_id,
+        "1" * 64,
+        candidate_set_hash,
+        config_hash,
+        "tree-one",
+        "reports/plan.json",
+        "2" * 64,
+        frozen_at=_time("2026-12-15T00:00:00"),
+    )
+    register_frozen_forward_prediction(
+        registry,
+        plan.plan_id,
+        vintage.start_time,
+        "head-one",
+        "panel-one",
+        "reports/prediction.json",
+        "prediction-one",
+        3900,
+        recorded_at=_time("2027-01-01T00:01:00"),
+    )
+    start_holdout_evaluation_attempt(
+        registry,
+        vintage.vintage_id,
+        candidate_set_hash,
+        evaluation_id,
+        started_at=_time("2027-02-02T00:00:00"),
+    )
+    terminal, manifest_path, manifest_sha256 = _write_holdout_evidence(
+        tmp_path,
+        vintage.vintage_id,
+        evaluation_identity,
+        candidate_set_identity,
+        "passed",
+        vintage.start_time,
+        forward_plan_id=plan.plan_id,
+        forward_prediction_count=1,
+    )
+    finalized, attempt = finalize_holdout_evaluation(
+        registry,
+        vintage.vintage_id,
+        evaluation_id,
+        terminal,
+        manifest_path,
+        manifest_sha256,
+        repository_root=tmp_path,
+    )
+    assert finalized.verdict == terminal
+    assert attempt.status == "completed"
 
 
 def test_holdout_cannot_be_selected_retroactively(tmp_path: Path) -> None:

@@ -94,6 +94,21 @@ class FrozenForwardPrediction:
     recorded_at: datetime
 
 
+@dataclass(frozen=True)
+class _TerminalEvidence:
+    """已经现场复核、可与治理注册表交叉核对的终态证据。"""
+
+    manifest_path: str
+    candidate_set_hash: str
+    config_hash: str
+    require_forward_predictions: bool
+    forward_plan_id: str | None
+    forward_prediction_count: int
+    score_start: datetime
+    score_end: datetime
+    score_bars: int
+
+
 def _utc(value: datetime) -> datetime:
     """把时间统一为有时区的 UTC。"""
     if value.tzinfo is None:
@@ -218,6 +233,58 @@ def _validated_candidate_set_identity(
     return candidate_ids
 
 
+def _validated_evaluation_identity(
+    manifest: dict[str, object],
+    vintage_id: str,
+    evaluation_id: str,
+    candidate_set_hash: str,
+) -> str:
+    """复算消费前已冻结且包含 config hash 的 evaluation 身份。"""
+    value = manifest.get("evaluation_identity")
+    if not isinstance(value, dict):
+        raise ValueError("holdout manifest 缺少 evaluation_identity")
+    identity = {str(key): item for key, item in value.items()}
+    required = {
+        "holdout_method_version",
+        "governance_method_version",
+        "vintage_id",
+        "candidate_set_hash",
+        "config_hash",
+        "code_tree_digest",
+        "input_head_generation",
+        "input_artifact_ids",
+    }
+    if set(identity) != required:
+        raise ValueError("holdout evaluation_identity 字段不完整")
+    if identity.get("holdout_method_version") != HOLDOUT_METHOD_VERSION:
+        raise ValueError("holdout evaluation_identity 方法版本不匹配")
+    if identity.get("governance_method_version") != GOVERNANCE_METHOD_VERSION:
+        raise ValueError("holdout evaluation_identity 治理版本不匹配")
+    if identity.get("vintage_id") != vintage_id:
+        raise ValueError("holdout evaluation_identity vintage_id 不匹配")
+    if identity.get("candidate_set_hash") != candidate_set_hash:
+        raise ValueError("holdout evaluation_identity candidate set 不匹配")
+    config_hash = identity.get("config_hash")
+    if not isinstance(config_hash, str) or not _canonical_sha256(config_hash):
+        raise ValueError("holdout evaluation_identity config_hash 无效")
+    for name in ("code_tree_digest", "input_head_generation"):
+        item = identity.get(name)
+        if not isinstance(item, str) or not item:
+            raise ValueError(f"holdout evaluation_identity.{name} 无效")
+    input_artifact_ids = identity.get("input_artifact_ids")
+    if (
+        not isinstance(input_artifact_ids, (list, tuple))
+        or not input_artifact_ids
+        or any(not isinstance(item, str) or not item for item in input_artifact_ids)
+    ):
+        raise ValueError("holdout evaluation_identity input_artifact_ids 无效")
+    if len(set(input_artifact_ids)) != len(input_artifact_ids):
+        raise ValueError("holdout evaluation_identity input_artifact_ids 重复")
+    if stable_identifier("holdout-evaluation", identity) != evaluation_id:
+        raise ValueError("holdout evaluation_id 现场复算不匹配")
+    return config_hash
+
+
 def _finite_number(value: object, label: str) -> float:
     """读取可复核政策和指标中的有限数值。"""
     if not isinstance(value, (int, float)) or isinstance(value, bool):
@@ -249,7 +316,7 @@ def _validated_terminal_evidence(
     verdict: str,
     result_manifest_path: str,
     result_manifest_sha256: str,
-) -> tuple[str, str]:
+) -> _TerminalEvidence:
     """现场复核 manifest、result 与最终 verdict 的同一业务身份。"""
     if not _canonical_sha256(result_manifest_sha256):
         raise ValueError("holdout manifest SHA-256 必须是规范小写十六进制")
@@ -287,11 +354,19 @@ def _validated_terminal_evidence(
     if not isinstance(candidate_set_hash, str) or not candidate_set_hash:
         raise ValueError("holdout manifest 缺少 candidate_set_hash")
     candidate_ids = _validated_candidate_set_identity(manifest, candidate_set_hash)
+    config_hash = _validated_evaluation_identity(
+        manifest, vintage_id, evaluation_id, candidate_set_hash,
+    )
     if terminal.get("candidate_ids") != candidate_ids:
         raise ValueError("holdout verdict 未绑定冻结 candidate IDs")
     artifacts = manifest.get("artifacts")
     if not isinstance(artifacts, dict):
         raise ValueError("holdout manifest 缺少 artifacts")
+    config_path, config_artifact_sha256 = _validated_artifact(
+        repository_root, artifacts, "config", "holdout_config",
+    )
+    if config_artifact_sha256 != config_hash:
+        raise ValueError("holdout config 制品与 evaluation_identity 不匹配")
     _, panel_sha256 = _validated_artifact(
         repository_root, artifacts, "panel", "holdout_panel",
     )
@@ -312,6 +387,8 @@ def _validated_terminal_evidence(
         raise ValueError("holdout result 的 evaluation_id 不匹配")
     if result.get("candidate_set_hash") != candidate_set_hash:
         raise ValueError("holdout result 的 candidate_set_hash 不匹配")
+    if result.get("config_hash") != config_hash:
+        raise ValueError("holdout result 的 config_hash 不匹配")
     if result.get("panel_sha256") != panel_sha256:
         raise ValueError("holdout result 未绑定现场 panel SHA-256")
     if result.get("verdict") != terminal_verdict:
@@ -321,9 +398,62 @@ def _validated_terminal_evidence(
         raise ValueError("holdout result 缺少候选评估结果")
     if len(candidate_results) != len(candidate_ids):
         raise ValueError("holdout candidate_results 未覆盖冻结候选全集")
+    config = _json_file(config_path, "holdout config")
+    governance = config.get("data_governance")
+    if not isinstance(governance, dict):
+        raise ValueError("holdout config 缺少 data_governance")
+    frozen_policy = governance.get("holdout_policy")
+    if not isinstance(frozen_policy, dict):
+        raise ValueError("holdout config 缺少 holdout_policy")
     policy = result.get("policy")
-    if not isinstance(policy, dict):
+    if not isinstance(policy, dict) or policy != frozen_policy:
         raise ValueError("holdout result 缺少固定 policy")
+    minimum_bars = policy.get("minimum_bars")
+    if (
+        not isinstance(minimum_bars, int)
+        or isinstance(minimum_bars, bool)
+        or minimum_bars <= 0
+    ):
+        raise ValueError("holdout policy.minimum_bars 无效")
+    score_bars = result.get("score_bars")
+    if (
+        not isinstance(score_bars, int)
+        or isinstance(score_bars, bool)
+        or score_bars < minimum_bars
+    ):
+        raise ValueError("holdout score_bars 低于冻结门槛")
+    score_start_value = result.get("score_start")
+    score_end_value = result.get("score_end")
+    if not isinstance(score_start_value, str) or not isinstance(score_end_value, str):
+        raise ValueError("holdout score 时间范围无效")
+    score_start = _parse_timestamp(score_start_value)
+    score_end = _parse_timestamp(score_end_value)
+    if score_start > score_end:
+        raise ValueError("holdout score 时间范围倒置")
+    require_forward_predictions = policy.get("require_frozen_forward_predictions")
+    if not isinstance(require_forward_predictions, bool):
+        raise ValueError("holdout policy 必须明确冻结前向预测要求")
+    target_source = result.get("target_source")
+    forward_plan_id = result.get("frozen_forward_plan_id")
+    forward_prediction_count = result.get("frozen_forward_prediction_count")
+    if (
+        not isinstance(forward_prediction_count, int)
+        or isinstance(forward_prediction_count, bool)
+        or forward_prediction_count < 0
+    ):
+        raise ValueError("holdout 冻结预测数量无效")
+    if require_forward_predictions:
+        if target_source != "recorded_frozen_forward":
+            raise ValueError("holdout 必须使用预先记录的冻结前向目标")
+        if not isinstance(forward_plan_id, str) or not forward_plan_id:
+            raise ValueError("holdout 缺少冻结前向 plan_id")
+        if forward_prediction_count != score_bars:
+            raise ValueError("holdout 冻结预测数量必须完整等于评分柱数")
+    else:
+        if target_source != "end_of_vintage_recompute":
+            raise ValueError("holdout target_source 与冻结 policy 不一致")
+        if forward_plan_id is not None or forward_prediction_count != 0:
+            raise ValueError("holdout 非冻结前向模式不得声称预测覆盖")
     minimum_sharpe = _finite_number(
         policy.get("minimum_sharpe"), "holdout policy.minimum_sharpe",
     )
@@ -407,7 +537,17 @@ def _validated_terminal_evidence(
         raise ValueError("holdout result 的 passed_families 不一致")
     if terminal.get("passed_families") != passed_families:
         raise ValueError("holdout verdict 的 passed_families 不一致")
-    return normalized_path, candidate_set_hash
+    return _TerminalEvidence(
+        manifest_path=normalized_path,
+        candidate_set_hash=candidate_set_hash,
+        config_hash=config_hash,
+        require_forward_predictions=require_forward_predictions,
+        forward_plan_id=forward_plan_id,
+        forward_prediction_count=forward_prediction_count,
+        score_start=score_start,
+        score_end=score_end,
+        score_bars=score_bars,
+    )
 
 
 def _validate_range(start_time: datetime, end_time: datetime) -> tuple[datetime, datetime]:
@@ -972,15 +1112,13 @@ def finalize_holdout_evaluation(
     normalized = verdict.strip()
     if not normalized or not result_manifest_path:
         raise ValueError("完成 holdout 必须绑定 verdict 与 manifest 身份")
-    normalized_manifest_path, manifest_candidate_set_hash = (
-        _validated_terminal_evidence(
-            repository_root,
-            vintage_id,
-            evaluation_id,
-            normalized,
-            result_manifest_path,
-            result_manifest_sha256,
-        )
+    evidence = _validated_terminal_evidence(
+        repository_root,
+        vintage_id,
+        evaluation_id,
+        normalized,
+        result_manifest_path,
+        result_manifest_sha256,
     )
     completed = _utc(completed_at or datetime.now(UTC))
     connection = _connect(registry_path)
@@ -1000,10 +1138,48 @@ def finalize_holdout_evaluation(
         if attempt["vintage_id"] != vintage_id:
             raise ValueError("holdout 评估尝试绑定了不同 vintage")
         if (
-            vintage["candidate_set_hash"] != manifest_candidate_set_hash
-            or attempt["candidate_set_hash"] != manifest_candidate_set_hash
+            vintage["candidate_set_hash"] != evidence.candidate_set_hash
+            or attempt["candidate_set_hash"] != evidence.candidate_set_hash
         ):
             raise ValueError("holdout manifest 的 candidate_set_hash 与注册表不匹配")
+        vintage_start = _parse_timestamp(str(vintage["start_time"]))
+        vintage_end = _parse_timestamp(str(vintage["end_time"]))
+        if evidence.score_start < vintage_start or evidence.score_end > vintage_end:
+            raise ValueError("holdout score 时间范围超出绑定 vintage")
+        plan = connection.execute(
+            "SELECT * FROM frozen_forward_plan WHERE vintage_id=?",
+            (vintage_id,),
+        ).fetchone()
+        if plan is not None:
+            if (
+                not evidence.require_forward_predictions
+                or plan["plan_id"] != evidence.forward_plan_id
+            ):
+                raise ValueError("holdout 冻结前向 plan 与注册表不一致")
+            if (
+                plan["candidate_set_hash"] != evidence.candidate_set_hash
+                or plan["config_hash"] != evidence.config_hash
+            ):
+                raise ValueError("holdout 冻结前向 plan 身份不匹配")
+            registered_predictions = int(connection.execute(
+                "SELECT COUNT(*) FROM frozen_forward_prediction WHERE plan_id=?",
+                (evidence.forward_plan_id,),
+            ).fetchone()[0])
+            covered_predictions = int(connection.execute(
+                "SELECT COUNT(*) FROM frozen_forward_prediction "
+                "WHERE plan_id=? AND decision_time>=? AND decision_time<=?",
+                (
+                    evidence.forward_plan_id,
+                    _timestamp(evidence.score_start),
+                    _timestamp(evidence.score_end),
+                ),
+            ).fetchone()[0])
+            if registered_predictions != evidence.forward_prediction_count:
+                raise ValueError("holdout 冻结预测数量与注册表不一致")
+            if covered_predictions != evidence.score_bars:
+                raise ValueError("holdout 冻结预测未完整覆盖评分区间")
+        elif evidence.require_forward_predictions:
+            raise ValueError("holdout 要求冻结前向预测但注册表没有 plan")
         if vintage["verdict"] is not None or attempt["status"] != "incomplete":
             raise ValueError("holdout 已经终结且不可改写")
         connection.execute(
@@ -1018,7 +1194,7 @@ def finalize_holdout_evaluation(
             (
                 _timestamp(completed),
                 _timestamp(completed),
-                normalized_manifest_path,
+                evidence.manifest_path,
                 result_manifest_sha256,
                 evaluation_id,
             ),
