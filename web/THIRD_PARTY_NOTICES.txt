@@ -1,0 +1,41 @@
+guvolu 前端第三方组件注记
+
+组件   lightweight-charts 5.2.0
+版权   Copyright 2023 TradingView, Inc.
+许可   Apache License, Version 2.0
+全文   http://www.apache.org/licenses/LICENSE-2.0
+源码   https://github.com/tradingview/lightweight-charts
+
+组件   lightweight-charts plugin-examples 的 stacked-area-series
+版权   Copyright 2023 TradingView, Inc.
+许可   Apache License, Version 2.0
+说明   移植入 src/plugins/stacked-area/，取色改经设计 token，注释中文化
+
+组件   @fontsource/noto-sans-sc 5.3.0（Noto Sans SC，weight 400 与 500）
+版权   Copyright 2014-2021 Adobe, Copyright The Noto Project Authors
+许可   SIL Open Font License 1.1
+全文   https://openfontlicense.org
+源码   https://github.com/fontsource/font-files
+说明   字体文件随构建产物本地打包，运行时不加载任何外部资源
+
+注记义务
+  Apache 2.0 第 4 条要求随分发保留 NOTICE 内容，归属注记由本文件承担。
+  设计语言第 3 节裁定界面零外部链接，故控制面不再展示厂商注记与
+  https://www.tradingview.com/ 链接；本文件随仓库与构建产物一同分发，
+  运行时不加载任何外部资源。
+
+许可要求的原始声明
+
+   Copyright 2023 TradingView, Inc.
+
+   Licensed under the Apache License, Version 2.0 (the "License");
+   you may not use this file except in compliance with the License.
+   You may obtain a copy of the License at
+
+       http://www.apache.org/licenses/LICENSE-2.0
+
+   Unless required by applicable law or agreed to in writing, software
+   distributed under the License is distributed on an "AS IS" BASIS,
+   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+   See the License for the specific language governing permissions and
+   limitations under the License.

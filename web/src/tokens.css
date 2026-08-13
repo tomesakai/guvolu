@@ -1,0 +1,182 @@
+/* 单一事实源：全部取值只在此定义 */
+:root {
+  /* 背景四层：整体底、面板、抬升面、输入框 */
+  --background-base: #07090c;
+  --background-panel: #0c1015;
+  --background-elevated: #121922;
+  --background-input: #0f161e;
+
+  /* 边框两级：默认分区线、焦点与激活 */
+  --border-default: #273442;
+  --border-focus: #7c91ad;
+
+  /* 文字四级 */
+  --text-primary: #e7edf4;
+  --text-secondary: #a7b2c0;
+  --text-muted: #738093;
+  --text-inverse: #07090c;
+
+  /* 语义色：颜色只表语义 */
+  --state-positive: #35ad78;
+  --state-negative: #d7636c;
+  --state-warning: #d5a33f;
+  --state-danger: #ef6b73;
+  --state-info: #6097ea;
+  --state-disabled: #44505e;
+  --state-editable: #d5a33f;
+
+  /* 语义色派生的透明档，供数据编码使用 */
+  --state-positive-soft: color-mix(in srgb, var(--state-positive) 12%, transparent);
+  --state-negative-soft: color-mix(in srgb, var(--state-negative) 12%, transparent);
+  --state-warning-soft: color-mix(in srgb, var(--state-warning) 10%, transparent);
+  --state-danger-soft: color-mix(in srgb, var(--state-danger) 10%, transparent);
+  --state-info-soft: color-mix(in srgb, var(--state-info) 12%, transparent);
+
+  /* 遮罩两档 */
+  --scrim-heavy: rgba(5, 6, 7, 0.75);
+  --scrim-light: rgba(5, 6, 7, 0.55);
+
+  /* 字体：拉丁走系统栈，中文统一落本地打包的开源 Noto */
+  --font-ui: "Segoe UI", "Noto Sans SC", sans-serif;
+  --font-mono: "Cascadia Mono", Consolas, "Noto Sans SC", monospace;
+
+  /* 字号八档 */
+  --fs-title: 18px;
+  --fs-command: 15px;
+  --fs-header: 15px;
+  --fs-base: 14px;
+  --fs-table: 13px;
+  --fs-micro: 12px;
+  --fs-nano: 11px;
+  --fs-badge: 10px;
+  --fs-formula: 9px;
+
+  /* 间距：全局唯一一套 */
+  --sp-micro: 2px;
+  --sp-tight: 5px;
+  --sp-normal: 10px;
+  --sp-panel: 14px;
+  --sp-modal: 20px;
+
+  /* 控件高度两档与表行档 */
+  --h-control: 26px;
+  --h-control-sm: 23px;
+  --h-row: 22px;
+  --h-ob-row: calc(var(--h-row) * 1.5);
+
+  /* 结构高度 */
+  --h-command-bar: 48px;
+  --h-statusbar: 28px;
+  --h-toolbar: 33px;
+  --h-market-summary: 80px;
+  --w-module-rail: 52px;
+  --panel-padding: 10px;
+
+  /* 面板下限与指标格 ch 下限 */
+  --w-panel-min: 256px;
+  --h-panel-min: 148px;
+  --w-metric-min: 15ch;
+
+  /* 语义列宽，等宽字体度量 */
+  --w-kv-label: 130px;
+  --w-kv-max: 44ch;
+  --w-col-id: 10ch;
+  --w-col-time: 15ch;
+  --w-command: 34ch;
+  --w-tooltip: 25ch;
+  --w-badge-slot: 12ch;
+  --w-status-drift: 8ch;
+
+  /* 盘口梯形：列 ch 定宽、失衡微条、缘强度计 */
+  --w-ob-price: 16ch;
+  --w-ob-size: 12ch;
+  --w-ob-notional: 14ch;
+  --w-ob-gauge: 9ch;
+  --w-ob-imbalance: 3ch;
+  --w-ob-meter: 4px;
+
+  /* 订单流抽屉恒宽 */
+  --w-drawer: 34ch;
+
+  /* 成交强度计半衰期，数据衰减参数 */
+  --t-meter-halflife: 6000ms;
+
+  /* 边框；圆角归零，token 位保留 */
+  --radius: 0;
+  --radius-modal: 0;
+  --bw-line: 1px;
+  --bw-accent: 2px;
+  --w-scrollbar: 8px;
+
+  /* 动效两档，另有单次闪烁时长 */
+  --motion-fast: 140ms;
+  --motion-pop: 100ms;
+  --motion-flash: 560ms;
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+
+  /* z-index 刻度 */
+  --z-sticky: 10;
+  --z-rail: 40;
+  --z-dropdown: 60;
+  --z-modal: 100;
+  --z-palette: 120;
+  --z-toast: 130;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  margin: 0;
+  background: var(--background-base);
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  font-size: var(--fs-base);
+  line-height: 1.35;
+  -webkit-font-smoothing: antialiased;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 焦点细环 */
+:focus-visible {
+  outline: var(--bw-line) solid var(--border-focus);
+  outline-offset: var(--bw-line);
+}
+
+/* 自绘滚动条 */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-default) var(--background-panel);
+}
+
+::-webkit-scrollbar {
+  width: var(--w-scrollbar);
+  height: var(--w-scrollbar);
+}
+
+::-webkit-scrollbar-track {
+  background: var(--background-panel);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--border-default);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition: none !important;
+    animation: none !important;
+  }
+}
