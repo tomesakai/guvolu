@@ -207,8 +207,10 @@ walk-forward 折；开发段已被反复
 组合研究分配为量价趋势 `0.180456`、趋势 `0.219544`、风险储备 `0.60`；突破当期家族目标
 为零，因此不占组合风险，研究聚合目标为 `0.40`。运行时 `feature_snapshot_stale` 门禁把
 全部权重清零并将储备提高到 `1.00`。本次 decision-grade manifest 为
-`research-run-1cbd4543444f90144df68577713e66db7172b5b3a937654f9c3d801ccf87769c`，
-SHA-256 为 `8d1187469491ddf6bc6e432529ce77b70d0e7b9e294028673b48396817a0d461`。
+`research-run-5fde0b697809dd290e02486b2e21f984bcc426e53ecf13040b95589927dd27dd`，
+SHA-256 为 `77c52f7c34426d021e853dd92992c0c0aef3992898b4dba429e8003bca14add7`；
+来源提交为 `a02fdfdfefcea04ff6b48cfd67ee09b56ba21a3d`，研究代码树散列为
+`c45b764ca372eae1e21dd9f86ceb8fc3d99406d02be161accccbe1d33358a4ba`。
 
 监视器只允许突破与趋势各扩展一个预登记边界轴到 264 小时。趋势派生候选把拼接 OOS
 Sharpe 从 0.772 提高到 0.866、PBO 从 0.320 降到 0.121；突破则把 Sharpe 从 1.114 降到
