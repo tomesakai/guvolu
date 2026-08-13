@@ -25,10 +25,17 @@ from guvolu.research.provenance import (
     stable_identifier,
 )
 from guvolu.research.validation import evaluate_targets, metrics_payload
+from guvolu.research.verification import verify_research_run
 from guvolu.strategy.baselines import generate_targets
 from guvolu.strategy.contracts import CandidateSpec
+from guvolu.strategy.expression import (
+    EXPRESSION_METHOD_VERSION,
+    candidate_identity,
+    expression_id,
+    strategy_expression,
+)
 
-HOLDOUT_METHOD_VERSION = "frozen-candidate-holdout-v1"
+HOLDOUT_METHOD_VERSION = "frozen-candidate-holdout-v2"
 SECONDS_PER_YEAR = 365.0 * 24.0 * 60.0 * 60.0
 _INTERVAL_SECONDS = {
     "5min": 300.0,
@@ -93,11 +100,39 @@ def _project_path(root: Path, value: Path, name: str) -> Path:
     return path
 
 
+def _verified_source_manifest(
+    root: Path,
+    summary_file: Path,
+) -> tuple[Mapping[str, object], Path]:
+    """完整复核来源 manifest，并证明调用方 summary 正是受保护制品。"""
+    manifest_file = summary_file.parent / "manifest.json"
+    verification = verify_research_run(root, manifest_file)
+    manifest = _load(manifest_file)
+    artifacts = _object(manifest.get("artifacts"), "manifest.artifacts")
+    summary_record = _object(artifacts.get("summary_json"), "summary_json")
+    protected_summary = _project_path(
+        root,
+        Path(_text(summary_record.get("path"), "summary_json.path")),
+        "manifest summary",
+    )
+    if protected_summary != summary_file:
+        raise ValueError("source summary 不是 manifest 保护的 summary_json")
+    if verification.run_id != manifest.get("run_id"):
+        raise ValueError("来源运行标识与 manifest 复核结果不一致")
+    return manifest, manifest_file
+
+
 def _candidate_set(
     root: Path,
     source_summary: Mapping[str, object],
+    source_manifest: Mapping[str, object],
 ) -> tuple[tuple[CandidateSpec, ...], Path]:
     """从已发布组合运行冻结 paper eligible 部署候选。"""
+    if source_summary.get("pipeline_method_version") != "strategy-research-pipeline-v9":
+        raise ValueError("holdout 只接受带表达式身份的 v9 来源运行")
+    for field in ("run_id", "research_identity", "config_hash"):
+        if source_summary.get(field) != source_manifest.get(field):
+            raise ValueError(f"source summary 与 manifest 的 {field} 不一致")
     if source_summary.get("decision_grade") is not True:
         raise ValueError("holdout 候选必须来自 decision_grade 组合运行")
     scope = source_summary.get("family_scope")
@@ -117,12 +152,42 @@ def _candidate_set(
         raise ValueError("组合运行没有可进入 holdout 的 paper eligible 候选")
     artifacts = _object(source_summary.get("artifacts"), "artifacts")
     registry_record = _object(artifacts.get("candidate_registry"), "candidate_registry")
+    manifest_artifacts = _object(
+        source_manifest.get("artifacts"),
+        "manifest.artifacts",
+    )
+    manifest_registry = _object(
+        manifest_artifacts.get("candidate_registry"),
+        "manifest.candidate_registry",
+    )
+    for field in ("path", "sha256", "bytes"):
+        if registry_record.get(field) != manifest_registry.get(field):
+            raise ValueError(
+                f"summary 与 manifest 的 candidate_registry.{field} 不一致"
+            )
     registry_path = _project_path(
         root,
         Path(_text(registry_record.get("path"), "registry.path")),
         "candidate registry",
     )
     registry = _load(registry_path)
+    expected_registry_hash = _text(
+        registry_record.get("sha256"),
+        "candidate_registry.sha256",
+    )
+    if sha256_file(registry_path) != expected_registry_hash:
+        raise ValueError("candidate registry 散列不匹配")
+    expected_registry_bytes = registry_record.get("bytes")
+    if (
+        not isinstance(expected_registry_bytes, int)
+        or isinstance(expected_registry_bytes, bool)
+        or registry_path.stat().st_size != expected_registry_bytes
+    ):
+        raise ValueError("candidate registry 字节数不匹配")
+    if registry.get("config_hash") != source_summary.get("config_hash"):
+        raise ValueError("candidate registry 与来源配置身份不一致")
+    if registry.get("expression_method_version") != EXPRESSION_METHOD_VERSION:
+        raise ValueError("candidate registry 缺少受支持的表达式方法身份")
     raw_candidates = registry.get("candidates")
     if not isinstance(raw_candidates, list):
         raise ValueError("candidate registry 缺少 candidates")
@@ -138,12 +203,23 @@ def _candidate_set(
             if not isinstance(value, (int, float)) or isinstance(value, bool):
                 raise ValueError(f"候选参数必须为数值: {name}")
             numeric_parameters[name] = value
+        family = _text(record.get("family"), "candidate.family")
+        candidate_expression_id = _text(
+            record.get("expression_id"),
+            "candidate.expression_id",
+        )
+        template = strategy_expression(family)
+        if candidate_expression_id != expression_id(template):
+            raise ValueError("冻结候选表达式身份与当前执行器不一致")
+        if candidate_id != candidate_identity(template, numeric_parameters):
+            raise ValueError("冻结候选身份未绑定表达式与完整参数")
         candidates.append(CandidateSpec(
             candidate_id=candidate_id,
-            family=_text(record.get("family"), "candidate.family"),
+            family=family,
             mode=_text(record.get("mode"), "candidate.mode"),
             parameters=numeric_parameters,
             complexity=_integer(record.get("complexity"), "candidate.complexity"),
+            expression_id=candidate_expression_id,
         ))
     if {candidate.candidate_id for candidate in candidates} != selected_ids:
         raise ValueError("部署候选与 candidate registry 不一致")
@@ -184,8 +260,19 @@ def run_holdout_validation(
     config_file = _project_path(repository, config_path, "holdout config")
     summary_file = _project_path(repository, source_summary_path, "source summary")
     config = _load(config_file)
+    config_hash = sha256_file(config_file)
+    source_manifest, source_manifest_path = _verified_source_manifest(
+        repository,
+        summary_file,
+    )
     source_summary = _load(summary_file)
-    candidates, candidate_registry_path = _candidate_set(repository, source_summary)
+    if source_summary.get("config_hash") != config_hash:
+        raise ValueError("holdout 配置与来源研究冻结配置不一致")
+    candidates, candidate_registry_path = _candidate_set(
+        repository,
+        source_summary,
+        source_manifest,
+    )
     market_id = _text(config.get("market_id"), "market_id")
     governance = _object(config.get("data_governance"), "data_governance")
     registry_path = _project_path(
@@ -204,8 +291,18 @@ def run_holdout_validation(
     identity = code_identity(repository, (config_file,))
     if not identity.decision_grade:
         raise ValueError("holdout 只允许 clean commit 的决策级代码")
+    source_code_identity = _object(
+        source_summary.get("code_identity"),
+        "source_summary.code_identity",
+    )
+    if (
+        source_code_identity.get("git_hash") != identity.git_hash
+        or source_code_identity.get("tree_digest") != identity.tree_digest
+    ):
+        raise ValueError("holdout 必须使用来源运行冻结的同一代码身份")
     candidate_set_hash = stable_identifier("candidate-set", {
         "holdout_method_version": HOLDOUT_METHOD_VERSION,
+        "source_manifest_sha256": sha256_file(source_manifest_path),
         "source_summary_sha256": sha256_file(summary_file),
         "candidate_registry_sha256": sha256_file(candidate_registry_path),
         "candidate_ids": [candidate.candidate_id for candidate in candidates],
@@ -215,7 +312,7 @@ def run_holdout_validation(
         "governance_method_version": GOVERNANCE_METHOD_VERSION,
         "vintage_id": vintage_id,
         "candidate_set_hash": candidate_set_hash,
-        "config_hash": sha256_file(config_file),
+        "config_hash": config_hash,
         "code_tree_digest": identity.tree_digest,
         "input_head_generation": inputs.head_generation,
         "input_artifact_ids": inputs.artifact_ids,

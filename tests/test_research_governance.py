@@ -1,6 +1,7 @@
 """研究数据暴露与一次性封存段治理测试。"""
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -15,6 +16,14 @@ from guvolu.research.governance import (
 )
 from guvolu.research.holdout import run_holdout_validation
 from guvolu.research.contracts import CodeIdentity, FrozenPanelInputs
+from guvolu.research.provenance import sha256_file
+from guvolu.research.verification import VerificationResult
+from guvolu.strategy.expression import (
+    EXPRESSION_METHOD_VERSION,
+    candidate_identity,
+    expression_id,
+    strategy_expression,
+)
 
 
 def _time(value: str) -> datetime:
@@ -171,26 +180,6 @@ def test_holdout_is_consumed_before_market_data_is_opened(
         _time("2027-02-01T00:00:00"),
         sealed_at=_time("2026-12-01T00:00:00"),
     )
-    candidate_id = "candidate-one"
-    candidate_registry = tmp_path / "reports" / "candidate-registry.json"
-    candidate_registry.parent.mkdir(parents=True)
-    candidate_registry.write_text(
-        '{"candidates":[{"candidate_id":"candidate-one",'
-        '"complexity":5,"family":"trend","mode":"paper",'
-        '"parameters":{"annual_volatility_target":0.4,"entry_score":0.5,'
-        '"exit_score":0.0,"lookback":168,"maximum_target":1.0}}]}',
-        encoding="utf-8",
-    )
-    summary = tmp_path / "reports" / "summary.json"
-    summary.write_text(
-        '{"decision_grade":true,"family_scope":["trend","breakout"],'
-        '"family_evaluations":[{"deployment_candidate_id":"'
-        + candidate_id
-        + '","eligible":true,"mode":"paper"}],'
-        '"artifacts":{"candidate_registry":{"path":'
-        '"reports/candidate-registry.json"}}}',
-        encoding="utf-8",
-    )
     config = tmp_path / "config.json"
     config.write_text(
         '{"market_id":"market-one","data_governance":{'
@@ -198,6 +187,82 @@ def test_holdout_is_consumed_before_market_data_is_opened(
         '"bar_interval":"1hour","from_time":"2020-01-01T00:00:00+00:00",'
         '"notional_scale":100000000}',
         encoding="utf-8",
+    )
+    config_hash = sha256_file(config)
+    template = strategy_expression("trend")
+    parameters: dict[str, int | float] = {
+        "annual_volatility_target": 0.4,
+        "entry_score": 0.5,
+        "exit_score": 0.0,
+        "lookback": 168,
+        "maximum_target": 1.0,
+    }
+    candidate_id = candidate_identity(template, parameters)
+    candidate_registry = tmp_path / "reports" / "candidate-registry.json"
+    candidate_registry.parent.mkdir(parents=True)
+    registry_text = json.dumps({
+        "config_hash": config_hash,
+        "expression_method_version": EXPRESSION_METHOD_VERSION,
+        "candidates": [{
+            "candidate_id": candidate_id,
+            "complexity": 5,
+            "expression_id": expression_id(template),
+            "family": "trend",
+            "mode": "paper",
+            "parameters": parameters,
+        }],
+    }, sort_keys=True, separators=(",", ":"))
+    candidate_registry.write_text(
+        registry_text,
+        encoding="utf-8",
+    )
+    registry_record = {
+        "path": "reports/candidate-registry.json",
+        "sha256": sha256_file(candidate_registry),
+        "bytes": candidate_registry.stat().st_size,
+    }
+    summary = tmp_path / "reports" / "summary.json"
+    summary.write_text(json.dumps({
+        "pipeline_method_version": "strategy-research-pipeline-v9",
+        "run_id": "run-one",
+        "research_identity": "research-one",
+        "config_hash": config_hash,
+        "decision_grade": True,
+        "code_identity": {"git_hash": "commit-one", "tree_digest": "tree-one"},
+        "family_scope": ["trend", "breakout"],
+        "family_evaluations": [{
+            "deployment_candidate_id": candidate_id,
+            "eligible": True,
+            "mode": "paper",
+        }],
+        "artifacts": {"candidate_registry": registry_record},
+    }, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    manifest = tmp_path / "reports" / "manifest.json"
+    manifest.write_text(json.dumps({
+        "run_id": "run-one",
+        "research_identity": "research-one",
+        "config_hash": config_hash,
+        "artifacts": {
+            "candidate_registry": registry_record,
+            "summary_json": {
+                "path": "reports/summary.json",
+                "sha256": sha256_file(summary),
+                "bytes": summary.stat().st_size,
+            },
+        },
+    }, sort_keys=True, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "guvolu.research.holdout.verify_research_run",
+        lambda _root, _manifest: VerificationResult(
+            run_id="run-one",
+            manifest_path=manifest,
+            manifest_sha256=sha256_file(manifest),
+            checked_artifacts=("candidate_registry", "summary_json"),
+        ),
     )
     monkeypatch.setattr(
         "guvolu.research.holdout.freeze_trade_inputs",
@@ -222,6 +287,17 @@ def test_holdout_is_consumed_before_market_data_is_opened(
             reason=None,
         ),
     )
+
+    candidate_registry.write_text(registry_text + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="candidate registry (散列|字节数)"):
+        run_holdout_validation(
+            tmp_path,
+            config,
+            summary,
+            vintage.vintage_id,
+        )
+    assert list_holdout_vintages(registry_path)[0].status == "sealed"
+    candidate_registry.write_text(registry_text, encoding="utf-8")
 
     def fail_after_consumption(*_args: object, **_kwargs: object) -> object:
         raise RuntimeError("simulated panel failure")
