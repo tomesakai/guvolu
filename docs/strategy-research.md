@@ -160,10 +160,12 @@ paper 分配遵守以下长期边界：趋势、量价确认趋势和突破合�
 | 活动指针 | `reports/strategy-research/latest.json` | 原子更新的最近完成运行位置 |
 
 `research_identity` 绑定输入 head、attempt、artifact、配置散列、研究源码、脚本、测试树、
-流派范围和全部候选身份；相同内容重复执行只计一个演进历史。`run_id` 是带
-`execution_evaluated_at` 的运行实例身份，允许同一研究内容产生多个运营快照，但不增加独立
-研究证据。有 Git commit 时另记 Git hash 和 dirty digest；仓库没有首个 commit 时仍可复现文件内容，
-但 `decision_grade=false`，目标不得进入决策级使用（D-09）。
+流派范围和全部候选身份；相同内容重复执行只形成一个研究身份。`run_id` 是带
+`execution_evaluated_at` 的运行实例身份，允许同一研究内容产生多个运营快照。两者都不直接
+代表独立时间证据：演进监视器另以市场和冻结面板散列生成 `data_vintage_id`，并要求相邻历史
+至少间隔一个 `walk_forward.step_bars`。有 Git commit 时另记 Git hash 和 dirty digest；仓库
+没有首个 commit 时仍可复现文件内容，但 `decision_grade=false`，目标不得进入决策级使用
+（D-09）。
 
 ## 7. 当前策略生成方式
 
@@ -183,8 +185,10 @@ walk-forward 折；开发段已被反复
 
 同一实现支持组合运行与单流派运行。单流派 `research_identity` 绑定 `family_scope`、生成器版本和候选
 身份，输出独立的候选注册表、试验台账、目标仓位与活动指针。监视器只读取完整候选网格的
-聚合样本外事实：对每个数值轴给出关联方向，并跨运行标记 improving、stable 或 decaying。
-自动提案最多扩展一个已配置边界轴，同时同步特征依赖、候选预算和 parent config hash；
+聚合样本外事实：对每个数值轴给出关联方向，并只在至少三个时间分离的数据 vintage 上标记
+improving、stable 或 decaying。重复面板、未早于当前决策时点和不足一个 walk-forward step 的
+累计样本写入 `excluded_history`，不得凑足历史门槛。自动提案最多扩展一个已配置边界轴，同时
+同步特征依赖、候选预算和 parent config hash；
 均值回归等在成本后净收益为负的流派返回“修订假设或成本模型”，不继续盲目扩大参数网格。
 
 单流派运行的 FDR 只回答该流派内部的试验范围，不能直接作为多流派组合 promotion 证据。
@@ -215,8 +219,10 @@ SHA-256 为 `77c52f7c34426d021e853dd92992c0c0aef3992898b4dba429e8003bca14add7`�
 监视器只允许突破与趋势各扩展一个预登记边界轴到 264 小时。趋势派生候选把拼接 OOS
 Sharpe 从 0.772 提高到 0.866、PBO 从 0.320 降到 0.121；突破则把 Sharpe 从 1.114 降到
 1.081、PBO 从 0.066 升到 0.188。两者部署冠军都仍是原 168 小时候选，因此这些结果只进入
-adaptive 历史，不自动改写基准配置。每个流派当前只有两个独立研究身份，低于三个历史运行
-的方向判定门槛，跨运行状态诚实保持 `insufficient_history`。
+adaptive 比较，不自动改写基准配置。`family-direction-monitor-v2` 用当前运行回放四个既有
+summary 后，五个流派均没有可计入的时间历史：每个流派排除两个重复面板 vintage，并排除
+两个没有早于当前策略决策时点的累计面板。当前数据只能支持参数轴诊断，不能支持跨时期
+稳定、改善或衰减结论，因此跨运行状态保持 `insufficient_history`。
 
 ## 8. 下一版 CPU 生成方式
 
