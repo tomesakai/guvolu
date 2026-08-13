@@ -112,6 +112,18 @@ class _TerminalEvidence:
     score_decision_times: tuple[datetime, ...]
 
 
+@dataclass(frozen=True)
+class _ForwardPlanEvidence:
+    """现场复核后的冻结候选与资金权重合同。"""
+
+    path: Path
+    normalized_path: str
+    candidate_ids: tuple[str, ...]
+    candidate_families: tuple[tuple[str, str], ...]
+    weights: tuple[tuple[str, float], ...]
+    reserve: float
+
+
 def _utc(value: datetime) -> datetime:
     """把时间统一为有时区的 UTC。"""
     if value.tzinfo is None:
@@ -203,7 +215,7 @@ def _validated_forward_plan_artifact(
     code_tree_digest: str,
     artifact_path: str,
     artifact_sha256: str,
-) -> tuple[Path, str]:
+) -> _ForwardPlanEvidence:
     """现场复核冻结前向计划制品与注册身份。"""
     if not _canonical_sha256(artifact_sha256):
         raise ValueError("冻结前向计划 SHA-256 无效")
@@ -235,7 +247,70 @@ def _validated_forward_plan_artifact(
         or source.get("manifest_sha256") != source_manifest_sha256
     ):
         raise ValueError("冻结前向计划来源 manifest 与注册身份不一致")
-    return path, normalized
+    raw_candidates = payload.get("candidates")
+    if not isinstance(raw_candidates, list) or not raw_candidates:
+        raise ValueError("冻结前向计划缺少 candidates")
+    candidate_families: list[tuple[str, str]] = []
+    for raw in raw_candidates:
+        if not isinstance(raw, dict):
+            raise ValueError("冻结前向计划 candidate 合同无效")
+        candidate = {str(key): item for key, item in raw.items()}
+        candidate_id = candidate.get("candidate_id")
+        family = candidate.get("family")
+        mode = candidate.get("mode")
+        expression_id = candidate.get("expression_id")
+        parameters = candidate.get("parameters")
+        complexity = candidate.get("complexity")
+        if (
+            not isinstance(candidate_id, str) or not candidate_id
+            or not isinstance(family, str) or not family
+            or not isinstance(mode, str) or not mode
+            or not isinstance(expression_id, str) or not expression_id
+            or not isinstance(parameters, dict)
+            or not isinstance(complexity, int) or isinstance(complexity, bool)
+            or complexity <= 0
+        ):
+            raise ValueError("冻结前向计划 candidate 合同无效")
+        if any(
+            not isinstance(value, (int, float)) or isinstance(value, bool)
+            or not math.isfinite(float(value))
+            for value in parameters.values()
+        ):
+            raise ValueError("冻结前向计划 candidate 参数无效")
+        candidate_families.append((candidate_id, family))
+    candidate_ids = tuple(item[0] for item in candidate_families)
+    families = tuple(item[1] for item in candidate_families)
+    if (
+        candidate_ids != tuple(sorted(candidate_ids))
+        or len(set(candidate_ids)) != len(candidate_ids)
+        or len(set(families)) != len(families)
+    ):
+        raise ValueError("冻结前向计划候选必须有序且 candidate/family 唯一")
+    allocation = payload.get("allocation")
+    if not isinstance(allocation, dict) or not isinstance(allocation.get("weights"), dict):
+        raise ValueError("冻结前向计划缺少 allocation")
+    weights_value = allocation["weights"]
+    weights: dict[str, float] = {}
+    for family, value in weights_value.items():
+        if not isinstance(family, str):
+            raise ValueError("冻结前向计划权重流派无效")
+        weight = _finite_number(value, f"frozen allocation.{family}")
+        if weight < 0.0:
+            raise ValueError("冻结前向计划权重不得为负")
+        weights[family] = weight
+    if set(weights) != set(families):
+        raise ValueError("冻结前向计划权重未覆盖候选流派")
+    reserve = _finite_number(allocation.get("reserve"), "frozen allocation.reserve")
+    if reserve < 0.0 or sum(weights.values()) + reserve > 1.0 + 1e-9:
+        raise ValueError("冻结前向计划资金权重与 reserve 合同不成立")
+    return _ForwardPlanEvidence(
+        path=path,
+        normalized_path=normalized,
+        candidate_ids=candidate_ids,
+        candidate_families=tuple(candidate_families),
+        weights=tuple(sorted(weights.items())),
+        reserve=reserve,
+    )
 
 
 def _validated_forward_prediction_artifact(
@@ -248,6 +323,7 @@ def _validated_forward_prediction_artifact(
     panel_sha256: str,
     config_hash: str,
     code_tree_digest: str,
+    plan_evidence: _ForwardPlanEvidence,
     artifact_path: str,
     artifact_sha256: str,
 ) -> tuple[Path, str]:
@@ -278,6 +354,76 @@ def _validated_forward_prediction_artifact(
     code = payload.get("code_identity")
     if not isinstance(code, dict) or code.get("tree_digest") != code_tree_digest:
         raise ValueError("冻结前向预测代码树与计划不一致")
+    quality = payload.get("quality")
+    quality_fields = ("integrity", "freshness", "clock", "coverage", "pit", "lineage")
+    if not isinstance(quality, dict) or any(
+        not isinstance(quality.get(field), bool) for field in quality_fields
+    ):
+        raise ValueError("冻结前向预测 quality 合同无效")
+    eligible = quality.get("eligible")
+    if eligible is not all(bool(quality[field]) for field in quality_fields):
+        raise ValueError("冻结前向预测 quality.eligible 推导不一致")
+    reasons = quality.get("reasons")
+    if not isinstance(reasons, list) or any(not isinstance(item, str) for item in reasons):
+        raise ValueError("冻结前向预测 quality.reasons 合同无效")
+    raw_families = payload.get("families")
+    if not isinstance(raw_families, list):
+        raise ValueError("冻结前向预测缺少 families")
+    expected_candidates = dict(plan_evidence.candidate_families)
+    expected_weights = dict(plan_evidence.weights)
+    seen: set[str] = set()
+    contribution_total = 0.0
+    for raw in raw_families:
+        if not isinstance(raw, dict):
+            raise ValueError("冻结前向预测 family 合同无效")
+        record = {str(key): item for key, item in raw.items()}
+        candidate_id = record.get("candidate_id")
+        family = record.get("family")
+        if (
+            not isinstance(candidate_id, str)
+            or candidate_id in seen
+            or not isinstance(family, str)
+            or expected_candidates.get(candidate_id) != family
+        ):
+            raise ValueError("冻结前向预测 candidate/family 与计划不一致")
+        seen.add(candidate_id)
+        weight = _finite_number(
+            record.get("frozen_allocation_weight"), "frozen prediction weight",
+        )
+        if not math.isclose(
+            weight, expected_weights[family], rel_tol=1e-12, abs_tol=1e-12,
+        ):
+            raise ValueError("冻结前向预测使用了计划外资金权重")
+        target = _finite_number(record.get("family_target"), "frozen family target")
+        contribution = _finite_number(
+            record.get("portfolio_target_contribution"), "frozen contribution",
+        )
+        if not math.isclose(
+            contribution, target * weight, rel_tol=1e-12, abs_tol=1e-12,
+        ):
+            raise ValueError("冻结前向预测流派贡献计算不一致")
+        if eligible is False and (
+            not math.isclose(target, 0.0, abs_tol=1e-12)
+            or not math.isclose(contribution, 0.0, abs_tol=1e-12)
+        ):
+            raise ValueError("冻结前向预测质量失败但存在非零目标")
+        contribution_total += contribution
+    if seen != set(plan_evidence.candidate_ids):
+        raise ValueError("冻结前向预测未覆盖计划候选全集")
+    reserve = _finite_number(payload.get("reserve"), "frozen prediction reserve")
+    if not math.isclose(
+        reserve, plan_evidence.reserve, rel_tol=1e-12, abs_tol=1e-12,
+    ):
+        raise ValueError("冻结前向预测 reserve 与计划不一致")
+    aggregate = _finite_number(payload.get("aggregate_target"), "aggregate_target")
+    if not math.isclose(
+        aggregate, contribution_total, rel_tol=1e-12, abs_tol=1e-12,
+    ):
+        raise ValueError("冻结前向预测组合目标聚合不一致")
+    if eligible is False and not math.isclose(aggregate, 0.0, abs_tol=1e-12):
+        raise ValueError("冻结前向预测质量失败但组合目标非零")
+    if payload.get("unit") != "risk_weighted_directional_target":
+        raise ValueError("冻结前向预测 unit 不受支持")
     return path, normalized
 
 
@@ -1284,7 +1430,7 @@ def finalize_holdout_evaluation(
                 or plan["config_hash"] != evidence.config_hash
             ):
                 raise ValueError("holdout 冻结前向 plan 身份不匹配")
-            _validated_forward_plan_artifact(
+            plan_evidence = _validated_forward_plan_artifact(
                 repository_root,
                 str(plan["plan_id"]),
                 vintage_id,
@@ -1316,6 +1462,7 @@ def finalize_holdout_evaluation(
                     str(prediction["panel_sha256"]),
                     evidence.config_hash,
                     str(plan["code_tree_digest"]),
+                    plan_evidence,
                     str(prediction["prediction_artifact_path"]),
                     str(prediction["prediction_artifact_sha256"]),
                 )
@@ -1460,7 +1607,7 @@ def register_frozen_forward_plan(
         "config_hash": config_hash,
         "code_tree_digest": code_tree_digest,
     })
-    _, normalized_artifact_path = _validated_forward_plan_artifact(
+    plan_evidence = _validated_forward_plan_artifact(
         repository_root,
         plan_id,
         vintage_id,
@@ -1476,7 +1623,7 @@ def register_frozen_forward_plan(
         candidate_set_hash,
         config_hash,
         code_tree_digest,
-        normalized_artifact_path,
+        plan_evidence.normalized_path,
         plan_artifact_sha256,
     )
     connection = _connect(registry_path)
@@ -1570,6 +1717,17 @@ def register_frozen_forward_prediction(
         end = _parse_timestamp(str(vintage["end_time"]))
         if not start <= decision < end:
             raise ValueError("预测决策时间不在绑定 vintage 内")
+        plan_evidence = _validated_forward_plan_artifact(
+            repository_root,
+            str(plan["plan_id"]),
+            vintage_id,
+            str(plan["source_manifest_sha256"]),
+            str(plan["candidate_set_hash"]),
+            str(plan["config_hash"]),
+            str(plan["code_tree_digest"]),
+            str(plan["plan_artifact_path"]),
+            str(plan["plan_artifact_sha256"]),
+        )
         prediction_id = stable_identifier("frozen-forward-prediction", {
             "governance_method_version": GOVERNANCE_METHOD_VERSION,
             "plan_id": plan_id,
@@ -1585,6 +1743,7 @@ def register_frozen_forward_prediction(
             panel_sha256,
             str(plan["config_hash"]),
             str(plan["code_tree_digest"]),
+            plan_evidence,
             prediction_artifact_path,
             prediction_artifact_sha256,
         )

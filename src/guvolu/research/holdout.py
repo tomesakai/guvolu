@@ -284,6 +284,23 @@ def _vintage_payload(value: HoldoutVintage) -> Mapping[str, object]:
     }
 
 
+def _score_decision_times(
+    bars: Sequence[object],
+    start: int,
+    end: int,
+) -> tuple[datetime, ...]:
+    """返回与 evaluate_targets 前一柱持仓索引完全相同的决策时点。"""
+    decisions: list[datetime] = []
+    for index in range(start, end):
+        decision_time = getattr(bars[index - 1], "decision_time", None)
+        if not isinstance(decision_time, datetime):
+            raise ValueError("评分柱缺少 decision_time")
+        decisions.append(decision_time)
+    if not decisions:
+        raise ValueError("评分时点表不得为空")
+    return tuple(decisions)
+
+
 def run_holdout_validation(
     root: Path,
     config_path: Path,
@@ -526,10 +543,8 @@ def run_holdout_validation(
             "rejection_reasons": reasons,
         })
     verdict = "passed" if len(passed_families) == len(candidates) else "failed"
-    score_schedule = [
-        panel.bars[index - 1].decision_time.isoformat()
-        for index in range(start, end)
-    ]
+    score_decision_times = _score_decision_times(panel.bars, start, end)
+    score_schedule = [value.isoformat() for value in score_decision_times]
     schedule_path = run_directory / "score-schedule.json"
     atomic_write_text(schedule_path, canonical_json({
         "schema_version": HOLDOUT_MANIFEST_SCHEMA_VERSION,
@@ -555,8 +570,8 @@ def run_holdout_validation(
         "code_identity": asdict(identity),
         "panel_sha256": panel.panel_sha256,
         "score_schedule_sha256": schedule_sha256,
-        "score_start": panel.bars[start - 1].decision_time.isoformat(),
-        "score_end": panel.bars[end - 1].decision_time.isoformat(),
+        "score_start": score_schedule[0],
+        "score_end": score_schedule[-1],
         "score_bars": end - start,
         "policy": dict(policy),
         "candidate_results": candidate_results,

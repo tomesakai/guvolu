@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import UTC, datetime
+from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -22,7 +23,7 @@ from guvolu.research.governance import (
     seal_holdout_vintage,
     start_holdout_evaluation_attempt,
 )
-from guvolu.research.holdout import run_holdout_validation
+from guvolu.research.holdout import _score_decision_times, run_holdout_validation
 from guvolu.research.contracts import (
     FROZEN_FORWARD_METHOD_VERSION,
     FROZEN_FORWARD_SCHEMA_VERSION,
@@ -41,9 +42,25 @@ from guvolu.strategy.expression import (
 )
 
 
+@dataclass(frozen=True)
+class _DecisionBar:
+    decision_time: datetime
+
+
 def _time(value: str) -> datetime:
     """构造测试 UTC 时间。"""
     return datetime.fromisoformat(value).replace(tzinfo=UTC)
+
+
+def test_score_schedule_uses_the_same_previous_bar_indices_as_returns() -> None:
+    """多柱评分时点边界必须来自 index-1，不得把标签结束柱混入 schedule。"""
+    bars = tuple(
+        _DecisionBar(_time(f"2027-01-01T0{hour}:00:00"))
+        for hour in range(5)
+    )
+    decisions = _score_decision_times(bars, 1, 5)
+    assert decisions == tuple(bar.decision_time for bar in bars[:4])
+    assert decisions[-1] != bars[4].decision_time
 
 
 def _test_candidate_set(candidate_ids: list[str]) -> tuple[dict[str, object], str]:
@@ -121,6 +138,15 @@ def _write_forward_plan_artifact(
         "candidate_set_hash": candidate_set_hash,
         "config_hash": config_hash,
         "code_tree_digest": code_tree_digest,
+        "candidates": [{
+            "candidate_id": "candidate-one",
+            "family": "trend",
+            "mode": "paper",
+            "expression_id": "expression-one",
+            "parameters": {"lookback": 1},
+            "complexity": 1,
+        }],
+        "allocation": {"weights": {"trend": 0.4}, "reserve": 0.6},
     }, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
     return plan_id, path.relative_to(root).as_posix(), sha256_file(path)
 
@@ -141,7 +167,8 @@ def _write_forward_prediction_artifact(
         "plan_id": plan_id,
         "decision_time": decision_time.isoformat(),
     })
-    path = root / "reports" / plan_id / "predictions" / "prediction.json"
+    stamp = decision_time.strftime("%Y%m%dT%H%M%SZ")
+    path = root / "reports" / plan_id / "predictions" / f"{stamp}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({
         "schema_version": FROZEN_FORWARD_SCHEMA_VERSION,
@@ -155,6 +182,26 @@ def _write_forward_prediction_artifact(
         "panel_sha256": panel_sha256,
         "config_hash": config_hash,
         "code_identity": {"tree_digest": code_tree_digest},
+        "quality": {
+            "integrity": True,
+            "freshness": True,
+            "clock": True,
+            "coverage": True,
+            "pit": True,
+            "lineage": True,
+            "eligible": True,
+            "reasons": [],
+        },
+        "families": [{
+            "candidate_id": "candidate-one",
+            "family": "trend",
+            "family_target": 0.5,
+            "frozen_allocation_weight": 0.4,
+            "portfolio_target_contribution": 0.2,
+        }],
+        "reserve": 0.6,
+        "aggregate_target": 0.2,
+        "unit": "risk_weighted_directional_target",
     }, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
     return path.relative_to(root).as_posix(), sha256_file(path)
 
@@ -167,6 +214,7 @@ def _write_holdout_evidence(
     verdict: str,
     score_start: datetime,
     *,
+    score_decision_times: tuple[datetime, ...] | None = None,
     forward_plan_id: str | None = None,
     forward_prediction_count: int = 0,
 ) -> tuple[str, str, str]:
@@ -177,12 +225,13 @@ def _write_holdout_evidence(
     panel_path = run_directory / "panel.parquet"
     panel_path.write_bytes(b"PAR1holdout-test-panelPAR1")
     panel_sha256 = sha256_file(panel_path)
+    decisions = score_decision_times or (score_start,)
     schedule_path = run_directory / "score-schedule.json"
     schedule_path.write_text(json.dumps({
         "schema_version": HOLDOUT_MANIFEST_SCHEMA_VERSION,
         "holdout_method_version": HOLDOUT_METHOD_VERSION,
         "evaluation_id": evaluation_id,
-        "decision_times": [score_start.isoformat()],
+        "decision_times": [value.isoformat() for value in decisions],
     }, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
     schedule_sha256 = sha256_file(schedule_path)
     raw_candidate_ids = candidate_set_identity["candidate_ids"]
@@ -230,8 +279,8 @@ def _write_holdout_evidence(
             "rejection_reasons": rejection_reasons,
         }],
         "score_start": score_start.isoformat(),
-        "score_end": score_start.isoformat(),
-        "score_bars": 1,
+        "score_end": decisions[-1].isoformat(),
+        "score_bars": len(decisions),
         "target_source": (
             "recorded_frozen_forward"
             if require_forward else "end_of_vintage_recompute"
@@ -833,6 +882,29 @@ def test_forward_required_finalize_matches_registered_prediction_coverage(
         repository_root=tmp_path,
         recorded_at=_time("2027-01-01T00:01:00"),
     )
+    second_decision = vintage.start_time + timedelta(hours=1)
+    second_path, second_sha256 = _write_forward_prediction_artifact(
+        tmp_path,
+        plan.plan_id,
+        vintage.vintage_id,
+        second_decision,
+        "head-two",
+        "panel-two",
+        config_hash,
+        "tree-one",
+    )
+    register_frozen_forward_prediction(
+        registry,
+        plan.plan_id,
+        second_decision,
+        "head-two",
+        "panel-two",
+        second_path,
+        second_sha256,
+        3900,
+        repository_root=tmp_path,
+        recorded_at=second_decision + timedelta(minutes=1),
+    )
     start_holdout_evaluation_attempt(
         registry,
         vintage.vintage_id,
@@ -847,8 +919,33 @@ def test_forward_required_finalize_matches_registered_prediction_coverage(
         candidate_set_identity,
         "passed",
         vintage.start_time,
+        score_decision_times=(
+            vintage.start_time,
+            vintage.start_time + timedelta(hours=2),
+        ),
         forward_plan_id=plan.plan_id,
-        forward_prediction_count=1,
+        forward_prediction_count=2,
+    )
+    with pytest.raises(ValueError, match="时点未逐柱匹配"):
+        finalize_holdout_evaluation(
+            registry,
+            vintage.vintage_id,
+            evaluation_id,
+            terminal,
+            manifest_path,
+            manifest_sha256,
+            repository_root=tmp_path,
+        )
+    terminal, manifest_path, manifest_sha256 = _write_holdout_evidence(
+        tmp_path,
+        vintage.vintage_id,
+        evaluation_identity,
+        candidate_set_identity,
+        "passed",
+        vintage.start_time,
+        score_decision_times=(vintage.start_time, second_decision),
+        forward_plan_id=plan.plan_id,
+        forward_prediction_count=2,
     )
     finalized, attempt = finalize_holdout_evaluation(
         registry,
