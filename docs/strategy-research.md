@@ -118,27 +118,42 @@ paper 分配遵守以下长期边界：趋势、量价确认趋势和突破合�
 派生配置是新制品，不覆盖基准配置。使用派生配置再次运行时仍属于开发回放；只有明确登记的
 一次性封存段才允许形成最终 promotion 证据（G-08）。
 
-`cpu-v8` 把这条纪律落实为 SQLite 原子状态机。普通管线在打开面板前登记
+治理 schema v2 把这条纪律落实为 SQLite 原子状态机。普通管线在打开面板前登记
 `DEV_ADAPTIVE` 暴露区间；封存段必须在区间开始前创建，且不得与任何历史暴露或其他 vintage
-重叠。专用 holdout runner 先把 vintage 永久改为 `consumed`，然后才打开市场数据；即使进程
-崩溃也不能重跑。候选必须来自 clean commit 的多流派组合运行，候选集、源码、配置、输入 head
-和结果散列全部绑定。结论只能登记一次且不能改写：
+重叠。区间开始前还必须建立唯一 `FROZEN_FORWARD` 计划，冻结来源 manifest、候选公式、参数、
+资金权重、风险余量、配置和代码树。区间内每根新决策柱只允许按该计划追加一个内容寻址预测；
+预测必须在配置的 3,900 秒窗口内产生，同一时点不能改写，质量或代码身份失败时目标必须为零。
+该路径不运行候选选择、验证指标或演进监视器，也不登记为 `DEV_ADAPTIVE`。
+
+专用 holdout runner 在期末先复核前向计划与全部预测，再把 vintage 永久改为 `consumed`，然后才
+打开市场标签。生产配置要求评价当时记录的逐候选目标，禁止在看到完整 vintage 后重新生成目标；
+预测覆盖不足也会烧毁 vintage，而不能补算后重试。候选必须来自 clean commit 的多流派组合运行，
+候选集、源码、配置、输入 head 和结果散列全部绑定。结论只能登记一次且不能改写：
 
 ```powershell
 # 示例时间必须是尚未开始的未来区间；不可对既有历史事后封存。
 .\.venv\Scripts\python.exe scripts\manage_holdout_vintage.py seal `
   mkt__gmo__btc__r0 2026-10-01T00:00:00Z 2027-01-01T00:00:00Z
 
-# 等到封存区间完整到达后，冻结候选并只运行一次。
+# 区间开始前冻结计划。source summary 必须来自同一 clean code tree。
+.\.venv\Scripts\python.exe scripts\manage_frozen_forward.py plan <vintage_id> `
+  <clean-combined-summary.json>
+
+# 区间内每个新决策柱调用一次；重复调用同一柱是幂等的。
+.\.venv\Scripts\python.exe scripts\manage_frozen_forward.py predict <plan_id>
+.\.venv\Scripts\python.exe scripts\manage_frozen_forward.py verify <plan_id>
+
+# 区间完整到达后只消费一次，并评价已登记预测。
 .\.venv\Scripts\python.exe scripts\run_holdout_validation.py <vintage_id> `
   --source-summary <clean-combined-summary.json>
 
 .\.venv\Scripts\python.exe scripts\manage_holdout_vintage.py list
 ```
 
-当前 2019 年以来的数据已进入 adaptive 开发历史，不能倒签为 holdout。因而状态机与专用
-评估路径已经可用，但现有策略仍没有 G-08 通过结论；必须等待一个事先封存的新数据段，这一
-时间约束不能由代码、回填或重复回测绕过。
+当前 2019 年以来的数据已进入 adaptive 开发历史，不能倒签为 holdout。评估路径与冻结前向
+路径已经可用，但现有策略仍没有 G-08 通过结论；必须先产生与当前代码树一致的新组合运行，
+再由负责人选择未来区间，依次 seal、plan、逐柱 predict 和期末 consume。这一时间约束不能由
+代码、回填或重复回测绕过。
 
 只读复核最近一次发布运行：
 
@@ -171,6 +186,8 @@ readiness 命令不创建、不消费 vintage，也不登记自适应研究暴�
 | target position | 同上 | 研究回放与运行快照目标位置 |
 | manifest | `reports/strategy-research/<run_id>/manifest.json` | 代码、配置、输入和输出散列 |
 | 活动指针 | `reports/strategy-research/latest.json` | 原子更新的最近完成运行位置 |
+| 冻结前向计划 | `reports/strategy-research/frozen-forward/<vintage_id>/` | 固定候选、公式、权重和来源 |
+| 冻结前向预测 | 同上 `predictions/` | 逐决策时点不可改写的候选与组合目标 |
 
 `research_identity` 绑定输入 head、attempt、artifact、配置散列、研究源码、脚本、测试树、
 流派范围和全部候选身份；相同内容重复执行只形成一个研究身份。`run_id` 是带
@@ -369,10 +386,13 @@ flowchart TB
     contract --> quality{"实时质量与代码身份"}
     quality -- "失败" --> flat["aggregate target = 0<br/>100% reserve"]
     quality -- "通过" --> paper["paper target artifact<br/>冻结多流派部署候选"]
-    paper --> sourceVerify["来源 manifest / config / code / AST<br/>消费前完整散列复核"]
+    paper --> sourceVerify["来源 manifest / config / code / AST<br/>完整散列复核"]
     sourceVerify --> sealed["未来 vintage 预先封存<br/>不得与 adaptive exposure 重叠"]
-    sealed --> consume["原子 consumed<br/>崩溃也禁止重跑"]
-    consume --> holdout["Holdout ValidationExact<br/>固定候选 / 固定政策 / 不重新选择"]
+    sealed --> frozenPlan["开始前冻结计划<br/>候选 / 公式 / 参数 / 资金权重"]
+    frozenPlan --> forward["区间内逐柱冻结前向预测<br/>及时追加 / 不可改写 / 不反馈演进"]
+    forward --> verifyForward["期末复核预测覆盖与散列<br/>禁止事后重算目标"]
+    verifyForward --> consume["原子 consumed<br/>崩溃也禁止重跑"]
+    consume --> holdout["Holdout ValidationExact<br/>评价已记录目标 / 固定政策"]
     holdout --> promotion["一次性 verdict<br/>人工 promotion"]
 ```
 
