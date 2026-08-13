@@ -5,9 +5,17 @@ import json
 import statistics
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
+from datetime import datetime
 from pathlib import Path
 
-from guvolu.research.provenance import sha256_file
+from guvolu.research.provenance import sha256_file, stable_identifier
+
+_INTERVAL_SECONDS = {
+    "5min": 300.0,
+    "15min": 900.0,
+    "1hour": 3600.0,
+    "4hour": 14_400.0,
+}
 
 
 def _object(value: object, name: str) -> Mapping[str, object]:
@@ -29,6 +37,54 @@ def _integer(value: object, name: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
         raise ValueError(f"{name} 必须为正整数")
     return value
+
+
+def _text(value: object, name: str) -> str:
+    """验证非空文本。"""
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{name} 必须为非空文本")
+    return value
+
+
+def _decision_time(summary: Mapping[str, object]) -> datetime:
+    """读取带时区的研究决策时点。"""
+    value = datetime.fromisoformat(_text(summary.get("decision_time"), "decision_time"))
+    if value.tzinfo is None:
+        raise ValueError("decision_time 必须带时区")
+    return value
+
+
+def _data_vintage(summary: Mapping[str, object]) -> tuple[str, str]:
+    """以冻结面板内容定义一次数据 vintage，而非以运行或代码身份代替。"""
+    panel = _object(summary.get("panel"), "summary.panel")
+    panel_sha256 = _text(panel.get("sha256"), "summary.panel.sha256")
+    market_id = _text(summary.get("market_id"), "summary.market_id")
+    return stable_identifier("data-vintage", {
+        "market_id": market_id,
+        "panel_sha256": panel_sha256,
+    }), panel_sha256
+
+
+def _history_entry(
+    summary: Mapping[str, object],
+    evaluation: Mapping[str, object],
+    identity: str,
+) -> Mapping[str, object]:
+    """构造可审计的跨运行历史条目。"""
+    vintage_id, panel_sha256 = _data_vintage(summary)
+    code_identity = _object(summary.get("code_identity"), "summary.code_identity")
+    return {
+        "research_identity": identity,
+        "run_id": summary.get("run_id"),
+        "decision_time": summary.get("decision_time"),
+        "data_vintage_id": vintage_id,
+        "panel_sha256": panel_sha256,
+        "config_hash": summary.get("config_hash"),
+        "code_tree_digest": code_identity.get("tree_digest"),
+        "adjusted_sharpe": evaluation.get("adjusted_sharpe"),
+        "fdr_q": evaluation.get("fdr_q"),
+        "eligible": evaluation.get("eligible"),
+    }
 
 
 def _correlation(left: Sequence[float], right: Sequence[float]) -> float:
@@ -180,25 +236,75 @@ def monitor_family_run(
         evolution_action = "revise_hypothesis_or_cost_model"
     else:
         evolution_action = "stabilize_validation_before_parameter_evolution"
-    current_identity = str(summary.get("research_identity") or summary.get("run_id"))
+    current_identity = _text(
+        summary.get("research_identity") or summary.get("run_id"),
+        "research_identity",
+    )
+    current_time = _decision_time(summary)
+    current_vintage_id, current_panel_sha256 = _data_vintage(summary)
+    interval = _text(config.get("bar_interval"), "bar_interval")
+    interval_seconds = _INTERVAL_SECONDS.get(interval)
+    if interval_seconds is None:
+        raise ValueError("bar_interval 不支持演进历史间隔")
+    walk_forward = _object(config.get("walk_forward"), "walk_forward")
+    minimum_spacing_bars = _integer(
+        walk_forward.get("step_bars"), "walk_forward.step_bars",
+    )
+    minimum_spacing_seconds = minimum_spacing_bars * interval_seconds
     history_by_identity: dict[str, Mapping[str, object]] = {}
+    excluded_history: list[Mapping[str, object]] = []
     for path in prior_summary_paths:
         prior = _object(json.loads(path.read_text(encoding="utf-8")), "prior_summary")
-        identity = str(prior.get("research_identity") or prior.get("run_id"))
-        if identity == current_identity or identity in history_by_identity:
-            continue
+        identity = _text(
+            prior.get("research_identity") or prior.get("run_id"),
+            "prior.research_identity",
+        )
         prior_evaluation = _family_evaluation(prior, family)
-        history_by_identity[identity] = {
-            "research_identity": identity,
-            "run_id": prior.get("run_id"),
-            "decision_time": prior.get("decision_time"),
-            "adjusted_sharpe": prior_evaluation.get("adjusted_sharpe"),
-            "fdr_q": prior_evaluation.get("fdr_q"),
-            "eligible": prior_evaluation.get("eligible"),
-        }
-    history = sorted(
+        entry = _history_entry(prior, prior_evaluation, identity)
+        if identity == current_identity or identity in history_by_identity:
+            excluded_history.append({**entry, "reason": "duplicate_research_identity"})
+            continue
+        history_by_identity[identity] = entry
+    candidates = sorted(
         history_by_identity.values(),
         key=lambda item: (str(item.get("decision_time")), str(item.get("run_id"))),
+        reverse=True,
+    )
+    accepted_reverse: list[Mapping[str, object]] = []
+    anchor_time = current_time
+    seen_vintages = {current_vintage_id}
+    for entry in candidates:
+        vintage_id = _text(entry.get("data_vintage_id"), "data_vintage_id")
+        if vintage_id in seen_vintages:
+            excluded_history.append({**entry, "reason": "duplicate_data_vintage"})
+            continue
+        seen_vintages.add(vintage_id)
+        entry_time = datetime.fromisoformat(
+            _text(entry.get("decision_time"), "history.decision_time"),
+        )
+        if entry_time.tzinfo is None:
+            raise ValueError("history.decision_time 必须带时区")
+        if entry_time >= current_time:
+            excluded_history.append({
+                **entry,
+                "reason": "not_before_current_decision_time",
+            })
+            continue
+        if (anchor_time - entry_time).total_seconds() < minimum_spacing_seconds:
+            excluded_history.append({
+                **entry,
+                "reason": "insufficient_temporal_spacing",
+            })
+            continue
+        accepted_reverse.append(entry)
+        anchor_time = entry_time
+    history = list(reversed(accepted_reverse))
+    excluded_history.sort(
+        key=lambda item: (
+            str(item.get("decision_time")),
+            str(item.get("run_id")),
+            str(item.get("reason")),
+        ),
     )
     current_sharpe = _number(
         evaluation.get("adjusted_sharpe"), "adjusted_sharpe",
@@ -227,9 +333,10 @@ def monitor_family_run(
             direction = "stable"
     return {
         "schema_version": 1,
-        "monitor_method_version": "family-direction-monitor-v1",
+        "monitor_method_version": "family-direction-monitor-v2",
         "run_id": summary.get("run_id"),
         "research_identity": current_identity,
+        "data_vintage_id": current_vintage_id,
         "decision_time": summary.get("decision_time"),
         "family": family,
         "eligible": evaluation.get("eligible"),
@@ -242,10 +349,18 @@ def monitor_family_run(
         "evolution_action": evolution_action,
         "cross_run_direction": direction,
         "history": history,
+        "excluded_history": excluded_history,
+        "history_policy": {
+            "method": "reverse_chronological_time_separated_vintages",
+            "minimum_history_runs": minimum_history,
+            "minimum_spacing_bars": minimum_spacing_bars,
+            "minimum_spacing_seconds": minimum_spacing_seconds,
+            "bar_interval": interval,
+        },
         "source": {
             "summary_sha256": sha256_file(summary_path),
             "config_hash": summary.get("config_hash"),
-            "panel_sha256": _object(summary.get("panel"), "summary.panel").get("sha256"),
+            "panel_sha256": current_panel_sha256,
             "code_identity": summary.get("code_identity"),
             "trial_ledger_sha256": ledger.get("sha256"),
         },
@@ -255,6 +370,7 @@ def monitor_family_run(
         ),
         "interpretation": (
             "参数方向是候选网格内的关联证据，不是因果结论；扩展轴必须先登记新版本，"
-            "不得复用一次性封存段。"
+            "不得复用一次性封存段。跨运行方向只使用至少相隔一个 walk-forward step 的"
+            "冻结数据 vintage；同面板重复运行和时间过近的累计样本不计入历史。"
         ),
     }

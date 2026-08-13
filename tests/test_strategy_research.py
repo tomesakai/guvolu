@@ -556,6 +556,7 @@ def test_family_monitor_reports_parameter_search_direction(tmp_path: Path) -> No
         "run_id": "run",
         "research_identity": "research-one",
         "decision_time": "2026-01-01T00:00:00+00:00",
+        "market_id": "market-one",
         "config_hash": "c" * 64,
         "panel": {"sha256": "p" * 64},
         "code_identity": {"tree_digest": "t" * 64},
@@ -585,7 +586,7 @@ def test_family_monitor_reports_parameter_search_direction(tmp_path: Path) -> No
     prior_payload = json.loads(summary.read_text(encoding="utf-8"))
     prior_payload["run_id"] = "prior-instance-one"
     prior_payload["research_identity"] = "same-prior-research"
-    prior_payload["decision_time"] = "2025-12-01T00:00:00+00:00"
+    prior_payload["decision_time"] = "2025-09-01T00:00:00+00:00"
     first_prior = tmp_path / "prior-one.json"
     first_prior.write_text(json.dumps(prior_payload), encoding="utf-8")
     prior_payload["run_id"] = "prior-instance-two"
@@ -598,8 +599,39 @@ def test_family_monitor_reports_parameter_search_direction(tmp_path: Path) -> No
         config,
         (first_prior, second_prior),
     )
-    assert len(deduplicated["history"]) == 1
+    assert deduplicated["monitor_method_version"] == "family-direction-monitor-v2"
+    assert len(deduplicated["history"]) == 0
+    assert {
+        item["reason"] for item in deduplicated["excluded_history"]
+    } == {"duplicate_data_vintage", "duplicate_research_identity"}
     assert deduplicated["cross_run_direction"] == "insufficient_history"
+
+    recent_prior = json.loads(summary.read_text(encoding="utf-8"))
+    recent_prior["run_id"] = "time-separated-one"
+    recent_prior["research_identity"] = "time-separated-research-one"
+    recent_prior["decision_time"] = "2025-09-01T00:00:00+00:00"
+    recent_prior["panel"]["sha256"] = "q" * 64
+    recent_prior["family_evaluations"][0]["adjusted_sharpe"] = 0.1
+    recent_prior["family_evaluations"][0]["fdr_q"] = 0.2
+    recent_path = tmp_path / "time-separated-one.json"
+    recent_path.write_text(json.dumps(recent_prior), encoding="utf-8")
+    older_prior = json.loads(json.dumps(recent_prior))
+    older_prior["run_id"] = "time-separated-two"
+    older_prior["research_identity"] = "time-separated-research-two"
+    older_prior["decision_time"] = "2025-05-01T00:00:00+00:00"
+    older_prior["panel"]["sha256"] = "r" * 64
+    older_path = tmp_path / "time-separated-two.json"
+    older_path.write_text(json.dumps(older_prior), encoding="utf-8")
+    time_separated = monitor_family_run(
+        tmp_path,
+        summary,
+        "trend",
+        config,
+        (recent_path, older_path),
+    )
+    assert len(time_separated["history"]) == 2
+    assert time_separated["excluded_history"] == []
+    assert time_separated["cross_run_direction"] == "improving"
 
 
 def test_evolution_proposal_updates_strategy_and_feature_dependencies() -> None:
@@ -608,7 +640,7 @@ def test_evolution_proposal_updates_strategy_and_feature_dependencies() -> None:
     monitor = {
         "family": "trend",
         "run_id": "run",
-        "monitor_method_version": "family-direction-monitor-v1",
+        "monitor_method_version": "family-direction-monitor-v2",
         "source": {
             "summary_sha256": "a" * 64,
             "trial_ledger_sha256": "b" * 64,
