@@ -1,0 +1,28 @@
+{
+  "evidence_id": "crypto_api_l3_registry_2026-08-12",
+  "source_filename": "crypto_api_l3_registry_2026-08-12.xlsx",
+  "source_path_at_review": "C:/Users/wu_zh/Downloads/crypto_api_l3_registry_2026-08-12.xlsx",
+  "byte_count": 214395,
+  "sha256": "b1e03a9d7c4dfca08788237676e2971fa0fa964f1f4cf8127962702aee471a08",
+  "reviewed_at": "2026-08-12T20:00:00+09:00",
+  "worksheets": [
+    "总览",
+    "判定标准",
+    "日本26家",
+    "全球场所",
+    "L3重点",
+    "链上订单簿",
+    "数据商",
+    "标准端点",
+    "字段字典",
+    "聚合规则"
+  ],
+  "validation": {
+    "endpoint_rows": 74,
+    "duplicate_endpoint_ids": 0,
+    "duplicate_endpoint_natural_keys": 0,
+    "formula_errors": 0
+  },
+  "repository_embeds_source_workbook": false,
+  "note": "该文件只登记外部工作簿身份与验证结果，不替代原始二进制证据。"
+}
