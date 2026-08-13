@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -35,6 +36,46 @@ from guvolu.strategy.expression import (
 def _time(value: str) -> datetime:
     """构造测试 UTC 时间。"""
     return datetime.fromisoformat(value).replace(tzinfo=UTC)
+
+
+def _write_holdout_evidence(
+    root: Path,
+    vintage_id: str,
+    evaluation_id: str,
+    candidate_set_hash: str,
+    verdict: str,
+) -> tuple[str, str, str]:
+    """写入彼此绑定的最小 holdout result、manifest 与终态 verdict。"""
+    run_directory = root / "reports" / "holdout" / evaluation_id
+    run_directory.mkdir(parents=True, exist_ok=True)
+    result_path = run_directory / "result.json"
+    result_path.write_text(json.dumps({
+        "evaluation_id": evaluation_id,
+        "vintage": {"vintage_id": vintage_id},
+        "candidate_set_hash": candidate_set_hash,
+        "verdict": verdict,
+    }, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+    result_sha256 = sha256_file(result_path)
+    manifest_path = run_directory / "manifest.json"
+    manifest_path.write_text(json.dumps({
+        "evaluation_id": evaluation_id,
+        "vintage_id": vintage_id,
+        "candidate_set_hash": candidate_set_hash,
+        "verdict": verdict,
+        "artifacts": {"result": {
+            "path": result_path.relative_to(root).as_posix(),
+            "sha256": result_sha256,
+            "bytes": result_path.stat().st_size,
+        }},
+    }, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+    manifest_sha256 = sha256_file(manifest_path)
+    terminal = json.dumps({
+        "evaluation_id": evaluation_id,
+        "verdict": verdict,
+        "result_sha256": result_sha256,
+        "manifest_sha256": manifest_sha256,
+    }, sort_keys=True, separators=(",", ":"))
+    return terminal, manifest_path.relative_to(root).as_posix(), manifest_sha256
 
 
 def test_holdout_vintage_is_unexposed_nonoverlapping_and_single_use(
@@ -114,26 +155,35 @@ def test_holdout_vintage_is_unexposed_nonoverlapping_and_single_use(
             "different-evaluation",
         )
 
+    terminal, manifest_path, manifest_sha256 = _write_holdout_evidence(
+        tmp_path,
+        vintage.vintage_id,
+        "evaluation-id",
+        "candidate-set-hash",
+        "failed",
+    )
     decided, completed_attempt = finalize_holdout_evaluation(
         registry,
         vintage.vintage_id,
         "evaluation-id",
-        "failed",
-        "reports/holdout/manual-manifest.json",
-        "a" * 64,
+        terminal,
+        manifest_path,
+        manifest_sha256,
+        repository_root=tmp_path,
         completed_at=_time("2025-08-03T00:00:00"),
     )
-    assert decided.verdict == "failed"
+    assert decided.verdict == terminal
     assert completed_attempt.status == "completed"
-    assert completed_attempt.result_manifest_sha256 == "a" * 64
+    assert completed_attempt.result_manifest_sha256 == manifest_sha256
     with pytest.raises(ValueError, match="已经终结"):
         finalize_holdout_evaluation(
             registry,
             vintage.vintage_id,
             "evaluation-id",
-            "passed",
-            "reports/holdout/manual-manifest.json",
-            "b" * 64,
+            terminal,
+            manifest_path,
+            manifest_sha256,
+            repository_root=tmp_path,
         )
     assert list_holdout_vintages(registry) == (decided,)
 
@@ -173,6 +223,70 @@ def test_consumed_vintage_can_become_adaptive_but_never_holdout_again(
         )
 
 
+def test_legacy_consumed_vintage_is_migrated_to_incomplete_attempt(
+    tmp_path: Path,
+) -> None:
+    """旧库已消费记录必须回填为明确且不可重跑的 incomplete 尝试。"""
+    registry = tmp_path / "governance.sqlite3"
+    vintage = seal_holdout_vintage(
+        registry,
+        "market-one",
+        _time("2027-01-01T00:00:00"),
+        _time("2027-02-01T00:00:00"),
+        sealed_at=_time("2026-12-01T00:00:00"),
+    )
+    consume_holdout_vintage(
+        registry,
+        vintage.vintage_id,
+        "candidate-set-hash",
+        "legacy-evaluation",
+        consumed_at=_time("2027-02-02T00:00:00"),
+    )
+    with sqlite3.connect(registry) as connection:
+        connection.execute("DELETE FROM holdout_evaluation_attempt")
+        connection.execute(
+            "UPDATE governance_meta SET value='2' WHERE key='schema_version'"
+        )
+    migrated = get_holdout_evaluation_attempt(registry, "legacy-evaluation")
+    assert migrated.status == "incomplete"
+    assert migrated.stage == "legacy_consumed_without_attempt"
+    assert migrated.started_at == _time("2027-02-02T00:00:00")
+    with sqlite3.connect(registry) as connection:
+        version = connection.execute(
+            "SELECT value FROM governance_meta WHERE key='schema_version'"
+        ).fetchone()
+    assert version == ("4",)
+
+
+def test_legacy_verdict_without_manifest_attempt_is_rejected(tmp_path: Path) -> None:
+    """无法证明 manifest 的旧 verdict 不得被伪装成合法 completed 终态。"""
+    registry = tmp_path / "governance.sqlite3"
+    vintage = seal_holdout_vintage(
+        registry,
+        "market-one",
+        _time("2027-01-01T00:00:00"),
+        _time("2027-02-01T00:00:00"),
+        sealed_at=_time("2026-12-01T00:00:00"),
+    )
+    consume_holdout_vintage(
+        registry,
+        vintage.vintage_id,
+        "candidate-set-hash",
+        "legacy-evaluation",
+    )
+    with sqlite3.connect(registry) as connection:
+        connection.execute("DELETE FROM holdout_evaluation_attempt")
+        connection.execute(
+            "UPDATE holdout_vintage SET verdict='passed',verdict_recorded_at=?",
+            (_time("2027-02-03T00:00:00").isoformat(),),
+        )
+        connection.execute(
+            "UPDATE governance_meta SET value='3' WHERE key='schema_version'"
+        )
+    with pytest.raises(ValueError, match="无 manifest attempt"):
+        list_holdout_vintages(registry)
+
+
 def test_holdout_verdict_and_completed_attempt_are_atomic(tmp_path: Path) -> None:
     """成功结论与 completed 尝试必须在同一事务中出现。"""
     registry = tmp_path / "governance.sqlite3"
@@ -190,26 +304,85 @@ def test_holdout_verdict_and_completed_attempt_are_atomic(tmp_path: Path) -> Non
         "evaluation-one",
         started_at=_time("2027-02-02T00:00:00"),
     )
+    wrong_terminal, wrong_manifest, wrong_sha256 = _write_holdout_evidence(
+        tmp_path,
+        "different-vintage",
+        "evaluation-one",
+        "candidate-set",
+        "passed",
+    )
+    with pytest.raises(ValueError, match="manifest 的 vintage_id 不匹配"):
+        finalize_holdout_evaluation(
+            registry,
+            vintage.vintage_id,
+            "evaluation-one",
+            wrong_terminal,
+            wrong_manifest,
+            wrong_sha256,
+            repository_root=tmp_path,
+        )
+    terminal, manifest_path, manifest_sha256 = _write_holdout_evidence(
+        tmp_path,
+        vintage.vintage_id,
+        "evaluation-one",
+        "candidate-set",
+        "passed",
+    )
+    with pytest.raises(ValueError, match="超出仓库范围"):
+        finalize_holdout_evaluation(
+            registry,
+            vintage.vintage_id,
+            "evaluation-one",
+            terminal,
+            "../outside-manifest.json",
+            manifest_sha256,
+            repository_root=tmp_path,
+        )
+    with pytest.raises(ValueError, match="规范小写十六进制"):
+        finalize_holdout_evaluation(
+            registry,
+            vintage.vintage_id,
+            "evaluation-one",
+            terminal,
+            manifest_path,
+            "g" * 64,
+            repository_root=tmp_path,
+        )
+    with pytest.raises(ValueError, match="现场 SHA-256 不匹配"):
+        finalize_holdout_evaluation(
+            registry,
+            vintage.vintage_id,
+            "evaluation-one",
+            terminal,
+            manifest_path,
+            "0" * 64,
+            repository_root=tmp_path,
+        )
+    assert get_holdout_evaluation_attempt(
+        registry, "evaluation-one",
+    ).status == "incomplete"
     finalized_vintage, finalized_attempt = finalize_holdout_evaluation(
         registry,
         vintage.vintage_id,
         "evaluation-one",
-        '{"verdict":"passed"}',
-        "reports/holdout/manifest.json",
-        "a" * 64,
+        terminal,
+        manifest_path,
+        manifest_sha256,
+        repository_root=tmp_path,
         completed_at=_time("2027-02-02T01:00:00"),
     )
-    assert finalized_vintage.verdict == '{"verdict":"passed"}'
+    assert finalized_vintage.verdict == terminal
     assert finalized_attempt.status == "completed"
-    assert finalized_attempt.result_manifest_sha256 == "a" * 64
+    assert finalized_attempt.result_manifest_sha256 == manifest_sha256
     with pytest.raises(ValueError, match="已经终结"):
         finalize_holdout_evaluation(
             registry,
             vintage.vintage_id,
             "evaluation-one",
-            '{"verdict":"failed"}',
-            "reports/holdout/manifest.json",
-            "b" * 64,
+            terminal,
+            manifest_path,
+            manifest_sha256,
+            repository_root=tmp_path,
         )
 
 

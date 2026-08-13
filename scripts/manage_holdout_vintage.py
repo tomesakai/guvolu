@@ -35,6 +35,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=Path,
         default=Path("data/research/governance.sqlite3"),
     )
+    parser.add_argument(
+        "--root",
+        type=Path,
+        default=Path("."),
+        help="用于现场复核终态 manifest 的仓库根目录",
+    )
     subparsers = parser.add_subparsers(dest="action", required=True)
     seal = subparsers.add_parser("seal", help="封存从未被自适应研究读取的区间")
     seal.add_argument("market_id")
@@ -56,6 +62,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     subparsers.add_parser("list", help="列出封存与已消费历史")
     arguments = parser.parse_args(argv)
     registry = arguments.registry.resolve()
+    repository = arguments.root.resolve()
     if arguments.action == "seal":
         result: object = seal_holdout_vintage(
             registry,
@@ -78,6 +85,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             arguments.verdict,
             arguments.result_manifest_path,
             arguments.result_manifest_sha256,
+            repository_root=repository,
         )
     else:
         result = list_holdout_vintages(registry)

@@ -539,6 +539,7 @@ def run_holdout_validation(
         "evaluation_id": evaluation_id,
         "vintage_id": vintage_id,
         "candidate_set_hash": candidate_set_hash,
+        "verdict": verdict,
         "artifacts": {
             "panel": {
                 **artifact_record(panel.panel_path, "holdout_panel"),
@@ -567,6 +568,7 @@ def run_holdout_validation(
         final_verdict,
         manifest_path.resolve().relative_to(repository).as_posix(),
         manifest_sha256,
+        repository_root=repository,
     )
     return HoldoutRunResult(
         evaluation_id=evaluation_id,

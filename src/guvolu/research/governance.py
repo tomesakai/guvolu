@@ -1,14 +1,15 @@
 """研究数据暴露与一次性封存段治理。"""
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from guvolu.research.provenance import stable_identifier
+from guvolu.research.provenance import sha256_file, stable_identifier
 
-GOVERNANCE_SCHEMA_VERSION = 3
+GOVERNANCE_SCHEMA_VERSION = 4
 GOVERNANCE_METHOD_VERSION = "research-data-governance-v2"
 _VINTAGE_STATUSES = ("sealed", "consumed")
 
@@ -105,6 +106,108 @@ def _parse_timestamp(value: str) -> datetime:
     return _utc(datetime.fromisoformat(value))
 
 
+def _canonical_sha256(value: str) -> bool:
+    """检查小写十六进制 SHA-256 的规范文本。"""
+    return len(value) == 64 and all(
+        character in "0123456789abcdef" for character in value
+    )
+
+
+def _evidence_file(root: Path, value: str, label: str) -> tuple[Path, str]:
+    """把证据路径约束在仓库内并返回规范相对路径。"""
+    repository = root.resolve()
+    relative = Path(value)
+    if relative.is_absolute():
+        raise ValueError(f"{label} 必须使用仓库内相对路径")
+    resolved = (repository / relative).resolve()
+    try:
+        normalized = resolved.relative_to(repository).as_posix()
+    except ValueError as error:
+        raise ValueError(f"{label} 超出仓库范围") from error
+    if not resolved.is_file():
+        raise ValueError(f"{label} 文件不存在")
+    return resolved, normalized
+
+
+def _json_file(path: Path, label: str) -> dict[str, object]:
+    """读取必须为 JSON 对象的终态证据。"""
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"{label} 不是可读 JSON") from error
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} 必须为 JSON 对象")
+    return {str(key): item for key, item in value.items()}
+
+
+def _validated_terminal_evidence(
+    repository_root: Path,
+    vintage_id: str,
+    evaluation_id: str,
+    verdict: str,
+    result_manifest_path: str,
+    result_manifest_sha256: str,
+) -> tuple[str, str]:
+    """现场复核 manifest、result 与最终 verdict 的同一业务身份。"""
+    if not _canonical_sha256(result_manifest_sha256):
+        raise ValueError("holdout manifest SHA-256 必须是规范小写十六进制")
+    manifest_path, normalized_path = _evidence_file(
+        repository_root, result_manifest_path, "holdout manifest",
+    )
+    if sha256_file(manifest_path) != result_manifest_sha256:
+        raise ValueError("holdout manifest 现场 SHA-256 不匹配")
+    manifest = _json_file(manifest_path, "holdout manifest")
+    try:
+        verdict_value = json.loads(verdict)
+    except json.JSONDecodeError as error:
+        raise ValueError("holdout verdict 必须为 JSON 对象") from error
+    if not isinstance(verdict_value, dict):
+        raise ValueError("holdout verdict 必须为 JSON 对象")
+    terminal = {str(key): item for key, item in verdict_value.items()}
+    if manifest.get("vintage_id") != vintage_id:
+        raise ValueError("holdout manifest 的 vintage_id 不匹配")
+    if manifest.get("evaluation_id") != evaluation_id:
+        raise ValueError("holdout manifest 的 evaluation_id 不匹配")
+    if terminal.get("evaluation_id") != evaluation_id:
+        raise ValueError("holdout verdict 的 evaluation_id 不匹配")
+    if terminal.get("manifest_sha256") != result_manifest_sha256:
+        raise ValueError("holdout verdict 未绑定现场 manifest SHA-256")
+    terminal_verdict = terminal.get("verdict")
+    if not isinstance(terminal_verdict, str) or not terminal_verdict:
+        raise ValueError("holdout verdict 缺少最终 verdict 值")
+    if manifest.get("verdict") != terminal_verdict:
+        raise ValueError("holdout manifest 与最终 verdict 不匹配")
+    candidate_set_hash = manifest.get("candidate_set_hash")
+    if not isinstance(candidate_set_hash, str) or not candidate_set_hash:
+        raise ValueError("holdout manifest 缺少 candidate_set_hash")
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, dict) or not isinstance(artifacts.get("result"), dict):
+        raise ValueError("holdout manifest 缺少 result 制品")
+    result_record = artifacts["result"]
+    result_path_value = result_record.get("path")
+    result_sha256 = result_record.get("sha256")
+    if not isinstance(result_path_value, str) or not isinstance(result_sha256, str):
+        raise ValueError("holdout result 制品身份不完整")
+    if not _canonical_sha256(result_sha256):
+        raise ValueError("holdout result SHA-256 必须是规范小写十六进制")
+    result_path, _ = _evidence_file(repository_root, result_path_value, "holdout result")
+    if sha256_file(result_path) != result_sha256:
+        raise ValueError("holdout result 现场 SHA-256 不匹配")
+    if terminal.get("result_sha256") != result_sha256:
+        raise ValueError("holdout verdict 未绑定现场 result SHA-256")
+    result = _json_file(result_path, "holdout result")
+    vintage = result.get("vintage")
+    if not isinstance(vintage, dict) or vintage.get("vintage_id") != vintage_id:
+        raise ValueError("holdout result 的 vintage_id 不匹配")
+    if result.get("evaluation_id") != evaluation_id:
+        raise ValueError("holdout result 的 evaluation_id 不匹配")
+    if result.get("candidate_set_hash") != candidate_set_hash:
+        raise ValueError("holdout result 的 candidate_set_hash 不匹配")
+    if result.get("verdict") != terminal_verdict:
+        raise ValueError("holdout result 与最终 verdict 不匹配")
+    return normalized_path, candidate_set_hash
+
+
 def _validate_range(start_time: datetime, end_time: datetime) -> tuple[datetime, datetime]:
     """验证左闭右开时间区间。"""
     start = _utc(start_time)
@@ -112,6 +215,117 @@ def _validate_range(start_time: datetime, end_time: datetime) -> tuple[datetime,
     if start >= end:
         raise ValueError("研究数据区间必须满足 start_time < end_time")
     return start, end
+
+
+def _terminal_invariant_violation(
+    connection: sqlite3.Connection,
+) -> sqlite3.Row | None:
+    """查找 vintage 与 evaluation attempt 的跨表非法终态。"""
+    row: sqlite3.Row | None = connection.execute(
+        """
+        SELECT v.vintage_id
+        FROM holdout_vintage AS v
+        LEFT JOIN holdout_evaluation_attempt AS a
+          ON a.vintage_id=v.vintage_id
+        WHERE
+          (v.status='sealed' AND a.evaluation_id IS NOT NULL)
+          OR
+          (v.status='consumed' AND (
+            a.evaluation_id IS NULL
+            OR a.evaluation_id<>v.evaluation_id
+            OR a.candidate_set_hash<>v.candidate_set_hash
+            OR (v.verdict IS NULL AND a.status<>'incomplete')
+            OR (v.verdict IS NOT NULL AND a.status<>'completed')
+            OR ((v.verdict IS NULL)<>(v.verdict_recorded_at IS NULL))
+          ))
+        LIMIT 1
+        """
+    ).fetchone()
+    return row
+
+
+def _upgrade_governance_state(
+    connection: sqlite3.Connection,
+    existing_version: str | None,
+) -> None:
+    """原子升级治理库，并把旧 consumed 记录变成可解释 incomplete 尝试。"""
+    supported = {None, "1", "2", "3", str(GOVERNANCE_SCHEMA_VERSION)}
+    if existing_version not in supported:
+        raise ValueError("不支持的研究治理注册表 schema_version")
+    orphan_count = int(connection.execute(
+        """
+        SELECT COUNT(*)
+        FROM holdout_vintage AS v
+        LEFT JOIN holdout_evaluation_attempt AS a
+          ON a.vintage_id=v.vintage_id
+        WHERE v.status='consumed' AND a.evaluation_id IS NULL
+        """
+    ).fetchone()[0])
+    needs_upgrade = existing_version != str(GOVERNANCE_SCHEMA_VERSION)
+    if needs_upgrade or orphan_count:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            invalid_legacy = connection.execute(
+                """
+                SELECT v.vintage_id
+                FROM holdout_vintage AS v
+                LEFT JOIN holdout_evaluation_attempt AS a
+                  ON a.vintage_id=v.vintage_id
+                WHERE v.status='consumed' AND a.evaluation_id IS NULL
+                  AND v.verdict IS NOT NULL
+                LIMIT 1
+                """
+            ).fetchone()
+            if invalid_legacy is not None:
+                raise ValueError(
+                    "旧治理库存在无 manifest attempt 的已判定 consumed vintage: "
+                    + str(invalid_legacy["vintage_id"])
+                )
+            connection.execute(
+                """
+                INSERT INTO holdout_evaluation_attempt(
+                  evaluation_id,vintage_id,candidate_set_hash,status,stage,
+                  started_at,updated_at
+                )
+                SELECT
+                  v.evaluation_id,v.vintage_id,v.candidate_set_hash,
+                  'incomplete','legacy_consumed_without_attempt',
+                  v.consumed_at,v.consumed_at
+                FROM holdout_vintage AS v
+                LEFT JOIN holdout_evaluation_attempt AS a
+                  ON a.vintage_id=v.vintage_id
+                WHERE v.status='consumed' AND v.verdict IS NULL
+                  AND a.evaluation_id IS NULL
+                """
+            )
+            violation = _terminal_invariant_violation(connection)
+            if violation is not None:
+                raise ValueError(
+                    "治理库存在不一致的 holdout 终态: "
+                    + str(violation["vintage_id"])
+                )
+            if existing_version is None:
+                connection.execute(
+                    "INSERT INTO governance_meta(key,value) "
+                    "VALUES('schema_version',?)",
+                    (str(GOVERNANCE_SCHEMA_VERSION),),
+                )
+            else:
+                connection.execute(
+                    "UPDATE governance_meta SET value=? WHERE key='schema_version'",
+                    (str(GOVERNANCE_SCHEMA_VERSION),),
+                )
+            connection.execute("COMMIT")
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+    violation = _terminal_invariant_violation(connection)
+    if violation is not None:
+        raise ValueError(
+            "治理库存在不一致的 holdout 终态: "
+            + str(violation["vintage_id"])
+        )
 
 
 def _connect(path: Path) -> sqlite3.Connection:
@@ -212,19 +426,14 @@ def _connect(path: Path) -> sqlite3.Connection:
     existing = connection.execute(
         "SELECT value FROM governance_meta WHERE key='schema_version'"
     ).fetchone()
-    if existing is None:
-        connection.execute(
-            "INSERT INTO governance_meta(key,value) VALUES('schema_version',?)",
-            (str(GOVERNANCE_SCHEMA_VERSION),),
+    try:
+        _upgrade_governance_state(
+            connection,
+            None if existing is None else str(existing["value"]),
         )
-    elif existing["value"] in ("1", "2"):
-        connection.execute(
-            "UPDATE governance_meta SET value=? WHERE key='schema_version'",
-            (str(GOVERNANCE_SCHEMA_VERSION),),
-        )
-    elif existing["value"] != str(GOVERNANCE_SCHEMA_VERSION):
+    except BaseException:
         connection.close()
-        raise ValueError("不支持的研究治理注册表 schema_version")
+        raise
     return connection
 
 
@@ -554,12 +763,23 @@ def finalize_holdout_evaluation(
     result_manifest_path: str,
     result_manifest_sha256: str,
     *,
+    repository_root: Path,
     completed_at: datetime | None = None,
 ) -> tuple[HoldoutVintage, HoldoutEvaluationAttempt]:
-    """在一个事务中写入 verdict 并把尝试终结为 completed。"""
+    """现场复核终态证据，再原子写入 verdict 与 completed attempt。"""
     normalized = verdict.strip()
-    if not normalized or not result_manifest_path or len(result_manifest_sha256) != 64:
+    if not normalized or not result_manifest_path:
         raise ValueError("完成 holdout 必须绑定 verdict 与 manifest 身份")
+    normalized_manifest_path, manifest_candidate_set_hash = (
+        _validated_terminal_evidence(
+            repository_root,
+            vintage_id,
+            evaluation_id,
+            normalized,
+            result_manifest_path,
+            result_manifest_sha256,
+        )
+    )
     completed = _utc(completed_at or datetime.now(UTC))
     connection = _connect(registry_path)
     try:
@@ -577,6 +797,11 @@ def finalize_holdout_evaluation(
             raise ValueError("holdout vintage 与评估尝试身份不一致")
         if attempt["vintage_id"] != vintage_id:
             raise ValueError("holdout 评估尝试绑定了不同 vintage")
+        if (
+            vintage["candidate_set_hash"] != manifest_candidate_set_hash
+            or attempt["candidate_set_hash"] != manifest_candidate_set_hash
+        ):
+            raise ValueError("holdout manifest 的 candidate_set_hash 与注册表不匹配")
         if vintage["verdict"] is not None or attempt["status"] != "incomplete":
             raise ValueError("holdout 已经终结且不可改写")
         connection.execute(
@@ -591,7 +816,7 @@ def finalize_holdout_evaluation(
             (
                 _timestamp(completed),
                 _timestamp(completed),
-                result_manifest_path,
+                normalized_manifest_path,
                 result_manifest_sha256,
                 evaluation_id,
             ),
