@@ -100,6 +100,11 @@ def test_holdout_vintage_is_unexposed_nonoverlapping_and_single_use(
     )
     assert consumed.status == "consumed"
     assert consumed.consumed_at == _time("2025-08-02T00:00:00")
+    manual_attempt = get_holdout_evaluation_attempt(
+        registry, "evaluation-id",
+    )
+    assert manual_attempt.status == "incomplete"
+    assert manual_attempt.stage == "manually_consumed"
     with pytest.raises(ValueError, match="已经消费"):
         consume_holdout_vintage(
             registry,

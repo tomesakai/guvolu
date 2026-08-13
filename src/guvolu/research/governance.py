@@ -421,6 +421,18 @@ def consume_holdout_vintage(
             "candidate_set_hash=?,evaluation_id=? WHERE vintage_id=? AND status='sealed'",
             (_timestamp(consumed), candidate_set_hash, evaluation_id, vintage_id),
         )
+        connection.execute(
+            "INSERT INTO holdout_evaluation_attempt("
+            "evaluation_id,vintage_id,candidate_set_hash,status,stage,started_at,updated_at"
+            ") VALUES(?,?,?,'incomplete','manually_consumed',?,?)",
+            (
+                evaluation_id,
+                vintage_id,
+                candidate_set_hash,
+                _timestamp(consumed),
+                _timestamp(consumed),
+            ),
+        )
         updated = connection.execute(
             "SELECT * FROM holdout_vintage WHERE vintage_id=?",
             (vintage_id,),
