@@ -17,6 +17,10 @@ from guvolu.research.features import (
     compute_features,
     feature_payload,
 )
+from guvolu.research.governance import (
+    GOVERNANCE_METHOD_VERSION,
+    register_research_exposure,
+)
 from guvolu.research.panel import (
     build_panel_snapshot,
     freeze_trade_inputs,
@@ -59,7 +63,7 @@ from guvolu.strategy.generation import (
 )
 
 PIPELINE_SCHEMA_VERSION = 1
-PIPELINE_METHOD_VERSION = "strategy-research-pipeline-v7"
+PIPELINE_METHOD_VERSION = "strategy-research-pipeline-v8"
 POSITION_CONTRACT_METHOD_VERSION = "risk-weighted-family-target-v1"
 SECONDS_PER_YEAR = 365.0 * 24.0 * 60.0 * 60.0
 _INTERVAL_SECONDS = {
@@ -119,6 +123,29 @@ def _load_config(path: Path) -> Mapping[str, object]:
     """读取版本化研究配置。"""
     value = json.loads(path.read_text(encoding="utf-8"))
     return _mapping(value, "root")
+
+
+def _governance_registry_path(
+    root: Path,
+    config: Mapping[str, object],
+) -> tuple[Path, str]:
+    """解析并限制研究治理注册表位于项目目录。"""
+    raw = config.get("data_governance")
+    governance = {} if raw is None else _mapping(raw, "data_governance")
+    scope = _text(governance.get("scope", "DEV_ADAPTIVE"), "data_governance.scope")
+    if scope != "DEV_ADAPTIVE":
+        raise ValueError("普通研究管线只允许 DEV_ADAPTIVE 数据范围")
+    relative = _text(
+        governance.get("registry", "data/research/governance.sqlite3"),
+        "data_governance.registry",
+    )
+    configured = Path(relative)
+    path = configured.resolve() if configured.is_absolute() else (root / configured).resolve()
+    try:
+        path.relative_to(root)
+    except ValueError as error:
+        raise ValueError("研究治理注册表必须位于项目目录内") from error
+    return path, scope
 
 
 def _write_content_text(
@@ -497,6 +524,8 @@ def run_research(
     inputs = freeze_trade_inputs(data_root, market_id)
     input_event = inputs.maximum_event_time
     execution_evaluated_at = datetime.now(UTC)
+    exposure_start = parse_time(config.get("from_time"), "from_time")
+    governance_path, data_scope = _governance_registry_path(root, config)
     research_identity = stable_identifier("research-identity", {
         "pipeline_method_version": PIPELINE_METHOD_VERSION,
         "p_value_method_version": P_VALUE_METHOD_VERSION,
@@ -512,6 +541,8 @@ def run_research(
         "generator_method_version": GENERATOR_METHOD_VERSION,
         "family_scope": resolved_family_scope,
         "candidate_ids": tuple(candidate.candidate_id for candidate in candidates),
+        "governance_method_version": GOVERNANCE_METHOD_VERSION,
+        "data_scope": data_scope,
     })
     run_id = stable_identifier("research-run", {
         "research_identity": research_identity,
@@ -519,11 +550,19 @@ def run_research(
     })
     run_directory = output_base / run_id
     artifact_directory = run_directory / "artifacts"
+    exposure = register_research_exposure(
+        governance_path,
+        research_identity,
+        market_id,
+        exposure_start,
+        input_event,
+        recorded_at=execution_evaluated_at,
+    )
     panel = build_panel_snapshot(
         inputs,
         data_root / "research" / "physical" / market_id,
         _text(config.get("bar_interval"), "bar_interval"),
-        parse_time(config.get("from_time"), "from_time"),
+        exposure_start,
         input_event,
         _integer(config.get("notional_scale"), "notional_scale"),
     )
@@ -811,6 +850,7 @@ def run_research(
         "pbo_method_version": PBO_METHOD_VERSION,
         "block_bootstrap_method_version": BLOCK_BOOTSTRAP_METHOD_VERSION,
         "position_contract_method_version": POSITION_CONTRACT_METHOD_VERSION,
+        "governance_method_version": GOVERNANCE_METHOD_VERSION,
         "run_id": run_id,
         "research_identity": research_identity,
         "generator_method_version": GENERATOR_METHOD_VERSION,
@@ -821,6 +861,13 @@ def run_research(
         "decision_grade": identity.decision_grade,
         "code_identity": asdict(identity),
         "config_hash": config_hash,
+        "data_governance": {
+            "scope": data_scope,
+            "exposure_id": exposure.exposure_id,
+            "from_time": exposure.start_time.isoformat(),
+            "to_time": exposure.end_time.isoformat(),
+            "registry": _relative(governance_path, root),
+        },
         "input": panel_inputs_payload(inputs),
         "panel": {
             "bars": len(panel.bars),
@@ -866,6 +913,7 @@ def run_research(
         "pbo_method_version": PBO_METHOD_VERSION,
         "block_bootstrap_method_version": BLOCK_BOOTSTRAP_METHOD_VERSION,
         "position_contract_method_version": POSITION_CONTRACT_METHOD_VERSION,
+        "governance_method_version": GOVERNANCE_METHOD_VERSION,
         "run_id": run_id,
         "research_identity": research_identity,
         "generator_method_version": GENERATOR_METHOD_VERSION,
@@ -874,6 +922,8 @@ def run_research(
         "execution_evaluated_at": execution_evaluated_at.isoformat(),
         "code_identity": asdict(identity),
         "config_hash": config_hash,
+        "data_scope": data_scope,
+        "research_exposure_id": exposure.exposure_id,
         "input_head_generation": panel.head_generation,
         "input_attempt_ids": list(panel.attempt_ids),
         "input_artifact_ids": list(panel.artifact_ids),

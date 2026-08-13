@@ -1,11 +1,21 @@
 {
   "schema_version": 1,
-  "pipeline_version": "strategy-research-cpu-v7",
+  "pipeline_version": "strategy-research-cpu-v8",
   "market_id": "mkt__gmo__btc__r0",
   "bar_interval": "1hour",
   "from_time": "2019-01-01T00:00:00+00:00",
   "notional_scale": 100000000,
   "strategy_decision_max_age_seconds": 3900,
+  "data_governance": {
+    "scope": "DEV_ADAPTIVE",
+    "registry": "data/research/governance.sqlite3",
+    "holdout_policy": {
+      "minimum_bars": 2160,
+      "minimum_sharpe": 0.0,
+      "maximum_drawdown": 0.45,
+      "maximum_fdr_q": 0.2
+    }
+  },
   "cost_model": {
     "fee_bps_assumption": 5.0,
     "half_spread_bps_assumption": 2.0,

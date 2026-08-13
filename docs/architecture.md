@@ -287,7 +287,7 @@ DuckDB 列裁剪、CPU 完成 schema/PIT/散列验证、盘口重放与 Decimal/
 | **TBD-18** | GPU 技术栈（CuPy / PyTorch / RAPIDS / 原生 CUDA） | |
 | **TBD-19** | 因子库的组织方式与注册机制 | 【提案 2026-08-14，CPU 基线已实现】趋势、突破、均值回归和网格候选以纯函数加版本化 JSON 参数展开，候选身份按家族、模式和参数内容寻址；GPU typed DSL 与长期 promotion registry 仍未决。见 [策略研究管线](strategy-research.md) |
 | **TBD-20** | 回测引擎形态（事件驱动 / 向量化 / 两者） | 【提案 2026-08-14，向量化基线已实现】中频系列使用前一决策目标、gap 门禁和完整主动成本的 CPU walk-forward；做市、queue、部分成交和撤单失败仍需事件驱动模拟器，当前保持 disabled/shadow。见 [策略研究管线](strategy-research.md) |
-| **TBD-21** | 因子存储格式与版本管理 | 【已锁定 2026-08-11 基础面，2026-08-14 扩展】规范化事实先以内容寻址 Parquet 物化；研究层已新增内容寻址紧凑面板、特征、label/cost/replay、全候选 trial ledger、目标位置与 manifest。长期 promotion registry 仍随 GPU 阶段定义。见 [materialization-design.md](materialization-design.md) 与 [策略研究管线](strategy-research.md) |
+| **TBD-21** | 因子存储格式与版本管理 | 【已锁定 2026-08-11 基础面，2026-08-14 扩展】规范化事实先以内容寻址 Parquet 物化；研究层已新增内容寻址紧凑面板、特征、label/cost/replay、全候选 trial ledger、目标位置与 manifest，并以 SQLite 原子注册表实施 adaptive exposure 与一次性 holdout vintage。完整因子生命周期/promotion registry 仍随 GPU 阶段定义。见 [materialization-design.md](materialization-design.md) 与 [策略研究管线](strategy-research.md) |
 | **TBD-22** | 硬件环境（GPU 型号、显存、是否本机） | Windows TDR 约束要求 GPU 计算进程隔离 |
 
 ### 外部参考评估

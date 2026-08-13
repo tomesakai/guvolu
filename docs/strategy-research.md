@@ -118,6 +118,28 @@ paper 分配遵守以下长期边界：趋势、量价确认趋势和突破合�
 派生配置是新制品，不覆盖基准配置。使用派生配置再次运行时仍属于开发回放；只有明确登记的
 一次性封存段才允许形成最终 promotion 证据（G-08）。
 
+`cpu-v8` 把这条纪律落实为 SQLite 原子状态机。普通管线在打开面板前登记
+`DEV_ADAPTIVE` 暴露区间；封存段必须在区间开始前创建，且不得与任何历史暴露或其他 vintage
+重叠。专用 holdout runner 先把 vintage 永久改为 `consumed`，然后才打开市场数据；即使进程
+崩溃也不能重跑。候选必须来自 clean commit 的多流派组合运行，候选集、源码、配置、输入 head
+和结果散列全部绑定。结论只能登记一次且不能改写：
+
+```powershell
+# 示例时间必须是尚未开始的未来区间；不可对既有历史事后封存。
+.\.venv\Scripts\python.exe scripts\manage_holdout_vintage.py seal `
+  mkt__gmo__btc__r0 2026-10-01T00:00:00Z 2027-01-01T00:00:00Z
+
+# 等到封存区间完整到达后，冻结候选并只运行一次。
+.\.venv\Scripts\python.exe scripts\run_holdout_validation.py <vintage_id> `
+  --source-summary <clean-combined-summary.json>
+
+.\.venv\Scripts\python.exe scripts\manage_holdout_vintage.py list
+```
+
+当前 2019 年以来的数据已进入 adaptive 开发历史，不能倒签为 holdout。因而状态机与专用
+评估路径已经可用，但现有策略仍没有 G-08 通过结论；必须等待一个事先封存的新数据段，这一
+时间约束不能由代码、回填或重复回测绕过。
+
 只读复核最近一次发布运行：
 
 ```powershell
@@ -193,7 +215,7 @@ CPU 阶段应先于 GPU 完成以下收敛：
    不把同一参数在所有节拍无边界复制。
 3. 在现有非正态 Probabilistic Sharpe、循环折块 percentile bootstrap 和折块 CSCV/PBO 之上
    增加 studentized bootstrap、Deflated Sharpe、参数邻域稳定性和 regime attribution；开发
-   回放与一次性封存段分开登记并执行 G-08。
+   回放与已经实现的一次性封存段状态机分开登记；积累未来 vintage 后再形成 G-08 结论。
 4. 均值回归和网格在当前主动成交成本下失败时保持拒绝。只有建立 snapshot-bounded 被动成交
    上下界、库存路径、逆向选择和撤单失败模拟后，才重新评估网格，不以较低费用假设直接放行。
 5. 建立多市场 PIT universe、共同 quote/FX、上市生命周期和流动性过滤后，再生成横截面与
@@ -302,7 +324,11 @@ flowchart TB
     aggregate --> contract["目标合同<br/>family target × allocation weight"]
     contract --> quality{"实时质量与代码身份"}
     quality -- "失败" --> flat["aggregate target = 0<br/>100% reserve"]
-    quality -- "通过" --> paper["paper target artifact<br/>人工 promotion / 一次性 holdout"]
+    quality -- "通过" --> paper["paper target artifact<br/>冻结多流派部署候选"]
+    paper --> sealed["未来 vintage 预先封存<br/>不得与 adaptive exposure 重叠"]
+    sealed --> consume["原子 consumed<br/>崩溃也禁止重跑"]
+    consume --> holdout["Holdout ValidationExact<br/>固定候选 / 固定政策 / 不重新选择"]
+    holdout --> promotion["一次性 verdict<br/>人工 promotion"]
 ```
 
 当前 CPU 网格与未来 GPU 搜索共享 `Candidate Registry -> ValidationExact -> ledger` 之后的路径。

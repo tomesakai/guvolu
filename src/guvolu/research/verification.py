@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from guvolu.research.governance import get_research_exposure
 from guvolu.research.provenance import sha256_file
 
 
@@ -130,6 +131,41 @@ def _verify_operational_gate(summary: Mapping[str, object]) -> None:
         raise ValueError("代码身份非决策级但组合目标非零")
 
 
+def _verify_data_governance(root: Path, summary: Mapping[str, object]) -> None:
+    """复核 v8 开发运行绑定的不可变数据暴露。"""
+    if summary.get("pipeline_method_version") != "strategy-research-pipeline-v8":
+        return
+    governance = _object(summary.get("data_governance"), "data_governance")
+    if governance.get("scope") != "DEV_ADAPTIVE":
+        raise ValueError("普通研究运行的数据范围必须为 DEV_ADAPTIVE")
+    relative = _text(governance.get("registry"), "data_governance.registry")
+    registry = (root / relative).resolve()
+    try:
+        registry.relative_to(root)
+    except ValueError as error:
+        raise ValueError("研究治理注册表越出项目目录") from error
+    exposure_id = _text(
+        governance.get("exposure_id"),
+        "data_governance.exposure_id",
+    )
+    exposure = get_research_exposure(registry, exposure_id)
+    if exposure.research_identity != summary.get("research_identity"):
+        raise ValueError("研究暴露与 summary 的 research_identity 不一致")
+    if exposure.market_id != summary.get("market_id"):
+        raise ValueError("研究暴露与 summary 的 market_id 不一致")
+    panel = _object(summary.get("panel"), "panel")
+    if exposure.start_time.isoformat() != governance.get("from_time"):
+        raise ValueError("研究暴露起点不一致")
+    if exposure.end_time.isoformat() != governance.get("to_time"):
+        raise ValueError("研究暴露终点不一致")
+    panel_from = _text(panel.get("from_time"), "panel.from_time")
+    panel_to = _text(panel.get("to_time"), "panel.to_time")
+    if panel_from < exposure.start_time.isoformat():
+        raise ValueError("研究面板早于已登记暴露区间")
+    if panel_to > exposure.end_time.isoformat():
+        raise ValueError("研究面板晚于已登记暴露区间")
+
+
 def verify_research_run(
     root: Path,
     manifest_path: Path | None = None,
@@ -169,6 +205,7 @@ def verify_research_run(
     if summary.get("run_id") != run_id:
         raise ValueError("summary 与 manifest 的 run_id 不一致")
     _verify_operational_gate(summary)
+    _verify_data_governance(resolved_root, summary)
     return VerificationResult(
         run_id=run_id,
         manifest_path=resolved_manifest,
