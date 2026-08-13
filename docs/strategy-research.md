@@ -53,8 +53,9 @@ GMO 历史成交可观察到周期性短空窗。第一版配置把最多四根�
 超过该上限即令滚动特征失效，直到完整回看窗重新形成。回放不获取跨超限缺口收益，而按
 入场换手加断流平仓的双边成本处理。该阈值属于版本化配置，不是来源事实（G-06）。
 
-成本模型至少包含 taker fee、半边 spread、slippage 和 impact。被动成交、撤单失败与部分成交
-尚无足够事实校准，因此当前 paper 系列统一使用主动成交保守成本；网格保持 shadow。
+成本模型至少包含 taker fee、半边 spread、slippage 和 impact。当前 paper 系列统一使用主动
+成交保守成本。网格另由第 8 节的 L2 事件 shadow 给出被动成交上下界；撤单失败、部分成交和
+私有队列仍无足够事实校准，因此网格保持零权重。
 
 ## 4. 验证与准入
 
@@ -274,7 +275,54 @@ summary 后，五个流派均没有可计入的时间历史：每个流派排除
 同时证明 monitor、summary、ledger 与父配置散列一致。该增强只收紧证据链，不改变上述历史不足
 结论，也不进入已经冻结的前向执行器代码树。
 
-## 8. 下一版 CPU 生成方式
+## 8. 被动网格与 L2 shadow
+
+网格不再借用中频主动成交回放表示被动成交。独立入口
+`scripts/run_passive_grid_shadow.py` 冻结 bitbank BTC/JPY 的 5 秒订单流 tile，并沿每个 tile 的
+物化依赖闭包解析其实际使用的实时逐笔，而不是读取运行时最新 trade head。它按
+一桶决策延迟重放一桶寿命的买卖报价，并同时发布两条不能互相替代的成交边界：
+
+- `trade_through_pessimistic` 只有主动成交严格穿过报价才视为成交；
+- `touch_queue_optimistic` 允许触价，但成交数量不超过该价观察量，并明确忽略队列优先级。
+
+每个候选从中性库存开始，库存限制为 2、4 或 8 个下单单位。任何 L2 gap 都取消待生效报价、
+切断损益路径，并按版本化压力成本将段末库存恢复到中性。输出同时记录 maker 费用、固定持有
+基准、库存上下界、段末恢复成本、5/30/60 秒 markout 与逆向选择。它始终是 shadow，
+`capital_weight=0`；没有私有委托与成交生命周期时，触价上界也不得解释为真实成交率。
+
+5 秒 tile 的价格行宽为 2 tick；tile 的价格点是行下界，不是未经分桶的逐 tick 报价。因此候选
+偏移以 `quote_offset_rows` 表示，并同时披露精确的 tick 等价值；成交记录保留
+`[price_row_lower, price_row_upper_exclusive)`，防止把一行误解释为一个 tick。
+
+2026-08-14 的真实 bitbank 运行冻结了 17,482 个桶，其中 9,142 个通过质量门，共 12.697 小时，
+被 437 个可信连续段分隔；tile 实际依赖闭包内的 4,778 条逐笔均为 taker 方向，镜像比例为零。
+九个候选的严格穿价下界全部为负；最好的 2 行（4 tick）、8 库存步候选为 `-359.500` bp，
+217 次成交事件，5 秒逆向中点移动为 `-2.717` bp。即使 bitbank 当前 maker 返还按 `2 bp`
+建模，成交后的价格逆向移动和频繁缺口下的库存恢复仍使假设失败。该结论是“拒绝当前网格
+方向”，不是继续扩大参数的理由。
+
+```powershell
+python scripts/run_passive_grid_shadow.py `
+  --repository . `
+  --data-root C:\Users\wu_zh\dev\guvolu\data
+
+python scripts/run_passive_grid_shadow.py `
+  --repository . `
+  --verify passive-grid-shadow-359fbd578f63353b5786dfcc40029736ca3ddebfd6ffa1295cc4ceec2715be07
+```
+
+方法选择与边界依据：GMO 官方成交 WS 支持 `TAKER_ONLY`，因此新采集显式启用该选项；历史
+未过滤 r0 数据只保留为参与方方向，不进入 signed flow。bitbank 官方现物说明给出 maker
+返还 `0.02%`。限价成交研究表明成交与不利价格移动并非独立，队列状态也是成交概率的重要
+输入，所以没有私有生命周期或队列证据时不能校准 promotion：
+
+- [GMO Coin Public WebSocket trades](https://api.coin.z.com/docs/)
+- [bitbank 现物交易费用](https://bitbank.cc/about/trade/)
+- [The Negative Drift of a Limit Order Fill](https://arxiv.org/abs/2407.16527)
+- [Market Simulation under Adverse Selection](https://arxiv.org/abs/2409.12721)
+- [Fill Probabilities in a Limit Order Book with State-Dependent Stochastic Order Flows](https://arxiv.org/abs/2403.02572)
+
+## 9. 下一版 CPU 生成方式
 
 CPU 阶段应先于 GPU 完成以下收敛：
 
@@ -306,7 +354,7 @@ CPU 阶段应先于 GPU 完成以下收敛：
 | [Deflated Sharpe Ratio](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=2460551) | 选择偏差、非正态与试验次数会抬高 Sharpe | 已加入 family-scoped raw/effective trial DSR；effective count 准入，raw count 作保守敏感性 |
 | [Ledoit-Wolf Sharpe 检验](https://www.ledoit.net/Robust_Sharpe_2008.pdf) | 肥尾或序列相关下应使用 time-series bootstrap | 已加入循环折块 percentile 门禁；studentized 区间列为下一步 |
 
-## 9. GPU 策略生成方式
+## 10. GPU 策略生成方式
 
 GPU 接入遵循 [GPU 因子挖掘规格](../gpu-factor-mining-v1.1/README.md)，并复用本管线已形成的
 面板、候选身份、成本回放和试验台账：
@@ -338,7 +386,7 @@ reference 中位数 7.80 s，微内核加速 956×，最大绝对差 `3.77e-8`�
 或制品写入，不能外推为全管线加速比。可重复脚本为
 `scripts/benchmark_strategy_search.py`；GPU 依赖保留在隔离环境，生产研究环境仍为零额外数值依赖。
 
-## 10. 多流派管线区分与聚合架构
+## 11. 多流派管线区分与聚合架构
 
 “多流派”不是把不同规则塞进同一个参数网格。每个流派拥有独立的事实需求、生成预算、候选
 身份、监视历史和演进提案；只有经过统一 Exact 验证后，才在组合层比较相关性并竞争风险预算。
@@ -349,7 +397,7 @@ reference 中位数 7.80 s，微内核加速 956×，最大绝对差 `3.77e-8`�
 | 量价趋势 | paper eligible | 趋势加 signed flow/volume 确认，同一方向风险桶 | 独立演进 flow confirmation |
 | 突破 | paper eligible | 区间突破加 flow 确认，最新信号允许空仓 | 监视冠军集中度与边界轴 |
 | 均值回归 | rejected | range 假设、逆势入场、主动成本后评估 | 当前先修订假设，不扩大亏损网格 |
-| 网格 | shadow rejected | 现有主动成交上界只用于否证，不能代表被动成交 | 待 fill/撤单/逆向选择模型后再演进 |
+| 网格 | L2 shadow rejected | snapshot 成交上下界、库存与逆向选择只用于否证 | 待私有 fill/撤单生命周期校准后再演进 |
 | 微观结构/做市/queue | disabled | 缺 L3、MBO、私有成交生命周期 | 不生成伪候选，先补事实合同 |
 | 跨场所套利 | shadow | 需同步可交易 BBO、双腿费用与 reconciliation | 先闭合 leg-risk，再参与分配 |
 | 横截面/相对价值 | disabled | 需 PIT universe、生命周期、共同报价与 FX | 多市场事实闭合后建立独立后端 |
@@ -359,6 +407,8 @@ flowchart TB
     raw["冻结源事实<br/>trade / OHLCV / L2 shadow / lineage"]
     pit["PIT PanelManifest<br/>三时间、gap、质量向量"]
     raw --> pit
+    l2["L2 事件重放<br/>snapshot bounds / inventory / markout"]
+    raw --> l2
 
     subgraph generation["独立流派生成与演进"]
         direction["方向时序池<br/>trend / flow_trend / breakout"]
@@ -376,7 +426,7 @@ flowchart TB
 
     pit --> direction
     pit --> reversion
-    pit --> grid
+    l2 --> grid
     pit -. "事实不足则 disabled" .-> micro
     pit -. "universe 未闭合" .-> cross
 
@@ -398,6 +448,9 @@ flowchart TB
     robust --> ledger["不可变 trial ledger<br/>失败候选也计数"]
     ledger --> evolution["SelectionView<br/>仅反馈本流派下一代"]
     evolution --> monitors
+
+    privateFill["未来私有委托/成交生命周期<br/>queue calibration"]
+    privateFill -. "未闭合前权重为零" .-> grid
 
     robust --> eligible{"paper eligible?"}
     eligible -- "否" --> reject["reject / shadow / disabled<br/>权重固定为零"]
