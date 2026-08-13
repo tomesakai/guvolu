@@ -546,57 +546,6 @@ def update_holdout_evaluation_attempt(
     return _attempt_from_row(current)
 
 
-def complete_holdout_evaluation_attempt(
-    registry_path: Path,
-    evaluation_id: str,
-    result_manifest_path: str,
-    result_manifest_sha256: str,
-    *,
-    completed_at: datetime | None = None,
-) -> HoldoutEvaluationAttempt:
-    """把评估尝试终结为带 manifest 身份的 completed。"""
-    if not result_manifest_path or len(result_manifest_sha256) != 64:
-        raise ValueError("完成 holdout 尝试必须绑定 manifest 路径与 SHA-256")
-    completed = _utc(completed_at or datetime.now(UTC))
-    connection = _connect(registry_path)
-    try:
-        _begin(connection)
-        row = connection.execute(
-            "SELECT * FROM holdout_evaluation_attempt WHERE evaluation_id=?",
-            (evaluation_id,),
-        ).fetchone()
-        if row is None:
-            raise LookupError(f"holdout 评估尝试不存在: {evaluation_id}")
-        if row["status"] != "incomplete":
-            raise ValueError("holdout 评估尝试已经完成")
-        connection.execute(
-            "UPDATE holdout_evaluation_attempt SET status='completed',stage='completed',"
-            "updated_at=?,completed_at=?,result_manifest_path=?,"
-            "result_manifest_sha256=? WHERE evaluation_id=? AND status='incomplete'",
-            (
-                _timestamp(completed),
-                _timestamp(completed),
-                result_manifest_path,
-                result_manifest_sha256,
-                evaluation_id,
-            ),
-        )
-        current = connection.execute(
-            "SELECT * FROM holdout_evaluation_attempt WHERE evaluation_id=?",
-            (evaluation_id,),
-        ).fetchone()
-        connection.execute("COMMIT")
-    except BaseException:
-        if connection.in_transaction:
-            connection.execute("ROLLBACK")
-        raise
-    finally:
-        connection.close()
-    if current is None:
-        raise RuntimeError("holdout 评估完成后不可见")
-    return _attempt_from_row(current)
-
-
 def finalize_holdout_evaluation(
     registry_path: Path,
     vintage_id: str,
@@ -682,55 +631,6 @@ def get_holdout_evaluation_attempt(
     if row is None:
         raise LookupError(f"holdout 评估尝试不存在: {evaluation_id}")
     return _attempt_from_row(row)
-
-
-def record_holdout_verdict(
-    registry_path: Path,
-    vintage_id: str,
-    verdict: str,
-    *,
-    recorded_at: datetime | None = None,
-) -> HoldoutVintage:
-    """为已消费封存段一次性记录最终结论。"""
-    normalized = verdict.strip()
-    if not normalized:
-        raise ValueError("holdout verdict 不得为空")
-    recorded = _utc(recorded_at or datetime.now(UTC))
-    connection = _connect(registry_path)
-    try:
-        _begin(connection)
-        row = connection.execute(
-            "SELECT * FROM holdout_vintage WHERE vintage_id=?",
-            (vintage_id,),
-        ).fetchone()
-        if row is None:
-            raise LookupError(f"封存段不存在: {vintage_id}")
-        if row["status"] != "consumed":
-            raise ValueError("封存段尚未消费，不能记录 verdict")
-        if row["verdict"] is not None:
-            if row["verdict"] != normalized:
-                raise ValueError("holdout verdict 已登记且不可改写")
-            connection.execute("COMMIT")
-            return _vintage_from_row(row)
-        connection.execute(
-            "UPDATE holdout_vintage SET verdict=?,verdict_recorded_at=? "
-            "WHERE vintage_id=? AND verdict IS NULL",
-            (normalized, _timestamp(recorded), vintage_id),
-        )
-        updated = connection.execute(
-            "SELECT * FROM holdout_vintage WHERE vintage_id=?",
-            (vintage_id,),
-        ).fetchone()
-        connection.execute("COMMIT")
-    except BaseException:
-        if connection.in_transaction:
-            connection.execute("ROLLBACK")
-        raise
-    finally:
-        connection.close()
-    if updated is None:
-        raise RuntimeError("verdict 写入后封存段不可见")
-    return _vintage_from_row(updated)
 
 
 def list_holdout_vintages(registry_path: Path) -> tuple[HoldoutVintage, ...]:

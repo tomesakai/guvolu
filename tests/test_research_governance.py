@@ -14,7 +14,6 @@ from guvolu.research.governance import (
     get_frozen_forward_plan_for_vintage,
     list_frozen_forward_predictions,
     list_holdout_vintages,
-    record_holdout_verdict,
     register_frozen_forward_plan,
     register_frozen_forward_prediction,
     register_research_exposure,
@@ -115,20 +114,27 @@ def test_holdout_vintage_is_unexposed_nonoverlapping_and_single_use(
             "different-evaluation",
         )
 
-    decided = record_holdout_verdict(
+    decided, completed_attempt = finalize_holdout_evaluation(
         registry,
         vintage.vintage_id,
+        "evaluation-id",
         "failed",
-        recorded_at=_time("2025-08-03T00:00:00"),
+        "reports/holdout/manual-manifest.json",
+        "a" * 64,
+        completed_at=_time("2025-08-03T00:00:00"),
     )
     assert decided.verdict == "failed"
-    assert record_holdout_verdict(
-        registry,
-        vintage.vintage_id,
-        "failed",
-    ).verdict == "failed"
-    with pytest.raises(ValueError, match="不可改写"):
-        record_holdout_verdict(registry, vintage.vintage_id, "passed")
+    assert completed_attempt.status == "completed"
+    assert completed_attempt.result_manifest_sha256 == "a" * 64
+    with pytest.raises(ValueError, match="已经终结"):
+        finalize_holdout_evaluation(
+            registry,
+            vintage.vintage_id,
+            "evaluation-id",
+            "passed",
+            "reports/holdout/manual-manifest.json",
+            "b" * 64,
+        )
     assert list_holdout_vintages(registry) == (decided,)
 
 
@@ -205,6 +211,8 @@ def test_holdout_verdict_and_completed_attempt_are_atomic(tmp_path: Path) -> Non
             "reports/holdout/manifest.json",
             "b" * 64,
         )
+
+
 def test_holdout_cannot_be_selected_retroactively(tmp_path: Path) -> None:
     """区间开始后才登记的所谓 holdout 必须被拒绝。"""
     with pytest.raises(ValueError, match="禁止事后挑选"):
