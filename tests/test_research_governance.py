@@ -42,6 +42,18 @@ from guvolu.strategy.expression import (
 )
 
 
+_TEST_PARAMETERS: dict[str, int | float] = {
+    "annual_volatility_target": 0.4,
+    "entry_score": 0.5,
+    "exit_score": 0.0,
+    "lookback": 168,
+    "maximum_target": 1.0,
+}
+_TEST_TEMPLATE = strategy_expression("trend")
+_TEST_EXPRESSION_ID = expression_id(_TEST_TEMPLATE)
+_TEST_CANDIDATE_ID = candidate_identity(_TEST_TEMPLATE, _TEST_PARAMETERS)
+
+
 @dataclass(frozen=True)
 class _DecisionBar:
     decision_time: datetime
@@ -139,12 +151,12 @@ def _write_forward_plan_artifact(
         "config_hash": config_hash,
         "code_tree_digest": code_tree_digest,
         "candidates": [{
-            "candidate_id": "candidate-one",
+            "candidate_id": _TEST_CANDIDATE_ID,
             "family": "trend",
             "mode": "paper",
-            "expression_id": "expression-one",
-            "parameters": {"lookback": 1},
-            "complexity": 1,
+            "expression_id": _TEST_EXPRESSION_ID,
+            "parameters": _TEST_PARAMETERS,
+            "complexity": len(_TEST_PARAMETERS),
         }],
         "allocation": {"weights": {"trend": 0.4}, "reserve": 0.6},
     }, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
@@ -193,7 +205,7 @@ def _write_forward_prediction_artifact(
             "reasons": [],
         },
         "families": [{
-            "candidate_id": "candidate-one",
+            "candidate_id": _TEST_CANDIDATE_ID,
             "family": "trend",
             "family_target": 0.5,
             "frozen_allocation_weight": 0.4,
@@ -399,7 +411,7 @@ def test_holdout_vintage_is_unexposed_nonoverlapping_and_single_use(
         )
 
     candidate_set_identity, candidate_set_hash = _test_candidate_set(
-        ["candidate-one"]
+        [_TEST_CANDIDATE_ID]
     )
     evaluation_identity, evaluation_id = _test_evaluation_identity(
         tmp_path, vintage.vintage_id, candidate_set_hash,
@@ -570,7 +582,7 @@ def test_holdout_verdict_and_completed_attempt_are_atomic(tmp_path: Path) -> Non
         sealed_at=_time("2026-12-01T00:00:00"),
     )
     candidate_set_identity, candidate_set_hash = _test_candidate_set(
-        ["candidate-one"]
+        [_TEST_CANDIDATE_ID]
     )
     evaluation_identity, evaluation_id = _test_evaluation_identity(
         tmp_path, vintage.vintage_id, candidate_set_hash,
@@ -759,7 +771,7 @@ def test_registered_forward_plan_prevents_relaxed_policy_finalize(
         sealed_at=_time("2026-12-01T00:00:00"),
     )
     candidate_set_identity, candidate_set_hash = _test_candidate_set(
-        ["candidate-one"]
+        [_TEST_CANDIDATE_ID]
     )
     evaluation_identity, evaluation_id = _test_evaluation_identity(
         tmp_path,
@@ -817,6 +829,140 @@ def test_registered_forward_plan_prevents_relaxed_policy_finalize(
     assert get_holdout_evaluation_attempt(registry, evaluation_id).status == "incomplete"
 
 
+def test_forward_plan_recomputes_candidate_formula_identity(tmp_path: Path) -> None:
+    """plan 内候选 ID 必须由受支持公式和完整参数现场重算。"""
+    registry = tmp_path / "governance.sqlite3"
+    vintage = seal_holdout_vintage(
+        registry,
+        "market-one",
+        _time("2027-01-01T00:00:00"),
+        _time("2027-02-01T00:00:00"),
+        sealed_at=_time("2026-12-01T00:00:00"),
+    )
+    _, plan_path, _ = _write_forward_plan_artifact(
+        tmp_path,
+        vintage.vintage_id,
+        "1" * 64,
+        "candidate-set-hash",
+        "config-hash",
+        "tree-one",
+    )
+    artifact = tmp_path / plan_path
+    payload = json.loads(artifact.read_text(encoding="utf-8"))
+    payload["candidates"][0]["parameters"]["lookback"] = 72
+    artifact.write_text(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="候选身份未绑定公式与完整参数"):
+        register_frozen_forward_plan(
+            registry,
+            vintage.vintage_id,
+            "1" * 64,
+            "candidate-set-hash",
+            "config-hash",
+            "tree-one",
+            plan_path,
+            sha256_file(artifact),
+            repository_root=tmp_path,
+            frozen_at=_time("2026-12-15T00:00:00"),
+        )
+
+
+def test_forward_finalize_rejects_plan_candidate_set_substitution(
+    tmp_path: Path,
+) -> None:
+    """顶层 hash 相同也不得用 plan 内另一组候选冒充冻结全集。"""
+    registry = tmp_path / "governance.sqlite3"
+    vintage = seal_holdout_vintage(
+        registry,
+        "market-one",
+        _time("2027-01-01T00:00:00"),
+        _time("2027-02-01T00:00:00"),
+        sealed_at=_time("2026-12-01T00:00:00"),
+    )
+    candidate_set_identity, candidate_set_hash = _test_candidate_set(
+        ["candidate-substituted"]
+    )
+    evaluation_identity, evaluation_id = _test_evaluation_identity(
+        tmp_path,
+        vintage.vintage_id,
+        candidate_set_hash,
+        require_forward_predictions=True,
+    )
+    config_hash = evaluation_identity["config_hash"]
+    assert isinstance(config_hash, str)
+    _, plan_path, plan_sha256 = _write_forward_plan_artifact(
+        tmp_path,
+        vintage.vintage_id,
+        "1" * 64,
+        candidate_set_hash,
+        config_hash,
+        "tree-one",
+    )
+    plan = register_frozen_forward_plan(
+        registry,
+        vintage.vintage_id,
+        "1" * 64,
+        candidate_set_hash,
+        config_hash,
+        "tree-one",
+        plan_path,
+        plan_sha256,
+        repository_root=tmp_path,
+        frozen_at=_time("2026-12-15T00:00:00"),
+    )
+    prediction_path, prediction_sha256 = _write_forward_prediction_artifact(
+        tmp_path,
+        plan.plan_id,
+        vintage.vintage_id,
+        vintage.start_time,
+        "head-one",
+        "panel-one",
+        config_hash,
+        "tree-one",
+    )
+    register_frozen_forward_prediction(
+        registry,
+        plan.plan_id,
+        vintage.start_time,
+        "head-one",
+        "panel-one",
+        prediction_path,
+        prediction_sha256,
+        3900,
+        repository_root=tmp_path,
+        recorded_at=_time("2027-01-01T00:01:00"),
+    )
+    start_holdout_evaluation_attempt(
+        registry,
+        vintage.vintage_id,
+        candidate_set_hash,
+        evaluation_id,
+        started_at=_time("2027-02-02T00:00:00"),
+    )
+    terminal, manifest_path, manifest_sha256 = _write_holdout_evidence(
+        tmp_path,
+        vintage.vintage_id,
+        evaluation_identity,
+        candidate_set_identity,
+        "passed",
+        vintage.start_time,
+        forward_plan_id=plan.plan_id,
+        forward_prediction_count=1,
+    )
+    with pytest.raises(ValueError, match="计划候选与 holdout 冻结候选全集"):
+        finalize_holdout_evaluation(
+            registry,
+            vintage.vintage_id,
+            evaluation_id,
+            terminal,
+            manifest_path,
+            manifest_sha256,
+            repository_root=tmp_path,
+        )
+
+
 def test_forward_required_finalize_matches_registered_prediction_coverage(
     tmp_path: Path,
 ) -> None:
@@ -830,7 +976,7 @@ def test_forward_required_finalize_matches_registered_prediction_coverage(
         sealed_at=_time("2026-12-01T00:00:00"),
     )
     candidate_set_identity, candidate_set_hash = _test_candidate_set(
-        ["candidate-one"]
+        [_TEST_CANDIDATE_ID]
     )
     evaluation_identity, evaluation_id = _test_evaluation_identity(
         tmp_path,

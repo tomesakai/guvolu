@@ -19,6 +19,7 @@ from guvolu.research.governance import (
 )
 from guvolu.research.provenance import canonical_json, sha256_file, stable_identifier
 from guvolu.strategy.contracts import FeatureRow, ResearchBar
+from guvolu.strategy.expression import candidate_identity, expression_id, strategy_expression
 
 
 def _time(value: str) -> datetime:
@@ -69,6 +70,14 @@ def test_frozen_forward_uses_fixed_weight_and_is_idempotent(
         "config_hash": config_hash,
         "code_tree_digest": "tree-one",
     })
+    template = strategy_expression("trend")
+    parameters: dict[str, int | float] = {
+        "annual_volatility_target": 0.4,
+        "entry_score": 0.5,
+        "exit_score": 0.0,
+        "lookback": 1,
+        "maximum_target": 1.0,
+    }
     plan_payload = {
         "schema_version": 1,
         "method_version": "frozen-forward-v1",
@@ -83,12 +92,12 @@ def test_frozen_forward_uses_fixed_weight_and_is_idempotent(
         "code_tree_digest": "tree-one",
         "config_path": "config/strategy.json",
         "candidates": [{
-            "candidate_id": "candidate-one",
+            "candidate_id": candidate_identity(template, parameters),
             "family": "trend",
             "mode": "paper",
-            "parameters": {"lookback": 1},
-            "complexity": 1,
-            "expression_id": "expression-one",
+            "parameters": parameters,
+            "complexity": len(parameters),
+            "expression_id": expression_id(template),
         }],
         "allocation": {"weights": {"trend": 0.4}, "reserve": 0.6},
     }

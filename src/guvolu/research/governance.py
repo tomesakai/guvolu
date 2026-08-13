@@ -15,6 +15,11 @@ from guvolu.research.contracts import (
     HOLDOUT_METHOD_VERSION,
 )
 from guvolu.research.provenance import sha256_file, stable_identifier
+from guvolu.strategy.expression import (
+    candidate_identity,
+    expression_id,
+    strategy_expression,
+)
 
 GOVERNANCE_SCHEMA_VERSION = 4
 GOVERNANCE_METHOD_VERSION = "research-data-governance-v2"
@@ -102,6 +107,7 @@ class _TerminalEvidence:
 
     manifest_path: str
     candidate_set_hash: str
+    candidate_ids: tuple[str, ...]
     config_hash: str
     require_forward_predictions: bool
     forward_plan_id: str | None
@@ -215,6 +221,7 @@ def _validated_forward_plan_artifact(
     code_tree_digest: str,
     artifact_path: str,
     artifact_sha256: str,
+    expected_candidate_ids: tuple[str, ...] | None = None,
 ) -> _ForwardPlanEvidence:
     """现场复核冻结前向计划制品与注册身份。"""
     if not _canonical_sha256(artifact_sha256):
@@ -258,25 +265,40 @@ def _validated_forward_plan_artifact(
         candidate_id = candidate.get("candidate_id")
         family = candidate.get("family")
         mode = candidate.get("mode")
-        expression_id = candidate.get("expression_id")
+        expression_identity = candidate.get("expression_id")
         parameters = candidate.get("parameters")
         complexity = candidate.get("complexity")
         if (
             not isinstance(candidate_id, str) or not candidate_id
             or not isinstance(family, str) or not family
             or not isinstance(mode, str) or not mode
-            or not isinstance(expression_id, str) or not expression_id
+            or not isinstance(expression_identity, str) or not expression_identity
             or not isinstance(parameters, dict)
             or not isinstance(complexity, int) or isinstance(complexity, bool)
             or complexity <= 0
         ):
             raise ValueError("冻结前向计划 candidate 合同无效")
         if any(
-            not isinstance(value, (int, float)) or isinstance(value, bool)
+            not isinstance(name, str) or not name
+            or not isinstance(value, (int, float)) or isinstance(value, bool)
             or not math.isfinite(float(value))
-            for value in parameters.values()
+            for name, value in parameters.items()
         ):
             raise ValueError("冻结前向计划 candidate 参数无效")
+        numeric_parameters = {
+            str(name): value for name, value in parameters.items()
+            if isinstance(value, (int, float)) and not isinstance(value, bool)
+        }
+        try:
+            template = strategy_expression(family)
+        except ValueError as error:
+            raise ValueError("冻结前向计划包含不受支持的策略流派") from error
+        if expression_id(template) != expression_identity:
+            raise ValueError("冻结前向计划表达式身份不匹配")
+        if candidate_identity(template, numeric_parameters) != candidate_id:
+            raise ValueError("冻结前向计划候选身份未绑定公式与完整参数")
+        if mode != "paper":
+            raise ValueError("冻结前向计划只允许 paper 候选")
         candidate_families.append((candidate_id, family))
     candidate_ids = tuple(item[0] for item in candidate_families)
     families = tuple(item[1] for item in candidate_families)
@@ -286,6 +308,8 @@ def _validated_forward_plan_artifact(
         or len(set(families)) != len(families)
     ):
         raise ValueError("冻结前向计划候选必须有序且 candidate/family 唯一")
+    if expected_candidate_ids is not None and candidate_ids != expected_candidate_ids:
+        raise ValueError("冻结前向计划候选与 holdout 冻结候选全集不一致")
     allocation = payload.get("allocation")
     if not isinstance(allocation, dict) or not isinstance(allocation.get("weights"), dict):
         raise ValueError("冻结前向计划缺少 allocation")
@@ -808,6 +832,7 @@ def _validated_terminal_evidence(
     return _TerminalEvidence(
         manifest_path=normalized_path,
         candidate_set_hash=candidate_set_hash,
+        candidate_ids=tuple(candidate_ids),
         config_hash=config_hash,
         require_forward_predictions=require_forward_predictions,
         forward_plan_id=forward_plan_id,
@@ -1440,6 +1465,7 @@ def finalize_holdout_evaluation(
                 str(plan["code_tree_digest"]),
                 str(plan["plan_artifact_path"]),
                 str(plan["plan_artifact_sha256"]),
+                evidence.candidate_ids,
             )
             prediction_rows = connection.execute(
                 "SELECT * FROM frozen_forward_prediction WHERE plan_id=? "
