@@ -22,6 +22,8 @@ from guvolu.research.contracts import (
     HOLDOUT_METHOD_VERSION,
     INTERVAL_SUITE_FORWARD_METHOD_VERSION,
     INTERVAL_SUITE_FORWARD_SCHEMA_VERSION,
+    INTERVAL_SUITE_PREDICTION_METHOD_VERSION,
+    INTERVAL_SUITE_PREDICTION_SCHEMA_VERSION,
     CodeIdentity,
     FrozenPanelInputs,
     PanelSnapshot,
@@ -48,11 +50,14 @@ from guvolu.research.governance import (
     get_frozen_forward_plan_for_vintage,
     get_frozen_forward_prediction_row_set,
     get_interval_suite_forward_plan_for_vintage,
+    get_interval_suite_forward_prediction_row_set,
+    list_interval_suite_forward_predictions,
     list_frozen_forward_predictions,
     list_holdout_vintages,
     register_frozen_forward_plan,
     register_frozen_forward_prediction,
     register_interval_suite_forward_plan,
+    register_interval_suite_forward_prediction,
     register_research_exposure,
     seal_holdout_vintage,
     start_holdout_evaluation_attempt,
@@ -67,6 +72,10 @@ from guvolu.research.interval_suite import build_interval_suite_plan
 from guvolu.research.interval_suite_forward_identity import (
     interval_suite_deployment_contract_id,
     interval_suite_forward_plan_id,
+)
+from guvolu.research.interval_suite_prediction_identity import (
+    interval_suite_forward_prediction_id,
+    interval_suite_member_panel_set_hash,
 )
 from guvolu.research.provenance import (
     canonical_json,
@@ -505,6 +514,128 @@ def _write_interval_suite_plan_artifact(
         actual_evidence_id,
         path.relative_to(root).as_posix(),
         sha256_file(path),
+    )
+
+
+def _write_interval_suite_prediction_artifact(
+    root: Path,
+    plan_path: str,
+    plan_id: str,
+    suite_plan_id: str,
+    suite_evidence_id: str,
+    vintage_id: str,
+    decision_time: datetime,
+) -> tuple[str, str, str, str, str]:
+    """写入含完整成员面板和 sleeve 贡献的套件预测制品。"""
+    plan = json.loads((root / plan_path).read_text(encoding="utf-8"))
+    receipt_path = root / "data" / "research" / "input-receipts" / "suite.json"
+    receipt_path.parent.mkdir(parents=True, exist_ok=True)
+    receipt_path.write_text("{}\n", encoding="utf-8")
+    receipt_sha = sha256_file(receipt_path)
+    input_head = "sha256-suite-head"
+    member_panels: list[dict[str, object]] = []
+    selected_member_ids = {
+        str(sleeve["member_id"]) for sleeve in plan["sleeves"]
+    }
+    for member in plan["members"]:
+        member_id = str(member["member_id"])
+        if member_id not in selected_member_ids:
+            continue
+        panel_path = root / "data" / "research" / "suite-panels" / f"{member_id}.parquet"
+        panel_path.parent.mkdir(parents=True, exist_ok=True)
+        panel_path.write_bytes(("PAR1" + member_id + "PAR1").encode())
+        member_panels.append({
+            "member_id": member_id,
+            "bar_interval": member["bar_interval"],
+            "panel_path": panel_path.relative_to(root).as_posix(),
+            "panel_sha256": sha256_file(panel_path),
+            "panel_bytes": panel_path.stat().st_size,
+            "decision_time": decision_time.isoformat(),
+            "latest_available_time": decision_time.isoformat(),
+            "input_head_generation": input_head,
+            "attempt_ids": ["attempt-one"],
+            "artifact_ids": ["artifact-one"],
+            "normalization_versions": ["trade-v1"],
+            "quality": {
+                "integrity": True,
+                "freshness": True,
+                "clock": True,
+                "coverage": True,
+                "pit": True,
+                "lineage": True,
+                "eligible": True,
+                "reasons": [],
+            },
+        })
+    panel_set = interval_suite_member_panel_set_hash(
+        plan_id, decision_time, member_panels,
+    )
+    prediction_id = interval_suite_forward_prediction_id(
+        GOVERNANCE_METHOD_VERSION,
+        INTERVAL_SUITE_PREDICTION_METHOD_VERSION,
+        plan_id,
+        decision_time,
+    )
+    sleeve = plan["sleeves"][0]
+    candidate = sleeve["candidate"]
+    payload = {
+        "schema_version": INTERVAL_SUITE_PREDICTION_SCHEMA_VERSION,
+        "method_version": INTERVAL_SUITE_PREDICTION_METHOD_VERSION,
+        "governance_method_version": GOVERNANCE_METHOD_VERSION,
+        "scope": "INTERVAL_SUITE_FROZEN_FORWARD_PREDICTION",
+        "prediction_id": prediction_id,
+        "plan_id": plan_id,
+        "suite_plan_id": suite_plan_id,
+        "suite_evidence_id": suite_evidence_id,
+        "deployment_contract_id": plan["deployment_contract_id"],
+        "decision_time": decision_time.isoformat(),
+        "generated_at": (decision_time + timedelta(minutes=1)).isoformat(),
+        "quality_reference_time": (
+            decision_time + timedelta(seconds=3900)
+        ).isoformat(),
+        "vintage": plan["vintage"],
+        "input": {
+            "head_generation": input_head,
+            "receipt_path": receipt_path.relative_to(root).as_posix(),
+            "receipt_sha256": receipt_sha,
+        },
+        "code_identity": {
+            "git_hash": plan["source_git_hash"],
+            "tree_digest": plan["code_tree_digest"],
+            "dirty_digest": "",
+            "dirty": False,
+            "decision_grade": True,
+            "reason": None,
+        },
+        "member_panel_set_hash": panel_set,
+        "member_panels": member_panels,
+        "sleeves": [{
+            "sleeve_id": sleeve["sleeve_id"],
+            "member_id": sleeve["member_id"],
+            "bar_interval": sleeve["bar_interval"],
+            "family": sleeve["family"],
+            "candidate_id": candidate["candidate_id"],
+            "weight": 0.4,
+            "raw_target": 0.5,
+            "operational_target": 0.2,
+        }],
+        "allocation": {
+            "weights": {"sleeve-one": 0.4},
+            "reserve": 0.6,
+            "aggregate_target": 0.2,
+            "unit": "fraction_of_portfolio_capital",
+        },
+        "operational": {"eligible": True, "reasons": []},
+    }
+    path = root / "reports" / plan_id / "predictions" / "suite.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(canonical_json(payload) + "\n", encoding="utf-8")
+    return (
+        prediction_id,
+        receipt_path.relative_to(root).as_posix(),
+        receipt_sha,
+        panel_set,
+        path.relative_to(root).as_posix(),
     )
 
 
@@ -1028,10 +1159,10 @@ def test_governance_upgrade_rejects_malformed_receipt_table(
         )
 
 
-def test_explicit_v5_to_v6_upgrade_creates_suite_plan_table(
+def test_explicit_v5_upgrade_creates_current_suite_tables(
     tmp_path: Path,
 ) -> None:
-    """真实 v5 形状须经备份后才获得套件计划写权限。"""
+    """真实 v5 形状须经备份后才获得当前套件写权限。"""
     registry = tmp_path / "governance.sqlite3"
     seal_holdout_vintage(
         registry,
@@ -1058,15 +1189,59 @@ def test_explicit_v5_to_v6_upgrade_creates_suite_plan_table(
     with sqlite3.connect(registry) as connection:
         assert connection.execute(
             "SELECT value FROM governance_meta WHERE key='schema_version'"
-        ).fetchone() == ("6",)
+        ).fetchone() == (str(GOVERNANCE_SCHEMA_VERSION),)
         assert connection.execute(
             "SELECT name FROM sqlite_master WHERE type='table' "
             "AND name='interval_suite_forward_plan'"
         ).fetchone() == ("interval_suite_forward_plan",)
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name='interval_suite_forward_prediction'"
+        ).fetchone() == ("interval_suite_forward_prediction",)
     with sqlite3.connect(backup) as connection:
         assert connection.execute(
             "SELECT name FROM sqlite_master WHERE type='table' "
             "AND name='interval_suite_forward_plan'"
+        ).fetchone() is None
+
+
+def test_explicit_v6_to_v7_upgrade_creates_suite_prediction_table(
+    tmp_path: Path,
+) -> None:
+    """v6 后继库须显式备份后才获得套件预测写权限。"""
+    registry = tmp_path / "governance.sqlite3"
+    seal_holdout_vintage(
+        registry,
+        "market-one",
+        _time("2027-01-01T00:00:00"),
+        _time("2027-02-01T00:00:00"),
+    )
+    with sqlite3.connect(registry) as connection:
+        connection.execute("DROP TABLE interval_suite_forward_prediction")
+        connection.execute(
+            "UPDATE governance_meta SET value='6' WHERE key='schema_version'"
+        )
+        connection.execute(
+            "INSERT INTO governance_meta(key,value) VALUES(?,?)",
+            ("schema_write_ceiling", "6"),
+        )
+    assert list_holdout_vintages(registry)
+    backup = tmp_path / "governance-v6.sqlite3.bak"
+    upgrade_governance_write_ceiling(
+        registry, backup, expected_version=6, expected_write_ceiling=6,
+    )
+    with sqlite3.connect(registry) as connection:
+        assert connection.execute(
+            "SELECT value FROM governance_meta WHERE key='schema_version'"
+        ).fetchone() == (str(GOVERNANCE_SCHEMA_VERSION),)
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name='interval_suite_forward_prediction'"
+        ).fetchone() == ("interval_suite_forward_prediction",)
+    with sqlite3.connect(backup) as connection:
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name='interval_suite_forward_prediction'"
         ).fetchone() is None
 
 
@@ -1102,6 +1277,41 @@ def test_governance_upgrade_rejects_malformed_suite_plan_table(
         assert connection.execute(
             "SELECT value FROM governance_meta WHERE key='schema_version'"
         ).fetchone() == ("5",)
+
+
+def test_governance_upgrade_rejects_malformed_suite_prediction_table(
+    tmp_path: Path,
+) -> None:
+    """v7 迁移不得接受预存的同名弱约束预测表。"""
+    registry = tmp_path / "governance.sqlite3"
+    seal_holdout_vintage(
+        registry,
+        "market-one",
+        _time("2027-01-01T00:00:00"),
+        _time("2027-02-01T00:00:00"),
+    )
+    with sqlite3.connect(registry) as connection:
+        connection.execute("DROP TABLE interval_suite_forward_prediction")
+        connection.execute(
+            "CREATE TABLE interval_suite_forward_prediction("
+            "prediction_id TEXT PRIMARY KEY)"
+        )
+        connection.execute(
+            "UPDATE governance_meta SET value='6' WHERE key='schema_version'"
+        )
+        connection.execute(
+            "INSERT INTO governance_meta(key,value) VALUES(?,?)",
+            ("schema_write_ceiling", "6"),
+        )
+    backup = tmp_path / "malformed-v6.sqlite3.bak"
+    with pytest.raises(ValueError, match="表结构不兼容"):
+        upgrade_governance_write_ceiling(
+            registry, backup, expected_version=6, expected_write_ceiling=6,
+        )
+    with sqlite3.connect(registry) as connection:
+        assert connection.execute(
+            "SELECT value FROM governance_meta WHERE key='schema_version'"
+        ).fetchone() == ("6",)
 
 
 def test_governance_upgrade_backup_includes_prior_concurrent_commit(
@@ -2140,6 +2350,239 @@ def test_interval_suite_forward_plan_is_precommitted_and_attested(
             different_suite_plan_id, different_evidence_id,
             "a" * 40, "tree-one", different_deployment_id,
             different_path, different_sha,
+            repository_root=tmp_path,
+        )
+
+
+def test_interval_suite_prediction_is_append_only_and_row_set_bound(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """共同栅格预测必须绑定活动收据、全部成员面板与聚合仓位。"""
+    registry = tmp_path / "governance.sqlite3"
+    vintage = seal_holdout_vintage(
+        registry,
+        "market-one",
+        _time("2027-01-01T00:00:00"),
+        _time("2027-02-01T00:00:00"),
+    )
+    (
+        plan_id, deployment_id, suite_plan_id,
+        suite_evidence_id, plan_path, plan_sha,
+    ) = _write_interval_suite_plan_artifact(
+        tmp_path, vintage.vintage_id, "suite-plan", "suite-evidence",
+        "a" * 40, "tree-one",
+    )
+    plan = register_interval_suite_forward_plan(
+        registry, vintage.vintage_id, suite_plan_id, suite_evidence_id,
+        "a" * 40, "tree-one", deployment_id, plan_path, plan_sha,
+        repository_root=tmp_path,
+    )
+    decision = _time("2027-01-01T04:00:00")
+    (
+        prediction_id, receipt_path, receipt_sha, panel_set, prediction_path,
+    ) = _write_interval_suite_prediction_artifact(
+        tmp_path,
+        plan_path,
+        plan_id,
+        suite_plan_id,
+        suite_evidence_id,
+        vintage.vintage_id,
+        decision,
+    )
+    fake_inputs = FrozenPanelInputs(
+        market={"market_id": "market-one"},
+        paths=(),
+        head_generation="sha256-suite-head",
+        attempt_ids=("attempt-one",),
+        artifact_ids=("artifact-one",),
+        normalization_versions=("trade-v1",),
+        maximum_event_time=decision,
+    )
+    monkeypatch.setattr(
+        "guvolu.research.panel.attest_trade_input_receipt",
+        lambda *_args, **_kwargs: fake_inputs,
+    )
+    monkeypatch.setattr(
+        "guvolu.research.interval_suite_prediction."
+        "attest_interval_suite_forward_prediction",
+        lambda *_args, **_kwargs: {},
+    )
+    clean_identity = CodeIdentity(
+        git_hash="a" * 40,
+        tree_digest="tree-one",
+        dirty_digest="",
+        dirty=False,
+        decision_grade=True,
+        reason=None,
+    )
+    dirty_identity = CodeIdentity(
+        git_hash="a" * 40,
+        tree_digest="tree-one",
+        dirty_digest="dirty-tree",
+        dirty=True,
+        decision_grade=False,
+        reason="repository_dirty",
+    )
+    identity_sequence = iter((clean_identity, dirty_identity))
+    monkeypatch.setattr(
+        governance_module,
+        "code_identity",
+        lambda *_args, **_kwargs: next(identity_sequence),
+    )
+    _set_now(decision + timedelta(minutes=1))
+    prediction_sha = sha256_file(tmp_path / prediction_path)
+    with pytest.raises(ValueError, match="代码树不是计划的 clean commit"):
+        register_interval_suite_forward_prediction(
+            registry,
+            plan.plan_id,
+            decision,
+            "sha256-suite-head",
+            receipt_path,
+            receipt_sha,
+            panel_set,
+            prediction_path,
+            prediction_sha,
+            repository_root=tmp_path,
+        )
+    assert list_interval_suite_forward_predictions(registry, plan.plan_id) == ()
+    monkeypatch.setattr(
+        governance_module,
+        "code_identity",
+        lambda *_args, **_kwargs: clean_identity,
+    )
+    registered = register_interval_suite_forward_prediction(
+        registry,
+        plan.plan_id,
+        decision,
+        "sha256-suite-head",
+        receipt_path,
+        receipt_sha,
+        panel_set,
+        prediction_path,
+        prediction_sha,
+        repository_root=tmp_path,
+    )
+    assert registered.prediction_id == prediction_id
+    assert list_interval_suite_forward_predictions(
+        registry, plan.plan_id,
+    ) == (registered,)
+    row_set, count, decision_times = (
+        get_interval_suite_forward_prediction_row_set(
+            registry, plan.plan_id,
+        )
+    )
+    assert row_set.startswith("interval-suite-forward-row-set-")
+    assert count == 1
+    assert decision_times == (decision,)
+    assert register_interval_suite_forward_prediction(
+        registry,
+        plan.plan_id,
+        decision,
+        "sha256-suite-head",
+        receipt_path,
+        receipt_sha,
+        panel_set,
+        prediction_path,
+        prediction_sha,
+        repository_root=tmp_path,
+    ) == registered
+
+    monkeypatch.setattr(
+        governance_module,
+        "code_identity",
+        lambda *_args, **_kwargs: dirty_identity,
+    )
+    with pytest.raises(ValueError, match="代码树不是计划的 clean commit"):
+        register_interval_suite_forward_prediction(
+            registry,
+            plan.plan_id,
+            decision,
+            "sha256-suite-head",
+            receipt_path,
+            receipt_sha,
+            panel_set,
+            prediction_path,
+            prediction_sha,
+            repository_root=tmp_path,
+        )
+
+    mismatched_identity = CodeIdentity(
+        git_hash="a" * 40,
+        tree_digest="different-tree",
+        dirty_digest="",
+        dirty=False,
+        decision_grade=True,
+        reason=None,
+    )
+    monkeypatch.setattr(
+        governance_module,
+        "code_identity",
+        lambda *_args, **_kwargs: mismatched_identity,
+    )
+    with pytest.raises(ValueError, match="代码树不是计划的 clean commit"):
+        register_interval_suite_forward_prediction(
+            registry,
+            plan.plan_id,
+            decision,
+            "sha256-suite-head",
+            receipt_path,
+            receipt_sha,
+            panel_set,
+            prediction_path,
+            prediction_sha,
+            repository_root=tmp_path,
+        )
+    monkeypatch.setattr(
+        governance_module,
+        "code_identity",
+        lambda *_args, **_kwargs: clean_identity,
+    )
+    _set_now(_time("2027-01-01T05:01:00"))
+    with pytest.raises(ValueError, match="未对齐共同栅格"):
+        register_interval_suite_forward_prediction(
+            registry,
+            plan.plan_id,
+            _time("2027-01-01T05:00:00"),
+            "sha256-suite-head",
+            receipt_path,
+            receipt_sha,
+            panel_set,
+            prediction_path,
+            prediction_sha,
+            repository_root=tmp_path,
+        )
+    _set_now(_time("2027-01-01T05:06:00"))
+    with pytest.raises(ValueError, match="时效窗口"):
+        register_interval_suite_forward_prediction(
+            registry,
+            plan.plan_id,
+            decision,
+            "sha256-suite-head",
+            receipt_path,
+            receipt_sha,
+            panel_set,
+            prediction_path,
+            prediction_sha,
+            repository_root=tmp_path,
+        )
+    _set_now(decision + timedelta(minutes=1))
+
+    changed_path = tmp_path / "reports" / plan_id / "predictions" / "changed.json"
+    changed = json.loads((tmp_path / prediction_path).read_text(encoding="utf-8"))
+    changed["sleeves"][0]["operational_target"] = 0.3
+    changed_path.write_text(canonical_json(changed) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="质量硬门"):
+        register_interval_suite_forward_prediction(
+            registry,
+            plan.plan_id,
+            decision,
+            "sha256-suite-head",
+            receipt_path,
+            receipt_sha,
+            panel_set,
+            changed_path.relative_to(tmp_path).as_posix(),
+            sha256_file(changed_path),
             repository_root=tmp_path,
         )
 

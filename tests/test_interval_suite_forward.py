@@ -16,12 +16,14 @@ from guvolu.research.config_lineage import (
 )
 from guvolu.research.governance import (
     IntervalSuiteForwardPlan,
+    IntervalSuiteForwardPrediction,
     get_interval_suite_forward_plan_for_vintage,
     seal_holdout_vintage,
 )
 from guvolu.research.interval_suite_forward import (
     attest_interval_suite_forward_plan,
     freeze_interval_suite_forward_plan,
+    suite_forward_decision_times,
     verified_interval_suite_forward_state,
 )
 from guvolu.research.interval_suite import build_interval_suite_plan
@@ -254,6 +256,26 @@ def test_suite_forward_identity_binds_live_root_config_and_method() -> None:
     assert len(plan_ids) == 3
 
 
+def test_suite_forward_schedule_is_left_closed_and_right_open() -> None:
+    """共同栅格包含 vintage 起点但不得包含终点。"""
+    assert suite_forward_decision_times(
+        datetime(2027, 1, 1, tzinfo=UTC),
+        datetime(2027, 1, 2, tzinfo=UTC),
+        14_400,
+    ) == tuple(
+        datetime(2027, 1, 1, hour=hour, tzinfo=UTC)
+        for hour in (0, 4, 8, 12, 16, 20)
+    )
+    assert suite_forward_decision_times(
+        datetime(2027, 1, 1, hour=1, tzinfo=UTC),
+        datetime(2027, 1, 1, hour=9, tzinfo=UTC),
+        14_400,
+    ) == (
+        datetime(2027, 1, 1, hour=4, tzinfo=UTC),
+        datetime(2027, 1, 1, hour=8, tzinfo=UTC),
+    )
+
+
 def test_verified_suite_state_isolates_history_and_includes_unbound_future(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -342,3 +364,118 @@ def test_verified_suite_state_isolates_history_and_includes_unbound_future(
         "end_time": "2027-02-01T00:00:00+00:00",
         "sealed_at": "2026-08-01T00:00:00+00:00",
     },)
+
+
+def test_verified_suite_state_requires_exact_prediction_schedule(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """vintage 结束后仅完整且无额外时点的行集可标记 data_complete。"""
+    plan = {"suite_plan_id": "suite-plan"}
+    evidence = {
+        "suite_plan_id": "suite-plan",
+        "suite_evidence_id": "suite-evidence",
+        "source_git_hash": "a" * 40,
+        "market_id": "market-one",
+    }
+    registered = IntervalSuiteForwardPlan(
+        plan_id="forward-plan",
+        vintage_id="vintage-one",
+        suite_plan_id="suite-plan",
+        suite_evidence_id="suite-evidence",
+        source_git_hash="a" * 40,
+        code_tree_digest="tree-one",
+        plan_artifact_path="reports/plan.json",
+        plan_artifact_sha256="b" * 64,
+        frozen_at=datetime(2026, 12, 1, tzinfo=UTC),
+    )
+    vintage = SimpleNamespace(
+        status="sealed",
+        market_id="market-one",
+        vintage_id="vintage-one",
+        start_time=datetime(2027, 1, 1, tzinfo=UTC),
+        end_time=datetime(2027, 1, 1, hour=8, tzinfo=UTC),
+        sealed_at=datetime(2026, 12, 1, tzinfo=UTC),
+    )
+    decision_times = (
+        datetime(2027, 1, 1, tzinfo=UTC),
+        datetime(2027, 1, 1, hour=4, tzinfo=UTC),
+    )
+    predictions = tuple(
+        IntervalSuiteForwardPrediction(
+            prediction_id=f"prediction-{index}",
+            plan_id=registered.plan_id,
+            vintage_id=registered.vintage_id,
+            decision_time=decision_time,
+            input_head_generation=f"head-{index}",
+            input_receipt_path=f"receipts/{index}.json",
+            input_receipt_sha256=str(index) * 64,
+            member_panel_set_hash=f"panel-set-{index}",
+            prediction_artifact_path=f"predictions/{index}.json",
+            prediction_artifact_sha256=str(index + 1) * 64,
+            recorded_at=decision_time,
+        )
+        for index, decision_time in enumerate(decision_times)
+    )
+    monkeypatch.setattr(
+        "guvolu.research.interval_suite_forward._config_contract",
+        lambda *_args: (tmp_path / "registry.sqlite3", (), {}, {}, {}),
+    )
+    monkeypatch.setattr(
+        "guvolu.research.interval_suite_forward.list_holdout_vintages",
+        lambda *_args: (vintage,),
+    )
+    monkeypatch.setattr(
+        "guvolu.research.interval_suite_forward."
+        "get_interval_suite_forward_plan_for_vintage",
+        lambda *_args: registered,
+    )
+    monkeypatch.setattr(
+        "guvolu.research.interval_suite_forward."
+        "attest_interval_suite_forward_plan",
+        lambda *_args, **_kwargs: {
+            "decision_grid": {
+                "interval_seconds": 14_400,
+                "utc_epoch_offset_seconds": 0,
+            },
+        },
+    )
+    monkeypatch.setattr(
+        "guvolu.research.interval_suite_forward."
+        "list_interval_suite_forward_predictions",
+        lambda *_args: predictions,
+    )
+    monkeypatch.setattr(
+        "guvolu.research.interval_suite_prediction."
+        "attest_interval_suite_forward_prediction",
+        lambda *_args, **_kwargs: {},
+    )
+    row_set = ["row-set", 2, decision_times]
+    monkeypatch.setattr(
+        "guvolu.research.interval_suite_forward."
+        "get_interval_suite_forward_prediction_row_set",
+        lambda *_args: tuple(row_set),
+    )
+    complete = verified_interval_suite_forward_state(
+        tmp_path,
+        (),
+        plan,
+        evidence,
+        reference_time=datetime(2027, 1, 2, tzinfo=UTC),
+    )
+    complete_plans = complete["plans"]
+    assert isinstance(complete_plans, tuple)
+    assert complete_plans[0]["data_complete"] is True
+    assert complete_plans[0]["prediction_schedule_complete"] is True
+
+    row_set[:] = ["row-set-missing", 1, decision_times[:1]]
+    incomplete = verified_interval_suite_forward_state(
+        tmp_path,
+        (),
+        plan,
+        evidence,
+        reference_time=datetime(2027, 1, 2, tzinfo=UTC),
+    )
+    incomplete_plans = incomplete["plans"]
+    assert isinstance(incomplete_plans, tuple)
+    assert incomplete_plans[0]["data_complete"] is False

@@ -162,14 +162,52 @@ def aggregate_interval_suite_readiness(
     ]
     if not valid_suite_plans:
         promotion_blockers.append("suite_frozen_forward_plan_not_registered")
+    plans_by_vintage = {
+        _text(item.get("vintage_id"), "suite plan vintage_id"): item
+        for item in valid_suite_plans
+    }
     suite_vintage_payloads: list[Mapping[str, object]] = []
     for raw_vintage in suite_vintages:
         vintage = _mapping(raw_vintage, "suite vintage")
+        vintage_id = _text(vintage.get("vintage_id"), "suite vintage_id")
+        registered_plan = plans_by_vintage.get(vintage_id)
+        data_complete = (
+            None if registered_plan is None
+            else registered_plan.get("data_complete")
+        )
+        if data_complete not in (None, True, False):
+            raise ValueError("suite plan data_complete 必须为布尔值或空")
         suite_vintage_payloads.append({
             **vintage,
-            "data_complete": None,
+            "plan_id": (
+                None if registered_plan is None
+                else registered_plan.get("plan_id")
+            ),
+            "prediction_row_set_hash": (
+                None if registered_plan is None
+                else registered_plan.get("prediction_row_set_hash")
+            ),
+            "prediction_count": (
+                0 if registered_plan is None
+                else registered_plan.get("prediction_count")
+            ),
+            "expected_prediction_count": (
+                None if registered_plan is None
+                else registered_plan.get("expected_prediction_count")
+            ),
+            "prediction_schedule_complete": (
+                False if registered_plan is None
+                else registered_plan.get("prediction_schedule_complete")
+            ),
+            "data_complete": data_complete,
             "data_completion_basis": (
-                "suite_forward_prediction_receipts_not_implemented"
+                "suite_forward_plan_not_registered"
+                if registered_plan is None
+                else (
+                    "registered_prediction_schedule_complete"
+                    if data_complete is True
+                    else "registered_prediction_schedule_incomplete"
+                )
             ),
         })
     if not suite_vintage_payloads:
@@ -184,12 +222,23 @@ def aggregate_interval_suite_readiness(
     }
     if suite_vintage_ids - planned_vintage_ids:
         promotion_blockers.append("suite_frozen_forward_plan_not_registered")
+    missing_predictions = False
+    for item in suite_vintage_payloads:
+        prediction_count = item.get("prediction_count")
+        if (
+            not isinstance(prediction_count, int)
+            or isinstance(prediction_count, bool)
+            or prediction_count < 0
+        ):
+            raise ValueError("suite prediction_count 必须为非负整数")
+        if item.get("plan_id") is not None and prediction_count == 0:
+            missing_predictions = True
+    if missing_predictions:
+        promotion_blockers.append("suite_forward_predictions_missing")
     if any(item.get("data_complete") is False for item in suite_vintage_payloads):
         promotion_blockers.append("sealed_suite_holdout_vintage_incomplete")
-    if valid_suite_plans and not (suite_vintage_ids - planned_vintage_ids):
-        promotion_blockers.append(
-            "suite_frozen_forward_prediction_pipeline_not_implemented"
-        )
+    if any(item.get("data_complete") is True for item in suite_vintage_payloads):
+        promotion_blockers.append("suite_holdout_not_evaluated")
     operational_blockers = _unique(operational_blockers)
     promotion_blockers = _unique(promotion_blockers)
     if "selected_member_operational_not_ready" in operational_blockers:
@@ -204,13 +253,12 @@ def aggregate_interval_suite_readiness(
         promotion_next_action = "seal_new_suite_vintage_in_successor_registry"
     elif "suite_frozen_forward_plan_not_registered" in promotion_blockers:
         promotion_next_action = "register_suite_frozen_forward_plan"
-    elif (
-        "suite_frozen_forward_prediction_pipeline_not_implemented"
-        in promotion_blockers
-    ):
-        promotion_next_action = "implement_suite_frozen_forward_predictions"
+    elif "suite_forward_predictions_missing" in promotion_blockers:
+        promotion_next_action = "append_suite_forward_predictions"
     elif "sealed_suite_holdout_vintage_incomplete" in promotion_blockers:
         promotion_next_action = "wait_for_sealed_suite_vintage_end"
+    elif "suite_holdout_not_evaluated" in promotion_blockers:
+        promotion_next_action = "run_suite_holdout_validation_once"
     else:
         promotion_next_action = "run_suite_holdout_validation_once"
 

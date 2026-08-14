@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -23,6 +23,8 @@ from guvolu.research.governance import (
     get_frozen_forward_plan_for_vintage,
     get_holdout_vintage,
     get_interval_suite_forward_plan_for_vintage,
+    get_interval_suite_forward_prediction_row_set,
+    list_interval_suite_forward_predictions,
     list_holdout_vintages,
     register_interval_suite_forward_plan,
 )
@@ -51,6 +53,33 @@ class IntervalSuiteForwardPlanResult:
     plan_id: str
     plan_path: Path
     plan_sha256: str
+
+
+def suite_forward_decision_times(
+    start_time: datetime,
+    end_time: datetime,
+    interval_seconds: int,
+    offset_seconds: int = 0,
+) -> tuple[datetime, ...]:
+    """列出左闭右开 vintage 内全部共同决策栅格。"""
+    if interval_seconds <= 0:
+        raise ValueError("共同决策栅格间隔必须为正数")
+    start = start_time.astimezone(UTC)
+    end = end_time.astimezone(UTC)
+    if start >= end:
+        raise ValueError("vintage 必须满足 start_time < end_time")
+    start_epoch = int(start.timestamp())
+    remainder = (start_epoch - offset_seconds) % interval_seconds
+    first_epoch = start_epoch if remainder == 0 else (
+        start_epoch + interval_seconds - remainder
+    )
+    result: list[datetime] = []
+    current = datetime.fromtimestamp(first_epoch, tz=UTC)
+    step = timedelta(seconds=interval_seconds)
+    while current < end:
+        result.append(current)
+        current += step
+    return tuple(result)
 
 
 def _mapping(value: object, name: str) -> Mapping[str, object]:
@@ -721,10 +750,43 @@ def verified_interval_suite_forward_state(
             "end_time": vintage.end_time.isoformat(),
             "sealed_at": vintage.sealed_at.isoformat(),
         })
-        attest_interval_suite_forward_plan(
+        attested_plan = attest_interval_suite_forward_plan(
             root, registered, suite_plan, evidence,
             expected_registry=registry,
         )
+        decision_grid = _mapping(
+            attested_plan.get("decision_grid"), "decision_grid",
+        )
+        interval_seconds = _positive_integer(
+            decision_grid.get("interval_seconds"), "interval_seconds",
+        )
+        offset_seconds = decision_grid.get("utc_epoch_offset_seconds")
+        if not isinstance(offset_seconds, int) or isinstance(offset_seconds, bool):
+            raise ValueError("utc_epoch_offset_seconds 必须为整数")
+        expected_times = suite_forward_decision_times(
+            vintage.start_time,
+            vintage.end_time,
+            interval_seconds,
+            offset_seconds,
+        )
+        predictions = list_interval_suite_forward_predictions(
+            registry, registered.plan_id,
+        )
+        from guvolu.research.interval_suite_prediction import (
+            attest_interval_suite_forward_prediction,
+        )
+
+        for prediction in predictions:
+            attest_interval_suite_forward_prediction(
+                root, prediction, registered,
+            )
+        row_set_hash, prediction_count, decision_times = (
+            get_interval_suite_forward_prediction_row_set(
+                registry, registered.plan_id,
+            )
+        )
+        exact_schedule = decision_times == expected_times
+        data_complete = reference >= vintage.end_time and exact_schedule
         result.append({
             "plan_id": registered.plan_id,
             "vintage_id": registered.vintage_id,
@@ -732,6 +794,17 @@ def verified_interval_suite_forward_state(
             "suite_evidence_id": registered.suite_evidence_id,
             "source_git_hash": registered.source_git_hash,
             "plan_artifact_sha256": registered.plan_artifact_sha256,
+            "prediction_row_set_hash": row_set_hash,
+            "prediction_count": prediction_count,
+            "expected_prediction_count": len(expected_times),
+            "first_prediction_time": (
+                None if not decision_times else decision_times[0].isoformat()
+            ),
+            "last_prediction_time": (
+                None if not decision_times else decision_times[-1].isoformat()
+            ),
+            "prediction_schedule_complete": exact_schedule,
+            "data_complete": data_complete,
         })
     return {
         "registry": _relative(root, registry),

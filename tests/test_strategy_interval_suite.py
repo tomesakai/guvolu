@@ -452,6 +452,11 @@ def test_interval_suite_readiness_aggregates_selected_members() -> None:
             "suite_evidence_id": "evidence",
             "source_git_hash": "a" * 40,
             "plan_artifact_sha256": "p" * 64,
+            "prediction_row_set_hash": "row-set",
+            "prediction_count": 0,
+            "expected_prediction_count": 186,
+            "prediction_schedule_complete": False,
+            "data_complete": False,
         },),
         suite_vintages,
     )
@@ -459,11 +464,12 @@ def test_interval_suite_readiness_aggregates_selected_members() -> None:
     assert isinstance(planned_promotion, Mapping)
     assert planned_promotion["ready"] is False
     assert planned_promotion["blockers"] == [
-        "suite_frozen_forward_prediction_pipeline_not_implemented",
+        "sealed_suite_holdout_vintage_incomplete",
+        "suite_forward_predictions_missing",
     ]
     assert (
         planned_promotion["next_action"]
-        == "implement_suite_frozen_forward_predictions"
+        == "append_suite_forward_predictions"
     )
     assert planned["suite_frozen_forward_plan_ids"] == ["suite-forward"]
 
