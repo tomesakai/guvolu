@@ -20,7 +20,7 @@ from guvolu.research.verification import (
 from guvolu.research.verification_attestation import verify_research_run_cached
 
 INTERVAL_SUITE_EVIDENCE_METHOD_VERSION = (
-    "verified-global-fdr-aligned-oos-v2"
+    "verified-global-fdr-aligned-oos-v3"
 )
 
 
@@ -71,6 +71,17 @@ def suite_member_input_identity(manifest: Mapping[str, object]) -> tuple[str, ..
         canonical_json(source_root),
         canonical_json(snapshot),
     )
+
+
+def suite_member_code_commit(manifest: Mapping[str, object]) -> str:
+    """套件成员必须来自同一个 clean、decision-grade Git commit。"""
+    code = _mapping(manifest.get("code_identity"), "manifest.code_identity")
+    if (
+        code.get("dirty") is not False
+        or code.get("decision_grade") is not True
+    ):
+        raise ValueError("套件成员代码身份不是 clean decision-grade")
+    return _text(code.get("git_hash"), "manifest.code_identity.git_hash")
 
 
 def _string_list(value: object, name: str) -> tuple[str, ...]:
@@ -446,6 +457,7 @@ def evaluate_interval_suite(
     return_points: dict[str, Sequence[tuple[datetime, float]]] = {}
     member_evidence: list[Mapping[str, object]] = []
     common_input_identity: tuple[str, ...] | None = None
+    common_code_commit: str | None = None
     seen_configs: set[str] = set()
     for raw_manifest_path in manifest_paths:
         manifest_path = raw_manifest_path.resolve()
@@ -467,6 +479,11 @@ def evaluate_interval_suite(
             common_input_identity = input_identity
         elif input_identity != common_input_identity:
             raise ValueError("套件成员没有使用同一 suite 快照与活动 head 收据")
+        code_commit = suite_member_code_commit(manifest)
+        if common_code_commit is None:
+            common_code_commit = code_commit
+        elif code_commit != common_code_commit:
+            raise ValueError("套件成员没有使用同一 clean Git commit")
         registry_path = integrity.artifact_paths.get("candidate_registry")
         if (
             registry_path is None
@@ -537,6 +554,7 @@ def evaluate_interval_suite(
             "manifest_path": integrity.manifest_path.relative_to(root).as_posix(),
             "manifest_sha256": integrity.manifest_sha256,
             "decision_grade": summary.get("decision_grade") is True,
+            "source_git_hash": code_commit,
         })
     if set(p_values) != set(domain):
         raise ValueError("实际 p-value 没有完整覆盖预登记全局试验域")
@@ -582,6 +600,7 @@ def evaluate_interval_suite(
         if common_input_identity else None,
         "input_receipt_sha256": common_input_identity[1]
         if common_input_identity else None,
+        "source_git_hash": common_code_commit,
         "alignment_interval_seconds": interval_seconds,
         "members": sorted(member_evidence, key=lambda item: str(item["bar_interval"])),
         "global_fdr": [

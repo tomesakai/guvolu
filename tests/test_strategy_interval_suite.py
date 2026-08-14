@@ -14,7 +14,11 @@ from guvolu.research.interval_suite_evidence import (
     allocate_interval_sleeves,
     align_returns_to_interval,
     global_fdr_q_values,
+    suite_member_code_commit,
     suite_member_input_identity,
+)
+from guvolu.research.interval_suite_readiness import (
+    aggregate_interval_suite_readiness,
 )
 
 
@@ -268,3 +272,121 @@ def test_interval_suite_input_identity_binds_snapshot_and_data_root() -> None:
     missing.pop("source_data_snapshot")
     with pytest.raises(ValueError, match="source_data_snapshot"):
         suite_member_input_identity(missing)
+
+
+def test_interval_suite_requires_one_clean_code_commit() -> None:
+    """独立有效的成员不能跨 commit 拼成同一套件证据。"""
+    manifest = {
+        "code_identity": {
+            "git_hash": "a" * 40,
+            "dirty": False,
+            "decision_grade": True,
+        },
+    }
+    assert suite_member_code_commit(manifest) == "a" * 40
+    dirty = copy.deepcopy(manifest)
+    dirty["code_identity"]["dirty"] = True
+    dirty["code_identity"]["decision_grade"] = False
+    with pytest.raises(ValueError, match="clean decision-grade"):
+        suite_member_code_commit(dirty)
+
+
+def test_interval_suite_readiness_aggregates_selected_members() -> None:
+    """只有被套件准入的成员影响 operational，promotion 另需 suite 冻结计划。"""
+    plan = {"suite_plan_id": "plan"}
+    evidence = {
+        "suite_plan_id": "plan",
+        "suite_evidence_id": "evidence",
+        "source_git_hash": "a" * 40,
+        "market_id": "market",
+        "input_head_generation": "head",
+        "input_receipt_sha256": "receipt",
+        "operational_status": "disabled_pending_suite_readiness_and_holdout",
+        "members": [
+            {
+                "member_id": "hour",
+                "bar_interval": "1hour",
+                "run_id": "run-hour",
+                "manifest_sha256": "h" * 64,
+            },
+            {
+                "member_id": "four",
+                "bar_interval": "4hour",
+                "run_id": "run-four",
+                "manifest_sha256": "f" * 64,
+            },
+        ],
+        "sleeves": [
+            {
+                "sleeve_id": "selected",
+                "member_id": "hour",
+                "suite_eligible": True,
+            },
+            {
+                "sleeve_id": "rejected",
+                "member_id": "four",
+                "suite_eligible": False,
+            },
+        ],
+        "suite_research_allocation": {
+            "status": "research_only",
+            "aggregate_target": 0.2,
+            "reserve": 0.4,
+        },
+    }
+    readiness = {
+        "hour": {
+            "run_id": "run-hour",
+            "operational": {
+                "ready": False,
+                "blockers": ["feature_snapshot_stale"],
+                "next_action": "wait_for_feature_maturity",
+            },
+            "promotion": {
+                "ready": False,
+                "blockers": ["sealed_holdout_vintage_incomplete"],
+                "next_action": "wait_for_sealed_vintage_end",
+            },
+        },
+        "four": {
+            "run_id": "run-four",
+            "operational": {
+                "ready": False,
+                "blockers": ["source_code_tree_mismatch"],
+                "next_action": "repair_operational_blockers",
+            },
+            "promotion": {
+                "ready": False,
+                "blockers": ["source_code_tree_mismatch"],
+                "next_action": "refresh_source_research_before_holdout",
+            },
+        },
+    }
+    blocked = aggregate_interval_suite_readiness(
+        plan, evidence, readiness, datetime(2026, 8, 15, tzinfo=UTC),
+    )
+    operational = blocked["operational"]
+    promotion = blocked["promotion"]
+    assert isinstance(operational, Mapping)
+    assert isinstance(promotion, Mapping)
+    assert operational["ready"] is False
+    assert operational["blockers"] == ["selected_member_operational_not_ready"]
+    assert promotion["blockers"] == [
+        "selected_member_promotion_not_ready",
+        "suite_frozen_forward_plan_not_registered",
+    ]
+    assert blocked["selected_member_ids"] == ["hour"]
+
+    ready = copy.deepcopy(readiness)
+    ready["hour"]["operational"]["ready"] = True
+    ready["hour"]["promotion"]["ready"] = True
+    aggregated = aggregate_interval_suite_readiness(
+        plan, evidence, ready, datetime(2026, 8, 15, tzinfo=UTC),
+    )
+    operational = aggregated["operational"]
+    promotion = aggregated["promotion"]
+    assert isinstance(operational, Mapping)
+    assert isinstance(promotion, Mapping)
+    assert operational["ready"] is True
+    assert promotion["ready"] is False
+    assert promotion["next_action"] == "register_suite_frozen_forward_plan"
