@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import subprocess
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -145,6 +147,91 @@ def _materialize(root: Path) -> L2Result:
     finally:
         conn.close()
     return result
+
+
+def _directory_link(link: Path, target: Path) -> None:
+    """创建测试用目录联接，Windows 不依赖开发者模式。"""
+    link.parent.mkdir(parents=True, exist_ok=True)
+    target.mkdir(parents=True, exist_ok=True)
+    if os.name == "nt":
+        subprocess.run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "New-Item -ItemType Junction -Path '"
+                + str(link).replace("'", "''")
+                + "' -Target '"
+                + str(target).replace("'", "''")
+                + "' | Out-Null",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    else:
+        link.symlink_to(target, target_is_directory=True)
+
+
+def test_sealed_input_allows_only_the_declared_logical_junction_root(
+    tmp_path: Path,
+) -> None:
+    """物理迁移可用，但 manifest 不能借 junction 逃逸逻辑目录。"""
+    root = tmp_path / "repo" / "data"
+    target = tmp_path / "physical" / "book_l2"
+    _directory_link(root / "raw" / "realtime" / "book_l2", target)
+    _write_segment(
+        root,
+        "gmo",
+        "BTC",
+        "run-junction-v3",
+        [(_gmo_payload(), "run-junction-v3-c000001", "orderbooks")],
+        schema_version=3,
+    )
+
+    inputs = _sealed_inputs(root)
+
+    assert len(inputs) == 1
+    assert inputs[0].artifact.absolute_path.is_relative_to(target.resolve())
+    manifest = next(target.rglob("segment-000001.manifest.json"))
+    body = json.loads(manifest.read_text(encoding="utf-8"))
+    body["storage_path"] = "raw/realtime/book_l2/../outside.jsonl"
+    manifest.write_text(json.dumps(body), encoding="utf-8")
+    with pytest.raises(ValueError, match="segment 逻辑路径非法"):
+        _sealed_inputs(root)
+
+    body["storage_path"] = (
+        "raw/realtime/book_l2/venue_id=gmo/venue_symbol=BTC/"
+        "run_id=run-junction-v3/segment-000001.jsonl"
+    )
+    manifest.write_text(json.dumps(body), encoding="utf-8")
+    outside = tmp_path / "outside-run"
+    nested = (
+        target / "venue_id=gmo" / "venue_symbol=BTC" /
+        "run_id=z"
+    )
+    _directory_link(nested, outside)
+    escaped_segment = outside / "segment-000001.jsonl"
+    escaped_segment.write_bytes(
+        manifest.with_name("segment-000001.jsonl").read_bytes()
+    )
+    escaped_sha = hashlib.sha256(escaped_segment.read_bytes()).hexdigest()
+    escaped_body = body | {
+        "run_id": "z",
+        "sha256": escaped_sha,
+        "artifact_id": f"sha256-{escaped_sha}",
+        "byte_count": escaped_segment.stat().st_size,
+        "storage_path": (
+            "raw/realtime/book_l2/venue_id=gmo/venue_symbol=BTC/"
+            "run_id=z/segment-000001.jsonl"
+        ),
+    }
+    (outside / "segment-000001.manifest.json").write_text(
+        json.dumps(escaped_body), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="segment 路径越界"):
+        _sealed_inputs(root)
 
 
 def test_legacy_raw_v1_becomes_explicit_nullable_v3_fact(tmp_path: Path) -> None:

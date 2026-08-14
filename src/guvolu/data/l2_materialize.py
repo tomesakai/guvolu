@@ -13,7 +13,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import duckdb
@@ -345,14 +345,26 @@ def _sealed_inputs(root: Path) -> list[SegmentInput]:
         if body.get("status") != "sealed" or body.get("completion_claim") is not True:
             continue
         recorded = str(body["storage_path"])
-        path = (root / recorded).resolve()
+        relative = PurePosixPath(recorded)
+        if (
+            relative.is_absolute()
+            or relative.as_posix() != recorded
+            or relative.parts[:3] != ("raw", "realtime", "book_l2")
+            or ".." in relative.parts
+        ):
+            raise ValueError(f"segment 逻辑路径非法: {recorded}")
+        logical_path = root.joinpath(*relative.parts).absolute()
+        expected_logical_path = manifest_path.with_name(
+            manifest_path.name.removesuffix(".manifest.json") + ".jsonl"
+        ).absolute()
+        if logical_path != expected_logical_path:
+            raise ValueError(f"manifest 与 segment 不同目录: {recorded}")
+        path = logical_path.resolve(strict=True)
         try:
-            path.relative_to(root.resolve())
+            path.relative_to(base.resolve(strict=True))
         except ValueError as exc:
             raise ValueError(f"segment 路径越界: {recorded}") from exc
-        expected_path = manifest_path.with_name(
-            manifest_path.name.removesuffix(".manifest.json") + ".jsonl"
-        ).resolve()
+        expected_path = expected_logical_path.resolve(strict=True)
         if path != expected_path:
             raise ValueError(f"manifest 与 segment 不同目录: {recorded}")
         sha = sha256_file(path)
