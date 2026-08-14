@@ -409,6 +409,10 @@ def make_folds(bar_count: int, config: Mapping[str, object]) -> tuple[WalkForwar
     test_bars = _integer(config.get("test_bars"), "test_bars")
     step_bars = _integer(config.get("step_bars"), "step_bars")
     embargo = _integer(config.get("embargo_bars"), "embargo_bars")
+    if step_bars != test_bars:
+        raise ValueError(
+            "当前 stitched walk-forward 要求 step_bars 与 test_bars 相等"
+        )
     folds: list[WalkForwardFold] = []
     test_start = minimum_train + embargo
     ordinal = 1

@@ -33,6 +33,7 @@ from guvolu.research.validation import (
     _circular_block_bootstrap_sharpe,
     _deflated_sharpe_probability,
     _effective_trial_count,
+    make_folds,
     _parameter_neighbors,
     _probabilistic_sharpe_p_value,
     _probability_backtest_overfitting,
@@ -87,6 +88,20 @@ def _metrics() -> PerformanceMetrics:
         p_value=0.02,
         capacity_score=1.0,
     )
+
+
+@pytest.mark.parametrize("step_bars", [5, 15])
+def test_stitched_walk_forward_requires_contiguous_test_windows(
+    step_bars: int,
+) -> None:
+    """共享拼接目标不得静默覆盖重叠窗或遗漏间隔窗。"""
+    with pytest.raises(ValueError, match="step_bars 与 test_bars 相等"):
+        make_folds(100, {
+            "minimum_train_bars": 20,
+            "test_bars": 10,
+            "step_bars": step_bars,
+            "embargo_bars": 2,
+        })
 
 
 def test_compact_panel_enforces_pit_and_integer_projection(tmp_path: Path) -> None:
