@@ -122,8 +122,9 @@ paper 分配遵守以下长期边界：趋势、量价确认趋势和突破合�
 .\.venv\Scripts\python.exe scripts\propose_strategy_evolution.py --monitor <monitor.json>
 ```
 
-监视入口会自动发现组合运行目录及对应单流派目录中的全部 canonical 历史；
-`--prior-summary` 只能追加项目内来源，不能通过省略参数隐藏已经发布的历史。
+监视入口会自动发现对应单流派目录中的全部 canonical 历史；组合运行的
+`family_scope` 与单流派 cohort 不同，不做无效重放。`--prior-summary` 只能追加项目内来源，
+不能通过省略参数隐藏已经发布的同流派历史；显式追加的组合运行仍会完整验证并由 cohort 门排除。
 
 两条命令的 `--output` 都表示输出目录；制品文件名由内容散列生成，不能把
 `--output` 直接指定成 `.json` 文件。
@@ -439,6 +440,30 @@ holdout 也分别把同一类收据与消费者身份原子绑定。配置及完
 `v12 research_position` 重建比较处拒绝该制品。该运行发生在未提交开发树，故
 `decision_grade=false` 且 operational 权重按硬门禁归零；它证明证据闭环，不是 promotion 结论。
 G-08 仍必须由开始前冻结、完整及时预测并一次性消费的未来 vintage 给出，不能由 v12 回测替代。
+
+提交后的首次 clean v12 运行暴露了 Windows Git 换行合同缺口：工作区的 PowerShell 与
+`uv.lock` 经 clean/smudge 检出为 CRLF，而 verifier 从 commit 读取 LF，导致代码树散列不能重建。
+`research-code-identity-v2` 随后改为 clean 运行散列 commit 规范字节，dirty 运行才散列工作区；
+真实临时 Git 仓库的 CRLF 回归与全量测试通过。修复后的组合运行是
+`research-run-4c2ec5d22350de8c12ec5d47ff9a3f3a9d72d3103fa859d8958566e526d9e502`，
+manifest SHA-256 为 `14b7ffdc5f87dab2f271fbbab21cc78487bca21b434c8cc3d543ca6caaf54fff`。
+独立 verifier 重建并核对全部 12 类制品；`decision_grade=true`。研究资本权重为突破
+`0.224190`、量价趋势 `0.081655`、趋势 `0.094155`、储备 `0.60`。最新特征仍停在旧决策时点，
+所以 `feature_snapshot_stale` 与 `strategy_data_stale` 将 operational 权重清零并把储备设为 `1.00`。
+
+同一 clean 代码合同下，五条单流派 run、v7 monitor 与提案器全部实际跑通：
+
+| 独立流派 | OOS Sharpe | 净收益 | FDR q | PBO | paper | monitor 动作 | 跨运行 | 提案 |
+|---|---:|---:|---:|---:|---|---|---|---|
+| 突破 | 1.114 | 1.672 | 0.006 | 0.066 | eligible | eligible axis refinement | insufficient history | none |
+| 量价趋势 | 0.741 | 1.234 | 0.033 | 0.330 | eligible | eligible axis refinement | insufficient history | none |
+| 趋势 | 0.772 | 1.274 | 0.036 | 0.320 | eligible | eligible axis refinement | insufficient history | none |
+| 均值回归 | -0.523 | -0.697 | 1.000 | 0.002 | rejected | revise hypothesis or cost model | insufficient history | none |
+| 网格 shadow | -1.495 | -1.953 | 1.000 | 0.000 | rejected | improve fill model first | insufficient history | none |
+
+五个提案均为 `no_parameter_proposal` 且没有派生配置。这个停止条件表明脚本生成、独立监视和
+受治理演进已经闭环；它不等于拥有三个时间分离的 vintage。后者必须随新市场数据自然形成，
+不能用同一面板重复运行补足。
 
 已经启动的 2026-08-21 至 2026-11-29 冻结窗口固定在主树的 v1 plan/v3 holdout 兼容合同上，
 继续由原执行器完成，研究分支不得改写。该窗口可作为 legacy 前向证据，但缺少 v2/v4 所需的
