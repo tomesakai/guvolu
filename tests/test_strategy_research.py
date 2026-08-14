@@ -953,12 +953,67 @@ def test_code_identity_includes_wrappers_native_sources_and_build_contracts(
     monkeypatch.setattr(
         provenance,
         "_git_output",
-        lambda _root, arguments: "abc123" if arguments[0] == "rev-parse" else "",
+        lambda _root, arguments: (
+            "a" * 40 if arguments[0] == "rev-parse" else " M src/guvolu/research.py"
+        ),
     )
     identity = provenance.code_identity(tmp_path, (included[-1],))
-    assert identity.decision_grade
+    assert not identity.decision_grade
     assert set(included).issubset(set(captured))
     assert ignored not in captured
+
+
+def test_clean_code_identity_uses_commit_bytes_across_crlf_checkout(
+    tmp_path: Path,
+) -> None:
+    """clean/smudge 后的 CRLF 工作区仍必须重建出相同的决策级身份。"""
+    source = tmp_path / "src" / "example.py"
+    config = tmp_path / "config" / "strategy.json"
+    source.parent.mkdir(parents=True)
+    config.parent.mkdir(parents=True)
+    (tmp_path / ".gitattributes").write_text(
+        "*.py text eol=crlf\n*.json text eol=crlf\n",
+        encoding="utf-8",
+    )
+    source.write_bytes(b"first = 1\nsecond = 2\n")
+    config.write_bytes(b'{"market":"BTC"}\n')
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "add", "."], cwd=tmp_path, check=True)
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=Research Test",
+            "-c",
+            "user.email=research@example.invalid",
+            "commit",
+            "-q",
+            "-m",
+            "fixture",
+        ],
+        cwd=tmp_path,
+        check=True,
+    )
+    source.unlink()
+    config.unlink()
+    subprocess.run(["git", "checkout-index", "-a"], cwd=tmp_path, check=True)
+    assert b"\r\n" in source.read_bytes()
+    assert b"\r\n" in config.read_bytes()
+    subprocess.run(["git", "add", "src/example.py", "config/strategy.json"], cwd=tmp_path, check=True)
+    assert subprocess.run(
+        ["git", "status", "--porcelain=v1"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout == ""
+
+    identity = provenance.code_identity(tmp_path, (config,))
+    assert identity.decision_grade
+    assert identity.git_hash is not None
+    assert identity.tree_digest == provenance.code_tree_digest_at_commit(
+        tmp_path, identity.git_hash, (config,),
+    )
 
 
 def test_position_contract_combines_family_direction_and_risk_weight() -> None:

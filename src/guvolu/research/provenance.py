@@ -105,24 +105,30 @@ def code_identity(root: Path, config_paths: Sequence[Path]) -> CodeIdentity:
         if (path := root / name).is_file()
     )
     source_paths.extend(config_paths)
-    tree_digest = hash_paths(root, tuple(source_paths))
     status = _git_output(root, ("status", "--porcelain=v1", "--untracked-files=all"))
     dirty = bool(status)
-    dirty_digest = tree_digest if dirty else sha256_text("")
     git_hash = _git_output(root, ("rev-parse", "HEAD"))
     if git_hash is None:
+        tree_digest = hash_paths(root, tuple(source_paths))
         return CodeIdentity(
             git_hash=None,
             tree_digest=tree_digest,
-            dirty_digest=dirty_digest,
+            dirty_digest=tree_digest if dirty else sha256_text(""),
             dirty=dirty,
             decision_grade=False,
             reason="repository_has_no_commit",
         )
+    if not dirty:
+        # 检出换行可能变化。
+        # clean 版改用 blob。
+        # commit 可重建身份。
+        tree_digest = code_tree_digest_at_commit(root, git_hash, config_paths)
+    else:
+        tree_digest = hash_paths(root, tuple(source_paths))
     return CodeIdentity(
         git_hash=git_hash,
         tree_digest=tree_digest,
-        dirty_digest=dirty_digest,
+        dirty_digest=tree_digest if dirty else sha256_text(""),
         dirty=dirty,
         decision_grade=not dirty,
         reason="repository_dirty" if dirty else None,
