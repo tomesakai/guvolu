@@ -19,6 +19,10 @@ def _source_data_root(root: Path) -> tuple[Path, Path]:
     artifact.parent.mkdir(parents=True)
     artifact.write_bytes(b"immutable-parquet-fixture")
     digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    l2_artifact = data_root / "materialized" / "book" / "part.parquet"
+    l2_artifact.parent.mkdir(parents=True)
+    l2_artifact.write_bytes(b"immutable-l2-fixture")
+    l2_digest = hashlib.sha256(l2_artifact.read_bytes()).hexdigest()
     connection = sqlite3.connect(data_root / DB_FILE_NAME)
     connection.executescript("""
         CREATE TABLE instrument(
@@ -48,6 +52,7 @@ def _source_data_root(root: Path) -> tuple[Path, Path]:
             market_id TEXT, domain TEXT, partition_key TEXT,
             normalization_version TEXT, attempt_id TEXT
         );
+        CREATE TABLE l2_quality_window(market_id TEXT);
     """)
     connection.execute(
         "INSERT INTO instrument VALUES (?,?,?,?)",
@@ -66,10 +71,24 @@ def _source_data_root(root: Path) -> tuple[Path, Path]:
         ("attempt", "market", "trade", "20260101", "trade-v1", "complete"),
     )
     connection.execute(
+        "INSERT INTO partition_attempt VALUES (?,?,?,?,?,?)",
+        (
+            "l2-attempt", "market", "book_l2", "20260101",
+            "book-v1", "complete",
+        ),
+    )
+    connection.execute(
         "INSERT INTO artifact VALUES (?,?,?,?)",
         (
             f"sha256-{digest}", "materialized/trade/part.parquet",
             digest, artifact.stat().st_size,
+        ),
+    )
+    connection.execute(
+        "INSERT INTO artifact VALUES (?,?,?,?)",
+        (
+            f"sha256-{l2_digest}", "materialized/book/part.parquet",
+            l2_digest, l2_artifact.stat().st_size,
         ),
     )
     connection.execute(
@@ -80,8 +99,19 @@ def _source_data_root(root: Path) -> tuple[Path, Path]:
         ),
     )
     connection.execute(
+        "INSERT INTO materialization_output VALUES (?,?,?,?,?,?)",
+        (
+            "l2-attempt", "book_l2_frame", f"sha256-{l2_digest}", 1,
+            "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00",
+        ),
+    )
+    connection.execute(
         "INSERT INTO materialization_partition_head VALUES (?,?,?,?,?)",
         ("market", "trade", "20260101", "trade-v1", "attempt"),
+    )
+    connection.execute(
+        "INSERT INTO materialization_partition_head VALUES (?,?,?,?,?)",
+        ("market", "book_l2", "20260101", "book-v1", "l2-attempt"),
     )
     connection.commit()
     connection.close()
@@ -104,10 +134,11 @@ def test_suite_data_snapshot_is_idempotent_and_hardlinked(
         "instrument": 1,
         "instrument_map": 1,
         "market": 1,
-        "partition_attempt": 1,
-        "artifact": 1,
-        "materialization_output": 1,
-        "materialization_partition_head": 1,
+        "partition_attempt": 2,
+        "artifact": 2,
+        "materialization_output": 2,
+        "materialization_partition_head": 2,
+        "l2_quality_window": 0,
     }
     linked = first / "materialized" / "trade" / "part.parquet"
     assert os.path.samefile(source_artifact, linked)

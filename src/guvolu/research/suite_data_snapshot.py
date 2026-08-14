@@ -26,6 +26,7 @@ _TABLES = (
     "artifact",
     "materialization_output",
     "materialization_partition_head",
+    "l2_quality_window",
 )
 
 
@@ -90,11 +91,16 @@ def _marks(values: Sequence[str]) -> str:
 def _build_minimal_control_plane(
     source_root: Path,
     target_root: Path,
-    receipt: Mapping[str, object],
+    market_ids: Sequence[str],
+    entries: Sequence[Mapping[str, object]],
 ) -> Mapping[str, int]:
-    market_id = _text(receipt.get("market_id"), "market_id")
-    attempt_ids = _strings(receipt.get("attempt_ids"), "attempt_ids")
-    artifact_ids = _strings(receipt.get("artifact_ids"), "artifact_ids")
+    ordered_markets = tuple(sorted(set(market_ids)))
+    attempt_ids = tuple(sorted({
+        _text(entry.get("attempt_id"), "attempt_id") for entry in entries
+    }))
+    artifact_ids = tuple(sorted({
+        _text(entry.get("artifact_id"), "artifact_id") for entry in entries
+    }))
     source = connect_readonly(source_root)
     if source is None:
         raise LookupError("源数据根缺少控制面数据库")
@@ -106,29 +112,38 @@ def _build_minimal_control_plane(
         target.execute("PRAGMA foreign_keys=OFF")
         for table in _TABLES:
             _create_table(source, target, table)
-        market = source.execute(
-            "SELECT market_id,venue_id,venue_symbol,instrument_id,"
-            "mapping_revision FROM market WHERE market_id=?",
-            (market_id,),
-        ).fetchone()
-        if market is None:
-            raise LookupError(f"源控制面缺少市场: {market_id}")
+        market_rows = source.execute(
+            f"SELECT market_id,venue_id,venue_symbol,instrument_id,"
+            f"mapping_revision FROM market WHERE market_id IN "
+            f"({_marks(ordered_markets)})",
+            ordered_markets,
+        ).fetchall()
+        if len(market_rows) != len(ordered_markets):
+            raise LookupError("源控制面缺少 suite 市场")
+        instrument_ids = tuple(sorted({
+            str(row["instrument_id"]) for row in market_rows
+        }))
+        venue_ids = tuple(sorted({str(row["venue_id"]) for row in market_rows}))
         counts["instrument"] = _copy_rows(
-            source, target, "instrument", "instrument_id=?",
-            (market["instrument_id"],),
+            source,
+            target,
+            "instrument",
+            f"instrument_id IN ({_marks(instrument_ids)})",
+            instrument_ids,
         )
         counts["instrument_map"] = _copy_rows(
             source,
             target,
             "instrument_map",
-            "venue_id=? AND venue_symbol=? AND revision_id=?",
-            (
-                market["venue_id"], market["venue_symbol"],
-                market["mapping_revision"],
-            ),
+            f"venue_id IN ({_marks(venue_ids)})",
+            venue_ids,
         )
         counts["market"] = _copy_rows(
-            source, target, "market", "market_id=?", (market_id,),
+            source,
+            target,
+            "market",
+            f"market_id IN ({_marks(ordered_markets)})",
+            ordered_markets,
         )
         counts["partition_attempt"] = _copy_rows(
             source,
@@ -156,15 +171,22 @@ def _build_minimal_control_plane(
             source,
             target,
             "materialization_partition_head",
-            f"market_id=? AND attempt_id IN ({_marks(attempt_ids)})",
-            (market_id, *attempt_ids),
+            f"market_id IN ({_marks(ordered_markets)}) "
+            f"AND attempt_id IN ({_marks(attempt_ids)})",
+            (*ordered_markets, *attempt_ids),
+        )
+        counts["l2_quality_window"] = _copy_rows(
+            source,
+            target,
+            "l2_quality_window",
+            f"market_id IN ({_marks(ordered_markets)})",
+            ordered_markets,
         )
         if (
-            counts["instrument"] != 1
-            or counts["market"] != 1
+            counts["instrument"] != len(instrument_ids)
+            or counts["market"] != len(ordered_markets)
             or counts["partition_attempt"] != len(attempt_ids)
             or counts["artifact"] != len(artifact_ids)
-            or counts["materialization_output"] != len(artifact_ids)
         ):
             raise ValueError("最小控制面没有精确覆盖输入收据")
         user_version = int(source.execute("PRAGMA user_version").fetchone()[0])
@@ -179,21 +201,64 @@ def _build_minimal_control_plane(
     return counts
 
 
+def _active_shadow_entries(
+    source_root: Path,
+    market_ids: Sequence[str],
+) -> tuple[Mapping[str, object], ...]:
+    """冻结完整管线读取的 L2、book-state 活动输出。"""
+    ordered = tuple(sorted(set(market_ids)))
+    if not ordered:
+        return ()
+    connection = connect_readonly(source_root)
+    if connection is None:
+        raise LookupError("源数据根缺少控制面数据库")
+    connection.row_factory = sqlite3.Row
+    try:
+        rows = connection.execute(
+            "SELECT h.market_id,h.domain,h.partition_key,"
+            "h.normalization_version,h.attempt_id,o.dataset,o.artifact_id,"
+            "a.storage_path,a.sha256,a.byte_count,o.row_count,"
+            "o.min_event_time,o.max_event_time "
+            "FROM materialization_partition_head h "
+            "JOIN materialization_output o ON o.attempt_id=h.attempt_id "
+            "JOIN artifact a ON a.artifact_id=o.artifact_id "
+            f"WHERE h.market_id IN ({_marks(ordered)}) "
+            "AND h.domain IN ('book_l2','book_state') "
+            "AND o.dataset IN ('book_l2_frame','book_l2_level',"
+            "'book_state_checkpoint')",
+            ordered,
+        ).fetchall()
+    finally:
+        connection.close()
+    entries: list[Mapping[str, object]] = []
+    for row in rows:
+        path = (source_root / str(row["storage_path"])).resolve()
+        digest = str(row["sha256"])
+        if (
+            not path.is_relative_to(source_root)
+            or not path.is_file()
+            or sha256_file(path) != digest
+            or str(row["artifact_id"]) != f"sha256-{digest}"
+            or path.stat().st_size != int(row["byte_count"])
+        ):
+            raise ValueError("L2 suite 快照源制品身份不一致")
+        entries.append({str(key): row[key] for key in row.keys()})
+    if not entries:
+        raise LookupError("suite 市场没有 L2/book-state 活动输出")
+    return tuple(entries)
+
+
 def _link_artifacts(
     source_root: Path,
     target_root: Path,
-    receipt: Mapping[str, object],
+    entries: Sequence[Mapping[str, object]],
 ) -> tuple[Mapping[str, object], ...]:
-    raw_entries = receipt.get("entries")
-    if not isinstance(raw_entries, list) or not raw_entries:
-        raise ValueError("输入收据缺少 entries")
     records: list[Mapping[str, object]] = []
     seen: set[str] = set()
-    for raw_entry in raw_entries:
-        entry = _mapping(raw_entry, "receipt.entry")
+    for entry in entries:
         relative = _text(entry.get("storage_path"), "storage_path")
         if relative in seen:
-            raise ValueError("输入收据包含重复 storage_path")
+            continue
         seen.add(relative)
         source = (source_root / relative).resolve()
         target = (target_root / relative).resolve()
@@ -225,6 +290,7 @@ def create_suite_data_snapshot(
     source_data_root: Path,
     market_id: str,
     output_base: Path,
+    shadow_market_ids: Sequence[str] = (),
 ) -> Path:
     """冻结当前 trade head，并发布可供多个节拍复用的数据根。"""
     source_root = source_data_root.resolve()
@@ -242,7 +308,35 @@ def create_suite_data_snapshot(
     receipt = _mapping(json.loads(
         inputs.receipt_path.read_text(encoding="utf-8"),
     ), "receipt")
-    snapshot_name = f"suite-data-snapshot-sha256-{inputs.receipt_sha256}"
+    raw_trade_entries = receipt.get("entries")
+    if not isinstance(raw_trade_entries, list):
+        raise ValueError("输入收据缺少 entries")
+    trade_entries = tuple(
+        _mapping(entry, "receipt.entry") for entry in raw_trade_entries
+    )
+    selected_markets = tuple(sorted(set((market_id, *shadow_market_ids))))
+    shadow_entries = _active_shadow_entries(source_root, selected_markets)
+    all_entries = (*trade_entries, *shadow_entries)
+    snapshot_input = {
+        "trade_receipt_sha256": inputs.receipt_sha256,
+        "shadow_market_ids": selected_markets,
+        "shadow_outputs": sorted((
+            {
+                "market_id": entry.get("market_id"),
+                "domain": entry.get("domain"),
+                "partition_key": entry.get("partition_key"),
+                "dataset": entry.get("dataset"),
+                "attempt_id": entry.get("attempt_id"),
+                "artifact_id": entry.get("artifact_id"),
+                "sha256": entry.get("sha256"),
+            }
+            for entry in shadow_entries
+        ), key=lambda item: tuple(str(item[key]) for key in sorted(item))),
+    }
+    snapshot_digest = hashlib.sha256(
+        canonical_json(snapshot_input).encode("utf-8"),
+    ).hexdigest()
+    snapshot_name = f"suite-data-snapshot-sha256-{snapshot_digest}"
     snapshot_root = output / snapshot_name
     if snapshot_root.exists():
         recaptured = capture_trade_input_receipt(
@@ -256,9 +350,9 @@ def create_suite_data_snapshot(
     ) as temporary:
         temporary_root = Path(temporary)
         counts = _build_minimal_control_plane(
-            source_root, temporary_root, receipt,
+            source_root, temporary_root, selected_markets, all_entries,
         )
-        artifacts = _link_artifacts(source_root, temporary_root, receipt)
+        artifacts = _link_artifacts(source_root, temporary_root, all_entries)
         recaptured = capture_trade_input_receipt(
             temporary_root, market_id, temporary_root / "receipts",
         )
@@ -270,6 +364,8 @@ def create_suite_data_snapshot(
             "market_id": market_id,
             "head_generation": inputs.head_generation,
             "input_receipt_sha256": inputs.receipt_sha256,
+            "shadow_market_ids": selected_markets,
+            "snapshot_input": snapshot_input,
             "control_plane_rows": counts,
             "artifacts": artifacts,
         }
