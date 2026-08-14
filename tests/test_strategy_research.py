@@ -16,6 +16,12 @@ import guvolu.research.allocator as allocator_module
 from guvolu.data import store
 from guvolu.data.materialize import ensure_markets
 from guvolu.research.allocator import _covariance, allocate
+from guvolu.research.artifact_contracts import (
+    cost_replay_body,
+    market_state_payload,
+    position_contract_payload,
+    trial_ledger_body,
+)
 from guvolu.research import provenance
 from guvolu.research.contracts import (
     AllocationResult,
@@ -50,12 +56,7 @@ from guvolu.research.panel import (
     load_panel_bars,
     registered_trade_inputs,
 )
-from guvolu.research.pipeline import (
-    _cost_replay_artifact,
-    _position_contract_payload,
-    _research_output_paths,
-    _trial_artifact,
-)
+from guvolu.research.pipeline import _research_output_paths
 from guvolu.research.provenance import canonical_json, stable_identifier
 from guvolu.research.quality import gate_feature_snapshot, panel_quality
 from guvolu.research.validation import (
@@ -790,11 +791,9 @@ def test_trial_roles_and_stitched_replay_are_explicitly_bounded(
         folds=(fold,),
         family_validation_targets={"trend": stitched_targets},
     )
-    ledger_path, _ledger_hash = _trial_artifact(
-        tmp_path, validation, "research-one",
-    )
     ledger_rows = [
-        json.loads(line) for line in ledger_path.read_text(encoding="utf-8").splitlines()
+        json.loads(line)
+        for line in trial_ledger_body(validation, "research-one").splitlines()
     ]
     roles = {
         row["evaluation_id"]: row["selection_role"]
@@ -820,11 +819,11 @@ def test_trial_roles_and_stitched_replay_are_explicitly_bounded(
         latest_available_time=bars[-1].latest_available_time,
     )
     config = json.loads(Path("config/strategy_research.json").read_text())
-    replay_path, _replay_hash = _cost_replay_artifact(
-        tmp_path, panel, validation, config, "research-one",
-    )
     replay_rows = [
-        json.loads(line) for line in replay_path.read_text(encoding="utf-8").splitlines()
+        json.loads(line)
+        for line in cost_replay_body(
+            panel, validation, config, "research-one",
+        ).splitlines()
         if json.loads(line)["record_type"] == "label_cost"
     ]
     assert [row["in_walk_forward_oos"] for row in replay_rows] == [
@@ -930,7 +929,7 @@ def test_allocator_weight_is_independent_of_current_family_signal() -> None:
     )
     config = json.loads(Path("config/strategy_research.json").read_text())["allocation"]
     result = allocate((family,), state, quality, config)
-    contract = _position_contract_payload(
+    contract = position_contract_payload(
         ValidationResult((family,), (), {}, ()), result,
     )
     assert result.weights["trend"] > 0.0
@@ -1178,11 +1177,48 @@ def test_position_contract_combines_family_direction_and_risk_weight() -> None:
     )
     validation = ValidationResult((family,), (), {}, ())
     allocation = AllocationResult({"trend": 0.2}, 0.8, 0.1, "mixed", 1)
-    payload = _position_contract_payload(validation, allocation)
-    assert payload["aggregate_target"] == pytest.approx(-0.1)
-    rows = payload["families"]
-    assert isinstance(rows, list)
-    assert rows[0]["portfolio_target_contribution"] == pytest.approx(-0.1)
+    payload = position_contract_payload(validation, allocation)
+    assert payload == {
+        "method_version": "risk-weighted-family-target-v1",
+        "unit": "risk_weighted_directional_target",
+        "aggregate_target": pytest.approx(-0.1),
+        "families": [{
+            "family": "trend",
+            "deployment_candidate_id": "candidate",
+            "eligible": True,
+            "family_target": -0.5,
+            "allocation_weight": 0.2,
+            "portfolio_target_contribution": pytest.approx(-0.1),
+        }],
+    }
+
+
+def test_market_state_contract_matches_hand_authored_fixture() -> None:
+    """共享合同必须保持与 producer/verifier 无关的字段语义。"""
+    state = MarketState(
+        trend=0.5,
+        volatility=0.25,
+        liquidity=-0.1,
+        flow=0.2,
+        carry=None,
+        cross_venue=None,
+        relative=None,
+        jump=1.5,
+        regime="mixed",
+        uncertainty=0.3,
+    )
+    assert market_state_payload(state) == {
+        "trend": 0.5,
+        "volatility": 0.25,
+        "liquidity": -0.1,
+        "flow": 0.2,
+        "carry": None,
+        "cross_venue": None,
+        "relative": None,
+        "jump": 1.5,
+        "regime": "mixed",
+        "uncertainty": 0.3,
+    }
 
 
 def test_operational_gate_requires_flat_position_for_non_decision_grade() -> None:

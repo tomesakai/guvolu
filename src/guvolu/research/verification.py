@@ -8,6 +8,15 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from guvolu.research.allocator import allocate, allocation_payload
+from guvolu.research.artifact_contracts import (
+    INTERVAL_SECONDS,
+    SECONDS_PER_YEAR,
+    cost_replay_body,
+    family_payload,
+    market_state_payload,
+    position_contract_payload,
+    trial_ledger_body,
+)
 from guvolu.research.config_lineage import attest_config_lineage_snapshot
 from guvolu.research.contracts import PanelSnapshot
 from guvolu.research.data_location import resolve_data_root_locator
@@ -20,15 +29,6 @@ from guvolu.research.panel import (
     attest_trade_input_receipt,
     build_panel_snapshot,
     parse_time,
-)
-from guvolu.research.pipeline import (
-    SECONDS_PER_YEAR,
-    _INTERVAL_SECONDS,
-    _cost_replay_artifact,
-    _family_payload,
-    _market_state_payload,
-    _position_contract_payload,
-    _trial_artifact,
 )
 from guvolu.research.provenance import (
     canonical_json,
@@ -273,7 +273,7 @@ def _attest_v12_decision_evidence(
         decision_index=decision_index,
     )
     interval = _text(config.get("bar_interval"), "bar_interval")
-    interval_seconds = _INTERVAL_SECONDS.get(interval)
+    interval_seconds = INTERVAL_SECONDS.get(interval)
     if interval_seconds is None:
         raise ValueError("v12 bar_interval 不受支持")
     periods_per_year = SECONDS_PER_YEAR / interval_seconds
@@ -305,11 +305,11 @@ def _attest_v12_decision_evidence(
     )
     expected = {
         "decision_time": decision_time.isoformat(),
-        "market_state": _market_state_payload(market_state),
+        "market_state": market_state_payload(market_state),
         "research_quality": quality_payload(research_quality),
-        "family_evaluations": _family_payload(validation),
+        "family_evaluations": family_payload(validation),
         "research_position": allocation_payload(research_position),
-        "research_target_contract": _position_contract_payload(
+        "research_target_contract": position_contract_payload(
             validation, research_position,
         ),
     }
@@ -334,23 +334,19 @@ def _attest_v12_decision_evidence(
         ("research_replay", allocation_payload(research_position)),
         (
             "research_target_contract",
-            _position_contract_payload(validation, research_position),
+            position_contract_payload(validation, research_position),
         ),
     ):
         if canonical_json(target.get(name)) != canonical_json(value):
             raise ValueError(f"v12 target_position.{name} 现场重建不一致")
-    with TemporaryDirectory(prefix="guvolu-decision-evidence-") as temporary:
-        evidence_directory = Path(temporary)
-        rebuilt_trial, _ = _trial_artifact(
-            evidence_directory, validation, research_identity,
-        )
-        rebuilt_replay, _ = _cost_replay_artifact(
-            evidence_directory, panel, validation, config, research_identity,
-        )
-        if rebuilt_trial.read_bytes() != trial_path.read_bytes():
-            raise ValueError("v12 trial ledger 不能由验证结果重建")
-        if rebuilt_replay.read_bytes() != replay_path.read_bytes():
-            raise ValueError("v12 成本回放不能由验证路径重建")
+    rebuilt_trial = trial_ledger_body(validation, research_identity).encode("utf-8")
+    rebuilt_replay = cost_replay_body(
+        panel, validation, config, research_identity,
+    ).encode("utf-8")
+    if rebuilt_trial != trial_path.read_bytes():
+        raise ValueError("v12 trial ledger 不能由验证结果重建")
+    if rebuilt_replay != replay_path.read_bytes():
+        raise ValueError("v12 成本回放不能由验证路径重建")
 
 
 def _verify_run_identity(
