@@ -113,6 +113,14 @@ paper 分配遵守以下长期边界：趋势、量价确认趋势和突破合�
 .\.venv\Scripts\python.exe scripts\run_strategy_research.py
 ```
 
+隔离 worktree 不得读取创建时复制的陈旧 catalog。用 `--data-root` 指向持续更新的权威市场数据根；
+输入只读，研究治理库、收据、面板与报告仍写入当前项目：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\run_strategy_research.py `
+  --data-root <authoritative-data-root>
+```
+
 独立生成候选、运行一个流派、监视方向并生成下一代预登记提案：
 
 ```powershell
@@ -464,6 +472,15 @@ manifest SHA-256 为 `14b7ffdc5f87dab2f271fbbab21cc78487bca21b434c8cc3d543ca6caa
 五个提案均为 `no_parameter_proposal` 且没有派生配置。这个停止条件表明脚本生成、独立监视和
 受治理演进已经闭环；它不等于拥有三个时间分离的 vintage。后者必须随新市场数据自然形成，
 不能用同一面板重复运行补足。
+
+外部活动数据根合同随后在真实主数据目录上运行。研究输入与研究状态分离后，组合运行
+`research-run-55d1469df0dec1b5919db5934be7c95115265a1dc0068dda1eb3b8a6fb56d9e8`
+把面板推进到 `2026-08-14T22:00:00+09:00`，manifest SHA-256 为
+`84fe27a5ec831d5153344be9030d7645e3c76b1fd3dce7d89f15360b526543eb`，12 类制品再次全部通过
+独立 verifier。`strategy_data_stale` 已消失；最新结构断点是
+`2026-08-13T17:00:00+09:00`，之后只有 29 根连续小时柱，距最长特征所需 169 根还差 140 根，
+所以唯一运行门禁是 `feature_snapshot_stale`。持续采集且不再断流时，最早在约
+`2026-08-20T17:00:00+09:00` 形成成熟特征；在此之前 operational 仓位必须保持全零。
 
 已经启动的 2026-08-21 至 2026-11-29 冻结窗口固定在主树的 v1 plan/v3 holdout 兼容合同上，
 继续由原执行器完成，研究分支不得改写。该窗口可作为 legacy 前向证据，但缺少 v2/v4 所需的
