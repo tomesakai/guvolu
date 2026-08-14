@@ -480,15 +480,16 @@ def test_holdout_vintage_is_unexposed_nonoverlapping_and_single_use(
 ) -> None:
     """封存段必须未暴露、不重叠且只能消费一次。"""
     registry = tmp_path / "governance.sqlite3"
+    _set_now(_time("2025-06-02T00:00:00"))
     exposure = register_research_exposure(
         registry,
         "research-identity-one",
         "market-one",
         _time("2025-01-01T00:00:00"),
         _time("2025-06-01T00:00:00"),
-        recorded_at=_time("2025-06-02T00:00:00"),
     )
     assert exposure.market_id == "market-one"
+    assert exposure.recorded_at == _time("2025-06-02T00:00:00")
     _set_now(_time("2025-04-01T00:00:00"))
     with pytest.raises(ValueError, match="已被自适应研究读取"):
         seal_holdout_vintage(
@@ -1490,6 +1491,9 @@ def test_holdout_cannot_be_selected_retroactively(tmp_path: Path) -> None:
 
 def test_governance_timestamps_are_not_caller_controlled(tmp_path: Path) -> None:
     """封存、计划、预测和消费时刻只能来自进程壁钟。"""
+    assert "recorded_at" not in inspect.signature(
+        register_research_exposure
+    ).parameters
     assert "sealed_at" not in inspect.signature(seal_holdout_vintage).parameters
     assert "frozen_at" not in inspect.signature(freeze_forward_plan).parameters
     assert "frozen_at" not in inspect.signature(register_frozen_forward_plan).parameters

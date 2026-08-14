@@ -1663,12 +1663,10 @@ def register_research_exposure(
     market_id: str,
     start_time: datetime,
     end_time: datetime,
-    *,
-    recorded_at: datetime | None = None,
 ) -> ResearchExposure:
     """登记开发研究暴露；未消费封存段与研究读取互斥。"""
     start, end = _validate_range(start_time, end_time)
-    recorded = _utc(recorded_at or datetime.now(UTC))
+    recorded = _utc(clock.utc_now())
     exposure_id = stable_identifier("research-exposure", {
         "governance_method_version": GOVERNANCE_METHOD_VERSION,
         "research_identity": research_identity,

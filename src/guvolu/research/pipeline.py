@@ -408,7 +408,6 @@ def run_research(
         market_id,
         exposure_start,
         input_event,
-        recorded_at=execution_evaluated_at,
     )
     receipt_registration = register_active_head_receipt(
         governance_path,
