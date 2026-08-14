@@ -1,5 +1,6 @@
 param(
     [Parameter(Mandatory = $true)]
+    [ValidatePattern('^frozen-forward-plan-[0-9a-f]{64}$')]
     [string]$PlanId,
     [Parameter(Mandatory = $true)]
     [datetime]$StartUtc,

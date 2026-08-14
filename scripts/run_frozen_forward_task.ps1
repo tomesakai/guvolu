@@ -1,5 +1,6 @@
 param(
     [Parameter(Mandatory = $true)]
+    [ValidatePattern('^frozen-forward-plan-[0-9a-f]{64}$')]
     [string]$PlanId,
     [Parameter(Mandatory = $true)]
     [string]$Repository,
@@ -23,6 +24,8 @@ $RunToken = [guid]::NewGuid().ToString("N")
 $StdoutPath = Join-Path $LogDirectory ("." + $RunToken + ".stdout.tmp")
 $StderrPath = Join-Path $LogDirectory ("." + $RunToken + ".stderr.tmp")
 $ExitCode = 1
+$PredictionExitCode = $null
+$WrapperError = $null
 $Output = ""
 try {
     $Arguments = @(
@@ -30,7 +33,7 @@ try {
         "--root",
         ('"' + $Root + '"'),
         "predict",
-        $PlanId,
+        ('"' + $PlanId + '"'),
         "--registry",
         ('"' + $Registry + '"')
     )
@@ -42,7 +45,8 @@ try {
         -WindowStyle Hidden `
         -Wait `
         -PassThru
-    $ExitCode = $Process.ExitCode
+    $PredictionExitCode = $Process.ExitCode
+    $ExitCode = $PredictionExitCode
     $Streams = @()
     $Stdout = Get-Content -LiteralPath $StdoutPath -Raw -Encoding UTF8
     $Stderr = Get-Content -LiteralPath $StderrPath -Raw -Encoding UTF8
@@ -56,7 +60,8 @@ try {
 }
 catch {
     $ExitCode = 1
-    $Output = $_.Exception.ToString()
+    $WrapperError = $_.Exception.ToString()
+    $Output = $WrapperError
 }
 finally {
     Remove-Item -LiteralPath $StdoutPath -Force -ErrorAction SilentlyContinue
@@ -67,6 +72,8 @@ $Record = [ordered]@{
     completed_at = [datetime]::UtcNow.ToString("o")
     plan_id = $PlanId
     exit_code = $ExitCode
+    prediction_exit_code = $PredictionExitCode
+    wrapper_error = $WrapperError
     output = $Output
 }
 $Json = $Record | ConvertTo-Json -Compress
