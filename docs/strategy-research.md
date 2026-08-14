@@ -78,7 +78,7 @@ trial ledger，不删除失败候选（G-07）。准入同时要求：
 - 全候选 Benjamini-Hochberg FDR 校正值不超过配置上限；
 - 成本后净收益为正的独立测试折比例达到配置下限；
 - CSCV 折块选择过拟合概率（PBO）不超过配置上限；
-- 168 小时循环折块 bootstrap 的 Sharpe 非正概率不超过 0.05；
+- 168 小时 studentized 循环折块 bootstrap 的 Sharpe 非正概率不超过 0.05；
 - 模式为 paper，shadow 不可因收益通过而获得本金。
 
 结果同时输出固定多头、单策略、无 L2 overlay 和无 regime 消融。Sharpe 只是一项指标；
@@ -91,8 +91,12 @@ Probabilistic Sharpe 近似。CSCV 使用最近的偶数个 walk-forward 测试�
 每个分割把所有折内并列冠军的折外平均并列秩作为该分割结果，候选 ID 不参与统计选择。
 `PBO` 是选择稳定性诊断，不是盈利性指标：一个稳定亏损的流派也可能有很低 PBO，仍会被净
 收益、Sharpe、回撤或正收益折比例门禁拒绝。另以 1,024 次固定种子循环折块重采样保留一周
-以内的短程依赖，输出单侧 5% Sharpe 下界与 Sharpe 不大于零的经验概率；后者进入准入门禁。
-该实现是可审计的 percentile 诊断，不冒充 Ledoit-Wolf 的完整 studentized bootstrap。
+以内的短程依赖。v2 把 Sharpe 写成收益一阶矩与二阶矩的平滑函数，以所有重叠循环块估计原
+序列长程协方差，并在每个 bootstrap 样本内按其已抽取的非重叠块重新估计自然标准误；由
+bootstrap-t 分布输出单侧 5% Sharpe 下界与 Sharpe 不大于零的经验概率，后者进入准入门禁。
+该实现采纳 Ledoit-Wolf 的 studentization 与 circular-block 原则，但固定使用配置中的 168 小时
+block-LRV，不冒充论文的预白化 QS 核、半参数块长校准或双策略 Sharpe 差异检验。旧 percentile
+v1 仍可由 manifest 选择并逐字节重建，不能被当前 v2 常量改写。
 
 ## 5. 质量、状态与分配
 
@@ -555,6 +559,12 @@ v5 提案证明已尝试，因 `insufficient_new_history` 拒绝重复；量价�
 网格分别按上述失败归因停止。v5/v6 只按创建时登记的历史集合重放，v7/v8 才自动发现 canonical
 历史，避免后来新增运行反向改变旧提案的可验证性。
 
+studentized bootstrap v2 先对既有 v1 manifest 完成 12 类制品逐字节兼容重建，再只读复用同一
+56,160 根 stitched OOS 收益运行正式验证入口。突破、量价趋势和趋势的单侧下界分别为 `0.440565`、
+`0.071554`、`0.055322`，p 值分别为 `0.001951`、`0.034146`、`0.038049`，继续通过；均值回归
+和网格下界为 `-1.083779`、`-2.007189`，p 值为 `0.935610`、`1.000000`，继续拒绝。该轮是冻结
+路径诊断而非新数据运行，没有发布新 manifest，也没有把方法升级伪装成第二个时间 vintage。
+
 该轮真实重建还暴露了旧面板查询的资源伸缩缺陷：762 个活动文件、约 1,945 万行被一次性送入
 全局 `ROW_NUMBER`，DuckDB 在 2 GB 和 4 GB 上限下都于同一去重算子耗尽内存。控制面证明 761 个
 非空文件的事件覆盖互不相交，最大单文件为 460,837 行。现在只把事件覆盖相交的文件组成联合
@@ -631,12 +641,11 @@ CPU 阶段应先于 GPU 完成以下收敛：
    自动繁殖并反复挑选。
 2. 增加 5 分钟、1 小时和 4 小时多节拍，但每个候选只使用预先登记的决策节拍与成本模型；
    不把同一参数在所有节拍无边界复制。
-3. 现有门禁已包括非正态 Probabilistic Sharpe、循环折块 percentile bootstrap、折块
+3. 现有门禁已包括非正态 Probabilistic Sharpe、studentized 循环折块 bootstrap、折块
    CSCV/PBO、Deflated Sharpe 和单轴最近参数邻域稳定性。DSR 同时发布全量候选原始试验数与
    基于折级得分相关矩阵参与率的有效试验数。DSR 的试验域是实际参与该流派冠军选择的候选；
    由于相邻参数候选高度相关，准入使用符合独立试验假设的 effective count，raw count 作为最
-   保守敏感性同时披露。跨流派比较继续由全局 BH-FDR 约束。下一步增加
-   studentized bootstrap 和 regime attribution；开发
+   保守敏感性同时披露。跨流派比较继续由全局 BH-FDR 约束。下一步增加 regime attribution；开发
    回放与已经实现的一次性封存段状态机分开登记；积累未来 vintage 后再形成 G-08 结论。
 4. 均值回归和网格在当前主动成交成本下失败时保持拒绝。只有建立 snapshot-bounded 被动成交
    上下界、库存路径、逆向选择和撤单失败模拟后，才重新评估网格，不以较低费用假设直接放行。
@@ -653,7 +662,7 @@ CPU 阶段应先于 GPU 完成以下收敛：
 | [Warm-start GP（2024）](https://arxiv.org/abs/2412.00896) | 结构约束和有依据的初始化可减少随机搜索浪费 | 以已验证流派为 seed，每个流派独立预算和繁殖池 |
 | [CPCV 比较研究（2024）](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=4686376) | 合成控制实验中 CPCV 比普通 walk-forward 更能抑制过拟合 | 已加入折块 CSCV/PBO；完整 CPCV 作为进入封存段前的 challenger |
 | [Deflated Sharpe Ratio](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=2460551) | 选择偏差、非正态与试验次数会抬高 Sharpe | 已加入 family-scoped raw/effective trial DSR；effective count 准入，raw count 作保守敏感性 |
-| [Ledoit-Wolf Sharpe 检验](https://www.ledoit.net/Robust_Sharpe_2008.pdf) | 肥尾或序列相关下应使用 time-series bootstrap | 已加入循环折块 percentile 门禁；studentized 区间列为下一步 |
+| [Ledoit-Wolf Sharpe 检验](https://www.ledoit.net/Robust_Sharpe_2008.pdf) | 肥尾或序列相关下应使用 studentized time-series bootstrap | 已加入固定 block-LRV 的一侧 bootstrap-t；QS 预白化与块长校准保持显式未实现 |
 
 ## 10. GPU 策略生成方式
 
