@@ -1,10 +1,16 @@
 param(
-    [int]$IntervalSeconds = 300
+    [int]$IntervalSeconds = 300,
+    [string]$Repository = ''
 )
 
 $ErrorActionPreference = 'Stop'
-$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$RepoRoot = if ($Repository) {
+    (Resolve-Path -LiteralPath $Repository).Path
+} else {
+    (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+}
 $PythonPath = Join-Path $RepoRoot '.venv\Scripts\python.exe'
+$DataRoot = Join-Path $RepoRoot 'data'
 $LogDirectory = Join-Path $RepoRoot 'logs'
 $LogPath = Join-Path $LogDirectory 'book-state-materializer-progress.log'
 
@@ -25,7 +31,8 @@ function Write-VisibleLog {
 try {
     "$(Get-Date -Format o) guvolu book-state-materializer started; interval=${IntervalSeconds}s." |
         Write-VisibleLog
-    & $PythonPath -m guvolu.data.book_state_materialize watch `
+    & $PythonPath -m guvolu.data.book_state_materialize `
+        --data-root $DataRoot watch `
         --poll-seconds $IntervalSeconds 2>&1 |
         Write-VisibleLog
 } finally {

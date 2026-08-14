@@ -1,8 +1,16 @@
-param([int]$IntervalSeconds = 300)
+param(
+    [int]$IntervalSeconds = 300,
+    [string]$Repository = ''
+)
 
 $ErrorActionPreference = 'Stop'
-$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$RepoRoot = if ($Repository) {
+    (Resolve-Path -LiteralPath $Repository).Path
+} else {
+    (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+}
 $PythonPath = Join-Path $RepoRoot '.venv\Scripts\python.exe'
+$DataRoot = Join-Path $RepoRoot 'data'
 $LogDirectory = Join-Path $RepoRoot 'logs'
 $LogPath = Join-Path $LogDirectory 'orderflow-tile-watcher.log'
 New-Item -ItemType Directory -Force -Path $LogDirectory | Out-Null
@@ -26,7 +34,8 @@ try {
         # 保留完整原生错误输出。
         $ErrorActionPreference =
             [System.Management.Automation.ActionPreference]::Continue
-        & $PythonPath -m guvolu.data.orderflow_tile_materialize watch `
+        & $PythonPath -m guvolu.data.orderflow_tile_materialize `
+            --data-root $DataRoot watch `
             --bucket 5s --poll-seconds $IntervalSeconds 2>&1 | Write-VisibleLog
         $NativeExitCode = $LASTEXITCODE
     } finally {
