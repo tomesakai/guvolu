@@ -8,7 +8,9 @@ from pathlib import Path
 from guvolu.research.config_lineage import load_verified_config_lineage
 from guvolu.research.evolution import _monitor_family_run, monitor_family_run
 from guvolu.research.provenance import canonical_json, sha256_file
-from guvolu.research.verification import verify_research_run
+from guvolu.research.verification_attestation import (
+    verify_research_run_cached as verify_research_run,
+)
 from guvolu.strategy.generation import build_family_batches
 
 

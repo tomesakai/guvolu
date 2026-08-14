@@ -79,6 +79,20 @@ class VerificationResult:
     manifest_path: Path
     manifest_sha256: str
     checked_artifacts: tuple[str, ...]
+    cache_hit: bool = False
+
+
+@dataclass(frozen=True)
+class ArtifactIntegrityResult:
+    """manifest 与全部受保护制品的逐字节完整性结果。"""
+
+    manifest_path: Path
+    manifest_sha256: str
+    manifest: Mapping[str, object]
+    summary: Mapping[str, object]
+    candidate_registry: Mapping[str, object] | None
+    artifact_paths: Mapping[str, Path]
+    checked_artifacts: tuple[str, ...]
 
 
 def _object(value: object, name: str) -> Mapping[str, object]:
@@ -608,11 +622,11 @@ def _verify_data_governance(root: Path, summary: Mapping[str, object]) -> None:
         raise ValueError("研究面板晚于已登记暴露区间")
 
 
-def verify_research_run(
+def verify_research_artifact_integrity(
     root: Path,
     manifest_path: Path | None = None,
-) -> VerificationResult:
-    """复核 manifest、全部制品散列和运行质量硬门禁。"""
+) -> ArtifactIntegrityResult:
+    """复核 manifest 指针、全部制品散列与字节数。"""
     resolved_root = root.resolve()
     resolved_manifest, expected_manifest_hash = _resolve_manifest(
         resolved_root,
@@ -622,10 +636,6 @@ def verify_research_run(
     if expected_manifest_hash is not None and manifest_hash != expected_manifest_hash:
         raise ValueError("latest 指针中的 manifest 散列不匹配")
     manifest = _read_json(resolved_manifest)
-    source_data_root = resolve_data_root_locator(
-        resolved_root, manifest.get("source_data_root"),
-    )
-    run_id = _text(manifest.get("run_id"), "manifest.run_id")
     artifacts = _object(manifest.get("artifacts"), "manifest.artifacts")
     checked: list[str] = []
     summary: Mapping[str, object] | None = None
@@ -652,19 +662,53 @@ def verify_research_run(
         checked.append(name)
     if summary is None:
         raise ValueError("manifest 缺少 summary_json 制品")
+    return ArtifactIntegrityResult(
+        manifest_path=resolved_manifest,
+        manifest_sha256=manifest_hash,
+        manifest=manifest,
+        summary=summary,
+        candidate_registry=candidate_registry,
+        artifact_paths=artifact_paths,
+        checked_artifacts=tuple(checked),
+    )
+
+
+def verify_research_runtime_invariants(
+    root: Path,
+    summary: Mapping[str, object],
+) -> None:
+    """复核无需重建历史面板的运行门禁与治理登记。"""
+    _verify_operational_gate(summary)
+    _verify_data_governance(root.resolve(), summary)
+
+
+def verify_research_run(
+    root: Path,
+    manifest_path: Path | None = None,
+) -> VerificationResult:
+    """完整重建研究决策证据，并复核运行质量硬门禁。"""
+    resolved_root = root.resolve()
+    integrity = verify_research_artifact_integrity(
+        resolved_root, manifest_path,
+    )
+    manifest = integrity.manifest
+    summary = integrity.summary
+    source_data_root = resolve_data_root_locator(
+        resolved_root, manifest.get("source_data_root"),
+    )
+    run_id = _text(manifest.get("run_id"), "manifest.run_id")
     _verify_run_identity(
         resolved_root,
         manifest,
         summary,
-        candidate_registry,
-        artifact_paths,
+        integrity.candidate_registry,
+        integrity.artifact_paths,
         source_data_root,
     )
-    _verify_operational_gate(summary)
-    _verify_data_governance(resolved_root, summary)
+    verify_research_runtime_invariants(resolved_root, summary)
     return VerificationResult(
         run_id=run_id,
-        manifest_path=resolved_manifest,
-        manifest_sha256=manifest_hash,
-        checked_artifacts=tuple(checked),
+        manifest_path=integrity.manifest_path,
+        manifest_sha256=integrity.manifest_sha256,
+        checked_artifacts=integrity.checked_artifacts,
     )

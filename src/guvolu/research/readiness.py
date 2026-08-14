@@ -18,7 +18,9 @@ from guvolu.research.governance import (
 )
 from guvolu.research.panel import freeze_trade_inputs, load_panel_bars
 from guvolu.research.provenance import code_identity
-from guvolu.research.verification import verify_research_run
+from guvolu.research.verification_attestation import (
+    verify_research_run_cached as verify_research_run,
+)
 from guvolu.strategy.contracts import ResearchBar
 
 READINESS_METHOD_VERSION = "strategy-readiness-v3"
@@ -291,6 +293,7 @@ def strategy_readiness(
         "evaluated_at": evaluated_at.isoformat(),
         "run_id": verified.run_id,
         "manifest_sha256": verified.manifest_sha256,
+        "verification_cache_hit": verified.cache_hit,
         "summary_path": summary_path.relative_to(root).as_posix(),
         "market_id": market_id,
         "source": {

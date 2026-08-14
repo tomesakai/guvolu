@@ -9,7 +9,9 @@ from datetime import datetime
 from pathlib import Path
 
 from guvolu.research.provenance import sha256_file, stable_identifier
-from guvolu.research.verification import verify_research_run
+from guvolu.research.verification_attestation import (
+    verify_research_run_cached as verify_research_run,
+)
 
 _INTERVAL_SECONDS = {
     "5min": 300.0,
