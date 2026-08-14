@@ -47,6 +47,18 @@ def _number(value: object, name: str) -> float:
     return result
 
 
+def _positive_integer(value: object, name: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise ValueError(f"{name} 必须为正整数")
+    return value
+
+
+def _string_list(value: object, name: str) -> tuple[str, ...]:
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"{name} 必须为非空数组")
+    return tuple(_text(item, name) for item in value)
+
+
 def global_fdr_q_values(p_values: Mapping[str, float]) -> Mapping[str, float]:
     """对预登记套件中的全部候选与家族路径执行 BH-FDR。"""
     if not p_values:
@@ -208,6 +220,179 @@ def _correlation(
     return len(common), covariance / (left_std * right_std)
 
 
+def _covariance(
+    left: Mapping[int, float],
+    right: Mapping[int, float],
+) -> tuple[int, float]:
+    common = sorted(set(left).intersection(right))
+    if len(common) < 2:
+        return len(common), 0.0
+    left_values = [left[key] for key in common]
+    right_values = [right[key] for key in common]
+    left_mean = statistics.fmean(left_values)
+    right_mean = statistics.fmean(right_values)
+    return len(common), statistics.fmean(
+        (left_value - left_mean) * (right_value - right_mean)
+        for left_value, right_value in zip(
+            left_values, right_values, strict=True,
+        )
+    )
+
+
+def _project_suite_weights(
+    weights: dict[str, float],
+    sleeve_by_id: Mapping[str, Mapping[str, object]],
+    gross_cap: float,
+    directional_cap: float,
+    reversion_cap: float,
+    directional_families: Sequence[str],
+) -> None:
+    for sleeve_id in weights:
+        weights[sleeve_id] = max(weights[sleeve_id], 0.0)
+    directional = set(directional_families)
+    directional_ids = [
+        sleeve_id for sleeve_id in weights
+        if sleeve_by_id[sleeve_id].get("family") in directional
+    ]
+    directional_total = sum(weights[sleeve_id] for sleeve_id in directional_ids)
+    if directional_total > directional_cap:
+        scale = directional_cap / directional_total
+        for sleeve_id in directional_ids:
+            weights[sleeve_id] *= scale
+    reversion_ids = [
+        sleeve_id for sleeve_id in weights
+        if sleeve_by_id[sleeve_id].get("family") == "mean_reversion"
+    ]
+    reversion_total = sum(weights[sleeve_id] for sleeve_id in reversion_ids)
+    if reversion_total > reversion_cap:
+        scale = reversion_cap / reversion_total
+        for sleeve_id in reversion_ids:
+            weights[sleeve_id] *= scale
+    gross = sum(weights.values())
+    if gross > gross_cap:
+        scale = gross_cap / gross
+        for sleeve_id in weights:
+            weights[sleeve_id] *= scale
+
+
+def allocate_interval_sleeves(
+    sleeves: Sequence[Mapping[str, object]],
+    aligned_returns: Mapping[str, Mapping[int, float]],
+    allocation: Mapping[str, object],
+    interval_seconds: int,
+) -> Mapping[str, object]:
+    """在共同栅格上分配 suite-eligible sleeve，结果仅供研究。"""
+    eligible = {
+        _text(sleeve.get("sleeve_id"), "sleeve_id"): sleeve
+        for sleeve in sleeves if sleeve.get("suite_eligible") is True
+    }
+    if not eligible:
+        return {
+            "status": "research_only",
+            "weights": {},
+            "reserve": 1.0,
+            "aggregate_target": 0.0,
+            "objective": 0.0,
+            "alignment_interval_seconds": interval_seconds,
+        }
+    maximum_gross = _number(
+        allocation.get("maximum_gross_weight"), "maximum_gross_weight",
+    )
+    minimum_reserve = _number(
+        allocation.get("minimum_risk_reserve"), "minimum_risk_reserve",
+    )
+    maximum_gross = min(maximum_gross, 1.0 - minimum_reserve)
+    directional_cap = _number(
+        allocation.get("trend_breakout_cap"), "trend_breakout_cap",
+    )
+    reversion_cap = _number(
+        allocation.get("mean_reversion_cap"), "mean_reversion_cap",
+    )
+    directional_families = _string_list(
+        allocation.get("directional_families"), "directional_families",
+    )
+    risk_aversion = _number(allocation.get("risk_aversion"), "risk_aversion")
+    uncertainty_penalty = _number(
+        allocation.get("uncertainty_penalty"), "uncertainty_penalty",
+    )
+    iterations = _positive_integer(
+        allocation.get("solver_iterations"), "solver_iterations",
+    )
+    step = _number(allocation.get("solver_step"), "solver_step")
+    keys = tuple(sorted(eligible))
+    expected: dict[str, float] = {}
+    uncertainty: dict[str, float] = {}
+    for sleeve_id in keys:
+        metrics = _mapping(eligible[sleeve_id].get("metrics"), "metrics")
+        expected[sleeve_id] = max(
+            _number(metrics.get("annual_return"), "annual_return"), 0.0,
+        ) * _number(metrics.get("capacity_score"), "capacity_score")
+        uncertainty[sleeve_id] = _number(
+            metrics.get("annual_volatility"), "annual_volatility",
+        ) / math.sqrt(max(_number(metrics.get("bars"), "bars"), 1.0))
+    periods_per_year = 365.0 * 24.0 * 60.0 * 60.0 / interval_seconds
+    covariance: dict[tuple[str, str], float] = {}
+    common_bars: dict[tuple[str, str], int] = {}
+    for left in keys:
+        for right in keys:
+            count, value = _covariance(
+                aligned_returns[left], aligned_returns[right],
+            )
+            common_bars[(left, right)] = count
+            covariance[(left, right)] = value * periods_per_year
+    weights = {key: 0.0 for key in keys}
+    for _ordinal in range(iterations):
+        updated = {}
+        for key in keys:
+            risk_gradient = 2.0 * risk_aversion * sum(
+                covariance[(key, other)] * weights[other]
+                for other in keys
+            )
+            updated[key] = weights[key] + step * (
+                expected[key]
+                - risk_gradient
+                - uncertainty_penalty * uncertainty[key]
+            )
+        weights = updated
+        _project_suite_weights(
+            weights,
+            eligible,
+            maximum_gross,
+            directional_cap,
+            reversion_cap,
+            directional_families,
+        )
+    contributions = {
+        key: weights[key] * _number(
+            eligible[key].get("latest_unallocated_target"), "latest target",
+        )
+        for key in keys
+    }
+    objective = sum(expected[key] * weights[key] for key in keys)
+    objective -= risk_aversion * sum(
+        weights[left] * covariance[(left, right)] * weights[right]
+        for left in keys for right in keys
+    )
+    objective -= uncertainty_penalty * sum(
+        uncertainty[key] * weights[key] for key in keys
+    )
+    return {
+        "status": "research_only",
+        "weights": weights,
+        "reserve": max(1.0 - sum(weights.values()), 0.0),
+        "portfolio_target_contributions": contributions,
+        "aggregate_target": sum(contributions.values()),
+        "objective": objective,
+        "alignment_interval_seconds": interval_seconds,
+        "minimum_pairwise_common_bars": min(common_bars.values()),
+        "shared_caps": {
+            "maximum_gross_weight": maximum_gross,
+            "directional_weight": directional_cap,
+            "mean_reversion_weight": reversion_cap,
+        },
+    }
+
+
 def evaluate_interval_suite(
     repository_root: Path,
     plan: Mapping[str, object],
@@ -365,6 +550,12 @@ def evaluate_interval_suite(
                 "common_bars": bars,
                 "correlation": correlation,
             })
+    allocation_contract = _mapping(
+        plan.get("allocation_contract"), "allocation_contract",
+    )
+    suite_allocation = allocate_interval_sleeves(
+        sleeves, aligned, allocation_contract, interval_seconds,
+    )
     evidence: dict[str, object] = {
         "schema_version": 1,
         "method_version": INTERVAL_SUITE_EVIDENCE_METHOD_VERSION,
@@ -388,7 +579,8 @@ def evaluate_interval_suite(
             sleeves, key=lambda item: (str(item["family"]), str(item["bar_interval"])),
         ),
         "pairwise_correlations": correlations,
-        "allocation_status": "pending_suite_level_optimizer",
+        "suite_research_allocation": suite_allocation,
+        "operational_status": "disabled_pending_suite_readiness_and_holdout",
     }
     return {
         **evidence,

@@ -88,6 +88,7 @@ def build_interval_suite_plan(
     from_time: str | None = None
     data_scope: str | None = None
     duration_contract: Mapping[str, object] | None = None
+    allocation_contract: Mapping[str, object] | None = None
     for raw_path in config_paths:
         path = raw_path.resolve()
         config, config_hash, root_hash, depth, source_paths = (
@@ -121,6 +122,11 @@ def build_interval_suite_plan(
             duration_contract = current_duration
         elif current_duration != duration_contract:
             raise ValueError("多节拍配置的墙钟回看或 walk-forward 合同不一致")
+        current_allocation = _mapping(config.get("allocation"), "allocation")
+        if allocation_contract is None:
+            allocation_contract = current_allocation
+        elif current_allocation != allocation_contract:
+            raise ValueError("多节拍配置必须共享同一 allocation 合同")
         batches = build_family_batches(config)
         registry = candidate_registry_payload(batches, config_hash)
         search_plan = _mapping(registry.get("search_plan"), "search_plan")
@@ -200,6 +206,7 @@ def build_interval_suite_plan(
         "from_time": from_time,
         "data_scope": data_scope,
         "duration_contract": duration_contract,
+        "allocation_contract": allocation_contract,
         "members": ordered_members,
         "global_multiple_testing_domain": ordered_trials,
     }

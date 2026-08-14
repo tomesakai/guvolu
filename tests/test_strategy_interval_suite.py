@@ -11,6 +11,7 @@ import pytest
 
 from guvolu.research.interval_suite import build_interval_suite_plan
 from guvolu.research.interval_suite_evidence import (
+    allocate_interval_sleeves,
     align_returns_to_interval,
     global_fdr_q_values,
 )
@@ -72,6 +73,7 @@ def test_interval_suite_rejects_duplicate_interval() -> None:
         (("walk_forward", "test_bars", 539), "墙钟回看或 walk-forward"),
         ((None, "market_id", "mkt__other"), "同一 market_id"),
         ((None, "from_time", "2020-01-01T00:00:00+00:00"), "同一 from_time"),
+        (("allocation", "risk_aversion", 4.0), "同一 allocation"),
     ],
 )
 def test_interval_suite_rejects_incomparable_members(
@@ -144,3 +146,63 @@ def test_interval_suite_aligns_returns_without_lookahead() -> None:
                 (datetime(2026, 1, 1, 1, tzinfo=UTC), 0.02),
             ),
         }, 14_400)
+
+
+def test_interval_suite_allocator_shares_directional_cap() -> None:
+    """同一家族跨节拍不得各自获得一份完整方向风险预算。"""
+    sleeves = (
+        {
+            "sleeve_id": "breakout-hour",
+            "family": "breakout",
+            "suite_eligible": True,
+            "latest_unallocated_target": 1.0,
+            "metrics": {
+                "annual_return": 0.8,
+                "annual_volatility": 0.4,
+                "capacity_score": 1.0,
+                "bars": 1000,
+            },
+        },
+        {
+            "sleeve_id": "breakout-four-hour",
+            "family": "breakout",
+            "suite_eligible": True,
+            "latest_unallocated_target": 1.0,
+            "metrics": {
+                "annual_return": 0.7,
+                "annual_volatility": 0.35,
+                "capacity_score": 1.0,
+                "bars": 1000,
+            },
+        },
+    )
+    aligned = {
+        "breakout-hour": {1: 0.01, 2: -0.01, 3: 0.02},
+        "breakout-four-hour": {1: 0.009, 2: -0.009, 3: 0.018},
+    }
+    result = allocate_interval_sleeves(sleeves, aligned, {
+        "directional_families": ["trend", "flow_trend", "breakout"],
+        "maximum_gross_weight": 0.85,
+        "trend_breakout_cap": 0.6,
+        "mean_reversion_cap": 0.25,
+        "minimum_risk_reserve": 0.15,
+        "risk_aversion": 3.0,
+        "uncertainty_penalty": 0.1,
+        "solver_iterations": 20,
+        "solver_step": 0.05,
+    }, 14_400)
+    weights = result["weights"]
+    reserve = result["reserve"]
+    assert isinstance(weights, Mapping)
+    assert isinstance(reserve, float)
+    assert sum(float(value) for value in weights.values()) <= 0.6 + 1e-12
+    assert reserve >= 0.4 - 1e-12
+    assert result["status"] == "research_only"
+    flat = allocate_interval_sleeves(
+        ({**sleeves[0], "suite_eligible": False},),
+        {"breakout-hour": aligned["breakout-hour"]},
+        {},
+        14_400,
+    )
+    assert flat["aggregate_target"] == 0.0
+    assert flat["reserve"] == 1.0
