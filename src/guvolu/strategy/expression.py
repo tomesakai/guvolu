@@ -364,9 +364,9 @@ def validate_strategy_expression(template: StrategyExpression) -> None:
         raise ValueError(f"E_SIZING_UNKNOWN:{template.sizing}")
 
 
-def _node_payload(node: ExpressionNode) -> Mapping[str, object]:
-    """生成规范 AST 节点。"""
-    children = [_node_payload(child) for child in node.args]
+def expression_node_payload(node: ExpressionNode) -> Mapping[str, object]:
+    """生成可供注册表与执行计划共享的规范 AST 节点。"""
+    children = [expression_node_payload(child) for child in node.args]
     if node.op == "and":
         children.sort(key=lambda item: json.dumps(
             item,
@@ -389,7 +389,7 @@ def _node_payload(node: ExpressionNode) -> Mapping[str, object]:
 def strategy_expression_payload(template: StrategyExpression) -> Mapping[str, object]:
     """生成用于身份和注册表的规范模板。"""
     validate_strategy_expression(template)
-    required = [_node_payload(node) for node in template.required]
+    required = [expression_node_payload(node) for node in template.required]
     required.sort(key=lambda item: json.dumps(
         item,
         sort_keys=True,
@@ -412,9 +412,18 @@ def strategy_expression_payload(template: StrategyExpression) -> Mapping[str, ob
             for name, value in sorted(template.parameter_types.items())
         },
         "required": required,
-        "entry": None if template.entry is None else _node_payload(template.entry),
-        "exit": None if template.exit is None else _node_payload(template.exit),
-        "target": None if template.target is None else _node_payload(template.target),
+        "entry": (
+            None if template.entry is None
+            else expression_node_payload(template.entry)
+        ),
+        "exit": (
+            None if template.exit is None
+            else expression_node_payload(template.exit)
+        ),
+        "target": (
+            None if template.target is None
+            else expression_node_payload(template.target)
+        ),
         "sizing": template.sizing,
     }
 

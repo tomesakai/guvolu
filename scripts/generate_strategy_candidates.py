@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Sequence
 
@@ -32,6 +33,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     batches = build_family_batches(config, arguments.families)
     payload = candidate_registry_payload(batches, config_hash)
+    search_plan = payload.get("search_plan")
+    if not isinstance(search_plan, Mapping):
+        raise ValueError("候选注册表缺少 search_plan")
     content = canonical_json(payload) + "\n"
     digest = sha256_text(content)
     output = arguments.output
@@ -49,6 +53,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "sha256": digest,
         "family_scope": payload["family_scope"],
         "candidate_count": payload["candidate_count"],
+        "search_plan_id": search_plan["search_plan_id"],
     }))
     return 0
 

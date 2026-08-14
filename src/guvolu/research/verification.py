@@ -423,8 +423,14 @@ def _verify_run_identity(
         ):
             raise ValueError("v12 配置身份不能由受保护配置谱系重建")
         family_scope = _text_sequence(manifest.get("family_scope"), "family_scope")
+        generator_method_version = _text(
+            manifest.get("generator_method_version"),
+            "generator_method_version",
+        )
         expected_registry = candidate_registry_payload(
-            build_family_batches(config, family_scope), config_hash,
+            build_family_batches(config, family_scope),
+            config_hash,
+            generator_method_version,
         )
         if canonical_json(candidate_registry) != canonical_json(expected_registry):
             raise ValueError("v12 candidate registry 不能由配置与公式注册表重建")
