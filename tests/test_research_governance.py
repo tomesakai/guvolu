@@ -2304,6 +2304,15 @@ def test_interval_suite_forward_plan_is_precommitted_and_attested(
             legacy_sha,
             repository_root=tmp_path,
         )
+    _set_now(vintage.end_time)
+    with pytest.raises(ValueError, match="套件 holdout 入口消费"):
+        start_holdout_evaluation_attempt(
+            registry,
+            vintage.vintage_id,
+            "candidate-set-hash",
+            "generic-evaluation",
+        )
+    assert get_holdout_vintage(registry, vintage.vintage_id).status == "sealed"
     _set_now(vintage.start_time)
     with pytest.raises(ValueError, match="开始前"):
         register_interval_suite_forward_plan(

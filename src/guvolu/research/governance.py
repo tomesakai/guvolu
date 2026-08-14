@@ -2776,6 +2776,17 @@ def start_holdout_evaluation_attempt(
             raise LookupError(f"封存段不存在: {vintage_id}")
         if vintage["status"] != "sealed":
             raise ValueError(f"封存段已经消费: {vintage_id}")
+        try:
+            suite_plan = connection.execute(
+                "SELECT plan_id FROM interval_suite_forward_plan WHERE vintage_id=?",
+                (vintage_id,),
+            ).fetchone()
+        except sqlite3.OperationalError as error:
+            if "no such table" not in str(error).lower():
+                raise
+            suite_plan = None
+        if suite_plan is not None:
+            raise ValueError("套件冻结计划 vintage 必须由套件 holdout 入口消费")
         if started < _parse_timestamp(str(vintage["end_time"])):
             raise ValueError("封存段必须完整结束后才能开始评估")
         connection.execute(
@@ -2892,6 +2903,17 @@ def finalize_holdout_evaluation(
             raise ValueError("holdout vintage 与评估尝试身份不一致")
         if attempt["vintage_id"] != vintage_id:
             raise ValueError("holdout 评估尝试绑定了不同 vintage")
+        try:
+            suite_plan = connection.execute(
+                "SELECT plan_id FROM interval_suite_forward_plan WHERE vintage_id=?",
+                (vintage_id,),
+            ).fetchone()
+        except sqlite3.OperationalError as error:
+            if "no such table" not in str(error).lower():
+                raise
+            suite_plan = None
+        if suite_plan is not None:
+            raise ValueError("套件冻结计划 vintage 不能写入单成员 holdout 终态")
         if (
             vintage["candidate_set_hash"] != evidence.candidate_set_hash
             or attempt["candidate_set_hash"] != evidence.candidate_set_hash
