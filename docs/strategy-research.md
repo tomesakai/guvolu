@@ -482,6 +482,15 @@ manifest SHA-256 为 `14b7ffdc5f87dab2f271fbbab21cc78487bca21b434c8cc3d543ca6caa
 所以唯一运行门禁是 `feature_snapshot_stale`。持续采集且不再断流时，最早在约
 `2026-08-20T17:00:00+09:00` 形成成熟特征；在此之前 operational 仓位必须保持全零。
 
+就绪检查接入同一数据根合同后，当前 HEAD 的组合运行
+`research-run-e9ac32d667077acbb119f809b47ebd602146ae770bd3b3c0c290913b56e86dea`
+及 manifest `bfcee9e23781c3cb6d1a107d2a6ead5c76807158f8e951d9c4536698892158d0` 通过完整来源重建。
+`strategy-readiness-v3` 确认代码树与配置均匹配，published panel 有 29 根尾部连续柱，尚差
+140 根；按整点柱连续到达估算，最早成熟时点为 `2026-08-20T18:00:00+09:00`。检查期间活动
+head 已继续推进，因此同时报告 `active_input_head_changed`；成熟后应在整点收盘窗口重跑研究，
+而不是复用旧快照。promotion 状态独立为 `sealed_holdout_vintage_incomplete`，等待
+`2026-08-21` 至 `2026-11-29` 的封存窗口完成。
+
 已经启动的 2026-08-21 至 2026-11-29 冻结窗口固定在主树的 v1 plan/v3 holdout 兼容合同上，
 继续由原执行器完成，研究分支不得改写。该窗口可作为 legacy 前向证据，但缺少 v2/v4 所需的
 完整 panel 输入收据，不能事后改名为最强 G-08 证据。promotion 级终局需要在其后另封存一个
