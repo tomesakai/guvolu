@@ -66,6 +66,9 @@ trial ledger，不删除失败候选（G-07）。准入同时要求：
 
 当前 stitched 方法要求 `step_bars == test_bars`，保证测试窗连续且互不重叠。重叠测试窗需要
 折级归属和重复样本统计合同，间隔测试窗需要显式退出成本合同；两者在另行版本化前都会被拒绝。
+摘要中的 `validation_metrics` 表示逐折冠军拼接验证路径，`deployment_oos_metrics` 表示固定部署
+候选在统一 OOS mask 上的证据。旧 `metrics` 仅是 v10 对 `validation_metrics` 的兼容别名，在下次
+摘要 schema 升级时移除；组合器只消费固定部署候选的指标和收益序列。
 
 - 样本外柱数达到配置下限；
 - 成本后净收益与 Sharpe 为正；

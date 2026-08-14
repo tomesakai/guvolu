@@ -11,6 +11,7 @@ from pathlib import Path
 import duckdb
 import pytest
 
+import guvolu.research.allocator as allocator_module
 from guvolu.research.allocator import _covariance, allocate
 from guvolu.research import provenance
 from guvolu.research.contracts import (
@@ -500,6 +501,64 @@ def test_allocator_uses_fixed_deployment_oos_evidence() -> None:
     config = json.loads(Path("config/strategy_research.json").read_text())["allocation"]
     result = allocate((family,), state, quality, config)
     assert result.weights["trend"] == 0.0
+
+
+def test_allocator_covariance_uses_deployment_oos_returns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """跨家族协方差不得读取逐折冠军拼接收益。"""
+    quality = QualityVector(True, True, True, True, True, True, ())
+    deployment_returns = {
+        "trend": (0.01, -0.02, 0.03),
+        "mean_reversion": (-0.04, 0.05, -0.06),
+    }
+    stitched_returns = {
+        "trend": (0.7, 0.8, 0.9),
+        "mean_reversion": (-0.7, -0.8, -0.9),
+    }
+    evaluations = tuple(FamilyEvaluation(
+        family=family,
+        mode="paper",
+        deployment_candidate=CandidateSpec(
+            "candidate-" + family, family, "paper", {}, 1,
+        ),
+        latest_target=1.0,
+        deployment_oos_metrics=_metrics(),
+        deployment_oos_returns=deployment_returns[family],
+        metrics=_metrics(),
+        adjusted_sharpe=0.5,
+        fdr_q=0.1,
+        eligible=True,
+        rejection_reasons=(),
+        oos_returns=stitched_returns[family],
+    ) for family in deployment_returns)
+    observed: list[tuple[tuple[float, ...], tuple[float, ...]]] = []
+
+    def record_covariance(
+        left: tuple[float, ...],
+        right: tuple[float, ...],
+    ) -> float:
+        observed.append((left, right))
+        return 0.0
+
+    monkeypatch.setattr(allocator_module, "_covariance", record_covariance)
+    state = MarketState(
+        1.0, 0.2, 0.0, 0.0, None, None, None, 0.0, "mixed", 0.0,
+    )
+    config = json.loads(Path("config/strategy_research.json").read_text())["allocation"]
+    allocate(evaluations, state, quality, config)
+
+    expected = {
+        (left, right)
+        for left in deployment_returns.values()
+        for right in deployment_returns.values()
+    }
+    assert len(observed) == 4
+    assert set(observed) == expected
+    assert not any(
+        left in stitched_returns.values() or right in stitched_returns.values()
+        for left, right in observed
+    )
 
 
 def test_directional_families_share_one_cap() -> None:
