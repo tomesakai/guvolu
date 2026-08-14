@@ -1,15 +1,24 @@
 param(
     [ValidateSet('Normal', 'Hidden')]
-    [string]$WindowStyle = 'Normal'
+    [string]$WindowStyle = 'Normal',
+    [ValidateSet('Full', 'ForwardMinimal')]
+    [string]$Profile = 'Full',
+    [string]$Repository = ''
 )
 
 $ErrorActionPreference = 'Stop'
-$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$RepoRoot = if ($Repository) {
+    (Resolve-Path -LiteralPath $Repository).Path
+} else {
+    (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+}
 $PythonPath = Join-Path $RepoRoot '.venv\Scripts\python.exe'
+$RunnerRoot = Join-Path $RepoRoot 'scripts'
 
 if (-not (Test-Path -LiteralPath $PythonPath -PathType Leaf)) {
     throw "Project Python runtime is missing: $PythonPath"
 }
+Set-Location -LiteralPath $RepoRoot
 
 # Recover only stale crash tails; a fresh checkpoint protects sparse live runs.
 & $PythonPath -m guvolu.data.l2_capture recover --older-minutes 60
@@ -39,7 +48,7 @@ foreach ($Collector in $Collectors) {
         Write-Host "[$($Collector.Name)] already running PID=$(($Existing.ProcessId -join ','))"
         continue
     }
-    $RunnerPath = Join-Path $PSScriptRoot $Collector.Runner
+    $RunnerPath = Join-Path $RunnerRoot $Collector.Runner
     $Arguments = @(
         '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $RunnerPath,
         '-Venue', $Venue, '-Symbol', $Symbol, '-Name', $Collector.Name
@@ -59,6 +68,36 @@ $Materializers = @(
     @{ Name = 'book-state-materializer'; Module = 'guvolu.data.book_state_materialize'; Runner = 'run_book_state_materializer.ps1' },
     @{ Name = 'orderflow-tile-watcher'; Module = 'guvolu.data.orderflow_tile_materialize'; Runner = 'run_orderflow_tile_watcher.ps1' }
 )
+if ($Profile -eq 'ForwardMinimal') {
+    $PausedMaterializers = @(
+        $Materializers |
+            Where-Object { $_.Name -ne 'trade-realtime-materializer' }
+    )
+    foreach ($Materializer in $PausedMaterializers) {
+        $Existing = @(
+            Get-CimInstance Win32_Process |
+                Where-Object {
+                    $_.CommandLine -and (
+                        $_.CommandLine -like "*-m $($Materializer.Module) watch*" -or
+                        $_.CommandLine -like "*$($Materializer.Runner)*"
+                    )
+                }
+        )
+        foreach ($Process in $Existing) {
+            Stop-Process -Id $Process.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+        if ($Existing.Count -gt 0) {
+            Write-Host (
+                "[$($Materializer.Name)] paused for ForwardMinimal " +
+                "PID=$(($Existing.ProcessId -join ','))"
+            )
+        }
+    }
+    $Materializers = @(
+        $Materializers |
+            Where-Object { $_.Name -eq 'trade-realtime-materializer' }
+    )
+}
 foreach ($Materializer in $Materializers) {
     $IntervalArgument = if ($Materializer.Name -in @('book-state-materializer', 'orderflow-tile-watcher')) {
         '--poll-seconds'
@@ -78,7 +117,7 @@ foreach ($Materializer in $Materializers) {
         Write-Host "[$($Materializer.Name)] already running PID=$(($Existing.ProcessId -join ','))"
         continue
     }
-    $RunnerPath = Join-Path $PSScriptRoot $Materializer.Runner
+    $RunnerPath = Join-Path $RunnerRoot $Materializer.Runner
     $Arguments = @(
         '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $RunnerPath,
         '-IntervalSeconds', '300'

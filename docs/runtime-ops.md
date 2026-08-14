@@ -109,8 +109,14 @@ OKX live books 已完成有界真实隔离小样本，但尚未证明重连和�
   `guvolu-marketdata-guard` 每五分钟调用同一幂等入口。
 - 两条任务只调用 `scripts/start_marketdata_pipeline.ps1 -WindowStyle Hidden`；
   重复实例策略为 IgnoreNew，不以 TCP 端口替代采集 checkpoint。
+- `start_marketdata_pipeline.ps1 -Profile ForwardMinimal -Repository <冻结仓库>`
+  是磁盘余量低于 20% 时的冻结前向配置：六条不可回补 raw 采集保持运行，且仅
+  保留冻结预测所需的实时逐笔物化；L2、book-state 与 OFL 派生物化暂停，之后可
+  从 sealed raw 确定性重建。`Repository` 只改变数据与 Python 运行根，不改变
+  脚本自身的版本身份。
 - `scripts/register_marketdata_tasks.ps1` 负责登记、查询和精确清理旧
-  `guvolu-api-*` 任务；不含任意命令执行能力。
+  `guvolu-api-*` 任务，并把受枚举约束的 profile 与已解析仓库绝对路径写入任务
+  动作；不含任意命令执行能力。
 - NSSM 服务化保留为后续选项（宿主常态 24 小时运行且需要免登录守护时启用）。
 
 任务定义与任务当前是否启用是两件事。版本切换期间可临时禁用 guard；是否已经
@@ -205,6 +211,12 @@ Parquet schema 与归一版本、L2 quality、market status、REST anchor 的 en
 ```
 
 磁盘余量高于 20% 正常运行；低于 20% 暂停历史扩量与派生重建；低于 10% 只保留不可回补实时流并报警；任何写入出现 `ENOSPC` 或 fsync 失败时立即停止该写者，不能继续推进 checkpoint、manifest 或 coverage。
+
+冻结前向期间允许将逻辑路径 `data/raw/realtime/book_l2` 做成指向另一健康 NTFS
+卷的目录联接，但必须先停止 L2 写者、完整复制并核对文件数、逻辑字节数和抽样
+SHA-256，再原子切换并恢复写者。应用仍只使用 C 盘项目下的逻辑数据根；物理卷
+不得通过修改配置或冻结代码路径暴露给研究身份。目标目录继续启用 NTFS 透明
+压缩，且迁移前副本在新段成功封存、物化和哈希复核前不得删除。
 
 当前可重复命令为：
 
