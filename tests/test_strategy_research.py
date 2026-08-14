@@ -257,14 +257,23 @@ def test_nonnormal_sharpe_and_pbo_diagnostics_are_deterministic() -> None:
     second = _probability_backtest_overfitting(scores, 10, 7)
     assert first == second
     assert first == (1.0, 0.5, 3)
-    odd = _probability_backtest_overfitting(
-        {"a": (1.0,) * 5, "b": (-1.0,) * 5}, 10, 7
-    )
-    assert odd[2] == 10
+    with pytest.raises(ValueError, match="偶数个测试折"):
+        _probability_backtest_overfitting(
+            {"a": (1.0,) * 5, "b": (-1.0,) * 5}, 10, 7
+        )
     tied = _probability_backtest_overfitting(
         {"a": (1.0,) * 4, "b": (1.0,) * 4}, 10, 7
     )
     assert tied == (1.0, 0.5, 3)
+    identity_first = _probability_backtest_overfitting({
+        "a": (-1.0, -1.0, -1.0, -1.0),
+        "b": (-1.0, -1.0, -1.0, 0.0),
+    }, 10, 7)
+    identity_renamed = _probability_backtest_overfitting({
+        "z": (-1.0, -1.0, -1.0, -1.0),
+        "b": (-1.0, -1.0, -1.0, 0.0),
+    }, 10, 7)
+    assert identity_first == identity_renamed
 
 
 def test_circular_block_bootstrap_sharpe_is_deterministic() -> None:

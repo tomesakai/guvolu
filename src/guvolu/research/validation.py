@@ -21,7 +21,7 @@ from guvolu.strategy.contracts import CandidateSpec, FeatureRow, ResearchBar
 
 SECONDS_PER_YEAR = 365.0 * 24.0 * 60.0 * 60.0
 P_VALUE_METHOD_VERSION = "probabilistic-sharpe-nonnormal-v1"
-PBO_METHOD_VERSION = "cscv-balanced-fold-block-v2"
+PBO_METHOD_VERSION = "cscv-even-fold-tie-average-v3"
 BLOCK_BOOTSTRAP_METHOD_VERSION = "circular-block-bootstrap-sharpe-v1"
 DEFLATED_SHARPE_METHOD_VERSION = "deflated-sharpe-family-effective-gate-v3"
 EFFECTIVE_TRIAL_METHOD_VERSION = "fold-score-correlation-participation-v1"
@@ -279,9 +279,10 @@ def _probability_backtest_overfitting(
         len(fold_scores[identifier]) != fold_count for identifier in identifiers
     ):
         raise ValueError("PBO 需要至少四个同长测试折")
+    if fold_count % 2 != 0:
+        raise ValueError("PBO 需要偶数个测试折以形成对称 CSCV 分割")
     half = fold_count // 2
-    paired_halves = fold_count % 2 == 0
-    total_unique = math.comb(fold_count, half) // (2 if paired_halves else 1)
+    total_unique = math.comb(fold_count, half) // 2
     target = min(split_budget, total_unique)
     subsets: set[tuple[int, ...]] = set()
     if total_unique <= split_budget:
@@ -289,7 +290,7 @@ def _probability_backtest_overfitting(
             complement = tuple(
                 index for index in range(fold_count) if index not in raw_subset
             )
-            subsets.add(min(raw_subset, complement) if paired_halves else raw_subset)
+            subsets.add(min(raw_subset, complement))
     else:
         generator = random.Random(seed)
         while len(subsets) < target:
@@ -297,7 +298,7 @@ def _probability_backtest_overfitting(
             complement = tuple(
                 index for index in range(fold_count) if index not in raw_subset
             )
-            subsets.add(min(raw_subset, complement) if paired_halves else raw_subset)
+            subsets.add(min(raw_subset, complement))
     below_median = 0
     ranks: list[float] = []
     for subset in sorted(subsets):
@@ -316,14 +317,20 @@ def _probability_backtest_overfitting(
             )
             for identifier in identifiers
         }
-        winner = min(
-            identifiers,
-            key=lambda identifier: (-in_sample[identifier], identifier),
+        winning_score = max(in_sample.values())
+        winners = tuple(
+            identifier for identifier in identifiers
+            if in_sample[identifier] == winning_score
         )
-        winner_score = out_sample[winner]
-        lower_count = sum(score < winner_score for score in out_sample.values())
-        tie_count = sum(score == winner_score for score in out_sample.values())
-        relative_rank = (lower_count + tie_count / 2.0) / len(identifiers)
+        winner_ranks: list[float] = []
+        for winner in winners:
+            winner_score = out_sample[winner]
+            lower_count = sum(score < winner_score for score in out_sample.values())
+            tie_count = sum(score == winner_score for score in out_sample.values())
+            winner_ranks.append(
+                (lower_count + tie_count / 2.0) / len(identifiers)
+            )
+        relative_rank = statistics.fmean(winner_ranks)
         ranks.append(relative_rank)
         below_median += int(relative_rank <= 0.5)
     return (
