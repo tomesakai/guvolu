@@ -4,11 +4,16 @@ from __future__ import annotations
 import copy
 import json
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 from guvolu.research.interval_suite import build_interval_suite_plan
+from guvolu.research.interval_suite_evidence import (
+    align_returns_to_interval,
+    global_fdr_q_values,
+)
 
 
 def _configs() -> tuple[Path, Path, Path]:
@@ -93,3 +98,49 @@ def test_interval_suite_rejects_incomparable_members(
             tmp_path,
             (local_hourly, local_four_hour),
         )
+
+
+def test_interval_suite_global_fdr_counts_every_registered_path() -> None:
+    """套件 BH-FDR 必须一次校正所有节拍的候选和家族路径。"""
+    q_values = global_fdr_q_values({
+        "one": 0.01,
+        "two": 0.04,
+        "three": 0.03,
+        "four": 0.002,
+    })
+    assert q_values == pytest.approx({
+        "one": 0.02,
+        "two": 0.04,
+        "three": 0.04,
+        "four": 0.008,
+    })
+    with pytest.raises(ValueError, match="零到一"):
+        global_fdr_q_values({"invalid": 1.1})
+
+
+def test_interval_suite_aligns_returns_without_lookahead() -> None:
+    """细节拍收益只可累加到同一最粗柱结束时点。"""
+    aligned = align_returns_to_interval({
+        "hourly": (
+            (datetime(2026, 1, 1, 1, tzinfo=UTC), 0.01),
+            (datetime(2026, 1, 1, 2, tzinfo=UTC), 0.02),
+            (datetime(2026, 1, 1, 3, tzinfo=UTC), -0.01),
+            (datetime(2026, 1, 1, 4, tzinfo=UTC), 0.03),
+            (datetime(2026, 1, 1, 5, tzinfo=UTC), 0.04),
+        ),
+        "four-hour": (
+            (datetime(2026, 1, 1, 4, tzinfo=UTC), 0.05),
+            (datetime(2026, 1, 1, 8, tzinfo=UTC), 0.06),
+        ),
+    }, 14_400)
+    hour_values = list(aligned["hourly"].values())
+    four_hour_values = list(aligned["four-hour"].values())
+    assert hour_values == pytest.approx([0.05, 0.04])
+    assert four_hour_values == pytest.approx([0.05, 0.06])
+    with pytest.raises(ValueError, match="重复收益时间"):
+        align_returns_to_interval({
+            "duplicate": (
+                (datetime(2026, 1, 1, 1, tzinfo=UTC), 0.01),
+                (datetime(2026, 1, 1, 1, tzinfo=UTC), 0.02),
+            ),
+        }, 14_400)
