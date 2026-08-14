@@ -8,7 +8,11 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime
 from pathlib import Path
 
-from guvolu.research.provenance import sha256_file, stable_identifier
+from guvolu.research.provenance import (
+    canonical_json,
+    sha256_file,
+    stable_identifier,
+)
 from guvolu.research.verification import (
     ArtifactIntegrityResult,
     verify_research_artifact_integrity,
@@ -16,7 +20,7 @@ from guvolu.research.verification import (
 from guvolu.research.verification_attestation import verify_research_run_cached
 
 INTERVAL_SUITE_EVIDENCE_METHOD_VERSION = (
-    "verified-global-fdr-aligned-oos-v1"
+    "verified-global-fdr-aligned-oos-v2"
 )
 
 
@@ -51,6 +55,22 @@ def _positive_integer(value: object, name: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
         raise ValueError(f"{name} 必须为正整数")
     return value
+
+
+def suite_member_input_identity(manifest: Mapping[str, object]) -> tuple[str, ...]:
+    """绑定成交 head、数据根和完整 suite 快照身份。"""
+    source_root = _mapping(
+        manifest.get("source_data_root"), "manifest.source_data_root",
+    )
+    snapshot = _mapping(
+        manifest.get("source_data_snapshot"), "manifest.source_data_snapshot",
+    )
+    return (
+        _text(manifest.get("input_head_generation"), "input_head_generation"),
+        _text(manifest.get("input_receipt_sha256"), "input_receipt_sha256"),
+        canonical_json(source_root),
+        canonical_json(snapshot),
+    )
 
 
 def _string_list(value: object, name: str) -> tuple[str, ...]:
@@ -425,7 +445,7 @@ def evaluate_interval_suite(
     sleeves: list[dict[str, object]] = []
     return_points: dict[str, Sequence[tuple[datetime, float]]] = {}
     member_evidence: list[Mapping[str, object]] = []
-    common_input_identity: tuple[object, object] | None = None
+    common_input_identity: tuple[str, ...] | None = None
     seen_configs: set[str] = set()
     for raw_manifest_path in manifest_paths:
         manifest_path = raw_manifest_path.resolve()
@@ -442,14 +462,11 @@ def evaluate_interval_suite(
         interval = _text(member.get("bar_interval"), "bar_interval")
         if summary.get("market_id") != plan.get("market_id"):
             raise ValueError("summary.market_id 与套件不一致")
-        input_identity = (
-            manifest.get("input_head_generation"),
-            manifest.get("input_receipt_sha256"),
-        )
+        input_identity = suite_member_input_identity(manifest)
         if common_input_identity is None:
             common_input_identity = input_identity
         elif input_identity != common_input_identity:
-            raise ValueError("套件成员没有使用同一活动 head 收据")
+            raise ValueError("套件成员没有使用同一 suite 快照与活动 head 收据")
         registry_path = integrity.artifact_paths.get("candidate_registry")
         if (
             registry_path is None

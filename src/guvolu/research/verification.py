@@ -65,6 +65,7 @@ _RUN_IDENTITY_FIELDS = (
     "decision_time",
     "execution_evaluated_at",
     "source_data_root",
+    "source_data_snapshot",
     "code_identity",
     "config_hash",
     "config_lineage_root_hash",

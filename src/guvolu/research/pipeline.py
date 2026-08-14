@@ -61,6 +61,7 @@ from guvolu.research.shadow import (
     l2_overlay_from_shadow,
     latest_common_l2_decision,
 )
+from guvolu.research.suite_data_snapshot import suite_data_snapshot_record
 from guvolu.research.validation import (
     BLOCK_BOOTSTRAP_METHOD_VERSION,
     DEFLATED_SHARPE_METHOD_VERSION,
@@ -352,6 +353,7 @@ def run_research(
     research_data_root = root / "data"
     source_data_root = (data_root or research_data_root).resolve()
     source_data_root_record = data_root_locator(root, source_data_root)
+    source_data_snapshot = suite_data_snapshot_record(source_data_root)
     output_base = (output_root or root / "reports" / "strategy-research").resolve()
     identity = code_identity(root, config_source_paths)
     batches = build_family_batches(config, family_scope)
@@ -388,6 +390,7 @@ def run_research(
         "attempt_ids": inputs.attempt_ids,
         "artifact_ids": inputs.artifact_ids,
         "input_receipt_sha256": inputs.receipt_sha256,
+        "source_data_snapshot": source_data_snapshot,
         "code_tree_digest": identity.tree_digest,
         "dirty_digest": identity.dirty_digest,
         "generator_method_version": GENERATOR_METHOD_VERSION,
@@ -750,6 +753,7 @@ def run_research(
         "decision_time": strategy_decision_time.isoformat(),
         "execution_evaluated_at": execution_evaluated_at.isoformat(),
         "source_data_root": source_data_root_record,
+        "source_data_snapshot": source_data_snapshot,
         "decision_grade": identity.decision_grade,
         "code_identity": asdict(identity),
         "config_hash": config_hash,
@@ -822,6 +826,7 @@ def run_research(
         "decision_time": strategy_decision_time.isoformat(),
         "execution_evaluated_at": execution_evaluated_at.isoformat(),
         "source_data_root": source_data_root_record,
+        "source_data_snapshot": source_data_snapshot,
         "code_identity": asdict(identity),
         "config_hash": config_hash,
         "config_lineage_root_hash": lineage_root_config_hash,

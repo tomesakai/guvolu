@@ -15,7 +15,7 @@ from guvolu.strategy.generation import (
     candidate_registry_payload,
 )
 
-INTERVAL_SUITE_METHOD_VERSION = "pre-registered-multi-interval-suite-v1"
+INTERVAL_SUITE_METHOD_VERSION = "pre-registered-multi-interval-suite-v2"
 _INTERVAL_SECONDS = {
     "5min": 300,
     "15min": 900,
@@ -55,9 +55,52 @@ def _duration_contract(
         _positive_integer(value, "features.lookbacks") * interval_seconds
         for value in raw_lookbacks
     })
+    state_lookback = _positive_integer(
+        features.get("state_lookback"), "features.state_lookback",
+    )
+    volume_lookback = _positive_integer(
+        features.get("volume_lookback"), "features.volume_lookback",
+    )
+    maximum_gap = _positive_integer(
+        features.get("maximum_structural_gap_bars_assumption"),
+        "features.maximum_structural_gap_bars_assumption",
+    )
     walk_forward = _mapping(config.get("walk_forward"), "walk_forward")
+    validation = dict(_mapping(config.get("validation"), "validation"))
+    validation["minimum_oos_seconds"] = _positive_integer(
+        validation.pop("minimum_oos_bars"), "validation.minimum_oos_bars",
+    ) * interval_seconds
+    validation["block_bootstrap_seconds"] = _positive_integer(
+        validation.pop("block_bootstrap_bars"),
+        "validation.block_bootstrap_bars",
+    ) * interval_seconds
+    governance = _mapping(config.get("data_governance"), "data_governance")
+    holdout = dict(_mapping(
+        governance.get("holdout_policy"), "data_governance.holdout_policy",
+    ))
+    holdout["minimum_seconds"] = _positive_integer(
+        holdout.pop("minimum_bars"), "holdout_policy.minimum_bars",
+    ) * interval_seconds
+    strategies: dict[str, object] = {}
+    for family, raw in sorted(
+        _mapping(config.get("strategies"), "strategies").items(),
+    ):
+        strategy = dict(_mapping(raw, f"strategies.{family}"))
+        raw_strategy_lookbacks = strategy.pop("lookbacks", None)
+        if not isinstance(raw_strategy_lookbacks, list) or not raw_strategy_lookbacks:
+            raise ValueError(f"strategies.{family}.lookbacks 必须为非空数组")
+        strategy["lookback_seconds"] = sorted({
+            _positive_integer(
+                value, f"strategies.{family}.lookbacks",
+            ) * interval_seconds
+            for value in raw_strategy_lookbacks
+        })
+        strategies[family] = strategy
     return {
         "feature_lookback_seconds": lookbacks,
+        "state_lookback_seconds": state_lookback * interval_seconds,
+        "volume_lookback_seconds": volume_lookback * interval_seconds,
+        "maximum_structural_gap_seconds": maximum_gap * interval_seconds,
         "minimum_train_seconds": _positive_integer(
             walk_forward.get("minimum_train_bars"), "minimum_train_bars",
         ) * interval_seconds,
@@ -70,6 +113,9 @@ def _duration_contract(
         "embargo_seconds": _positive_integer(
             walk_forward.get("embargo_bars"), "embargo_bars",
         ) * interval_seconds,
+        "validation": validation,
+        "holdout_policy": holdout,
+        "strategies": strategies,
     }
 
 

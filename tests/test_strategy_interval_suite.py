@@ -14,6 +14,7 @@ from guvolu.research.interval_suite_evidence import (
     allocate_interval_sleeves,
     align_returns_to_interval,
     global_fdr_q_values,
+    suite_member_input_identity,
 )
 
 
@@ -35,13 +36,29 @@ def test_interval_suite_pre_registers_one_global_trial_domain() -> None:
     suite_plan_id = first["suite_plan_id"]
     assert isinstance(suite_plan_id, str)
     assert suite_plan_id.startswith("interval-suite-plan-")
-    assert first["duration_contract"] == {
-        "feature_lookback_seconds": [86_400, 259_200, 604_800],
-        "minimum_train_seconds": 31_536_000,
-        "test_seconds": 7_776_000,
-        "step_seconds": 7_776_000,
-        "embargo_seconds": 86_400,
-    }
+    duration = first["duration_contract"]
+    assert isinstance(duration, Mapping)
+    assert duration["feature_lookback_seconds"] == [86_400, 259_200, 604_800]
+    assert duration["state_lookback_seconds"] == 259_200
+    assert duration["volume_lookback_seconds"] == 604_800
+    assert duration["maximum_structural_gap_seconds"] == 14_400
+    assert duration["minimum_train_seconds"] == 31_536_000
+    assert duration["test_seconds"] == 7_776_000
+    assert duration["step_seconds"] == 7_776_000
+    assert duration["embargo_seconds"] == 86_400
+    validation = duration["validation"]
+    holdout = duration["holdout_policy"]
+    strategies = duration["strategies"]
+    assert isinstance(validation, Mapping)
+    assert isinstance(holdout, Mapping)
+    assert isinstance(strategies, Mapping)
+    assert validation["minimum_oos_seconds"] == 28_800_000
+    assert validation["block_bootstrap_seconds"] == 604_800
+    assert validation["maximum_fdr_q"] == 0.2
+    assert holdout["minimum_seconds"] == 7_776_000
+    trend = strategies["trend"]
+    assert isinstance(trend, Mapping)
+    assert trend["lookback_seconds"] == [86_400, 259_200, 604_800]
     members = first["members"]
     assert isinstance(members, list)
     assert all(isinstance(member, Mapping) for member in members)
@@ -68,17 +85,33 @@ def test_interval_suite_rejects_duplicate_interval() -> None:
 
 
 @pytest.mark.parametrize(
-    ("mutation", "message"),
+    ("path", "value", "message"),
     [
-        (("walk_forward", "test_bars", 539), "墙钟回看或 walk-forward"),
-        ((None, "market_id", "mkt__other"), "同一 market_id"),
-        ((None, "from_time", "2020-01-01T00:00:00+00:00"), "同一 from_time"),
-        (("allocation", "risk_aversion", 4.0), "同一 allocation"),
+        (("walk_forward", "test_bars"), 539, "墙钟回看或 walk-forward"),
+        (("market_id",), "mkt__other", "同一 market_id"),
+        (("from_time",), "2020-01-01T00:00:00+00:00", "同一 from_time"),
+        (("allocation", "risk_aversion"), 4.0, "同一 allocation"),
+        (("features", "state_lookback"), 17, "墙钟回看或 walk-forward"),
+        (
+            ("features", "maximum_structural_gap_bars_assumption"),
+            2,
+            "墙钟回看或 walk-forward",
+        ),
+        (("validation", "minimum_oos_bars"), 1999, "墙钟回看或 walk-forward"),
+        (("validation", "block_bootstrap_bars"), 41, "墙钟回看或 walk-forward"),
+        (("validation", "maximum_fdr_q"), 0.25, "墙钟回看或 walk-forward"),
+        (
+            ("data_governance", "holdout_policy", "minimum_bars"),
+            539,
+            "墙钟回看或 walk-forward",
+        ),
+        (("strategies", "trend", "lookbacks"), [6, 18, 41], "墙钟回看或 walk-forward"),
     ],
 )
 def test_interval_suite_rejects_incomparable_members(
     tmp_path: Path,
-    mutation: tuple[str | None, str, object],
+    path: tuple[str, ...],
+    value: object,
     message: str,
 ) -> None:
     """跨节拍比较必须共享市场和等价的墙钟验证合同。"""
@@ -86,11 +119,10 @@ def test_interval_suite_rejects_incomparable_members(
     hourly_body = json.loads(hourly.read_text(encoding="utf-8"))
     four_hour_body = json.loads(four_hour.read_text(encoding="utf-8"))
     mutated = copy.deepcopy(four_hour_body)
-    section, key, value = mutation
-    if section is None:
-        mutated[key] = value
-    else:
-        mutated[section][key] = value
+    target = mutated
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
     local_hourly = tmp_path / "hourly.json"
     local_four_hour = tmp_path / "four-hour.json"
     local_hourly.write_text(json.dumps(hourly_body), encoding="utf-8")
@@ -206,3 +238,33 @@ def test_interval_suite_allocator_shares_directional_cap() -> None:
     )
     assert flat["aggregate_target"] == 0.0
     assert flat["reserve"] == 1.0
+
+
+def test_interval_suite_input_identity_binds_snapshot_and_data_root() -> None:
+    """相同成交 receipt 不能掩盖不同的 L2/control-plane 快照。"""
+    manifest = {
+        "input_head_generation": "sha256-head",
+        "input_receipt_sha256": "receipt",
+        "source_data_root": {
+            "schema_version": 1,
+            "kind": "repository_relative",
+            "path": "reports/suite-a",
+        },
+        "source_data_snapshot": {
+            "schema_version": 2,
+            "method_version": "hardlinked-minimal-control-plane-v2",
+            "snapshot_identity": "snapshot-a",
+            "manifest_sha256": "manifest-a",
+        },
+    }
+    baseline = suite_member_input_identity(manifest)
+    changed_root = copy.deepcopy(manifest)
+    changed_root["source_data_root"]["path"] = "reports/suite-b"
+    changed_snapshot = copy.deepcopy(manifest)
+    changed_snapshot["source_data_snapshot"]["snapshot_identity"] = "snapshot-b"
+    assert suite_member_input_identity(changed_root) != baseline
+    assert suite_member_input_identity(changed_snapshot) != baseline
+    missing = dict(manifest)
+    missing.pop("source_data_snapshot")
+    with pytest.raises(ValueError, match="source_data_snapshot"):
+        suite_member_input_identity(missing)

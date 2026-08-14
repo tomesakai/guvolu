@@ -17,7 +17,8 @@ from guvolu.research.panel import (
 )
 from guvolu.research.provenance import canonical_json, sha256_file
 
-SUITE_DATA_SNAPSHOT_METHOD_VERSION = "hardlinked-minimal-control-plane-v1"
+SUITE_DATA_SNAPSHOT_SCHEMA_VERSION = 2
+SUITE_DATA_SNAPSHOT_METHOD_VERSION = "hardlinked-minimal-control-plane-v2"
 _TABLES = (
     "instrument",
     "instrument_map",
@@ -49,6 +50,133 @@ def _strings(value: object, name: str) -> tuple[str, ...]:
     if result != tuple(sorted(set(result))):
         raise ValueError(f"{name} 必须有序且不重复")
     return result
+
+
+def _read_snapshot_manifest(snapshot_root: Path) -> Mapping[str, object]:
+    manifest_path = snapshot_root / "snapshot-manifest.json"
+    if not manifest_path.is_file():
+        raise ValueError("suite 数据快照缺少 snapshot-manifest.json")
+    text = manifest_path.read_text(encoding="utf-8")
+    manifest = _mapping(json.loads(text), "snapshot_manifest")
+    if text != canonical_json(manifest) + "\n":
+        raise ValueError("suite 数据快照 manifest 不是规范 JSON")
+    return manifest
+
+
+def attest_suite_data_snapshot(snapshot_root: Path) -> Mapping[str, object]:
+    """逐字节验明共享控制面、全部硬链接制品和成交收据。"""
+    root = snapshot_root.resolve()
+    manifest = _read_snapshot_manifest(root)
+    if manifest.get("schema_version") != SUITE_DATA_SNAPSHOT_SCHEMA_VERSION:
+        raise ValueError("suite 数据快照 schema 不受支持")
+    if manifest.get("method_version") != SUITE_DATA_SNAPSHOT_METHOD_VERSION:
+        raise ValueError("suite 数据快照方法版本不受支持")
+    recorded_identity = _text(
+        manifest.get("snapshot_identity"), "snapshot_identity",
+    )
+    identity_body = dict(manifest)
+    identity_body.pop("snapshot_identity", None)
+    expected_identity = "suite-data-snapshot-" + hashlib.sha256(
+        canonical_json(identity_body).encode("utf-8"),
+    ).hexdigest()
+    if recorded_identity != expected_identity:
+        raise ValueError("suite 数据快照身份散列不一致")
+    snapshot_input = _mapping(manifest.get("snapshot_input"), "snapshot_input")
+    expected_directory = "suite-data-snapshot-sha256-" + hashlib.sha256(
+        canonical_json(snapshot_input).encode("utf-8"),
+    ).hexdigest()
+    if root.name != expected_directory:
+        raise ValueError("suite 数据快照目录身份不一致")
+
+    raw_artifacts = manifest.get("artifacts")
+    if not isinstance(raw_artifacts, list) or not raw_artifacts:
+        raise ValueError("suite 数据快照缺少制品清单")
+    artifact_records = tuple(
+        _mapping(value, "snapshot.artifact") for value in raw_artifacts
+    )
+    paths = tuple(
+        _text(record.get("storage_path"), "artifact.storage_path")
+        for record in artifact_records
+    )
+    if paths != tuple(sorted(set(paths))):
+        raise ValueError("suite 数据快照制品路径必须有序且不重复")
+    for record, relative in zip(artifact_records, paths, strict=True):
+        path = (root / relative).resolve()
+        if not path.is_relative_to(root) or not path.is_file():
+            raise ValueError("suite 数据快照制品不存在或越出数据根")
+        digest = _text(record.get("sha256"), "artifact.sha256")
+        byte_count = record.get("bytes")
+        if (
+            not isinstance(byte_count, int)
+            or isinstance(byte_count, bool)
+            or byte_count < 0
+            or path.stat().st_size != byte_count
+            or sha256_file(path) != digest
+        ):
+            raise ValueError("suite 数据快照制品完整性不一致")
+
+    control = _mapping(manifest.get("control_plane"), "control_plane")
+    control_path = (root / _text(control.get("path"), "control_plane.path")).resolve()
+    if not control_path.is_relative_to(root) or not control_path.is_file():
+        raise ValueError("suite 数据快照缺少控制面数据库")
+    control_bytes = control.get("bytes")
+    if (
+        not isinstance(control_bytes, int)
+        or isinstance(control_bytes, bool)
+        or control_bytes <= 0
+        or control_path.stat().st_size != control_bytes
+        or sha256_file(control_path)
+        != _text(control.get("sha256"), "control_plane.sha256")
+    ):
+        raise ValueError("suite 数据快照控制面散列不一致")
+    connection = sqlite3.connect(f"file:{control_path.as_posix()}?mode=ro", uri=True)
+    try:
+        check = connection.execute("PRAGMA integrity_check").fetchone()
+        if check is None or check[0] != "ok":
+            raise ValueError("suite 数据快照控制面 integrity_check 失败")
+        expected_counts = _mapping(
+            manifest.get("control_plane_rows"), "control_plane_rows",
+        )
+        for table in _TABLES:
+            expected = expected_counts.get(table)
+            actual = int(connection.execute(
+                f"SELECT COUNT(*) FROM {table}",
+            ).fetchone()[0])
+            if not isinstance(expected, int) or isinstance(expected, bool):
+                raise ValueError("suite 数据快照控制面行数合同无效")
+            if actual != expected:
+                raise ValueError("suite 数据快照控制面行数不一致")
+    finally:
+        connection.close()
+
+    market_id = _text(manifest.get("market_id"), "market_id")
+    with tempfile.TemporaryDirectory(prefix="guvolu-suite-attest-") as temporary:
+        recaptured = capture_trade_input_receipt(
+            root, market_id, Path(temporary) / "receipts",
+        )
+    if (
+        recaptured.receipt_sha256
+        != _text(manifest.get("input_receipt_sha256"), "input_receipt_sha256")
+        or recaptured.head_generation
+        != _text(manifest.get("head_generation"), "head_generation")
+    ):
+        raise ValueError("suite 数据快照成交活动 head 不一致")
+    return manifest
+
+
+def suite_data_snapshot_record(snapshot_root: Path) -> Mapping[str, object] | None:
+    """若数据根是 suite 快照，返回可写入研究 manifest 的受保护身份。"""
+    root = snapshot_root.resolve()
+    manifest_path = root / "snapshot-manifest.json"
+    if not manifest_path.exists():
+        return None
+    manifest = attest_suite_data_snapshot(root)
+    return {
+        "schema_version": SUITE_DATA_SNAPSHOT_SCHEMA_VERSION,
+        "method_version": manifest["method_version"],
+        "snapshot_identity": manifest["snapshot_identity"],
+        "manifest_sha256": sha256_file(manifest_path),
+    }
 
 
 def _create_table(
@@ -318,6 +446,7 @@ def create_suite_data_snapshot(
     shadow_entries = _active_shadow_entries(source_root, selected_markets)
     all_entries = (*trade_entries, *shadow_entries)
     snapshot_input = {
+        "method_version": SUITE_DATA_SNAPSHOT_METHOD_VERSION,
         "trade_receipt_sha256": inputs.receipt_sha256,
         "shadow_market_ids": selected_markets,
         "shadow_outputs": sorted((
@@ -339,10 +468,10 @@ def create_suite_data_snapshot(
     snapshot_name = f"suite-data-snapshot-sha256-{snapshot_digest}"
     snapshot_root = output / snapshot_name
     if snapshot_root.exists():
-        recaptured = capture_trade_input_receipt(
-            snapshot_root, market_id, snapshot_root / "receipts",
-        )
-        if recaptured.receipt_sha256 != inputs.receipt_sha256:
+        existing = attest_suite_data_snapshot(snapshot_root)
+        if canonical_json(existing.get("snapshot_input")) != canonical_json(
+            snapshot_input
+        ):
             raise ValueError("既有 suite 数据快照与当前收据身份不一致")
         return snapshot_root
     with tempfile.TemporaryDirectory(
@@ -358,8 +487,9 @@ def create_suite_data_snapshot(
         )
         if recaptured.receipt_sha256 != inputs.receipt_sha256:
             raise ValueError("suite 数据快照不能重建相同活动 head 收据")
+        control_path = temporary_root / DB_FILE_NAME
         body: dict[str, object] = {
-            "schema_version": 1,
+            "schema_version": SUITE_DATA_SNAPSHOT_SCHEMA_VERSION,
             "method_version": SUITE_DATA_SNAPSHOT_METHOD_VERSION,
             "market_id": market_id,
             "head_generation": inputs.head_generation,
@@ -367,6 +497,11 @@ def create_suite_data_snapshot(
             "shadow_market_ids": selected_markets,
             "snapshot_input": snapshot_input,
             "control_plane_rows": counts,
+            "control_plane": {
+                "path": DB_FILE_NAME,
+                "sha256": sha256_file(control_path),
+                "bytes": control_path.stat().st_size,
+            },
             "artifacts": artifacts,
         }
         body["snapshot_identity"] = "suite-data-snapshot-" + hashlib.sha256(
@@ -377,4 +512,5 @@ def create_suite_data_snapshot(
             canonical_json(body) + "\n",
         )
         os.replace(temporary_root, snapshot_root)
+    attest_suite_data_snapshot(snapshot_root)
     return snapshot_root

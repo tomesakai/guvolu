@@ -7,9 +7,15 @@ import os
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from guvolu.data.store import DB_FILE_NAME
 from guvolu.research.panel import capture_trade_input_receipt
-from guvolu.research.suite_data_snapshot import create_suite_data_snapshot
+from guvolu.research.suite_data_snapshot import (
+    attest_suite_data_snapshot,
+    create_suite_data_snapshot,
+    suite_data_snapshot_record,
+)
 
 
 def _source_data_root(root: Path) -> tuple[Path, Path]:
@@ -146,3 +152,38 @@ def test_suite_data_snapshot_is_idempotent_and_hardlinked(
         first, "market", first / "second-receipts",
     )
     assert recaptured.receipt_sha256 == manifest["input_receipt_sha256"]
+    assert attest_suite_data_snapshot(first)["snapshot_identity"] == (
+        manifest["snapshot_identity"]
+    )
+    record = suite_data_snapshot_record(first)
+    assert record is not None
+    assert record["snapshot_identity"] == manifest["snapshot_identity"]
+
+
+def test_suite_data_snapshot_reuse_rejects_artifact_tampering(
+    tmp_path: Path,
+) -> None:
+    """复用分支必须重新散列 L2/成交制品，而非只比较 trade receipt。"""
+    source, _source_artifact = _source_data_root(tmp_path)
+    output = tmp_path / "snapshots"
+    snapshot = create_suite_data_snapshot(source, "market", output)
+    linked = snapshot / "materialized" / "book" / "part.parquet"
+    linked.unlink()
+    linked.write_bytes(b"tampered-l2")
+    with pytest.raises(ValueError, match="制品完整性"):
+        create_suite_data_snapshot(source, "market", output)
+
+
+def test_suite_data_snapshot_reuse_rejects_control_plane_tampering(
+    tmp_path: Path,
+) -> None:
+    """控制库即使仍可读取，字节变化也必须使快照复用失败。"""
+    source, _source_artifact = _source_data_root(tmp_path)
+    output = tmp_path / "snapshots"
+    snapshot = create_suite_data_snapshot(source, "market", output)
+    connection = sqlite3.connect(snapshot / DB_FILE_NAME)
+    connection.execute("UPDATE market SET venue_symbol='MUTATED'")
+    connection.commit()
+    connection.close()
+    with pytest.raises(ValueError, match="控制面散列"):
+        create_suite_data_snapshot(source, "market", output)
