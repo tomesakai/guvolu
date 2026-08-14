@@ -149,7 +149,16 @@ paper 分配遵守以下长期边界：趋势、量价确认趋势和突破合�
   --config config\strategy_research_4hour.json `
   --manifest <one-hour-manifest> --manifest <four-hour-manifest> `
   --output reports\strategy-research\interval-suite-evidence.json
+.\.venv\Scripts\python.exe scripts\check_strategy_interval_suite_readiness.py `
+  --config config\strategy_research.json `
+  --config config\strategy_research_4hour.json `
+  --manifest <one-hour-manifest> --manifest <four-hour-manifest>
 ```
+
+套件 readiness 会重新构造 v3 evidence，要求全部成员来自同一个 clean Git commit、同一快照和
+同一活动 head，再只聚合被 suite 准入成员的 operational/promotion 状态。未准入节拍不会阻塞
+当前执行候选；promotion 继续显式阻塞在 `suite_frozen_forward_plan_not_registered`，因为单成员
+冻结计划不能证明跨节拍权重与共同决策时点。该检查只读，不登记计划、不消费 vintage。
 
 独立生成候选、运行一个流派、监视方向并生成下一代预登记提案：
 
@@ -847,7 +856,9 @@ flowchart TB
     suiteFdr --> eligible{"suite paper eligible?"}
     eligible -- "否" --> reject["reject / shadow / disabled<br/>权重固定为零"]
     eligible -- "是" --> aggregate["组合聚合器<br/>相关性、regime、容量与方向共享上限"]
-    aggregate --> contract["目标合同<br/>family target × allocation weight"]
+    aggregate --> suiteReady{"suite readiness<br/>同 clean commit / 快照 / 成熟度"}
+    suiteReady -- "失败" --> flat
+    suiteReady -- "通过" --> contract["目标合同<br/>family target × allocation weight"]
     contract --> quality{"实时质量与代码身份"}
     quality -- "失败" --> flat["aggregate target = 0<br/>100% reserve"]
     quality -- "通过" --> paper["paper target artifact<br/>冻结多流派部署候选"]
