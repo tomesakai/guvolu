@@ -6,7 +6,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from guvolu.research.config_lineage import load_verified_config_lineage
-from guvolu.research.evolution import _monitor_family_run, monitor_family_run
+from guvolu.research.evolution import monitor_family_run
 from guvolu.research.provenance import canonical_json, sha256_file
 from guvolu.research.verification_attestation import (
     verify_research_run_cached as verify_research_run,
@@ -144,6 +144,7 @@ def _verify_prior_proposal_source(
     if monitor_method in {
         "family-direction-monitor-v6",
         "family-direction-monitor-v7",
+        "family-direction-monitor-v8",
     }:
         verify_monitor_sources(root, config, monitor, parent_config_hash)
     else:
@@ -302,13 +303,14 @@ def _recompute_monitor_sources(
         raise ValueError("monitor trial ledger 身份与 summary 不一致")
     family = _text(monitor.get("family"), "monitor.family")
     monitor_method = monitor.get("monitor_method_version")
-    monitor_function = (
-        monitor_family_run
-        if monitor_method == "family-direction-monitor-v7"
-        else _monitor_family_run
-    )
-    return monitor_function(
-        root, summary_path, family, config, parent_config_hash, prior_paths,
+    return monitor_family_run(
+        root,
+        summary_path,
+        family,
+        config,
+        parent_config_hash,
+        prior_paths,
+        monitor_method_version=str(monitor_method),
     )
 
 
@@ -318,7 +320,7 @@ def verify_monitor_sources(
     monitor: Mapping[str, object],
     parent_config_hash: str,
 ) -> None:
-    """验证 v6/v7 监视器的完整历史来源并重算实际消费结论。"""
+    """验证 v6-v8 监视器的完整历史来源并重算实际消费结论。"""
     root = repository_root.resolve()
     source = _object(monitor.get("source"), "monitor.source")
     raw_history_sources = source.get("history_summaries")
@@ -344,7 +346,7 @@ def verify_monitor_sources(
         parent_config_hash,
         tuple(prior_paths),
     )
-    consumed_fields = (
+    consumed_fields = [
         "monitor_method_version",
         "run_id",
         "research_identity",
@@ -365,7 +367,11 @@ def verify_monitor_sources(
         "history_policy",
         "parameter_directions",
         "source",
-    )
+    ]
+    if monitor.get("monitor_method_version") == "family-direction-monitor-v8":
+        consumed_fields.insert(
+            consumed_fields.index("evolution_action"), "failure_attribution",
+        )
     mismatches = [
         field for field in consumed_fields
         if monitor.get(field) != recomputed.get(field)

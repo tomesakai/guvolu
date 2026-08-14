@@ -1452,6 +1452,10 @@ def test_family_monitor_reports_parameter_search_direction(
     }), encoding="utf-8")
     config = json.loads(Path("config/strategy_research.json").read_text())
     payload = monitor_family_run(tmp_path, summary, "trend", config, "c" * 64)
+    assert payload["monitor_method_version"] == "family-direction-monitor-v8"
+    assert payload["failure_attribution"] == {
+        "category": "eligible_performance",
+    }
     directions = {
         item["parameter"]: item["direction"]
         for item in payload["parameter_directions"]
@@ -1484,13 +1488,55 @@ def test_family_monitor_reports_parameter_search_direction(
         (second_prior, first_prior),
     )
     assert deduplicated == deduplicated_reversed
-    assert deduplicated["monitor_method_version"] == "family-direction-monitor-v7"
+    assert deduplicated["monitor_method_version"] == "family-direction-monitor-v8"
     assert len(deduplicated["source"]["history_summaries"]) == 2
     assert len(deduplicated["history"]) == 0
     assert {
         item["reason"] for item in deduplicated["excluded_history"]
     } == {"duplicate_data_vintage", "duplicate_research_identity"}
     assert deduplicated["cross_run_direction"] == "insufficient_history"
+
+    cost_dominated = json.loads(summary.read_text(encoding="utf-8"))
+    cost_dominated["run_id"] = "cost-dominated"
+    cost_dominated["research_identity"] = "cost-dominated-research"
+    cost_dominated["family_evaluations"][0].update({
+        "eligible": False,
+        "rejection_reasons": ["non_positive_oos_net_return"],
+        "validation_metrics": {"net_return": -0.1, "cost": 0.3},
+    })
+    cost_path = tmp_path / "cost-dominated.json"
+    cost_path.write_text(json.dumps(cost_dominated), encoding="utf-8")
+    cost_monitor = monitor_family_run(
+        tmp_path, cost_path, "trend", config, "c" * 64,
+    )
+    assert cost_monitor["failure_attribution"] == {
+        "category": "execution_cost_dominated",
+        "net_return": -0.1,
+        "estimated_gross_return_before_cost": pytest.approx(0.2),
+        "cost": 0.3,
+    }
+    assert cost_monitor["evolution_action"] == (
+        "reduce_turnover_or_improve_execution_before_parameter_evolution"
+    )
+
+    signal_negative = json.loads(json.dumps(cost_dominated))
+    signal_negative["run_id"] = "signal-negative"
+    signal_negative["research_identity"] = "signal-negative-research"
+    signal_negative["family_evaluations"][0]["validation_metrics"] = {
+        "net_return": -0.4,
+        "cost": 0.1,
+    }
+    signal_path = tmp_path / "signal-negative.json"
+    signal_path.write_text(json.dumps(signal_negative), encoding="utf-8")
+    signal_monitor = monitor_family_run(
+        tmp_path, signal_path, "trend", config, "c" * 64,
+    )
+    assert signal_monitor["failure_attribution"]["category"] == (
+        "signal_edge_non_positive"
+    )
+    assert signal_monitor["evolution_action"] == (
+        "revise_hypothesis_before_parameter_evolution"
+    )
 
     recent_prior = json.loads(summary.read_text(encoding="utf-8"))
     recent_prior["run_id"] = "time-separated-one"
@@ -1927,7 +1973,7 @@ def test_monitor_source_verification_recomputes_consumed_direction(
     }
     monkeypatch.setattr(
         "guvolu.research.tuning.monitor_family_run",
-        lambda *_args: recomputed,
+        lambda *_args, **_kwargs: recomputed,
     )
     forged = {
         **monitor,

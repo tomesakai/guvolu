@@ -279,6 +279,47 @@ def _family_evaluation(
     return matches[0]
 
 
+def _failure_attribution(
+    evaluation: Mapping[str, object],
+    best_candidate_sharpe: float,
+) -> Mapping[str, object]:
+    """区分信号、执行成本、成交模型与验证稳定性失败。"""
+    raw_reasons = evaluation.get("rejection_reasons")
+    reasons = tuple(
+        str(item) for item in raw_reasons
+    ) if isinstance(raw_reasons, list) else ()
+    if evaluation.get("eligible") is True:
+        return {"category": "eligible_performance"}
+    if "shadow_only" in reasons:
+        return {"category": "fill_model_unverified"}
+    if "non_positive_oos_net_return" in reasons:
+        raw_metrics = evaluation.get("validation_metrics")
+        if raw_metrics is None:
+            raw_metrics = evaluation.get("metrics")
+        if not isinstance(raw_metrics, Mapping):
+            return {"category": "unresolved_net_return_loss"}
+        metrics = _object(raw_metrics, "family_evaluation.validation_metrics")
+        net_return = _number(metrics.get("net_return"), "metrics.net_return")
+        cost = _number(metrics.get("cost"), "metrics.cost")
+        if cost < 0.0:
+            raise ValueError("metrics.cost 不得为负")
+        gross_return = net_return + cost
+        category = (
+            "execution_cost_dominated"
+            if gross_return > 0.0 and net_return <= 0.0
+            else "signal_edge_non_positive"
+        )
+        return {
+            "category": category,
+            "net_return": net_return,
+            "estimated_gross_return_before_cost": gross_return,
+            "cost": cost,
+        }
+    if best_candidate_sharpe <= 0.0:
+        return {"category": "candidate_signal_non_positive"}
+    return {"category": "validation_instability"}
+
+
 def _monitor_family_run(
     repository_root: Path,
     summary_path: Path,
@@ -286,8 +327,17 @@ def _monitor_family_run(
     config: Mapping[str, object],
     config_hash: str,
     prior_summary_paths: Sequence[Path] = (),
+    *,
+    monitor_method_version: str = "family-direction-monitor-v8",
 ) -> Mapping[str, object]:
     """用已经确定的完整历史集合重算流派监视制品。"""
+    if monitor_method_version not in {
+        "family-direction-monitor-v5",
+        "family-direction-monitor-v6",
+        "family-direction-monitor-v7",
+        "family-direction-monitor-v8",
+    }:
+        raise ValueError("监视器方法版本不受支持")
     root = repository_root.resolve()
     summary_path = summary_path.resolve()
     try:
@@ -325,16 +375,39 @@ def _monitor_family_run(
         )
         for row in rows
     )
+    failure_attribution = _failure_attribution(evaluation, best_candidate_sharpe)
     raw_reasons = evaluation.get("rejection_reasons")
-    reasons = tuple(str(item) for item in raw_reasons) if isinstance(raw_reasons, list) else ()
-    if evaluation.get("eligible") is True:
-        evolution_action = "eligible_axis_refinement"
-    elif "shadow_only" in reasons:
-        evolution_action = "improve_fill_model_before_parameter_evolution"
-    elif "non_positive_oos_net_return" in reasons or best_candidate_sharpe <= 0:
-        evolution_action = "revise_hypothesis_or_cost_model"
+    reasons = tuple(
+        str(item) for item in raw_reasons
+    ) if isinstance(raw_reasons, list) else ()
+    if monitor_method_version != "family-direction-monitor-v8":
+        if evaluation.get("eligible") is True:
+            evolution_action = "eligible_axis_refinement"
+        elif "shadow_only" in reasons:
+            evolution_action = "improve_fill_model_before_parameter_evolution"
+        elif "non_positive_oos_net_return" in reasons or best_candidate_sharpe <= 0:
+            evolution_action = "revise_hypothesis_or_cost_model"
+        else:
+            evolution_action = "stabilize_validation_before_parameter_evolution"
     else:
-        evolution_action = "stabilize_validation_before_parameter_evolution"
+        category = str(failure_attribution["category"])
+        if category == "eligible_performance":
+            evolution_action = "eligible_axis_refinement"
+        elif category == "fill_model_unverified":
+            evolution_action = "improve_fill_model_before_parameter_evolution"
+        elif category == "execution_cost_dominated":
+            evolution_action = (
+                "reduce_turnover_or_improve_execution_before_parameter_evolution"
+            )
+        elif category in {
+            "signal_edge_non_positive",
+            "candidate_signal_non_positive",
+        }:
+            evolution_action = "revise_hypothesis_before_parameter_evolution"
+        elif category == "unresolved_net_return_loss":
+            evolution_action = "revise_hypothesis_or_cost_model"
+        else:
+            evolution_action = "stabilize_validation_before_parameter_evolution"
     current_identity = _text(
         summary.get("research_identity") or summary.get("run_id"),
         "research_identity",
@@ -494,7 +567,7 @@ def _monitor_family_run(
             direction = "stable"
     return {
         "schema_version": 1,
-        "monitor_method_version": "family-direction-monitor-v7",
+        "monitor_method_version": monitor_method_version,
         "run_id": summary.get("run_id"),
         "research_identity": current_identity,
         "data_vintage_id": current_vintage_id,
@@ -507,6 +580,7 @@ def _monitor_family_run(
         "latest_unallocated_target": evaluation.get("latest_unallocated_target"),
         "candidate_count": len(rows),
         "best_fixed_candidate_sharpe": best_candidate_sharpe,
+        "failure_attribution": failure_attribution,
         "evolution_action": evolution_action,
         "cross_run_direction": direction,
         "history": history,
@@ -569,6 +643,8 @@ def monitor_family_run(
     config: Mapping[str, object],
     config_hash: str,
     prior_summary_paths: Sequence[Path] = (),
+    *,
+    monitor_method_version: str = "family-direction-monitor-v8",
 ) -> Mapping[str, object]:
     """发现 canonical 全历史后生成单流派方向与健康监视制品。"""
     root = repository_root.resolve()
@@ -590,4 +666,5 @@ def monitor_family_run(
         config,
         config_hash,
         governed_paths,
+        monitor_method_version=monitor_method_version,
     )
