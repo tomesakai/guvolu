@@ -130,6 +130,27 @@ paper 分配遵守以下长期边界：趋势、量价确认趋势和突破合�
   --data-root <authoritative-data-root>
 ```
 
+跨节拍比较必须先冻结共同 trade/L2/book-state 数据根，再顺序运行成员并统一评价；不能把两个不同
+活动 head 的 `summary.json` 手工拼接：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\snapshot_strategy_suite_data.py `
+  --data-root <authoritative-data-root> --market mkt__gmo__btc__r0 `
+  --shadow-market mkt__gmo__btc__r0 `
+  --shadow-market mkt__bitbank__btc_jpy__r0 `
+  --shadow-market mkt__bitflyer__btc_jpy__r0 `
+  --output reports\strategy-research\suite-data
+.\.venv\Scripts\python.exe scripts\run_strategy_research.py `
+  --config config\strategy_research.json --data-root <suite-data-root>
+.\.venv\Scripts\python.exe scripts\run_strategy_research.py `
+  --config config\strategy_research_4hour.json --data-root <suite-data-root>
+.\.venv\Scripts\python.exe scripts\evaluate_strategy_interval_suite.py `
+  --config config\strategy_research.json `
+  --config config\strategy_research_4hour.json `
+  --manifest <one-hour-manifest> --manifest <four-hour-manifest> `
+  --output reports\strategy-research\interval-suite-evidence.json
+```
+
 独立生成候选、运行一个流派、监视方向并生成下一代预登记提案：
 
 ```powershell
@@ -654,14 +675,22 @@ CPU 阶段应先于 GPU 完成以下收敛：
    自动繁殖并反复挑选。
 2. 增加 5 分钟、1 小时和 4 小时多节拍，但每个候选只使用预先登记的决策节拍与成本模型；
    不把同一参数在所有节拍无边界复制。首个
-   `pre-registered-multi-interval-suite-v1` 已把 1 小时与 4 小时配置绑定为同一墙钟合同：1/3/7
+   `pre-registered-multi-interval-suite-v2` 已把 1 小时与 4 小时配置绑定为同一墙钟合同：1/3/7
    天特征窗、一年训练、90 天测试/步长和一天 embargo；两套 34 候选加十条家族选择路径形成
    78 项全局试验域。4 小时真实 clean 运行含 16,672 根柱，只有突破通过；其 Sharpe 0.85、
    FDR 0.05、PBO 0.31、block p 0.02、effective DSR 0.98。趋势虽有 1.19 净对数收益，仍因
    FDR 0.12、block p 0.06、DSR 0.90 被拒；量价趋势 PBO 0.68、block p 0.21，表明失败来自
    节拍稳定性而非候选数量不足。套件消费者会完整复核成员、执行一次全局 BH-FDR，并把 stitched
    OOS 收益无前视地对齐到最粗栅格；首次真实组合因两次运行的活动 head 收据不同被硬拒绝。
-   在 suite-owned 冻结输入状态机完成前，不发布跨节拍权重，也不把这两份 summary 手工拼接。
+   `hardlinked-minimal-control-plane-v2` 随后冻结三市场最小控制面、成交收据、L2/book-state 质量窗
+   和 4,541 个内容寻址制品；Parquet 使用同卷硬链接，不复制数据字节。1 小时与 4 小时 clean
+   运行在共同 receipt `841d11a4...150e` 上完成，78 项全局校正后仍准入突破 1h/4h、量价趋势
+   1h 和趋势 1h，suite q 分别约 0.04、0.05、0.07、0.06。同家族跨节拍相关性为 0.80–0.96，
+   因此研究分配器在共同 14,015 个 4h OOS 栅格上共享方向总上限，而不是等权叠加：突破 1h/4h、
+   趋势 1h、量价趋势 1h 权重约为 0.35/0.10/0.08/0.06，gross 0.60、reserve 0.40。突破 1h
+   最新目标为零，故当前 aggregate research target 约 0.246。该结果仍是 `research_only`；
+   suite readiness、冻结前向和 sealed holdout 未完成前，operational target 固定禁用。成员 manifest
+   绑定快照身份与 manifest 散列；快照复用会重新散列控制库和全部硬链接制品。
 3. 现有门禁已包括非正态 Probabilistic Sharpe、studentized 循环折块 bootstrap、折块
    CSCV/PBO、Deflated Sharpe 和单轴最近参数邻域稳定性。DSR 同时发布全量候选原始试验数与
    基于折级得分相关矩阵参与率的有效试验数。DSR 的试验域是实际参与该流派冠军选择的候选；
