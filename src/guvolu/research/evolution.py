@@ -277,7 +277,7 @@ def _family_evaluation(
     return matches[0]
 
 
-def monitor_family_run(
+def _monitor_family_run(
     repository_root: Path,
     summary_path: Path,
     family: str,
@@ -285,7 +285,7 @@ def monitor_family_run(
     config_hash: str,
     prior_summary_paths: Sequence[Path] = (),
 ) -> Mapping[str, object]:
-    """生成单流派参数方向与跨运行健康监视制品。"""
+    """用已经确定的完整历史集合重算流派监视制品。"""
     root = repository_root.resolve()
     summary_path = summary_path.resolve()
     try:
@@ -353,9 +353,31 @@ def monitor_family_run(
     comparable_by_identity: dict[str, list[Mapping[str, object]]] = defaultdict(list)
     history_sources: dict[tuple[str, str, str], Mapping[str, object]] = {}
     excluded_history: list[Mapping[str, object]] = []
-    for path in prior_summary_paths:
-        prior, prior_manifest_sha256 = _verified_summary_source(root, path)
-        source_relative = path.resolve().relative_to(root).as_posix()
+    for path in sorted(
+        {item.resolve() for item in prior_summary_paths},
+        key=lambda item: item.as_posix(),
+    ):
+        try:
+            source_relative = path.relative_to(root).as_posix()
+        except ValueError as error:
+            raise ValueError("监视历史 summary 必须位于项目目录内") from error
+        try:
+            prior, prior_manifest_sha256 = _verified_summary_source(root, path)
+        except (OSError, RecursionError, ValueError) as error:
+            exclusion: dict[str, object] = {
+                "source_summary_path": source_relative,
+                "reason": "unreadable_or_invalid_summary_artifact",
+                "detail": str(error),
+            }
+            try:
+                exclusion["source_summary_sha256"] = sha256_file(path)
+            except OSError:
+                pass
+            excluded_history.append(exclusion)
+            continue
+        if _decision_time(prior) >= current_time:
+            # 忽略非历史运行，保持旧证据稳定。
+            continue
         source_sha256 = sha256_file(path)
         history_sources[
             (source_relative, source_sha256, prior_manifest_sha256)
@@ -470,7 +492,7 @@ def monitor_family_run(
             direction = "stable"
     return {
         "schema_version": 1,
-        "monitor_method_version": "family-direction-monitor-v6",
+        "monitor_method_version": "family-direction-monitor-v7",
         "run_id": summary.get("run_id"),
         "research_identity": current_identity,
         "data_vintage_id": current_vintage_id,
@@ -522,3 +544,49 @@ def monitor_family_run(
             "冻结数据 vintage；同面板重复运行和时间过近的累计样本不计入历史。"
         ),
     }
+
+
+def _canonical_summary_paths(root: Path, family: str) -> tuple[Path, ...]:
+    """发现组合运行与单流派目录中的 canonical 研究摘要。"""
+    if Path(family).name != family:
+        raise ValueError("family 不能用于 canonical 历史目录")
+    reports = root / "reports" / "strategy-research"
+    paths = {
+        *reports.glob("research-run-*/summary.json"),
+        *(reports / "families" / family).glob("research-run-*/summary.json"),
+    }
+    return tuple(sorted(
+        (path.resolve() for path in paths),
+        key=lambda path: path.as_posix(),
+    ))
+
+
+def monitor_family_run(
+    repository_root: Path,
+    summary_path: Path,
+    family: str,
+    config: Mapping[str, object],
+    config_hash: str,
+    prior_summary_paths: Sequence[Path] = (),
+) -> Mapping[str, object]:
+    """发现 canonical 全历史后生成单流派方向与健康监视制品。"""
+    root = repository_root.resolve()
+    current = summary_path.resolve()
+    governed_paths = tuple(sorted(
+        {
+            *(path.resolve() for path in prior_summary_paths),
+            *(
+                path for path in _canonical_summary_paths(root, family)
+                if path != current
+            ),
+        },
+        key=lambda path: path.as_posix(),
+    ))
+    return _monitor_family_run(
+        root,
+        current,
+        family,
+        config,
+        config_hash,
+        governed_paths,
+    )

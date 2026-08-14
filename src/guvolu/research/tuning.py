@@ -6,7 +6,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from guvolu.research.config_lineage import load_verified_config_lineage
-from guvolu.research.evolution import monitor_family_run
+from guvolu.research.evolution import _monitor_family_run, monitor_family_run
 from guvolu.research.provenance import canonical_json, sha256_file
 from guvolu.research.verification import verify_research_run
 from guvolu.strategy.generation import build_family_batches
@@ -139,7 +139,10 @@ def _verify_prior_proposal_source(
         ):
             raise ValueError(f"历史提案 {source_field} 来源不一致")
     monitor_method = monitor.get("monitor_method_version")
-    if monitor_method == "family-direction-monitor-v6":
+    if monitor_method in {
+        "family-direction-monitor-v6",
+        "family-direction-monitor-v7",
+    }:
         verify_monitor_sources(root, config, monitor, parent_config_hash)
     else:
         _verify_legacy_single_vintage_monitor(
@@ -296,13 +299,14 @@ def _recompute_monitor_sources(
     if ledger.get("sha256") != source.get("trial_ledger_sha256"):
         raise ValueError("monitor trial ledger 身份与 summary 不一致")
     family = _text(monitor.get("family"), "monitor.family")
-    return monitor_family_run(
-        root,
-        summary_path,
-        family,
-        config,
-        parent_config_hash,
-        prior_paths,
+    monitor_method = monitor.get("monitor_method_version")
+    monitor_function = (
+        monitor_family_run
+        if monitor_method == "family-direction-monitor-v7"
+        else _monitor_family_run
+    )
+    return monitor_function(
+        root, summary_path, family, config, parent_config_hash, prior_paths,
     )
 
 
@@ -312,7 +316,7 @@ def verify_monitor_sources(
     monitor: Mapping[str, object],
     parent_config_hash: str,
 ) -> None:
-    """验证 v6 监视器的完整历史来源并重算实际消费结论。"""
+    """验证 v6/v7 监视器的完整历史来源并重算实际消费结论。"""
     root = repository_root.resolve()
     source = _object(monitor.get("source"), "monitor.source")
     raw_history_sources = source.get("history_summaries")

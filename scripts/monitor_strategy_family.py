@@ -3,13 +3,13 @@ from __future__ import annotations
 
 import argparse
 import json
-from collections.abc import Mapping
 from pathlib import Path
 from typing import Sequence
 
 from guvolu.data.durable_io import atomic_write_text
+from guvolu.research.config_lineage import load_governed_strategy_config
 from guvolu.research.evolution import monitor_family_run
-from guvolu.research.provenance import canonical_json, sha256_file, sha256_text
+from guvolu.research.provenance import canonical_json, sha256_text
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -35,10 +35,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     config_path = arguments.config
     if not config_path.is_absolute():
         config_path = root / config_path
-    raw_config = json.loads(config_path.read_text(encoding="utf-8"))
-    if not isinstance(raw_config, Mapping):
-        raise ValueError("策略研究配置必须为对象")
-    config = {str(key): value for key, value in raw_config.items()}
+    config, config_hash, _lineage_root_hash, _lineage_depth = (
+        load_governed_strategy_config(root, config_path)
+    )
     summary_path = arguments.summary
     if summary_path is None:
         latest_path = (
@@ -58,7 +57,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         summary_path,
         arguments.family,
         config,
-        sha256_file(config_path),
+        config_hash,
         prior_paths,
     )
     content = canonical_json(payload) + "\n"
