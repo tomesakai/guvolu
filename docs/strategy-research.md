@@ -125,6 +125,9 @@ paper 分配遵守以下长期边界：趋势、量价确认趋势和突破合�
 
 ```powershell
 .\.venv\Scripts\python.exe scripts\generate_strategy_candidates.py --family trend
+.\.venv\Scripts\python.exe scripts\generate_strategy_structure_challengers.py trend
+.\.venv\Scripts\python.exe scripts\generate_strategy_structure_challengers.py `
+  flow_trend --operator numeric_bound_swap --donor-family trend --limit 1
 .\.venv\Scripts\python.exe scripts\run_strategy_family.py trend
 .\.venv\Scripts\python.exe scripts\monitor_strategy_family.py trend
 .\.venv\Scripts\python.exe scripts\propose_strategy_evolution.py --monitor <monitor.json>
@@ -519,6 +522,14 @@ registry schema v2 含 34 个候选、36 个公共节点，计划身份为
 逐项零漂移。v3 注册表仍可按旧方法逐字节重建，历史 monitor 不因生成器升级失去复核能力。
 五个单流派生成脚本分别发布独立计划，候选数为 6、12、4、6、6，均在 24 个候选预算内。
 
+有界结构搜索 v1 已在同一 typed AST 上实现确定性的比较严格度变异、AND 子句删除、数值上下界
+交换和参数域兼容的子树交叉。五流派真实脚本分别生成 3、1、2、3、2 个 mutation challenger；
+量价趋势另以趋势为 donor 生成一个 `entry` 到 `entry` 的 typed crossover。每个制品绑定来源
+SearchPlan、生成器版本和完整候选 ID 集，并在参数网格展开前校验每流派 24 个候选的预算。
+这些输出的状态固定为 `unregistered_structural_challengers`、`holdout_consumed=false`，不会进入
+Candidate Registry、研究冠军或冻结计划。只有经过已验证的流派 monitor 提案、把规范表达式登记
+到源码、形成 clean commit 并重新执行完整 ValidationExact 后，结构 challenger 才能成为新候选。
+
 该轮真实重建还暴露了旧面板查询的资源伸缩缺陷：762 个活动文件、约 1,945 万行被一次性送入
 全局 `ROW_NUMBER`，DuckDB 在 2 GB 和 4 GB 上限下都于同一去重算子耗尽内存。控制面证明 761 个
 非空文件的事件覆盖互不相交，最大单文件为 460,837 行。现在只把事件覆盖相交的文件组成联合
@@ -589,7 +600,10 @@ CPU 阶段应先于 GPU 完成以下收敛：
 
 1. 类型化表达式注册表、规范身份、CPU reference 和公共子表达式 DAG SearchPlan 已完成；
    v4 注册表在生成阶段即约束每流派候选预算，独立 CPU 解释器与递归 Exact 参考逐根对照。
-   下一步是在该 DAG 上加入有界 typed mutation/crossover，同时保持公式身份与参数身份分离。
+   有界 typed mutation/crossover 也已完成，但故意停在未注册 challenger 制品：来源 SearchPlan、
+   候选集合、生成器版本、参数预算和 donor 身份均被绑定。下一步是让时间分离的 monitor 证据选择
+   极少数结构提案，再通过源码登记、clean commit 和完整 Exact 复核激活，而不是在同一 vintage
+   自动繁殖并反复挑选。
 2. 增加 5 分钟、1 小时和 4 小时多节拍，但每个候选只使用预先登记的决策节拍与成本模型；
    不把同一参数在所有节拍无边界复制。
 3. 现有门禁已包括非正态 Probabilistic Sharpe、循环折块 percentile bootstrap、折块
@@ -640,7 +654,9 @@ bootstrap 和截面排序，不负责解析原始 JSON、修补
 E2/E3 截面后端。SearchFast 可用 float32 和近似排序，但最终候选必须由 ValidationExact 与
 CPU reference 在登记容差内复算。遗传搜索、NSGA-II 或 MAP-Elites 只在 typed DSL 上运行，
 fitness 同时惩罚成本、换手、容量、复杂度、相关冗余和跨时期不稳定；所有失败候选仍计入
-试验台账。GPU worker 独立进程、只读挂载上游制品、永不持有 `TRADE` 密钥（G-01、T-13）。
+试验台账。GPU 可以批量产生与评分未注册结构 challenger，但不能自行写 Candidate Registry；
+同样必须经过时间分离 monitor、源码公式登记、clean commit 和 ValidationExact 才能激活。
+GPU worker 独立进程、只读挂载上游制品、永不持有 `TRADE` 密钥（G-01、T-13）。
 对固定 shape、重复执行的候选批次和 bootstrap 批次，可在 E0/E1 基准证明 CPU launch overhead
 占主导后再捕获 [CUDA Graph](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cuda-graphs.html)，
 把依赖图实例化一次并重复提交；动态 AST 生成、数据质量判断和制品写入仍留在图外。CUDA Graph
@@ -685,11 +701,13 @@ flowchart TB
         micro["微观结构池<br/>MM / queue / cross-venue"]
         cross["横截面池<br/>relative value"]
         monitors["每流派独立 ledger / monitor / budget / proposal"]
+        challengers["未注册结构 challenger<br/>typed mutation / crossover"]
         monitors --> direction
         monitors --> reversion
         monitors --> grid
         monitors --> micro
         monitors --> cross
+        monitors --> challengers
     end
 
     pit --> direction
@@ -711,6 +729,8 @@ flowchart TB
     gpu["可选 GPU SearchFast<br/>批量粗筛 / 独立繁殖池"]
     plan --> cpuFast
     plan --> gpu
+    plan --> challengers
+    challengers -. "monitor + 源码登记 + clean commit" .-> registry
 
     exact["ValidationExact<br/>CPU reference + GPU 数值对照"]
     registry --> exact
@@ -743,5 +763,7 @@ flowchart TB
     holdout --> promotion["一次性 verdict<br/>人工 promotion"]
 ```
 
-当前 CPU 网格与未来 GPU 搜索共享 `Candidate Registry -> ValidationExact -> ledger` 之后的路径。
-因此 GPU 只改变候选吞吐，不改变 PIT、成本、统计门禁、质量清仓和人工 promotion 的所有权。
+当前 CPU 网格与未来 GPU 搜索共享
+`Candidate Registry -> SearchPlan -> SearchFast -> ValidationExact -> ledger` 路径；结构搜索形成的
+未注册 challenger 只能经治理门回到 Registry。因此 GPU 只改变候选吞吐，不改变 PIT、成本、
+统计门禁、质量清仓、公式注册和人工 promotion 的所有权。
