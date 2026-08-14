@@ -19,6 +19,10 @@ def main() -> None:
     parser.add_argument("--manifest", type=Path, action="append", required=True)
     parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--registry", type=Path)
+    parser.add_argument(
+        "--live-data-root", type=Path, default=Path("data"),
+        help="未来逐栅格预测读取的活动数据根",
+    )
     arguments = parser.parse_args()
     root = arguments.root.resolve()
 
@@ -32,6 +36,7 @@ def main() -> None:
         resolve(arguments.evidence),
         arguments.vintage_id,
         None if arguments.registry is None else resolve(arguments.registry),
+        live_data_root=resolve(arguments.live_data_root),
     )
     payload = asdict(result)
     payload["plan_path"] = result.plan_path.as_posix()

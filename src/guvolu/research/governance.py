@@ -9,6 +9,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from guvolu.research import clock
+from guvolu.research.config_lineage import (
+    load_governed_strategy_config_with_paths,
+)
 from guvolu.research.contracts import (
     FROZEN_FORWARD_METHOD_VERSION,
     FROZEN_FORWARD_SCHEMA_VERSION,
@@ -17,7 +20,24 @@ from guvolu.research.contracts import (
     INTERVAL_SUITE_FORWARD_METHOD_VERSION,
     INTERVAL_SUITE_FORWARD_SCHEMA_VERSION,
 )
-from guvolu.research.provenance import sha256_file, stable_identifier
+from guvolu.research.data_location import (
+    data_root_locator,
+    resolve_data_root_locator,
+)
+from guvolu.research.interval_suite import (
+    LoadedIntervalConfig,
+    build_interval_suite_plan,
+)
+from guvolu.research.interval_suite_forward_identity import (
+    interval_suite_deployment_contract_id,
+    interval_suite_forward_plan_id,
+)
+from guvolu.research.provenance import (
+    canonical_json,
+    sha256_file,
+    sha256_text,
+    stable_identifier,
+)
 from guvolu.strategy.expression import (
     candidate_identity,
     expression_id,
@@ -377,10 +397,14 @@ def _validated_interval_suite_forward_plan_artifact(
     repository_root: Path,
     plan_id: str,
     vintage_id: str,
+    vintage_market_id: str,
+    vintage_start_time: str,
+    vintage_end_time: str,
     suite_plan_id: str,
     suite_evidence_id: str,
     source_git_hash: str,
     code_tree_digest: str,
+    deployment_contract_id: str,
     governance_registry: str,
     artifact_path: str,
     artifact_sha256: str,
@@ -405,12 +429,24 @@ def _validated_interval_suite_forward_plan_artifact(
         "suite_evidence_id": suite_evidence_id,
         "source_git_hash": source_git_hash,
         "code_tree_digest": code_tree_digest,
+        "deployment_contract_id": deployment_contract_id,
     }
     for key, value in expected.items():
         if payload.get(key) != value:
             raise ValueError(f"套件冻结前向计划 {key} 与登记身份不一致")
     vintage = payload.get("vintage")
-    if not isinstance(vintage, dict) or vintage.get("vintage_id") != vintage_id:
+    if not isinstance(vintage, dict):
+        raise ValueError("套件冻结前向计划 vintage 身份不一致")
+    raw_start = vintage.get("start_time")
+    raw_end = vintage.get("end_time")
+    if (
+        vintage.get("vintage_id") != vintage_id
+        or vintage.get("market_id") != vintage_market_id
+        or not isinstance(raw_start, str)
+        or not isinstance(raw_end, str)
+        or _parse_timestamp(raw_start) != _parse_timestamp(vintage_start_time)
+        or _parse_timestamp(raw_end) != _parse_timestamp(vintage_end_time)
+    ):
         raise ValueError("套件冻结前向计划 vintage 身份不一致")
     source_record = payload.get("source_evidence")
     if not isinstance(source_record, dict):
@@ -433,6 +469,131 @@ def _validated_interval_suite_forward_plan_artifact(
         or evidence.get("source_git_hash") != source_git_hash
     ):
         raise ValueError("套件冻结前向计划 evidence 顶层身份不一致")
+    raw_live_data_root = payload.get("live_data_root")
+    if raw_live_data_root is None:
+        raise ValueError("套件冻结前向计划缺少 live_data_root")
+    live_data_root = resolve_data_root_locator(
+        repository_root, raw_live_data_root,
+    )
+    if not live_data_root.is_dir():
+        raise ValueError("套件冻结前向 live_data_root 不存在")
+    if (live_data_root / "snapshot-manifest.json").exists():
+        raise ValueError("套件冻结前向 live_data_root 不得是研究 snapshot")
+    if data_root_locator(repository_root, live_data_root) != raw_live_data_root:
+        raise ValueError("套件冻结前向 live_data_root 不是规范定位对象")
+    raw_evidence_members = evidence.get("members")
+    raw_members = payload.get("members")
+    if not isinstance(raw_evidence_members, list) or not isinstance(
+        raw_members, list,
+    ):
+        raise ValueError("套件冻结前向计划缺少 members")
+    evidence_members: dict[str, dict[str, object]] = {}
+    for raw in raw_evidence_members:
+        if not isinstance(raw, dict):
+            raise ValueError("套件 evidence member 合同无效")
+        member_id = raw.get("member_id")
+        if not isinstance(member_id, str) or not member_id:
+            raise ValueError("套件 evidence member_id 无效")
+        if member_id in evidence_members:
+            raise ValueError("套件 evidence 包含重复 member_id")
+        evidence_members[member_id] = {str(key): value for key, value in raw.items()}
+    frozen_member_ids: set[str] = set()
+    loaded_configs: dict[Path, LoadedIntervalConfig] = {}
+    normalized_members: list[dict[str, object]] = []
+    for raw in raw_members:
+        if not isinstance(raw, dict):
+            raise ValueError("套件冻结前向 member 合同无效")
+        member_id = raw.get("member_id")
+        interval = raw.get("bar_interval")
+        config_path_value = raw.get("config_source_path")
+        config_hash = raw.get("config_source_sha256")
+        root_hash = raw.get("config_lineage_root_sha256")
+        depth = raw.get("config_lineage_depth")
+        raw_source_paths = raw.get("config_source_paths")
+        config_contract = raw.get("config_contract")
+        contract_sha = raw.get("config_contract_sha256")
+        if (
+            not isinstance(member_id, str) or not member_id
+            or not isinstance(interval, str) or not interval
+            or not isinstance(config_path_value, str) or not config_path_value
+            or not isinstance(config_hash, str) or not _canonical_sha256(config_hash)
+            or not isinstance(root_hash, str) or not _canonical_sha256(root_hash)
+            or not isinstance(depth, int) or isinstance(depth, bool) or depth < 0
+            or not isinstance(raw_source_paths, list) or not raw_source_paths
+            or not isinstance(config_contract, dict)
+            or not isinstance(contract_sha, str) or not _canonical_sha256(contract_sha)
+        ):
+            raise ValueError("套件冻结前向 member 身份无效")
+        if sha256_text(canonical_json(config_contract)) != contract_sha:
+            raise ValueError("套件冻结前向 member config_contract SHA-256 不匹配")
+        if member_id in frozen_member_ids:
+            raise ValueError("套件冻结前向计划包含重复 member_id")
+        evidence_member = evidence_members.get(member_id)
+        if evidence_member is None or evidence_member.get("bar_interval") != interval:
+            raise ValueError("套件冻结前向 member 与 evidence 不一致")
+        config_path, _normalized_config = _evidence_file(
+            repository_root, config_path_value, "interval suite member config",
+        )
+        if config_path_value != _normalized_config:
+            raise ValueError("套件冻结前向 member config_source_path 不规范")
+        if sha256_file(config_path) != config_hash:
+            raise ValueError("套件冻结前向 member config SHA-256 不匹配")
+        source_paths: list[Path] = []
+        for source_path_value in raw_source_paths:
+            if not isinstance(source_path_value, str) or not source_path_value:
+                raise ValueError("套件冻结前向 member config_source_paths 无效")
+            source_path, _normalized_source = _evidence_file(
+                repository_root, source_path_value,
+                "interval suite member config lineage",
+            )
+            if source_path_value != _normalized_source:
+                raise ValueError("套件冻结前向 member config_source_paths 不规范")
+            source_paths.append(source_path)
+        current = load_governed_strategy_config_with_paths(
+            repository_root, config_path,
+        )
+        current_config, current_hash, current_root, current_depth, current_paths = current
+        if (
+            canonical_json(current_config) != canonical_json(config_contract)
+            or current_hash != config_hash
+            or current_root != root_hash
+            or current_depth != depth
+            or tuple(source_paths) != current_paths
+        ):
+            raise ValueError("套件冻结前向 member 配置快照不能由现场谱系重建")
+        # 配置 registry 只记录研究血缘。
+        # 后继库由部署合同绑定。
+        # 隔离迁移时允许二者不同。
+        loaded_configs[config_path] = (
+            config_contract, config_hash, root_hash, depth, tuple(source_paths),
+        )
+        normalized_members.append({str(key): value for key, value in raw.items()})
+        frozen_member_ids.add(member_id)
+    if frozen_member_ids != set(evidence_members):
+        raise ValueError("套件冻结前向 members 未完整覆盖 evidence")
+    rebuilt_plan = build_interval_suite_plan(
+        repository_root, tuple(loaded_configs), loaded_configs=loaded_configs,
+    )
+    if rebuilt_plan.get("suite_plan_id") != suite_plan_id:
+        raise ValueError("套件冻结前向配置不能重建 suite_plan_id")
+    if (
+        rebuilt_plan.get("market_id") != evidence.get("market_id")
+        or evidence.get("market_id") != vintage_market_id
+    ):
+        raise ValueError("套件冻结前向配置、evidence 与 vintage 市场不一致")
+    raw_rebuilt_members = rebuilt_plan.get("members")
+    if not isinstance(raw_rebuilt_members, list):
+        raise ValueError("重建 suite plan 缺少 members")
+    rebuilt_members = {
+        str(item.get("member_id")): str(item.get("bar_interval"))
+        for item in raw_rebuilt_members
+        if isinstance(item, dict)
+    }
+    if rebuilt_members != {
+        member_id: str(member.get("bar_interval"))
+        for member_id, member in evidence_members.items()
+    }:
+        raise ValueError("套件冻结前向配置成员与 evidence 不一致")
     raw_evidence_sleeves = evidence.get("sleeves")
     if not isinstance(raw_evidence_sleeves, list):
         raise ValueError("套件 evidence 缺少 sleeves")
@@ -570,6 +731,21 @@ def _validated_interval_suite_forward_plan_artifact(
         != evidence.get("input_receipt_sha256")
     ):
         raise ValueError("套件冻结前向 input 与 evidence 不一致")
+    evidence_body = {
+        str(key): value for key, value in evidence.items()
+        if key != "suite_evidence_id"
+    }
+    if stable_identifier("interval-suite-evidence", evidence_body) != suite_evidence_id:
+        raise ValueError("套件冻结前向 evidence 内容身份不一致")
+    normalized_members.sort(key=lambda item: str(item.get("bar_interval")))
+    computed_deployment_id = interval_suite_deployment_contract_id(
+        governance_registry,
+        data_root_locator(repository_root, live_data_root),
+        normalized_members,
+        {str(key): value for key, value in decision_grid.items()},
+    )
+    if computed_deployment_id != deployment_contract_id:
+        raise ValueError("套件冻结前向 deployment_contract_id 不一致")
     return normalized
 
 
@@ -2544,6 +2720,7 @@ def register_interval_suite_forward_plan(
     suite_evidence_id: str,
     source_git_hash: str,
     code_tree_digest: str,
+    deployment_contract_id: str,
     plan_artifact_path: str,
     plan_artifact_sha256: str,
     *,
@@ -2562,18 +2739,20 @@ def register_interval_suite_forward_plan(
         raise ValueError("套件治理注册表必须位于项目目录内") from error
     identity_values = (
         suite_plan_id, suite_evidence_id, source_git_hash, code_tree_digest,
+        deployment_contract_id,
         plan_artifact_path, plan_artifact_sha256,
     )
     if any(not value.strip() for value in identity_values):
         raise ValueError("套件冻结前向计划身份字段不得为空")
-    plan_id = stable_identifier("interval-suite-forward-plan", {
-        "governance_method_version": GOVERNANCE_METHOD_VERSION,
-        "vintage_id": vintage_id,
-        "suite_plan_id": suite_plan_id,
-        "suite_evidence_id": suite_evidence_id,
-        "source_git_hash": source_git_hash,
-        "code_tree_digest": code_tree_digest,
-    })
+    plan_id = interval_suite_forward_plan_id(
+        GOVERNANCE_METHOD_VERSION,
+        vintage_id,
+        suite_plan_id,
+        suite_evidence_id,
+        source_git_hash,
+        code_tree_digest,
+        deployment_contract_id,
+    )
     connection = _connect(resolved_registry, write=True)
     try:
         _begin(connection)
@@ -2594,8 +2773,11 @@ def register_interval_suite_forward_plan(
         if legacy_plan is not None:
             raise ValueError("vintage 已绑定单成员冻结前向计划")
         normalized_path = _validated_interval_suite_forward_plan_artifact(
-            repository_root, plan_id, vintage_id, suite_plan_id,
+            repository_root, plan_id, vintage_id,
+            str(vintage["market_id"]), str(vintage["start_time"]),
+            str(vintage["end_time"]), suite_plan_id,
             suite_evidence_id, source_git_hash, code_tree_digest,
+            deployment_contract_id,
             governance_registry, plan_artifact_path, plan_artifact_sha256,
         )
         values = (

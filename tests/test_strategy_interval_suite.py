@@ -9,6 +9,9 @@ from pathlib import Path
 
 import pytest
 
+from guvolu.research.config_lineage import (
+    load_governed_strategy_config_with_paths,
+)
 from guvolu.research.interval_suite import build_interval_suite_plan
 from guvolu.research.interval_suite_evidence import (
     allocate_interval_sleeves,
@@ -87,6 +90,32 @@ def test_interval_suite_rejects_duplicate_interval() -> None:
     root, hourly, _four_hour = _configs()
     with pytest.raises(ValueError, match="重复节拍"):
         build_interval_suite_plan(root, (hourly, hourly))
+
+
+def test_interval_suite_preloaded_configs_are_strict_and_root_relative(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """预加载模式不得受 cwd 影响或在缺键时静默二次读盘。"""
+    root, hourly, four_hour = _configs()
+    loaded = {
+        path.resolve(): load_governed_strategy_config_with_paths(root, path)
+        for path in (hourly, four_hour)
+    }
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        "guvolu.research.interval_suite.load_governed_strategy_config_with_paths",
+        lambda *_args: pytest.fail("预加载模式不得重新读取配置"),
+    )
+    relative_paths = tuple(path.relative_to(root) for path in (hourly, four_hour))
+    plan = build_interval_suite_plan(
+        root, relative_paths, loaded_configs=loaded,
+    )
+    assert plan["suite_plan_id"]
+    with pytest.raises(ValueError, match="预加载套件配置未覆盖路径"):
+        build_interval_suite_plan(
+            root, relative_paths, loaded_configs={hourly.resolve(): loaded[hourly.resolve()]},
+        )
 
 
 @pytest.mark.parametrize(

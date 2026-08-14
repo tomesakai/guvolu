@@ -178,11 +178,16 @@ forward plan；首次部署须先备份并显式把 v5 写入上限升级到 v6�
   --config config\strategy_research_4hour.json `
   --manifest <one-hour-manifest> --manifest <four-hour-manifest> `
   --evidence reports\strategy-research\interval-suite-evidence-v4.json `
-  --registry <isolated-successor-registry>
+  --registry <isolated-successor-registry> `
+  --live-data-root <authoritative-live-data-root>
 ```
 
 登记会重新构造 evidence，并冻结准入 sleeve、部署候选完整公式/参数、固定权重、reserve、共同最粗
-决策栅格、来源 commit 和计划创建代码树。同 vintage 的套件计划只能有一个且不可改写。readiness
+决策栅格、成员合并配置与谱系、未来活动数据根、来源 commit 和计划创建代码树。`plan_id` 同时绑定
+前向方法版本与上述部署合同；登记事务在写锁内从现场谱系重建同一个 `suite_plan_id`，历史复核则从
+计划内联配置重建，不要求源配置永远不演进。同 vintage 的套件计划只能有一个且不可改写。研究
+snapshot 仅证明候选选择，逐栅格预测必须从计划绑定的仓库内或外部绝对 live data root 捕获新活动
+head 收据，不能继续读取冻结研究 snapshot。readiness
 只接受治理库登记且现场散列、候选注册表、持久化 evidence 与重建结果全部一致的计划；不登记计划、
 不消费 vintage。套件逐栅格预测的代码、计划与调度合同必须在 vintage 开始前就绪；预测收据在
 区间内逐栅格追加，期末 suite holdout 只能在区间完整结束后消费并验证，不能以单成员预测替代。

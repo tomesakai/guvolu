@@ -22,6 +22,9 @@ _INTERVAL_SECONDS = {
     "1hour": 3_600,
     "4hour": 14_400,
 }
+LoadedIntervalConfig = tuple[
+    Mapping[str, object], str, str, int, tuple[Path, ...],
+]
 
 
 def _mapping(value: object, name: str) -> Mapping[str, object]:
@@ -122,6 +125,8 @@ def _duration_contract(
 def build_interval_suite_plan(
     repository_root: Path,
     config_paths: Sequence[Path],
+    *,
+    loaded_configs: Mapping[Path, LoadedIntervalConfig] | None = None,
 ) -> Mapping[str, object]:
     """生成跨节拍统一身份和全局多重检验域，不执行回测。"""
     root = repository_root.resolve()
@@ -136,10 +141,19 @@ def build_interval_suite_plan(
     duration_contract: Mapping[str, object] | None = None
     allocation_contract: Mapping[str, object] | None = None
     for raw_path in config_paths:
-        path = raw_path.resolve()
-        config, config_hash, root_hash, depth, source_paths = (
-            load_governed_strategy_config_with_paths(root, path)
+        path = (
+            raw_path.resolve()
+            if raw_path.is_absolute()
+            else (root / raw_path).resolve()
         )
+        if loaded_configs is None:
+            loaded = load_governed_strategy_config_with_paths(root, path)
+        else:
+            preloaded = loaded_configs.get(path)
+            if preloaded is None:
+                raise ValueError(f"预加载套件配置未覆盖路径: {path}")
+            loaded = preloaded
+        config, config_hash, root_hash, depth, source_paths = loaded
         interval = _text(config.get("bar_interval"), "bar_interval")
         seconds = _INTERVAL_SECONDS.get(interval)
         if seconds is None:

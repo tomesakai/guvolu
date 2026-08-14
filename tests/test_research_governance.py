@@ -6,6 +6,7 @@ import json
 import sqlite3
 import threading
 import time
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -26,7 +27,11 @@ from guvolu.research.contracts import (
     PanelSnapshot,
     PerformanceMetrics,
 )
-from guvolu.research.config_lineage import snapshot_verified_config_lineage
+from guvolu.research.config_lineage import (
+    load_governed_strategy_config_with_paths,
+    snapshot_verified_config_lineage,
+)
+from guvolu.research.data_location import data_root_locator
 from guvolu.research.frozen_forward import (
     attest_frozen_forward_batch,
     attest_frozen_prediction_artifact as _actual_forward_attestation,
@@ -58,7 +63,17 @@ from guvolu.research.holdout import (
     attest_holdout_terminal_artifacts as _actual_holdout_attestation,
     run_holdout_validation,
 )
-from guvolu.research.provenance import sha256_file, stable_identifier
+from guvolu.research.interval_suite import build_interval_suite_plan
+from guvolu.research.interval_suite_forward_identity import (
+    interval_suite_deployment_contract_id,
+    interval_suite_forward_plan_id,
+)
+from guvolu.research.provenance import (
+    canonical_json,
+    sha256_file,
+    sha256_text,
+    stable_identifier,
+)
 from guvolu.research.verification import VerificationResult
 from guvolu.strategy.expression import (
     EXPRESSION_METHOD_VERSION,
@@ -322,30 +337,62 @@ def _write_interval_suite_plan_artifact(
     suite_evidence_id: str,
     source_git_hash: str,
     code_tree_digest: str,
-) -> tuple[str, str, str]:
+) -> tuple[str, str, str, str, str, str]:
     """写入与治理登记合同一致的跨节拍冻结计划。"""
-    plan_id = stable_identifier("interval-suite-forward-plan", {
-        "governance_method_version": GOVERNANCE_METHOD_VERSION,
-        "vintage_id": vintage_id,
-        "suite_plan_id": suite_plan_id,
-        "suite_evidence_id": suite_evidence_id,
+    data_root = root / "data"
+    data_root.mkdir(exist_ok=True)
+    repository = Path(__file__).resolve().parents[1]
+    config_paths: list[Path] = []
+    loaded_configs: dict[Path, tuple[
+        dict[str, object], str, str, int, tuple[Path, ...],
+    ]] = {}
+    for interval, source_name in (
+        ("1hour", "strategy_research.json"),
+        ("4hour", "strategy_research_4hour.json"),
+    ):
+        source_config, _hash, _root, _depth, _paths = (
+            load_governed_strategy_config_with_paths(
+                repository, repository / "config" / source_name,
+            )
+        )
+        config = deepcopy(dict(source_config))
+        config["market_id"] = "market-one"
+        config["pipeline_version"] = f"fixture-{suite_plan_id}"
+        governance = deepcopy(dict(config["data_governance"]))
+        governance["registry"] = "governance.sqlite3"
+        config["data_governance"] = governance
+        config_path = root / f"suite-{interval}.json"
+        config_path.write_text(
+            canonical_json(config) + "\n", encoding="utf-8",
+        )
+        config_hash = sha256_file(config_path)
+        config_paths.append(config_path)
+        loaded_configs[config_path] = (
+            config, config_hash, config_hash, 0, (config_path,),
+        )
+    suite_plan = build_interval_suite_plan(
+        root, tuple(config_paths), loaded_configs=loaded_configs,
+    )
+    actual_suite_plan_id = str(suite_plan["suite_plan_id"])
+    suite_members = suite_plan["members"]
+    assert isinstance(suite_members, list)
+    evidence_members = [{
+        "member_id": member["member_id"],
+        "bar_interval": member["bar_interval"],
+    } for member in suite_members if isinstance(member, dict)]
+    first_member = evidence_members[0]
+    evidence_body = {
+        "suite_plan_id": actual_suite_plan_id,
         "source_git_hash": source_git_hash,
-        "code_tree_digest": code_tree_digest,
-    })
-    path = root / "reports" / plan_id / "plan.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    evidence_path = path.parent / "suite-evidence.json"
-    evidence_path.write_text(json.dumps({
-        "suite_plan_id": suite_plan_id,
-        "suite_evidence_id": suite_evidence_id,
-        "source_git_hash": source_git_hash,
+        "market_id": "market-one",
         "input_head_generation": "head-one",
         "input_receipt_sha256": "r" * 64,
         "alignment_interval_seconds": 14_400,
+        "members": evidence_members,
         "sleeves": [{
             "sleeve_id": "sleeve-one",
-            "member_id": "member-one",
-            "bar_interval": "1hour",
+            "member_id": first_member["member_id"],
+            "bar_interval": first_member["bar_interval"],
             "family": "trend",
             "deployment_candidate_id": _TEST_CANDIDATE_ID,
             "suite_eligible": True,
@@ -355,19 +402,72 @@ def _write_interval_suite_plan_artifact(
             "reserve": 0.6,
             "shared_caps": {"maximum_gross_weight": 0.85},
         },
-    }, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
-    path.write_text(json.dumps({
+        "operational_status": f"fixture-{suite_evidence_id}",
+    }
+    actual_evidence_id = stable_identifier(
+        "interval-suite-evidence", evidence_body,
+    )
+    evidence = {**evidence_body, "suite_evidence_id": actual_evidence_id}
+    frozen_members = []
+    for member, config_path in zip(
+        evidence_members, config_paths, strict=True,
+    ):
+        config, config_hash, root_hash, depth, source_paths = (
+            loaded_configs[config_path]
+        )
+        frozen_members.append({
+            **member,
+            "config_source_path": config_path.relative_to(root).as_posix(),
+            "config_source_sha256": config_hash,
+            "config_lineage_root_sha256": root_hash,
+            "config_lineage_depth": depth,
+            "config_source_paths": [
+                path.relative_to(root).as_posix() for path in source_paths
+            ],
+            "config_contract": config,
+            "config_contract_sha256": sha256_text(canonical_json(config)),
+        })
+    live_root = data_root_locator(root, data_root)
+    decision_grid = {
+        "interval_seconds": 14_400,
+        "utc_epoch_offset_seconds": 0,
+        "maximum_recording_lag_seconds": 3900,
+    }
+    deployment_contract_id = interval_suite_deployment_contract_id(
+        "governance.sqlite3", live_root, frozen_members, decision_grid,
+    )
+    plan_id = interval_suite_forward_plan_id(
+        GOVERNANCE_METHOD_VERSION,
+        vintage_id,
+        actual_suite_plan_id,
+        actual_evidence_id,
+        source_git_hash,
+        code_tree_digest,
+        deployment_contract_id,
+    )
+    path = root / "reports" / plan_id / "plan.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    evidence_path = path.parent / "suite-evidence.json"
+    evidence_path.write_text(canonical_json(evidence) + "\n", encoding="utf-8")
+    path.write_text(canonical_json({
         "schema_version": INTERVAL_SUITE_FORWARD_SCHEMA_VERSION,
         "method_version": INTERVAL_SUITE_FORWARD_METHOD_VERSION,
         "governance_method_version": GOVERNANCE_METHOD_VERSION,
         "scope": "INTERVAL_SUITE_FROZEN_FORWARD",
         "governance_registry": "governance.sqlite3",
         "plan_id": plan_id,
-        "suite_plan_id": suite_plan_id,
-        "suite_evidence_id": suite_evidence_id,
+        "suite_plan_id": actual_suite_plan_id,
+        "suite_evidence_id": actual_evidence_id,
         "source_git_hash": source_git_hash,
         "code_tree_digest": code_tree_digest,
-        "vintage": {"vintage_id": vintage_id},
+        "deployment_contract_id": deployment_contract_id,
+        "live_data_root": live_root,
+        "vintage": {
+            "vintage_id": vintage_id,
+            "market_id": "market-one",
+            "start_time": "2027-01-01T00:00:00+00:00",
+            "end_time": "2027-02-01T00:00:00+00:00",
+        },
         "source_evidence": {
             "path": evidence_path.relative_to(root).as_posix(),
             "sha256": sha256_file(evidence_path),
@@ -375,15 +475,12 @@ def _write_interval_suite_plan_artifact(
         "input": {
             "head_generation": "head-one", "receipt_sha256": "r" * 64,
         },
-        "decision_grid": {
-            "interval_seconds": 14_400,
-            "utc_epoch_offset_seconds": 0,
-            "maximum_recording_lag_seconds": 3900,
-        },
+        "decision_grid": decision_grid,
+        "members": frozen_members,
         "sleeves": [{
             "sleeve_id": "sleeve-one",
-            "member_id": "member-one",
-            "bar_interval": "1hour",
+            "member_id": first_member["member_id"],
+            "bar_interval": first_member["bar_interval"],
             "family": "trend",
             "candidate": {
                 "candidate_id": _TEST_CANDIDATE_ID,
@@ -400,8 +497,15 @@ def _write_interval_suite_plan_artifact(
             "reserve": 0.6,
             "shared_caps": {"maximum_gross_weight": 0.85},
         },
-    }, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
-    return plan_id, path.relative_to(root).as_posix(), sha256_file(path)
+    }) + "\n", encoding="utf-8")
+    return (
+        plan_id,
+        deployment_contract_id,
+        actual_suite_plan_id,
+        actual_evidence_id,
+        path.relative_to(root).as_posix(),
+        sha256_file(path),
+    )
 
 
 def _write_holdout_evidence(
@@ -1800,14 +1904,18 @@ def test_frozen_forward_plan_and_predictions_are_precommitted_and_append_only(
         repository_root=tmp_path,
     )
     assert repeated == plan
-    _suite_id, suite_path, suite_sha = _write_interval_suite_plan_artifact(
+    (
+        _suite_id, suite_deployment_id, suite_plan_id,
+        suite_evidence_id, suite_path, suite_sha,
+    ) = _write_interval_suite_plan_artifact(
         tmp_path, vintage.vintage_id, "suite-plan", "suite-evidence",
         "a" * 40, "tree-one",
     )
     with pytest.raises(ValueError, match="单成员冻结前向计划"):
         register_interval_suite_forward_plan(
-            registry, vintage.vintage_id, "suite-plan", "suite-evidence",
-            "a" * 40, "tree-one", suite_path, suite_sha,
+            registry, vintage.vintage_id, suite_plan_id, suite_evidence_id,
+            "a" * 40, "tree-one", suite_deployment_id,
+            suite_path, suite_sha,
             repository_root=tmp_path,
         )
     _, different_path, different_sha256 = _write_forward_plan_artifact(
@@ -1942,16 +2050,19 @@ def test_interval_suite_forward_plan_is_precommitted_and_attested(
         _time("2027-01-01T00:00:00"),
         _time("2027-02-01T00:00:00"),
     )
-    plan_id, plan_path, plan_sha = _write_interval_suite_plan_artifact(
+    (
+        plan_id, deployment_id, suite_plan_id,
+        suite_evidence_id, plan_path, plan_sha,
+    ) = _write_interval_suite_plan_artifact(
         tmp_path, vintage.vintage_id, "suite-plan", "suite-evidence",
         "a" * 40, "tree-one",
     )
     registered = register_interval_suite_forward_plan(
         Path("governance.sqlite3"),
         vintage.vintage_id,
-        "suite-plan",
-        "suite-evidence",
-        "a" * 40, "tree-one", plan_path, plan_sha,
+        suite_plan_id,
+        suite_evidence_id,
+        "a" * 40, "tree-one", deployment_id, plan_path, plan_sha,
         repository_root=tmp_path,
     )
     assert registered.plan_id == plan_id
@@ -1959,8 +2070,8 @@ def test_interval_suite_forward_plan_is_precommitted_and_attested(
         registry, vintage.vintage_id,
     ) == registered
     assert register_interval_suite_forward_plan(
-        registry, vintage.vintage_id, "suite-plan", "suite-evidence",
-        "a" * 40, "tree-one", plan_path, plan_sha,
+        registry, vintage.vintage_id, suite_plan_id, suite_evidence_id,
+        "a" * 40, "tree-one", deployment_id, plan_path, plan_sha,
         repository_root=tmp_path,
     ) == registered
     _legacy_id, legacy_path, legacy_sha = _write_forward_plan_artifact(
@@ -1986,8 +2097,8 @@ def test_interval_suite_forward_plan_is_precommitted_and_attested(
     _set_now(vintage.start_time)
     with pytest.raises(ValueError, match="开始前"):
         register_interval_suite_forward_plan(
-            registry, vintage.vintage_id, "suite-plan", "suite-evidence",
-            "a" * 40, "tree-one", plan_path, plan_sha,
+            registry, vintage.vintage_id, suite_plan_id, suite_evidence_id,
+            "a" * 40, "tree-one", deployment_id, plan_path, plan_sha,
             repository_root=tmp_path,
         )
     _set_now(_time("2026-08-14T00:00:00"))
@@ -2001,18 +2112,22 @@ def test_interval_suite_forward_plan_is_precommitted_and_attested(
     )
     with pytest.raises(ValueError, match="SHA-256 不匹配"):
         register_interval_suite_forward_plan(
-            registry, vintage.vintage_id, "suite-plan", "suite-evidence",
-            "a" * 40, "tree-one", plan_path, plan_sha,
+            registry, vintage.vintage_id, suite_plan_id, suite_evidence_id,
+            "a" * 40, "tree-one", deployment_id, plan_path, plan_sha,
             repository_root=tmp_path,
         )
     with pytest.raises(ValueError, match="allocation 与 evidence 不一致"):
         register_interval_suite_forward_plan(
-            registry, vintage.vintage_id, "suite-plan", "suite-evidence",
-            "a" * 40, "tree-one", plan_path, sha256_file(path),
+            registry, vintage.vintage_id, suite_plan_id, suite_evidence_id,
+            "a" * 40, "tree-one", deployment_id,
+            plan_path, sha256_file(path),
             repository_root=tmp_path,
         )
 
-    different_id, different_path, different_sha = (
+    (
+        different_id, different_deployment_id, different_suite_plan_id,
+        different_evidence_id, different_path, different_sha,
+    ) = (
         _write_interval_suite_plan_artifact(
             tmp_path, vintage.vintage_id, "different-suite", "suite-evidence",
             "a" * 40, "tree-one",
@@ -2021,8 +2136,10 @@ def test_interval_suite_forward_plan_is_precommitted_and_attested(
     assert different_id != plan_id
     with pytest.raises(ValueError, match="不同的套件冻结前向计划"):
         register_interval_suite_forward_plan(
-            registry, vintage.vintage_id, "different-suite", "suite-evidence",
-            "a" * 40, "tree-one", different_path, different_sha,
+            registry, vintage.vintage_id,
+            different_suite_plan_id, different_evidence_id,
+            "a" * 40, "tree-one", different_deployment_id,
+            different_path, different_sha,
             repository_root=tmp_path,
         )
 
@@ -2039,7 +2156,10 @@ def test_interval_suite_plan_artifact_is_validated_under_write_lock(
         _time("2027-01-01T00:00:00"),
         _time("2027-02-01T00:00:00"),
     )
-    _plan_id, plan_path, plan_sha = _write_interval_suite_plan_artifact(
+    (
+        _plan_id, deployment_id, suite_plan_id,
+        suite_evidence_id, plan_path, plan_sha,
+    ) = _write_interval_suite_plan_artifact(
         tmp_path, vintage.vintage_id, "suite-plan", "suite-evidence",
         "a" * 40, "tree-one",
     )
@@ -2064,10 +2184,85 @@ def test_interval_suite_plan_artifact_is_validated_under_write_lock(
         validate,
     )
     register_interval_suite_forward_plan(
-        registry, vintage.vintage_id, "suite-plan", "suite-evidence",
-        "a" * 40, "tree-one", plan_path, plan_sha,
+        registry, vintage.vintage_id, suite_plan_id, suite_evidence_id,
+        "a" * 40, "tree-one", deployment_id, plan_path, plan_sha,
         repository_root=tmp_path,
     )
+
+
+def test_interval_suite_plan_requires_explicit_live_root_and_exact_config_snapshot(
+    tmp_path: Path,
+) -> None:
+    """v2 计划不得缺省活动根，也不能把另一份配置伪装成冻结快照。"""
+    for case in ("missing-live-root", "config-drift"):
+        root = tmp_path / case
+        root.mkdir()
+        registry = root / "governance.sqlite3"
+        vintage = seal_holdout_vintage(
+            registry,
+            "market-one",
+            _time("2027-01-01T00:00:00"),
+            _time("2027-02-01T00:00:00"),
+        )
+        (
+            _plan_id, deployment_id, suite_plan_id,
+            suite_evidence_id, plan_path, _plan_sha,
+        ) = _write_interval_suite_plan_artifact(
+            root, vintage.vintage_id, "suite-plan", "suite-evidence",
+            "a" * 40, "tree-one",
+        )
+        path = root / plan_path
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if case == "missing-live-root":
+            del payload["live_data_root"]
+            path.write_text(canonical_json(payload) + "\n", encoding="utf-8")
+            with pytest.raises(ValueError, match="缺少 live_data_root"):
+                register_interval_suite_forward_plan(
+                    registry, vintage.vintage_id,
+                    suite_plan_id, suite_evidence_id,
+                    "a" * 40, "tree-one", deployment_id,
+                    plan_path, sha256_file(path), repository_root=root,
+                )
+            continue
+        members = payload["members"]
+        assert isinstance(members, list)
+        member = members[0]
+        assert isinstance(member, dict)
+        source_path = root / str(member["config_source_path"])
+        changed_config = json.loads(source_path.read_text(encoding="utf-8"))
+        changed_config["pipeline_version"] = "different-live-config"
+        source_path.write_text(
+            canonical_json(changed_config) + "\n", encoding="utf-8",
+        )
+        changed_hash = sha256_file(source_path)
+        member["config_source_sha256"] = changed_hash
+        member["config_lineage_root_sha256"] = changed_hash
+        live_root = payload["live_data_root"]
+        decision_grid = payload["decision_grid"]
+        assert isinstance(live_root, dict)
+        assert isinstance(decision_grid, dict)
+        deployment_id = interval_suite_deployment_contract_id(
+            "governance.sqlite3", live_root, members, decision_grid,
+        )
+        plan_id = interval_suite_forward_plan_id(
+            GOVERNANCE_METHOD_VERSION,
+            vintage.vintage_id,
+            suite_plan_id,
+            suite_evidence_id,
+            "a" * 40,
+            "tree-one",
+            deployment_id,
+        )
+        payload["deployment_contract_id"] = deployment_id
+        payload["plan_id"] = plan_id
+        path.write_text(canonical_json(payload) + "\n", encoding="utf-8")
+        with pytest.raises(ValueError, match="配置快照不能由现场谱系重建"):
+            register_interval_suite_forward_plan(
+                registry, vintage.vintage_id,
+                suite_plan_id, suite_evidence_id,
+                "a" * 40, "tree-one", deployment_id,
+                plan_path, sha256_file(path), repository_root=root,
+            )
 
 
 def test_holdout_attestation_rejects_self_reported_positive_metrics(

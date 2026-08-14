@@ -13,7 +13,7 @@ HOLDOUT_METHOD_VERSION = "frozen-candidate-holdout-v4"
 FROZEN_FORWARD_SCHEMA_VERSION = 1
 FROZEN_FORWARD_METHOD_VERSION = "frozen-forward-v2"
 INTERVAL_SUITE_FORWARD_SCHEMA_VERSION = 1
-INTERVAL_SUITE_FORWARD_METHOD_VERSION = "interval-suite-frozen-forward-v1"
+INTERVAL_SUITE_FORWARD_METHOD_VERSION = "interval-suite-frozen-forward-v2"
 
 
 @dataclass(frozen=True)
