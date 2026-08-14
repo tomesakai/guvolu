@@ -1131,6 +1131,14 @@ def walk_forward_validate(
             latest_target=candidate_targets[item.deployment_candidate.candidate_id][
                 resolved_decision_index
             ],
+            deployment_oos_metrics=candidate_oos_metrics[
+                item.deployment_candidate.candidate_id
+            ],
+            deployment_oos_returns=tuple(
+                candidate_returns[item.deployment_candidate.candidate_id][index]
+                for index in range(1, len(bars))
+                if common_oos_mask[index]
+            ),
             metrics=item.metrics,
             adjusted_sharpe=item.adjusted_sharpe,
             fdr_q=q_value,

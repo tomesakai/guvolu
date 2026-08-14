@@ -68,7 +68,7 @@ from guvolu.strategy.generation import (
 )
 
 PIPELINE_SCHEMA_VERSION = 1
-PIPELINE_METHOD_VERSION = "strategy-research-pipeline-v9"
+PIPELINE_METHOD_VERSION = "strategy-research-pipeline-v10"
 POSITION_CONTRACT_METHOD_VERSION = "risk-weighted-family-target-v1"
 SECONDS_PER_YEAR = 365.0 * 24.0 * 60.0 * 60.0
 _INTERVAL_SECONDS = {
@@ -367,6 +367,8 @@ def _family_payload(validation: ValidationResult) -> list[Mapping[str, object]]:
         "deployment_parameters": dict(item.deployment_candidate.parameters),
         "walk_forward_selection_path": list(item.fold_selected_candidate_ids),
         "latest_unallocated_target": item.latest_target,
+        "validation_metrics": metrics_payload(item.metrics),
+        "deployment_oos_metrics": metrics_payload(item.deployment_oos_metrics),
         "metrics": metrics_payload(item.metrics),
         "adjusted_sharpe": item.adjusted_sharpe,
         "fdr_q": item.fdr_q,

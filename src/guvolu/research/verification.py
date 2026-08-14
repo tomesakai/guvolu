@@ -136,6 +136,7 @@ def _verify_data_governance(root: Path, summary: Mapping[str, object]) -> None:
     if summary.get("pipeline_method_version") not in (
         "strategy-research-pipeline-v8",
         "strategy-research-pipeline-v9",
+        "strategy-research-pipeline-v10",
     ):
         return
     governance = _object(summary.get("data_governance"), "data_governance")

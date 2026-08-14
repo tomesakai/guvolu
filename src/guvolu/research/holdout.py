@@ -133,8 +133,11 @@ def load_frozen_candidates(
     source_manifest: Mapping[str, object],
 ) -> tuple[tuple[CandidateSpec, ...], Path]:
     """从已发布组合运行冻结 paper eligible 部署候选。"""
-    if source_summary.get("pipeline_method_version") != "strategy-research-pipeline-v9":
-        raise ValueError("holdout 只接受带表达式身份的 v9 来源运行")
+    if source_summary.get("pipeline_method_version") not in {
+        "strategy-research-pipeline-v9",
+        "strategy-research-pipeline-v10",
+    }:
+        raise ValueError("holdout 只接受带表达式身份的 v9/v10 来源运行")
     for field in ("run_id", "research_identity", "config_hash"):
         if source_summary.get(field) != source_manifest.get(field):
             raise ValueError(f"source summary 与 manifest 的 {field} 不一致")

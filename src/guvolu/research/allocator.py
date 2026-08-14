@@ -147,8 +147,8 @@ def allocate(
         return flat_allocation(state.regime, family_names)
     keys = tuple(sorted(eligible))
     expected = {
-        key: max(eligible[key].metrics.annual_return, 0.0)
-        * eligible[key].metrics.capacity_score
+        key: max(eligible[key].deployment_oos_metrics.annual_return, 0.0)
+        * eligible[key].deployment_oos_metrics.capacity_score
         for key in keys
     }
     annualization = statistics.fmean(
@@ -156,14 +156,14 @@ def allocate(
     )
     covariance = {
         (left, right): _covariance(
-            eligible[left].oos_returns,
-            eligible[right].oos_returns,
+            eligible[left].deployment_oos_returns,
+            eligible[right].deployment_oos_returns,
         ) * annualization
         for left in keys for right in keys
     }
     uncertainty = {
-        key: eligible[key].metrics.annual_volatility
-        / math.sqrt(max(eligible[key].metrics.bars, 1))
+        key: eligible[key].deployment_oos_metrics.annual_volatility
+        / math.sqrt(max(eligible[key].deployment_oos_metrics.bars, 1))
         for key in keys
     }
     weights = {key: max(previous.get(key, 0.0), 0.0) for key in keys}

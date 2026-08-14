@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -382,6 +383,8 @@ def test_quality_failure_forces_zero_allocation(tmp_path: Path) -> None:
         mode="paper",
         deployment_candidate=candidate,
         latest_target=0.5,
+        deployment_oos_metrics=_metrics(),
+        deployment_oos_returns=(0.01, 0.02),
         metrics=_metrics(),
         adjusted_sharpe=0.5,
         fdr_q=0.1,
@@ -429,6 +432,8 @@ def test_true_quality_respects_family_caps() -> None:
         mode="paper",
         deployment_candidate=candidate,
         latest_target=0.5,
+        deployment_oos_metrics=_metrics(),
+        deployment_oos_returns=(0.01, 0.02, 0.01),
         metrics=_metrics(),
         adjusted_sharpe=0.5,
         fdr_q=0.1,
@@ -443,6 +448,36 @@ def test_true_quality_respects_family_caps() -> None:
     assert result.reserve >= 0.15
 
 
+def test_allocator_uses_fixed_deployment_oos_evidence() -> None:
+    """组合器不得用逐折冠军路径替代固定部署候选的收益证据。"""
+    quality = QualityVector(True, True, True, True, True, True, ())
+    candidate = CandidateSpec("candidate", "trend", "paper", {}, 1)
+    family = FamilyEvaluation(
+        family="trend",
+        mode="paper",
+        deployment_candidate=candidate,
+        latest_target=1.0,
+        deployment_oos_metrics=replace(
+            _metrics(),
+            annual_return=-0.1,
+            annual_volatility=0.0,
+        ),
+        deployment_oos_returns=(0.0, 0.0, 0.0),
+        metrics=replace(_metrics(), annual_return=1.0),
+        adjusted_sharpe=0.5,
+        fdr_q=0.1,
+        eligible=True,
+        rejection_reasons=(),
+        oos_returns=(0.1, 0.1, 0.1),
+    )
+    state = MarketState(
+        1.0, 0.2, 0.0, 0.0, None, None, None, 0.0, "positive_trend", 0.0,
+    )
+    config = json.loads(Path("config/strategy_research.json").read_text())["allocation"]
+    result = allocate((family,), state, quality, config)
+    assert result.weights["trend"] == 0.0
+
+
 def test_directional_families_share_one_cap() -> None:
     """量价趋势不得绕过趋势与突破共享的方向风险上限。"""
     quality = QualityVector(True, True, True, True, True, True, ())
@@ -451,6 +486,8 @@ def test_directional_families_share_one_cap() -> None:
         mode="paper",
         deployment_candidate=CandidateSpec("candidate-" + family, family, "paper", {}, 1),
         latest_target=1.0,
+        deployment_oos_metrics=_metrics(),
+        deployment_oos_returns=(0.01, 0.02, 0.01),
         metrics=_metrics(),
         adjusted_sharpe=0.5,
         fdr_q=0.1,
@@ -489,6 +526,8 @@ def test_position_contract_combines_family_direction_and_risk_weight() -> None:
         mode="paper",
         deployment_candidate=CandidateSpec("candidate", "trend", "paper", {}, 1),
         latest_target=-0.5,
+        deployment_oos_metrics=_metrics(),
+        deployment_oos_returns=(0.01,),
         metrics=_metrics(),
         adjusted_sharpe=0.5,
         fdr_q=0.1,

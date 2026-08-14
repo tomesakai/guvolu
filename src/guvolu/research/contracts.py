@@ -121,6 +121,8 @@ class FamilyEvaluation:
     mode: str
     deployment_candidate: CandidateSpec
     latest_target: float
+    deployment_oos_metrics: PerformanceMetrics
+    deployment_oos_returns: tuple[float, ...]
     metrics: PerformanceMetrics
     adjusted_sharpe: float
     fdr_q: float
