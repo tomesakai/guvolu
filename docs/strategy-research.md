@@ -544,18 +544,17 @@ producer 用时 286 秒，独立 verifier 用时 271 秒并重建核对全部 12
 `decision_grade=true`，eligible 家族仍为突破、量价趋势和趋势；当前目标因
 `feature_snapshot_stale` 保持全零与百分之百储备。
 
-2026-08-15 的 `strategy-readiness-v3` 复核显示：发布面板决策时点为
-`2026-08-15T00:00:00+09:00`，尾部连续覆盖为 31/169 根、尚差 138 根；持续无断流时最早在
-`2026-08-20T18:00:00+09:00` 成熟。活动 head 在复核期间继续前移到
-`2026-08-15T01:05:46.441000+09:00`，所以同时保留 `active_input_head_changed`，成熟后必须基于
-新 head 重跑。该运行与现有五条单流派 run 属于同一数据 vintage，不进入 monitor 历史，也不
-产生新的调参提案。8 月 20 日是 operational 特征成熟点，不是跨运行演进成熟点；monitor 要求
-相邻冻结 vintage 至少间隔 2,160 根小时柱。以当前单流派决策时点计，持续采集时最早约在
-`2026-11-06T06:00:00+09:00` 才可能形成第二条可比较历史，且仍需实际来源复核。
-当前发布研究来自 `71f0dfcafe4d4e23f764bd7bfbc183b2f3acf43a`，而验证器和结构搜索已推进到
-`22fa2724bb1130633a210c40eaaef32dc02faa16`，因此 readiness 还明确保留
-`source_code_tree_mismatch`。即使尾部特征成熟，也必须先基于当前 clean tree 和新活动 head
-重跑五流派组合研究，不能把旧运行直接解释为 operational snapshot。
+2026-08-15 的最新 `strategy-readiness-v3` 来源为 clean 提交
+`6a6a4a80b8d11405713f7a33ca2d9d439af7563f` 的运行
+`research-run-ecd55d083ff1d706b77cc24a047d3f99300befb3d262b03733eab92dc314b514`，manifest 为
+`d8a6c64fc0b21ffd0a2f37bf8bf4a7615bbde77d01ebe1e149b41fd075a411eb`。发布面板决策时点为
+`2026-08-15T04:00:00+09:00`，尾部连续覆盖为 35/169 根、尚差 134 根；持续无断流时最早在
+`2026-08-20T18:00:00+09:00` 成熟。活动 head 与发布 head 一致，配置和代码树也完全匹配，
+所以 operational 只剩 `latest_panel_feature_not_mature` 与 `feature_snapshot_stale`；promotion
+只剩 `sealed_holdout_vintage_incomplete`。该运行与现有五条单流派 run 属于同一数据 vintage，
+不进入 monitor 历史，也不产生新的调参提案。8 月 20 日是 operational 特征成熟点，不是跨运行
+演进成熟点；monitor 要求相邻冻结 vintage 至少间隔 2,160 根小时柱。以当前单流派决策时点计，
+持续采集时最早约在 `2026-11-06T06:00:00+09:00` 才可能形成第二条可比较历史，且仍需实际来源复核。
 
 生成器 v4 进一步把五个流派的规范 AST 编译为带完整执行类型、候选参数列、每流派预算和
 子节点优先顺序的公共 DAG SearchPlan。提交 `71f0dfcafe4d4e23f764bd7bfbc183b2f3acf43a`
@@ -690,7 +689,9 @@ CPU 阶段应先于 GPU 完成以下收敛：
    趋势 1h、量价趋势 1h 权重约为 0.35/0.10/0.08/0.06，gross 0.60、reserve 0.40。突破 1h
    最新目标为零，故当前 aggregate research target 约 0.246。该结果仍是 `research_only`；
    suite readiness、冻结前向和 sealed holdout 未完成前，operational target 固定禁用。成员 manifest
-   绑定快照身份与 manifest 散列；快照复用会重新散列控制库和全部硬链接制品。
+   绑定快照身份与 manifest 散列；快照复用会重新散列控制库和全部硬链接制品。v2 套件制品为
+   `interval-suite-evidence-e772fd5152fd304227a6174e22b4b25c629f4d717c3349d4d756dbbbca3b6274`，
+   缓存复跑 SHA-256 逐字节相同。
 3. 现有门禁已包括非正态 Probabilistic Sharpe、studentized 循环折块 bootstrap、折块
    CSCV/PBO、Deflated Sharpe 和单轴最近参数邻域稳定性。DSR 同时发布全量候选原始试验数与
    基于折级得分相关矩阵参与率的有效试验数。DSR 的试验域是实际参与该流派冠军选择的候选；
