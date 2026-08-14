@@ -122,6 +122,9 @@ paper 分配遵守以下长期边界：趋势、量价确认趋势和突破合�
 .\.venv\Scripts\python.exe scripts\propose_strategy_evolution.py --monitor <monitor.json>
 ```
 
+监视入口会自动发现组合运行目录及对应单流派目录中的全部 canonical 历史；
+`--prior-summary` 只能追加项目内来源，不能通过省略参数隐藏已经发布的历史。
+
 两条命令的 `--output` 都表示输出目录；制品文件名由内容散列生成，不能把
 `--output` 直接指定成 `.json` 文件。
 每个输出目录的 `latest.json` 是唯一活动指针；历史内容寻址文件仅供审计，不得通过 glob 选择
@@ -142,6 +145,9 @@ paper 分配遵守以下长期边界：趋势、量价确认趋势和突破合�
 资金权重、风险余量、配置和代码树。区间内每根新决策柱只允许按该计划追加一个内容寻址预测；
 预测必须在配置的 3,900 秒窗口内产生，同一时点不能改写，质量或代码身份失败时目标必须为零。
 该路径不运行候选选择、验证指标或演进监视器，也不登记为 `DEV_ADAPTIVE`。
+`frozen-forward-v2` 还把逐次冻结面板的项目内路径、SHA-256、字节数、活动 head、attempt、
+artifact 和 normalization 身份写入预测；登记及期末复核都会重新加载该面板，并按冻结公式现场
+重算特征、六维质量、各候选目标和组合贡献，不能接受调用方自报目标。
 
 封存、冻结计划、逐柱预测与开始消费的登记时间全部取自进程当前 UTC 壁钟，公共 Python API
 不接受调用方时间覆盖；治理层还会拒绝区间开始后的封存/计划、决策前或过期预测，以及区间
@@ -152,6 +158,9 @@ paper 分配遵守以下长期边界：趋势、量价确认趋势和突破合�
 打开市场标签。生产配置要求评价当时记录的逐候选目标，禁止在看到完整 vintage 后重新生成目标；
 预测覆盖不足也会烧毁 vintage，而不能补算后重试。候选必须来自 clean commit 的多流派组合运行，
 候选集、源码、配置、输入 head 和结果散列全部绑定。结论只能登记一次且不能改写：
+`frozen-candidate-holdout-v4` 的终态登记会从受保护的来源 manifest、summary、candidate registry、
+面板、评分日程、配置及冻结前向目标重算成本后指标、FDR、通过流派与 verdict，终态 JSON 仅是待
+核对声明，不能作为自身证明。
 
 ```powershell
 # 示例时间必须是尚未开始的未来区间；不可对既有历史事后封存。
@@ -183,6 +192,19 @@ paper 分配遵守以下长期边界：趋势、量价确认趋势和突破合�
 高版本治理写入全部拒绝。暴露登记仍先原子检查 sealed vintage，不能用兼容模式读取或登记与
 holdout 重叠的数据。旧冻结 reader 会忽略这个附加键并继续登记及时预测。移除写入上限和升级
 schema 必须等冻结区间结束，并作为显式部署动作完成，不能由监视器、验证器或演进脚本触发。
+当前已经启用的 2026-08-21 至 2026-11-29 窗口继续使用封存时的 v1 reader 与 clean main 代码；
+本分支的 v2/v4 合同只用于后续计划和期末验证，不追溯重写活动计划或已登记预测。
+
+隔离的后继研究注册表可由维护者在核对旧版本和旧上限后显式迁移。命令必须提供一个不存在的
+备份路径；迁移先使用 SQLite backup API 生成一致性副本，再在单个写事务内创建新表、迁移旧
+终态并同时提高 `schema_version` 与写入上限。它不得指向上述仍由旧 reader 使用的执行注册表：
+
+```powershell
+python scripts\upgrade_research_governance.py `
+  --registry data\research\governance.sqlite3 `
+  --backup data\research\governance-v2-before-v5.sqlite3.bak `
+  --expected-version 2 --expected-write-ceiling 2
+```
 
 当前 2019 年以来的数据已进入 adaptive 开发历史，不能倒签为 holdout。评估路径与冻结前向
 路径已经可用，但现有策略仍没有 G-08 通过结论；必须先产生与当前代码树一致的新组合运行，
@@ -202,7 +224,9 @@ schema 必须等冻结区间结束，并作为显式部署动作完成，不能�
 ```
 
 readiness 命令不创建、不消费 vintage，也不登记自适应研究暴露。它只读取已验证 manifest、
-活动 head、冻结面板和治理注册表。2026-08-14 的当前结果为：研究来源与 clean tree 完全匹配；
+活动 head、冻结面板和治理注册表。v3 要求来源、当前与请求配置的三个散列一致，配置不匹配与
+代码树不匹配一样会阻止 operational readiness。2026-08-14 的当前结果为：研究来源与 clean
+tree 完全匹配；
 最长特征需要 169 根连续观测柱，最新结构性断点后只有 11 根，尚差 158 根。如果之后每根
 小时柱均正常到达，最早成熟时点约为 2026-08-20 18:00（项目时区）；这只是条件估算，新的
 超限断点会重新计数。治理库已经在 `2026-08-13T20:12:07Z` 封存
@@ -247,6 +271,9 @@ vintage，防止失败重跑窥视，但注册表会保留最后成功阶段，�
 至少间隔一个 `walk_forward.step_bars`。有 Git commit 时另记 Git hash 和 dirty digest；仓库
 没有首个 commit 时仍可复现文件内容，但 `decision_grade=false`，目标不得进入决策级使用
 （D-09）。
+`research-code-identity-v2` 的树身份覆盖 `src/`、`scripts/`、`tests/` 下的 Python、PowerShell、
+Rust、CUDA 和 C/C++ 执行源码，以及存在的 Cargo、Python 与 uv 构建合同；未来 GPU 内核和本机
+任务包装器因此不能脱离研究身份变化。
 
 ## 7. 当前策略生成方式
 
@@ -368,7 +395,7 @@ vintage。单 vintage 的候选轴诊断再次指向突破和趋势的 264 小�
 entry 方向触及配置边界；均值回归要求修订假设或成本模型；网格要求先完善被动成交模型。
 264 小时 challenger 已在同一面板的上一轮隔离试验中输给 168 小时冠军；v3 提案器自动扫描
 内容寻址历史后，以 `duplicate_axis_value_proposal` 同时拒绝两个重复提案，因此本轮不重复运行
-相同 challenger，也不把提案当成新时间证据或 promotion。只有未来时间分离的 v11 vintage
+相同 challenger，也不把提案当成新时间证据或 promotion。只有未来时间分离的 v12 vintage
 才能推动 improving、stable 或 decaying，并决定是否重新开启该轴。
 
 隔离开发分支的 `family-direction-monitor-v6` 进一步要求在监视时实际复核 trial ledger 散列，
@@ -392,8 +419,32 @@ entry 方向触及配置边界；均值回归要求修订假设或成本模型�
 面板，或当前仍缺少新的时间分离历史，就返回 `duplicate_axis_value_proposal`。未来真正形成
 stable、improving 或 decaying 的新 vintage 仍可重新提出同值 challenger，不会被永久封死。
 历史提案读取限制为 1 MiB，并把无效或过深 JSON 作为单文件排除，避免损坏制品中断整条演进管线。
-v6 对相同研究身份和相同数据 vintage 先按配置、代码树、summary 与 manifest 内容散列选择
+v7 在 v6 的内容去重和时间间隔合同上增加 canonical 历史自动发现；相同研究身份和相同数据
+vintage 先按配置、代码树、summary 与 manifest 内容散列选择
 唯一代表，再按时间排序和间隔过滤；因此颠倒 CLI 历史路径顺序不会改变监视方向或消费的证据。
+
+`pipeline-v12` 已完成 `holdout-v4` 所需的研究来源合同。面板建立前会捕获完整活动 head 收据，
+登记每个 partition 对应的 materialization output、artifact SHA、行数与事件区间；冻结预测和
+holdout 也分别把同一类收据与消费者身份原子绑定。配置及完整父谱系按原始字节复制为内容寻址
+快照，并与记录的 clean Git commit blob 逐字节比对。复核器会从受保护 panel、配置与公式重建
+候选、walk-forward 选择路径、准入、部署候选、研究权重、目标合同、trial ledger 和成本回放，
+而不是信任 summary 自报字段。冻结区间期末通过一个已登记 prediction row-set hash 批量绑定
+全部及时预测；深度 panel/收据校验在每次登记时完成，holdout 不再为每个决策柱重复扫描多年输入。
+
+开发分支的真实 v12 组合运行
+`research-run-4492a7236542bd319d86d15b02532c8ee840357c316350e4c7a8981a3e6f6f21`
+发布 12 类制品，manifest SHA-256 为
+`95170d88f16b1fa4bba5e3d32e9ee68024b1d9244440cad1925c5f58358a9a22`；完整重建复核通过。
+把 summary 的突破资金权重单独改为 `0.99` 并同步更新文件与 manifest 散列后，复核器仍在
+`v12 research_position` 重建比较处拒绝该制品。该运行发生在未提交开发树，故
+`decision_grade=false` 且 operational 权重按硬门禁归零；它证明证据闭环，不是 promotion 结论。
+G-08 仍必须由开始前冻结、完整及时预测并一次性消费的未来 vintage 给出，不能由 v12 回测替代。
+
+已经启动的 2026-08-21 至 2026-11-29 冻结窗口固定在主树的 v1 plan/v3 holdout 兼容合同上，
+继续由原执行器完成，研究分支不得改写。该窗口可作为 legacy 前向证据，但缺少 v2/v4 所需的
+完整 panel 输入收据，不能事后改名为最强 G-08 证据。promotion 级终局需要在其后另封存一个
+不重叠的 v2/v4 vintage。此区分避免一边宽松接纳旧研究来源、一边又无法复验旧前向证据的
+不对称兼容路径。
 
 ## 8. 被动网格与 L2 shadow
 
@@ -500,6 +551,10 @@ E2/E3 截面后端。SearchFast 可用 float32 和近似排序，但最终候选
 CPU reference 在登记容差内复算。遗传搜索、NSGA-II 或 MAP-Elites 只在 typed DSL 上运行，
 fitness 同时惩罚成本、换手、容量、复杂度、相关冗余和跨时期不稳定；所有失败候选仍计入
 试验台账。GPU worker 独立进程、只读挂载上游制品、永不持有 `TRADE` 密钥（G-01、T-13）。
+对固定 shape、重复执行的候选批次和 bootstrap 批次，可在 E0/E1 基准证明 CPU launch overhead
+占主导后再捕获 [CUDA Graph](https://docs.nvidia.com/cuda/cuda-programming-guide/04-special-topics/cuda-graphs.html)，
+把依赖图实例化一次并重复提交；动态 AST 生成、数据质量判断和制品写入仍留在图外。CUDA Graph
+只减少重复 kernel 的提交开销，不应被当成 GPU-bound 大 kernel 或全管线的普遍加速手段。
 
 2026-08-14 已在 RTX 5070 12 GB（compute capability 12.0）、驱动 580.88、PyTorch 2.11.0
 cu128 的隔离环境运行首个 `typed-searchfast-threshold-grid-v1` 微基准。4,096 个阈值候选乘
