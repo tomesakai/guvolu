@@ -21,6 +21,7 @@ from guvolu.research.contracts import (
     AllocationResult,
     FamilyEvaluation,
     FrozenPanelInputs,
+    FrozenPanelPartition,
     PanelSnapshot,
     PerformanceMetrics,
     QualityVector,
@@ -42,6 +43,7 @@ from guvolu.research.governance import (
 )
 from guvolu.research.evolution import monitor_family_run
 from guvolu.research.panel import (
+    _panel_path_groups,
     attest_trade_input_receipt,
     capture_trade_input_receipt,
     compact_trade_panel,
@@ -200,6 +202,89 @@ def test_compact_panel_enforces_pit_and_integer_projection(tmp_path: Path) -> No
     assert row == (100, 10, 10_000_000_000)
 
 
+def test_compact_panel_deduplicates_only_overlapping_partition_groups(
+    tmp_path: Path,
+) -> None:
+    """不相交分区独立聚合，同小时片段合并且重叠组仍全局去重。"""
+    columns = (
+        "observation_id VARCHAR,event_time TIMESTAMPTZ,"
+        "available_time TIMESTAMPTZ,ingest_time TIMESTAMPTZ,"
+        "side VARCHAR,source_side_basis VARCHAR,price VARCHAR,size VARCHAR,"
+        "source_artifact_id VARCHAR,source_row_index BIGINT,market_id VARCHAR"
+    )
+
+    def write_source(name: str, rows: list[tuple[object, ...]]) -> Path:
+        path = tmp_path / f"{name}.parquet"
+        database = duckdb.connect()
+        try:
+            database.execute(f"CREATE TABLE source({columns})")
+            database.executemany(
+                "INSERT INTO source VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows,
+            )
+            escaped = str(path.resolve()).replace("'", "''")
+            database.execute(f"COPY source TO '{escaped}' (FORMAT PARQUET)")
+        finally:
+            database.close()
+        return path
+
+    first = write_source("first", [
+        ("a", _time(0, 10), _time(0, 10), _time(0, 11),
+         "buy", "taker", "100", "1", "x", 0, "m"),
+    ])
+    second = write_source("second", [
+        ("b", _time(0, 20), _time(0, 20), _time(0, 21),
+         "buy", "taker", "110", "1", "y", 0, "m"),
+    ])
+    overlap = write_source("overlap", [
+        ("b", _time(0, 20), _time(0, 20), _time(0, 22),
+         "buy", "taker", "110", "1", "z", 0, "m"),
+        ("c", _time(0, 30), _time(0, 30), _time(0, 31),
+         "sell", "taker", "120", "2", "z", 1, "m"),
+    ])
+    inputs = FrozenPanelInputs(
+        market={
+            "market_id": "m", "mapping_revision": 0,
+            "tick_size": "1", "size_step": "0.1",
+        },
+        paths=(first, second, overlap),
+        head_generation="sha256-" + "2" * 64,
+        attempt_ids=("a", "b", "c"),
+        artifact_ids=("a", "b", "c"),
+        normalization_versions=("v1",),
+        maximum_event_time=_time(1),
+        partitions=(
+            FrozenPanelPartition(first, 1, _time(0, 10), _time(0, 10)),
+            FrozenPanelPartition(second, 1, _time(0, 20), _time(0, 20)),
+            FrozenPanelPartition(overlap, 2, _time(0, 20), _time(0, 30)),
+        ),
+    )
+    assert _panel_path_groups(inputs, _time(0), _time(1)) == (
+        (first.resolve(),), (second.resolve(), overlap.resolve()),
+    )
+    panel, _digest = compact_trade_panel(
+        inputs, tmp_path / "output-grouped", "1hour",
+        _time(0), _time(1), 100_000_000,
+    )
+    bars = load_panel_bars(panel)
+    assert len(bars) == 1
+    assert bars[0].open == 100.0
+    assert bars[0].close == 120.0
+    assert bars[0].base_volume == 4.0
+    assert bars[0].trade_count == 3
+    check = duckdb.connect()
+    try:
+        schema = {
+            str(row[0]): str(row[1])
+            for row in check.execute(
+                "DESCRIBE SELECT * FROM read_parquet(?)", (str(panel),),
+            ).fetchall()
+        }
+    finally:
+        check.close()
+    assert schema["quote_volume"] == "DECIMAL(38,24)"
+    assert schema["trade_count"] == "BIGINT"
+
+
 def test_registered_trade_inputs_rebuilds_control_plane_identity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -289,6 +374,10 @@ def test_registered_trade_inputs_rebuilds_control_plane_identity(
     assert rebuilt.attempt_ids == (attempt_id,)
     assert rebuilt.normalization_versions == ("trade-test-v1",)
     assert rebuilt.maximum_event_time == _time(1)
+    assert len(rebuilt.partitions) == 1
+    assert rebuilt.partitions[0] == FrozenPanelPartition(
+        source.resolve(), 1, _time(0), _time(1),
+    )
     assert rebuilt.head_generation.startswith("sha256-")
 
     captured = capture_trade_input_receipt(
@@ -302,6 +391,7 @@ def test_registered_trade_inputs_rebuilds_control_plane_identity(
         data_root, captured.receipt_path, require_current_head=True,
     )
     assert attested.head_generation == captured.head_generation
+    assert attested.partitions == rebuilt.partitions
     receipt_payload = json.loads(
         captured.receipt_path.read_text(encoding="utf-8")
     )

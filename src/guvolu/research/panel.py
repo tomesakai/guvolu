@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import tempfile
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -15,7 +16,11 @@ import duckdb
 
 from guvolu.data.store import connect_readonly
 from guvolu.data.durable_io import atomic_write_text
-from guvolu.research.contracts import FrozenPanelInputs, PanelSnapshot
+from guvolu.research.contracts import (
+    FrozenPanelInputs,
+    FrozenPanelPartition,
+    PanelSnapshot,
+)
 from guvolu.research.provenance import sha256_file
 from guvolu.strategy.contracts import ResearchBar
 from guvolu.ui.query_catalog import QueryCatalog
@@ -23,6 +28,8 @@ from guvolu.ui.query_catalog import QueryCatalog
 PANEL_SCHEMA_VERSION = 1
 PANEL_METHOD_VERSION = "trade-bars-pit-v1"
 TRADE_INPUT_RECEIPT_METHOD_VERSION = "active-trade-head-receipt-v1"
+PANEL_DUCKDB_MEMORY_LIMIT = "4GB"
+PANEL_DUCKDB_THREADS = 2
 _INTERVAL_SQL = {
     "5min": "5 minutes",
     "15min": "15 minutes",
@@ -80,6 +87,15 @@ def _freeze_trade_snapshot(
             row.normalization_version for row in outputs
         })),
         maximum_event_time=max(maximum_event_times),
+        partitions=tuple(
+            FrozenPanelPartition(
+                path=row.path,
+                row_count=row.row_count,
+                min_event_time=row.min_event_time,
+                max_event_time=row.max_event_time,
+            )
+            for row in outputs
+        ),
     )
     return inputs, outputs
 
@@ -247,6 +263,7 @@ def attest_trade_input_receipt(
         for row in output_rows
     }
     recorded_paths: list[Path] = []
+    recorded_partitions: list[FrozenPanelPartition] = []
     root = data_root.resolve()
     recorded_attempts: set[str] = set()
     recorded_artifacts: set[str] = set()
@@ -295,6 +312,18 @@ def attest_trade_input_receipt(
         ):
             raise ValueError(f"活动成交输入收据散列不匹配: {index}")
         recorded_paths.append(path)
+        recorded_partitions.append(FrozenPanelPartition(
+            path=path,
+            row_count=int(output["row_count"]),
+            min_event_time=(
+                None if output["min_event_time"] is None
+                else parse_time(output["min_event_time"], "min_event_time")
+            ),
+            max_event_time=(
+                None if output["max_event_time"] is None
+                else parse_time(output["max_event_time"], "max_event_time")
+            ),
+        ))
         recorded_attempts.add(identity_key[0])
         recorded_artifacts.add(identity_key[1])
         recorded_normalizations.add(str(entry.get("normalization_version") or ""))
@@ -329,6 +358,7 @@ def attest_trade_input_receipt(
         artifact_ids=artifact_ids,
         normalization_versions=normalizations,
         maximum_event_time=maximum_event_time,
+        partitions=tuple(recorded_partitions),
     )
     if require_current_head:
         current, current_outputs = _freeze_trade_snapshot(data_root, market_id)
@@ -401,6 +431,7 @@ def registered_trade_inputs(
         raise ValueError("panel 输入 artifact_ids 不能由控制面完整重建")
     root = data_root.resolve()
     paths: list[Path] = []
+    partitions: list[FrozenPanelPartition] = []
     heads: set[tuple[str, str, str, str]] = set()
     maximum_event_times: list[datetime] = []
     registered_attempts: set[str] = set()
@@ -438,6 +469,18 @@ def registered_trade_inputs(
             normalization,
         ))
         paths.append(path)
+        partitions.append(FrozenPanelPartition(
+            path=path,
+            row_count=int(row["row_count"]),
+            min_event_time=(
+                None if row["min_event_time"] is None
+                else parse_time(row["min_event_time"], "min_event_time")
+            ),
+            max_event_time=(
+                None if row["max_event_time"] is None
+                else parse_time(row["max_event_time"], "max_event_time")
+            ),
+        ))
     generation_body = json.dumps(
         sorted(heads), separators=(",", ":"), ensure_ascii=False,
     )
@@ -467,15 +510,14 @@ def registered_trade_inputs(
         artifact_ids=expected,
         normalization_versions=tuple(sorted(registered_normalizations)),
         maximum_event_time=max(maximum_event_times),
+        partitions=tuple(partitions),
     )
-def _panel_query(
+def _panel_contract(
     inputs: FrozenPanelInputs,
     interval: str,
-    from_time: datetime,
-    to_time: datetime,
     notional_scale: int,
-) -> tuple[str, tuple[object, ...]]:
-    """构造紧凑面板查询及参数。"""
+) -> tuple[str, str, str, int]:
+    """验证面板市场合同并返回 SQL 所需标量。"""
     interval_sql = _INTERVAL_SQL.get(interval)
     if interval_sql is None:
         raise ValueError(f"不支持的研究柱周期: {interval}")
@@ -489,8 +531,71 @@ def _panel_query(
         raise ValueError("tick 与 lot 必须为正数")
     if notional_scale <= 0:
         raise ValueError("名义金额缩放必须为正数")
-    files = _path_list(inputs.paths)
-    query = f"""
+    return market_id, str(tick_size), str(size_step), mapping_revision
+
+
+def _panel_path_groups(
+    inputs: FrozenPanelInputs,
+    from_time: datetime,
+    to_time: datetime,
+) -> tuple[tuple[Path, ...], ...]:
+    """把事件覆盖相交的文件归组，使去重内存只随最大重叠组增长。"""
+    if not inputs.partitions:
+        return (inputs.paths,)
+    partition_paths = tuple(item.path.resolve() for item in inputs.partitions)
+    input_paths = tuple(path.resolve() for path in inputs.paths)
+    if (
+        len(set(partition_paths)) != len(partition_paths)
+        or set(partition_paths) != set(input_paths)
+    ):
+        raise ValueError("冻结输入的文件覆盖与控制面分区不一致")
+    low = _utc(from_time)
+    high = _utc(to_time)
+    ranges: list[tuple[datetime, datetime, Path]] = []
+    for partition in inputs.partitions:
+        if partition.row_count < 0:
+            raise ValueError("冻结输入分区行数不能为负")
+        if partition.row_count == 0:
+            if (
+                partition.min_event_time is not None
+                or partition.max_event_time is not None
+            ):
+                raise ValueError("空冻结输入分区不得声明事件覆盖")
+            continue
+        if (
+            partition.min_event_time is None
+            or partition.max_event_time is None
+        ):
+            raise ValueError("非空冻结输入分区缺少事件覆盖")
+        minimum = _utc(partition.min_event_time)
+        maximum = _utc(partition.max_event_time)
+        if minimum > maximum:
+            raise ValueError("冻结输入分区事件覆盖倒置")
+        if maximum < low or minimum >= high:
+            continue
+        ranges.append((minimum, maximum, partition.path.resolve()))
+    ranges.sort(key=lambda item: (item[0], item[1], item[2].as_posix()))
+    groups: list[list[Path]] = []
+    group_maximum: datetime | None = None
+    for minimum, maximum, path in ranges:
+        if group_maximum is None or minimum > group_maximum:
+            groups.append([path])
+            group_maximum = maximum
+        else:
+            groups[-1].append(path)
+            group_maximum = max(group_maximum, maximum)
+    if not groups:
+        raise ValueError("冻结输入在研究窗口内没有事件覆盖")
+    return tuple(tuple(group) for group in groups)
+
+
+def _bar_fragment_query(
+    paths: tuple[Path, ...],
+    interval_sql: str,
+) -> str:
+    """生成一个事件覆盖重叠组的局部去重小时片段。"""
+    files = _path_list(paths)
+    return f"""
         WITH source AS (
           SELECT observation_id,event_time,available_time,side,
                  source_side_basis,price,size,
@@ -513,26 +618,62 @@ def _panel_query(
           WHERE price_decimal>0 AND size_decimal>0
             AND available_time<=bucket_start+INTERVAL '{interval_sql}'
             AND bucket_start+INTERVAL '{interval_sql}'<=?
-        ), bars AS (
+        )
+        SELECT bucket_start,MAX(available_time) AS latest_available_time,
+               FIRST(event_time ORDER BY event_time,observation_id)
+                 AS open_event_time,
+               FIRST(observation_id ORDER BY event_time,observation_id)
+                 AS open_observation_id,
+               FIRST(price_decimal ORDER BY event_time,observation_id)
+                 AS open_price,
+               MAX(price_decimal) AS high_price,
+               MIN(price_decimal) AS low_price,
+               LAST(event_time ORDER BY event_time,observation_id)
+                 AS close_event_time,
+               LAST(observation_id ORDER BY event_time,observation_id)
+                 AS close_observation_id,
+               LAST(price_decimal ORDER BY event_time,observation_id)
+                 AS close_price,
+               SUM(size_decimal) AS base_volume,
+               SUM(price_decimal*size_decimal) AS quote_volume,
+               SUM(CASE
+                     WHEN source_side_basis LIKE 'taker%' AND side='buy'
+                       THEN size_decimal
+                     WHEN source_side_basis LIKE 'taker%' AND side='sell'
+                       THEN -size_decimal
+                     ELSE 0
+                   END) AS signed_base_volume,
+               COUNT(*) AS trade_count
+        FROM eligible GROUP BY bucket_start
+    """
+
+
+def _panel_output_query(
+    market_id: str,
+    interval: str,
+    interval_sql: str,
+    tick_size: str,
+    size_step: str,
+    mapping_revision: int,
+    notional_scale: int,
+) -> tuple[str, tuple[object, ...]]:
+    """把局部片段确定性归并为最终面板。"""
+    query = f"""
+        WITH bars AS (
           SELECT bucket_start,
                  bucket_start+INTERVAL '{interval_sql}' AS decision_time,
-                 MAX(available_time) AS latest_available_time,
-                 FIRST(price_decimal ORDER BY event_time,observation_id) AS open_price,
-                 MAX(price_decimal) AS high_price,
-                 MIN(price_decimal) AS low_price,
-                 LAST(price_decimal ORDER BY event_time,observation_id) AS close_price,
-                 SUM(size_decimal) AS base_volume,
-                 SUM(price_decimal*size_decimal) AS quote_volume,
-                 SUM(CASE
-                       WHEN source_side_basis LIKE 'taker%' AND side='buy'
-                         THEN size_decimal
-                       WHEN source_side_basis LIKE 'taker%' AND side='sell'
-                         THEN -size_decimal
-                       ELSE 0
-                     END)
-                   AS signed_base_volume,
-                 COUNT(*) AS trade_count
-          FROM eligible GROUP BY bucket_start
+                 MAX(latest_available_time) AS latest_available_time,
+                 FIRST(open_price ORDER BY open_event_time,open_observation_id)
+                   AS open_price,
+                 MAX(high_price) AS high_price,
+                 MIN(low_price) AS low_price,
+                 LAST(close_price ORDER BY close_event_time,close_observation_id)
+                   AS close_price,
+                 SUM(base_volume) AS base_volume,
+                 SUM(quote_volume) AS quote_volume,
+                 SUM(signed_base_volume) AS signed_base_volume,
+                 CAST(SUM(trade_count) AS BIGINT) AS trade_count
+          FROM bar_fragments GROUP BY bucket_start
         )
         SELECT ? AS market_id,? AS bar_interval,bucket_start AS open_time,
                decision_time,latest_available_time,
@@ -558,11 +699,6 @@ def _panel_query(
         FROM bars ORDER BY bucket_start
     """
     parameters: tuple[object, ...] = (
-        market_id,
-        _utc(from_time),
-        _utc(to_time),
-        _utc(to_time),
-        _utc(to_time),
         market_id,
         interval,
         str(tick_size),
@@ -594,24 +730,72 @@ def compact_trade_panel(
     temporary = output_directory / f".research-panel.{os.getpid()}.tmp.parquet"
     if temporary.exists():
         temporary.unlink()
-    query, parameters = _panel_query(
-        inputs,
+    market_id, tick_size, size_step, mapping_revision = _panel_contract(
+        inputs, interval, notional_scale,
+    )
+    interval_sql = _INTERVAL_SQL[interval]
+    groups = _panel_path_groups(inputs, from_time, to_time)
+    query, parameters = _panel_output_query(
+        market_id,
         interval,
-        from_time,
-        to_time,
+        interval_sql,
+        tick_size,
+        size_step,
+        mapping_revision,
         notional_scale,
     )
     try:
-        db: Any = duckdb.connect()
-        try:
-            db.execute("SET TimeZone='UTC'")
-            copy = (
-                "COPY (" + query + ") TO '" + _quote(str(temporary.resolve()))
-                + "' (FORMAT PARQUET,COMPRESSION ZSTD,ROW_GROUP_SIZE 122880)"
-            )
-            db.execute(copy, parameters)
-        finally:
-            db.close()
+        with tempfile.TemporaryDirectory(
+            prefix=".duckdb-panel-spill.", dir=output_directory,
+        ) as spill_directory:
+            db: Any = duckdb.connect(config={
+                "memory_limit": PANEL_DUCKDB_MEMORY_LIMIT,
+                "preserve_insertion_order": False,
+                "temp_directory": spill_directory,
+                "threads": PANEL_DUCKDB_THREADS,
+            })
+            try:
+                db.execute("SET TimeZone='UTC'")
+                db.execute("""
+                    CREATE TEMP TABLE bar_fragments(
+                      bucket_start TIMESTAMPTZ,
+                      latest_available_time TIMESTAMPTZ,
+                      open_event_time TIMESTAMPTZ,
+                      open_observation_id VARCHAR,
+                      open_price DECIMAL(38,12),
+                      high_price DECIMAL(38,12),
+                      low_price DECIMAL(38,12),
+                      close_event_time TIMESTAMPTZ,
+                      close_observation_id VARCHAR,
+                      close_price DECIMAL(38,12),
+                      base_volume DECIMAL(38,12),
+                      quote_volume DECIMAL(38,24),
+                      signed_base_volume DECIMAL(38,12),
+                      trade_count BIGINT
+                    )
+                """)
+                fragment_parameters: tuple[object, ...] = (
+                    market_id,
+                    _utc(from_time),
+                    _utc(to_time),
+                    _utc(to_time),
+                    _utc(to_time),
+                )
+                for paths in groups:
+                    db.execute(
+                        "INSERT INTO bar_fragments "
+                        + _bar_fragment_query(paths, interval_sql),
+                        fragment_parameters,
+                    )
+                copy = (
+                    "COPY (" + query + ") TO '"
+                    + _quote(str(temporary.resolve()))
+                    + "' (FORMAT PARQUET,COMPRESSION ZSTD,"
+                    "ROW_GROUP_SIZE 122880)"
+                )
+                db.execute(copy, parameters)
+            finally:
+                db.close()
     except BaseException:
         if temporary.exists():
             temporary.unlink()

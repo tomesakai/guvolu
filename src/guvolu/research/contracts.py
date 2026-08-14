@@ -27,6 +27,16 @@ class CodeIdentity:
 
 
 @dataclass(frozen=True)
+class FrozenPanelPartition:
+    """一个冻结输入文件及其控制面事件覆盖。"""
+
+    path: Path
+    row_count: int
+    min_event_time: datetime | None
+    max_event_time: datetime | None
+
+
+@dataclass(frozen=True)
 class FrozenPanelInputs:
     """活动 head 冻结后的研究输入。"""
 
@@ -37,6 +47,7 @@ class FrozenPanelInputs:
     artifact_ids: tuple[str, ...]
     normalization_versions: tuple[str, ...]
     maximum_event_time: datetime
+    partitions: tuple[FrozenPanelPartition, ...] = ()
     receipt_path: Path | None = None
     receipt_sha256: str | None = None
 
