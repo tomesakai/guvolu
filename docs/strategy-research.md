@@ -148,17 +148,46 @@ paper 分配遵守以下长期边界：趋势、量价确认趋势和突破合�
   --config config\strategy_research.json `
   --config config\strategy_research_4hour.json `
   --manifest <one-hour-manifest> --manifest <four-hour-manifest> `
-  --output reports\strategy-research\interval-suite-evidence.json
+  --output reports\strategy-research\interval-suite-evidence-v4.json
 .\.venv\Scripts\python.exe scripts\check_strategy_interval_suite_readiness.py `
   --config config\strategy_research.json `
   --config config\strategy_research_4hour.json `
-  --manifest <one-hour-manifest> --manifest <four-hour-manifest>
+  --manifest <one-hour-manifest> --manifest <four-hour-manifest> `
+  --output-directory reports\strategy-research\interval-suite-readiness `
+  --suite-registry <isolated-successor-registry>
 ```
 
-套件 readiness 会重新构造 v3 evidence，要求全部成员来自同一个 clean Git commit、同一快照和
+套件 readiness 会重新构造 v4 evidence，要求全部成员来自同一个 clean Git commit、同一快照和
 同一活动 head，再只聚合被 suite 准入成员的 operational/promotion 状态。未准入节拍不会阻塞
-当前执行候选；promotion 继续显式阻塞在 `suite_frozen_forward_plan_not_registered`，因为单成员
-冻结计划不能证明跨节拍权重与共同决策时点。该检查只读，不登记计划、不消费 vintage。
+当前执行候选。每次结果按 `suite_readiness_id` 内容寻址落盘；身份绑定成员当前 Git/tree、活动
+head、成熟柱数、vintage 与全部 blocker 事实，而不是只绑定 blocker 名称。
+套件 holdout 的数据完成度不能从冻结研究快照的最大事件时点推断；逐栅格预测尚未实现时该字段
+保持未知并 fail-closed。后续只能由套件预测收据与受保护 live head 证明覆盖，不能靠重跑研究跨入
+已经开始的 vintage。
+
+单成员冻结计划不能证明跨节拍权重与共同决策时点。治理 schema v6 因此增加独立的 suite
+forward plan；首次部署须先备份并显式把 v5 写入上限升级到 v6，再在 vintage 开始前冻结：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\upgrade_research_governance.py `
+  --registry <isolated-successor-registry> `
+  --backup <isolated-successor-v5-backup> `
+  --expected-version 5 --expected-write-ceiling 5
+.\.venv\Scripts\python.exe scripts\manage_interval_suite_forward.py `
+  <new-future-vintage-id> --config config\strategy_research.json `
+  --config config\strategy_research_4hour.json `
+  --manifest <one-hour-manifest> --manifest <four-hour-manifest> `
+  --evidence reports\strategy-research\interval-suite-evidence-v4.json `
+  --registry <isolated-successor-registry>
+```
+
+登记会重新构造 evidence，并冻结准入 sleeve、部署候选完整公式/参数、固定权重、reserve、共同最粗
+决策栅格、来源 commit 和计划创建代码树。同 vintage 的套件计划只能有一个且不可改写。readiness
+只接受治理库登记且现场散列、候选注册表、持久化 evidence 与重建结果全部一致的计划；不登记计划、
+不消费 vintage。套件逐栅格预测的代码、计划与调度合同必须在 vintage 开始前就绪；预测收据在
+区间内逐栅格追加，期末 suite holdout 只能在区间完整结束后消费并验证，不能以单成员预测替代。
+这里的 successor 必须是与当前旧 reader 执行库物理隔离的后继副本，并使用新创建的未来 vintage；
+不得把仍服务 2026-08-21 至 2026-11-29 单成员冻结任务的 main 执行库原地升级或追溯绑定。
 
 独立生成候选、运行一个流派、监视方向并生成下一代预登记提案：
 
@@ -217,7 +246,7 @@ UTC 壁钟，公共 Python API 不接受调用方时间覆盖；治理层还会�
 ```powershell
 # 示例时间必须是尚未开始的未来区间；不可对既有历史事后封存。
 .\.venv\Scripts\python.exe scripts\manage_holdout_vintage.py seal `
-  mkt__gmo__btc__r0 2026-10-01T00:00:00Z 2027-01-01T00:00:00Z
+  mkt__gmo__btc__r0 2026-12-01T00:00:00Z 2027-03-01T00:00:00Z
 
 # 区间开始前冻结计划。source summary 必须来自同一 clean code tree。
 .\.venv\Scripts\python.exe scripts\manage_frozen_forward.py plan <vintage_id> `
@@ -253,8 +282,8 @@ schema 必须等冻结区间结束，并作为显式部署动作完成，不能�
 
 ```powershell
 python scripts\upgrade_research_governance.py `
-  --registry data\research\governance.sqlite3 `
-  --backup data\research\governance-v2-before-v5.sqlite3.bak `
+  --registry <isolated-successor-registry> `
+  --backup <isolated-successor-backup> `
   --expected-version 2 --expected-write-ceiling 2
 ```
 
@@ -699,12 +728,12 @@ CPU 阶段应先于 GPU 完成以下收敛：
    最新目标为零，故当前 aggregate research target 约 0.246。该结果仍是 `research_only`；
    suite readiness、冻结前向和 sealed holdout 未完成前，operational target 固定禁用。成员 manifest
    绑定快照身份与 manifest 散列；快照复用会重新散列控制库和全部硬链接制品。加入同 clean commit
-   门后的 v3 套件制品为
-   `interval-suite-evidence-45b32294766b31ab9675ccf5203f17e3bbca3f87f23851689864b2c511be75c1`。
-   首次套件 readiness 为
-   `interval-suite-readiness-17a258a2bf20875c018f4120e906126e7785255aa904787b89799e3f0b6bb008`：
-   research ready，operational 因两成员未成熟及来源代码落后而拒绝，promotion 因成员 holdout 与
-   suite frozen-forward 缺失而拒绝。成熟窗口到达后应在同一最终 clean commit 重跑两个成员，
+   门后的 v4 evidence 和 v2 readiness 均支持按内容身份落盘；完成最终 clean commit 后由上述命令
+   生成 `reports/strategy-research/interval-suite-evidence-v4.json` 与
+   `reports/strategy-research/interval-suite-readiness/`。现有 v2 evidence 证明 research ready，
+   operational 因两成员未成熟
+   及来源代码落后而拒绝，promotion 因成员 holdout 与套件逐栅格冻结前向尚未闭合而拒绝。
+   成熟窗口到达后应在同一最终 clean commit 重跑两个成员，
    不能把当前历史 evidence 直接升级为执行目标。
 3. 现有门禁已包括非正态 Probabilistic Sharpe、studentized 循环折块 bootstrap、折块
    CSCV/PBO、Deflated Sharpe 和单轴最近参数邻域稳定性。DSR 同时发布全量候选原始试验数与
@@ -869,8 +898,11 @@ flowchart TB
     quality -- "通过" --> paper["paper target artifact<br/>冻结多流派部署候选"]
     paper --> sourceVerify["来源 manifest / config / code / AST<br/>完整散列复核"]
     sourceVerify --> sealed["未来 vintage 预先封存<br/>不得与 adaptive exposure 重叠"]
-    sealed --> frozenPlan["开始前冻结计划<br/>候选 / 公式 / 参数 / 资金权重"]
-    frozenPlan --> forward["区间内逐柱冻结前向预测<br/>及时追加 / 不可改写 / 不反馈演进"]
+    sealed --> frozenPlan["单成员冻结计划<br/>候选 / 公式 / 参数 / 资金权重"]
+    sealed --> suitePlan["v6 套件冻结计划<br/>sleeve / 候选 / 固定权重 / 共同栅格"]
+    frozenPlan --> forward["单成员逐柱冻结预测<br/>及时追加 / 不可改写"]
+    suitePlan --> suiteForward["套件逐栅格冻结预测<br/>待闭合，不得由单成员替代"]
+    suiteForward --> verifyForward
     forward --> verifyForward["期末复核预测覆盖与散列<br/>禁止事后重算目标"]
     verifyForward --> consume["原子 consumed<br/>崩溃也禁止重跑"]
     consume --> holdout["Holdout ValidationExact<br/>评价已记录目标 / 固定政策"]
