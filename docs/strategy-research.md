@@ -115,6 +115,14 @@ paper 分配遵守以下长期边界：趋势、量价确认趋势和突破合�
 
 两条命令的 `--output` 都表示输出目录；制品文件名由内容散列生成，不能把
 `--output` 直接指定成 `.json` 文件。
+每个输出目录的 `latest.json` 是唯一活动指针；历史内容寻址文件仅供审计，不得通过 glob 选择
+“最后一个”或混用旧版提案。
+提案入口只接受名为 `family-monitor-sha256-<实际文件 SHA-256>.json` 的项目内制品；
+它不会接受调用方直接传入的内存方向对象，并会从受保护的 summary、trial ledger 与父配置重算
+提案实际消费的当前流派行动和参数方向。提案（包括拒绝提案）均记录 monitor 的项目内路径、实际
+文件散列、来源 summary、trial ledger、父配置和证据范围。`insufficient_history` 时仍可把当前
+冻结 vintage 内的候选轴关联登记成单轴 adaptive challenger，但不得称为跨时期 improving、stable
+或 decaying，也不得自动替换基准配置。
 
 派生配置是新制品，不覆盖基准配置。使用派生配置再次运行时仍属于开发回放；只有明确登记的
 一次性封存段才允许形成最终 promotion 证据（G-08）。
@@ -281,10 +289,16 @@ summary 后，五个流派均没有可计入的时间历史：每个流派排除
 两个没有早于当前策略决策时点的累计面板。当前数据只能支持参数轴诊断，不能支持跨时期
 稳定、改善或衰减结论，因此跨运行状态保持 `insufficient_history`。
 
-隔离开发分支的 `family-direction-monitor-v3` 进一步要求在监视时实际复核 trial ledger 散列，
-并把 summary 与 ledger 的项目内路径写入监视制品；生成下一代提案前还会完整复核来源 manifest，
-同时证明 monitor、summary、ledger 与父配置散列一致。该增强只收紧证据链，不改变上述历史不足
-结论，也不进入已经冻结的前向执行器代码树。
+隔离开发分支的 `family-direction-monitor-v4` 进一步要求在监视时实际复核 trial ledger 散列，
+并把 summary 与 ledger 的项目内路径写入监视制品；`family-evolution-proposal-v2` 只读取文件名与
+实际内容 SHA-256 一致的监视制品，生成下一代提案前还会完整复核来源 manifest，并从来源事实重算
+实际消费的行动与参数方向，同时证明 monitor、summary、ledger 与父配置散列一致。拒绝提案也保留
+同一证据链。跨运行比较另绑定市场、流派试验范围、配置谱系根和全部验证方法版本；不同 cohort
+写入 `incomparable_cohort`，不参与 improving/stable/decaying。派生配置必须保存项目内父配置路径、
+父文件真实 SHA、谱系根和深度；研究运行与下一代提案都会递归验证整条父链，不能自行声明谱系根。
+验证还会从父配置和 source monitor 现场重建允许的单轴变换，并要求完整子配置逐字段相等；结构上
+自洽但包含额外手工改动的配置会被拒绝。该增强只收紧证据链，不改变上述
+历史不足结论，也不进入已经冻结的前向执行器代码树。
 
 ## 8. 被动网格与 L2 shadow
 

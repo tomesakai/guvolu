@@ -1,9 +1,9 @@
 """策略研究管线的 PIT、成本与门禁测试。"""
 from __future__ import annotations
 
+import hashlib
 import json
 import math
-import hashlib
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -20,6 +20,7 @@ from guvolu.research.contracts import (
     PerformanceMetrics,
     QualityVector,
 )
+from guvolu.research.config_lineage import verify_config_lineage
 from guvolu.research.features import MarketState, classify_market_state, compute_features
 from guvolu.research.evolution import monitor_family_run
 from guvolu.research.panel import compact_trade_panel, load_panel_bars
@@ -37,7 +38,10 @@ from guvolu.research.validation import (
     strategy_returns,
 )
 from guvolu.research.verification import verify_research_run
-from guvolu.research.tuning import propose_family_evolution
+from guvolu.research.tuning import (
+    propose_family_evolution,
+    verify_evolution_config,
+)
 from guvolu.strategy.baselines import build_candidates, generate_targets
 from guvolu.strategy.contracts import CandidateSpec, FeatureRow, ResearchBar
 from guvolu.strategy.generation import build_family_batches
@@ -612,7 +616,7 @@ def test_family_monitor_reports_parameter_search_direction(
         "c" * 64,
         (first_prior, second_prior),
     )
-    assert deduplicated["monitor_method_version"] == "family-direction-monitor-v3"
+    assert deduplicated["monitor_method_version"] == "family-direction-monitor-v4"
     assert len(deduplicated["history"]) == 0
     assert {
         item["reason"] for item in deduplicated["excluded_history"]
@@ -647,12 +651,33 @@ def test_family_monitor_reports_parameter_search_direction(
     assert time_separated["excluded_history"] == []
     assert time_separated["cross_run_direction"] == "improving"
 
+    other_market = json.loads(json.dumps(older_prior))
+    other_market["run_id"] = "other-market"
+    other_market["research_identity"] = "other-market-research"
+    other_market["market_id"] = "market-two"
+    other_market["panel"]["sha256"] = "s" * 64
+    other_market_path = tmp_path / "other-market.json"
+    other_market_path.write_text(json.dumps(other_market), encoding="utf-8")
+    cohort_filtered = monitor_family_run(
+        tmp_path,
+        summary,
+        "trend",
+        config,
+        "c" * 64,
+        (other_market_path,),
+    )
+    assert cohort_filtered["history"] == []
+    assert cohort_filtered["excluded_history"][0]["reason"] == "incomparable_cohort"
+    assert cohort_filtered["excluded_history"][0]["source_summary_sha256"]
+    assert cohort_filtered["excluded_history"][0]["source_manifest_sha256"] == "m" * 64
+
     ledger.write_text(ledger.read_text(encoding="utf-8") + "{}\n", encoding="utf-8")
     with pytest.raises(ValueError, match="trial ledger 散列"):
         monitor_family_run(tmp_path, summary, "trend", config, "c" * 64)
 
 
 def test_evolution_proposal_updates_strategy_and_feature_dependencies(
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """扩展回看轴时必须同步共享特征并遵守候选预算。"""
@@ -661,30 +686,246 @@ def test_evolution_proposal_updates_strategy_and_feature_dependencies(
         lambda *_args: None,
     )
     config = json.loads(Path("config/strategy_research.json").read_text())
+    config_content = canonical_json(config) + "\n"
+    config_path = tmp_path / "strategy_research.json"
+    config_path.write_bytes(config_content.encode("utf-8"))
+    parent_hash = hashlib.sha256(config_path.read_bytes()).hexdigest()
     monitor = {
         "family": "trend",
         "run_id": "run",
-        "monitor_method_version": "family-direction-monitor-v3",
+        "monitor_method_version": "family-direction-monitor-v4",
         "source": {
             "summary_sha256": "a" * 64,
             "trial_ledger_sha256": "b" * 64,
-            "config_hash": "c" * 64,
+            "config_hash": parent_hash,
         },
         "evolution_action": "eligible_axis_refinement",
+        "cross_run_direction": "insufficient_history",
+        "history_policy": {"comparison_cohort_id": "cohort"},
         "parameter_directions": [{
             "parameter": "lookback",
             "direction": "explore_higher_after_preregistration",
             "association": 0.8,
         }],
     }
+    monitor_content = canonical_json(monitor) + "\n"
+    monitor_hash = hashlib.sha256(monitor_content.encode("utf-8")).hexdigest()
+    monitor_path = tmp_path / f"family-monitor-sha256-{monitor_hash}.json"
+    monitor_path.write_bytes(monitor_content.encode("utf-8"))
     proposal, proposed = propose_family_evolution(
-        Path.cwd(), config, monitor, "c" * 64,
+        tmp_path, config_path, monitor_path,
     )
     assert proposal["status"] == "proposed"
     assert proposed is not None
     assert 264 in proposed["strategies"]["trend"]["lookbacks"]
     assert 264 in proposed["features"]["lookbacks"]
     assert len(build_family_batches(proposed, ("trend",))[0].candidates) == 8
+    assert proposal["source_monitor_sha256"] == hashlib.sha256(
+        monitor_path.read_bytes(),
+    ).hexdigest()
+    assert proposal["source_monitor_path"] == monitor_path.name
+    assert proposed["evolution_parent"]["source_monitor_sha256"] == monitor_hash
+    assert proposed["evolution_parent"]["parent_config_path"] == config_path.name
+    assert proposed["evolution_parent"]["lineage_depth"] == 1
+    assert proposed["evolution_parent"]["lineage_root_config_hash"] == parent_hash
+    derived_path = tmp_path / "derived.json"
+    derived_path.write_bytes((canonical_json(proposed) + "\n").encode("utf-8"))
+    assert verify_config_lineage(tmp_path, derived_path) == (parent_hash, 1)
+    verify_evolution_config(tmp_path, derived_path, proposed)
+    arbitrary_child = json.loads(derived_path.read_text(encoding="utf-8"))
+    arbitrary_child["strategies"]["trend"]["maximum_target"] = 0.25
+    arbitrary_path = tmp_path / "arbitrary-child.json"
+    arbitrary_path.write_bytes(
+        (canonical_json(arbitrary_child) + "\n").encode("utf-8"),
+    )
+    assert verify_config_lineage(tmp_path, arbitrary_path) == (parent_hash, 1)
+    with pytest.raises(ValueError, match="允许的单轴变换"):
+        verify_evolution_config(tmp_path, arbitrary_path, arbitrary_child)
+    type_changed = json.loads(derived_path.read_text(encoding="utf-8"))
+    type_changed["strategies"]["trend"]["lookbacks"][0] = 24.0
+    type_changed_path = tmp_path / "type-changed-child.json"
+    type_changed_path.write_bytes(
+        (canonical_json(type_changed) + "\n").encode("utf-8"),
+    )
+    assert verify_config_lineage(tmp_path, type_changed_path) == (parent_hash, 1)
+    with pytest.raises(ValueError, match="允许的单轴变换"):
+        verify_evolution_config(tmp_path, type_changed_path, type_changed)
+    boolean_changed = json.loads(derived_path.read_text(encoding="utf-8"))
+    boolean_changed["schema_version"] = True
+    boolean_path = tmp_path / "boolean-child.json"
+    boolean_path.write_bytes(
+        (canonical_json(boolean_changed) + "\n").encode("utf-8"),
+    )
+    with pytest.raises(ValueError, match="允许的单轴变换"):
+        verify_evolution_config(tmp_path, boolean_path, boolean_changed)
+    non_finite_path = tmp_path / "non-finite.json"
+    non_finite_path.write_text('{"maximum_target":NaN}', encoding="utf-8")
+    with pytest.raises(ValueError, match="非有限数值"):
+        verify_config_lineage(tmp_path, non_finite_path)
+    forged_lineage = json.loads(derived_path.read_text(encoding="utf-8"))
+    forged_lineage["evolution_parent"]["lineage_root_config_hash"] = "f" * 64
+    derived_path.write_bytes(
+        (canonical_json(forged_lineage) + "\n").encode("utf-8"),
+    )
+    with pytest.raises(ValueError, match="谱系根散列"):
+        verify_config_lineage(tmp_path, derived_path)
 
+    changed_config = json.loads(config_content)
+    changed_config["strategies"]["trend"]["lookbacks"] = [24, 72]
+    config_path.write_bytes((canonical_json(changed_config) + "\n").encode("utf-8"))
     with pytest.raises(ValueError, match="来源配置"):
-        propose_family_evolution(Path.cwd(), config, monitor, "d" * 64)
+        propose_family_evolution(tmp_path, config_path, monitor_path)
+    config_path.write_bytes(config_content.encode("utf-8"))
+
+    rejected_monitor = json.loads(monitor_content)
+    rejected_monitor["evolution_action"] = "revise_hypothesis_or_cost_model"
+    rejected_content = canonical_json(rejected_monitor) + "\n"
+    rejected_hash = hashlib.sha256(rejected_content.encode("utf-8")).hexdigest()
+    rejected_path = tmp_path / f"family-monitor-sha256-{rejected_hash}.json"
+    rejected_path.write_bytes(rejected_content.encode("utf-8"))
+    rejected, rejected_config = propose_family_evolution(
+        tmp_path, config_path, rejected_path,
+    )
+    assert rejected_config is None
+    assert rejected["status"] == "no_parameter_proposal"
+    assert rejected["reason"] == "revise_hypothesis_or_cost_model"
+    assert rejected["source_monitor_sha256"] == rejected_hash
+    assert rejected["source_summary_sha256"] == "a" * 64
+    assert rejected["source_trial_ledger_sha256"] == "b" * 64
+
+    tampered = json.loads(monitor_path.read_text(encoding="utf-8"))
+    tampered["parameter_directions"][0]["direction"] = (
+        "explore_lower_after_preregistration"
+    )
+    monitor_path.write_bytes((canonical_json(tampered) + "\n").encode("utf-8"))
+    with pytest.raises(ValueError, match="文件名与实际制品散列"):
+        propose_family_evolution(tmp_path, config_path, monitor_path)
+
+
+def test_monitor_source_verification_recomputes_consumed_direction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """自洽命名的伪造方向也必须被来源事实重算拒绝。"""
+    summary = tmp_path / "summary.json"
+    ledger = tmp_path / "ledger.jsonl"
+    summary.write_text("{}", encoding="utf-8")
+    ledger.write_text("{}\n", encoding="utf-8")
+    monitor = {
+        "family": "trend",
+        "run_id": "run",
+        "research_identity": "research",
+        "source": {
+            "summary_path": "summary.json",
+            "summary_sha256": hashlib.sha256(summary.read_bytes()).hexdigest(),
+            "trial_ledger_path": "ledger.jsonl",
+            "trial_ledger_sha256": hashlib.sha256(ledger.read_bytes()).hexdigest(),
+            "config_hash": "c" * 64,
+        },
+    }
+    protected_summary = {
+        "run_id": "run",
+        "research_identity": "research",
+        "config_hash": "c" * 64,
+        "artifacts": {
+            "trial_ledger": {
+                "path": "ledger.jsonl",
+                "sha256": monitor["source"]["trial_ledger_sha256"],
+            },
+        },
+    }
+    monkeypatch.setattr(
+        "guvolu.research.tuning.verify_research_run", lambda *_args: None,
+    )
+    monkeypatch.setattr(
+        "guvolu.research.tuning.json.loads", lambda *_args, **_kwargs: protected_summary,
+    )
+    recomputed = {
+        **monitor,
+        "evolution_action": "eligible_axis_refinement",
+        "parameter_directions": [{
+            "parameter": "lookback",
+            "direction": "explore_higher_after_preregistration",
+        }],
+    }
+    monkeypatch.setattr(
+        "guvolu.research.tuning.monitor_family_run",
+        lambda *_args: recomputed,
+    )
+    forged = {
+        **monitor,
+        "evolution_action": "eligible_axis_refinement",
+        "parameter_directions": [{
+            "parameter": "lookback",
+            "direction": "explore_lower_after_preregistration",
+        }],
+    }
+    from guvolu.research.tuning import verify_monitor_sources
+
+    with pytest.raises(ValueError, match="parameter_directions"):
+        verify_monitor_sources(tmp_path, {}, forged, "c" * 64)
+
+
+def test_config_lineage_rejects_invalid_and_excessive_chains(
+    tmp_path: Path,
+) -> None:
+    """配置父链须验证路径、SHA、深度、多级递归和最大长度。"""
+    base = tmp_path / "base.json"
+    base.write_bytes(b'{"schema_version":1}\n')
+    root_hash = hashlib.sha256(base.read_bytes()).hexdigest()
+
+    def write_child(
+        path: Path,
+        parent: Path,
+        parent_hash: str,
+        depth: int,
+    ) -> None:
+        path.write_bytes((canonical_json({
+            "schema_version": 1,
+            "evolution_parent": {
+                "parent_config_path": parent.relative_to(tmp_path).as_posix(),
+                "parent_config_hash": parent_hash,
+                "lineage_root_config_hash": root_hash,
+                "lineage_depth": depth,
+            },
+        }) + "\n").encode("utf-8"))
+
+    first = tmp_path / "first.json"
+    write_child(first, base, root_hash, 1)
+    first_hash = hashlib.sha256(first.read_bytes()).hexdigest()
+    second = tmp_path / "second.json"
+    write_child(second, first, first_hash, 2)
+    assert verify_config_lineage(tmp_path, second) == (root_hash, 2)
+
+    bad_hash = tmp_path / "bad-hash.json"
+    write_child(bad_hash, base, "0" * 64, 1)
+    with pytest.raises(ValueError, match="父配置实际散列"):
+        verify_config_lineage(tmp_path, bad_hash)
+    bad_depth = tmp_path / "bad-depth.json"
+    write_child(bad_depth, base, root_hash, 2)
+    with pytest.raises(ValueError, match="谱系深度"):
+        verify_config_lineage(tmp_path, bad_depth)
+    outside = tmp_path.parent / "outside-lineage.json"
+    outside.write_bytes(b'{"schema_version":1}\n')
+    outside_hash = hashlib.sha256(outside.read_bytes()).hexdigest()
+    outside_child = tmp_path / "outside-child.json"
+    outside_child.write_bytes((canonical_json({
+        "evolution_parent": {
+            "parent_config_path": "../outside-lineage.json",
+            "parent_config_hash": outside_hash,
+            "lineage_root_config_hash": outside_hash,
+            "lineage_depth": 1,
+        },
+    }) + "\n").encode("utf-8"))
+    with pytest.raises(ValueError, match="父配置路径越出"):
+        verify_config_lineage(tmp_path, outside_child)
+
+    parent = base
+    parent_hash = root_hash
+    for depth in range(1, 33):
+        child = tmp_path / f"deep-{depth:02d}.json"
+        write_child(child, parent, parent_hash, depth)
+        parent = child
+        parent_hash = hashlib.sha256(child.read_bytes()).hexdigest()
+    with pytest.raises(ValueError, match="最大深度"):
+        verify_config_lineage(tmp_path, parent)

@@ -5,7 +5,9 @@ import json
 from collections.abc import Mapping
 from pathlib import Path
 
-from guvolu.research.provenance import canonical_json, sha256_file, sha256_text
+from guvolu.research.config_lineage import load_verified_config_lineage
+from guvolu.research.evolution import monitor_family_run
+from guvolu.research.provenance import canonical_json, sha256_file
 from guvolu.research.verification import verify_research_run
 from guvolu.strategy.generation import build_family_batches
 
@@ -41,12 +43,89 @@ def _source_path(root: Path, value: object, name: str) -> Path:
     return path
 
 
+def _load_monitor_artifact(
+    repository_root: Path,
+    monitor_path: Path,
+) -> tuple[Mapping[str, object], str, str]:
+    """读取并绑定一个内容寻址的监视器文件。"""
+    root = repository_root.resolve()
+    path = monitor_path.resolve()
+    try:
+        relative = path.relative_to(root).as_posix()
+    except ValueError as error:
+        raise ValueError("monitor 制品必须位于项目目录内") from error
+    monitor_hash = sha256_file(path)
+    expected_name = f"family-monitor-sha256-{monitor_hash}.json"
+    if path.name != expected_name:
+        raise ValueError("monitor 文件名与实际制品散列不一致")
+    monitor = _object(
+        json.loads(path.read_text(encoding="utf-8")), "monitor",
+    )
+    return monitor, relative, monitor_hash
+
+
+def _load_config_artifact(
+    repository_root: Path,
+    config_path: Path,
+) -> tuple[Mapping[str, object], str, str, int, str]:
+    """从项目内文件读取父配置并计算其唯一散列。"""
+    root = repository_root.resolve()
+    path = config_path.resolve()
+    try:
+        path.relative_to(root)
+    except ValueError as error:
+        raise ValueError("父配置必须位于项目目录内") from error
+    config, config_hash, lineage_root_hash, lineage_depth = (
+        load_verified_config_lineage(root, path)
+    )
+    return (
+        config,
+        config_hash,
+        lineage_root_hash,
+        lineage_depth,
+        path.relative_to(root).as_posix(),
+    )
+
+
+def verify_evolution_config(
+    repository_root: Path,
+    config_path: Path,
+    config: Mapping[str, object],
+) -> None:
+    """从父配置和监视制品重建并精确核对派生配置。"""
+    raw_parent = config.get("evolution_parent")
+    if raw_parent is None:
+        return
+    root = repository_root.resolve()
+    parent = _object(raw_parent, "evolution_parent")
+    parent_path = _source_path(
+        root,
+        parent.get("parent_config_path"),
+        "evolution_parent.parent_config_path",
+    )
+    monitor_path = _source_path(
+        root,
+        parent.get("source_monitor_path"),
+        "evolution_parent.source_monitor_path",
+    )
+    if sha256_file(monitor_path) != parent.get("source_monitor_sha256"):
+        raise ValueError("派生配置 source monitor 散列不匹配")
+    _proposal, rebuilt = propose_family_evolution(
+        root,
+        parent_path,
+        monitor_path,
+    )
+    if rebuilt is None or canonical_json(rebuilt) != canonical_json(config):
+        raise ValueError("派生配置不是父配置与监视证据允许的单轴变换")
+
+
 def verify_monitor_sources(
     repository_root: Path,
+    config: Mapping[str, object],
     monitor: Mapping[str, object],
     parent_config_hash: str,
 ) -> None:
-    """验证监视制品绑定的受保护 summary、ledger 和父配置。"""
+    """验证监视来源并重算提案实际消费的单 vintage 证据。"""
     root = repository_root.resolve()
     source = _object(monitor.get("source"), "monitor.source")
     if source.get("config_hash") != parent_config_hash:
@@ -78,6 +157,40 @@ def verify_monitor_sources(
         raise ValueError("monitor trial ledger 路径与 summary 不一致")
     if ledger.get("sha256") != source.get("trial_ledger_sha256"):
         raise ValueError("monitor trial ledger 身份与 summary 不一致")
+    family = _text(monitor.get("family"), "monitor.family")
+    recomputed = monitor_family_run(
+        root,
+        summary_path,
+        family,
+        config,
+        parent_config_hash,
+    )
+    consumed_fields = (
+        "monitor_method_version",
+        "run_id",
+        "research_identity",
+        "data_vintage_id",
+        "decision_time",
+        "family",
+        "eligible",
+        "rejection_reasons",
+        "adjusted_sharpe",
+        "fdr_q",
+        "latest_unallocated_target",
+        "candidate_count",
+        "best_fixed_candidate_sharpe",
+        "evolution_action",
+        "parameter_directions",
+        "source",
+    )
+    mismatches = [
+        field for field in consumed_fields
+        if monitor.get(field) != recomputed.get(field)
+    ]
+    if mismatches:
+        raise ValueError(
+            "monitor 与来源事实重算不一致: " + ", ".join(mismatches)
+        )
 
 
 def _singular(name: str) -> str:
@@ -103,14 +216,25 @@ def _axis_map(strategy: Mapping[str, object]) -> Mapping[str, str]:
 
 def propose_family_evolution(
     repository_root: Path,
-    config: Mapping[str, object],
-    monitor: Mapping[str, object],
-    parent_config_hash: str,
+    config_path: Path,
+    monitor_path: Path,
 ) -> tuple[Mapping[str, object], Mapping[str, object] | None]:
     """扩展一个预登记数值轴，不直接覆盖基准配置。"""
-    verify_monitor_sources(repository_root, monitor, parent_config_hash)
+    (
+        config,
+        parent_config_hash,
+        lineage_root_config_hash,
+        lineage_depth,
+        parent_config_path,
+    ) = _load_config_artifact(
+        repository_root, config_path,
+    )
+    verify_evolution_config(repository_root, config_path, config)
+    monitor, monitor_relative, monitor_hash = _load_monitor_artifact(
+        repository_root, monitor_path,
+    )
+    verify_monitor_sources(repository_root, config, monitor, parent_config_hash)
     family = str(monitor.get("family"))
-    monitor_hash = sha256_text(canonical_json(monitor))
     source = _object(monitor.get("source"), "monitor.source")
     source_summary_hash = source.get("summary_sha256")
     source_ledger_hash = source.get("trial_ledger_sha256")
@@ -122,15 +246,39 @@ def propose_family_evolution(
         raise ValueError("monitor 缺少合法 source summary hash")
     if not isinstance(source_ledger_hash, str) or len(source_ledger_hash) != 64:
         raise ValueError("monitor 缺少合法 source trial ledger hash")
-    action = monitor.get("evolution_action")
-    if action != "eligible_axis_refinement":
+    evidence = {
+        "proposal_method_version": "family-evolution-proposal-v2",
+        "parent_config_hash": parent_config_hash,
+        "source_run_id": monitor.get("run_id"),
+        "source_monitor_method_version": monitor.get("monitor_method_version"),
+        "source_monitor_path": monitor_relative,
+        "source_monitor_sha256": monitor_hash,
+        "source_summary_sha256": source_summary_hash,
+        "source_trial_ledger_sha256": source_ledger_hash,
+        "source_manifest_sha256": source.get("manifest_sha256"),
+        "source_panel_sha256": source.get("panel_sha256"),
+        "source_code_identity": source.get("code_identity"),
+        "evidence_scope": "single_vintage_candidate_axis",
+        "holdout_consumed": False,
+    }
+
+    def no_proposal(
+        reason: object,
+        **details: object,
+    ) -> tuple[Mapping[str, object], None]:
+        """发布同样受来源约束的拒绝结论。"""
         return ({
             "schema_version": 1,
             "family": family,
             "status": "no_parameter_proposal",
-            "reason": action,
-            "parent_config_hash": parent_config_hash,
+            "reason": reason,
+            **details,
+            **evidence,
         }, None)
+
+    action = monitor.get("evolution_action")
+    if action != "eligible_axis_refinement":
+        return no_proposal(action)
     strategies = _object(config.get("strategies"), "strategies")
     strategy = _object(strategies.get(family), f"strategies.{family}")
     axes = _axis_map(strategy)
@@ -147,13 +295,7 @@ def propose_family_evolution(
         }
     ]
     if not directions:
-        return ({
-            "schema_version": 1,
-            "family": family,
-            "status": "no_parameter_proposal",
-            "reason": "no_boundary_direction",
-            "parent_config_hash": parent_config_hash,
-        }, None)
+        return no_proposal("no_boundary_direction")
     directions.sort(key=lambda item: (-abs(_number(
         item.get("association"), "association",
     )), str(item.get("parameter"))))
@@ -183,15 +325,11 @@ def propose_family_evolution(
     minimum = _number(axis_constraint.get("minimum"), "constraint.minimum")
     maximum = _number(axis_constraint.get("maximum"), "constraint.maximum")
     if proposed_value < minimum or proposed_value > maximum:
-        return ({
-            "schema_version": 1,
-            "family": family,
-            "status": "no_parameter_proposal",
-            "reason": "configured_axis_boundary_reached",
-            "parameter": parameter,
-            "proposed_value": proposed_value,
-            "parent_config_hash": parent_config_hash,
-        }, None)
+        return no_proposal(
+            "configured_axis_boundary_reached",
+            parameter=parameter,
+            proposed_value=proposed_value,
+        )
     proposed = json.loads(json.dumps(config))
     proposed_strategy = proposed["strategies"][family]
     original_items = strategy[config_key]
@@ -209,12 +347,16 @@ def propose_family_evolution(
         ]))
     proposed["evolution_parent"] = {
         "parent_config_hash": parent_config_hash,
+        "parent_config_path": parent_config_path,
+        "lineage_root_config_hash": lineage_root_config_hash,
+        "lineage_depth": lineage_depth + 1,
         "family": family,
         "parameter": parameter,
         "direction": direction,
         "proposed_value": stored_value,
         "source_run_id": monitor.get("run_id"),
         "source_monitor_method_version": monitor.get("monitor_method_version"),
+        "source_monitor_path": monitor_relative,
         "source_monitor_sha256": monitor_hash,
         "source_summary_sha256": source_summary_hash,
         "source_trial_ledger_sha256": source_ledger_hash,
@@ -226,15 +368,11 @@ def propose_family_evolution(
     ))
     candidate_count = len(build_family_batches(proposed, (family,))[0].candidates)
     if candidate_count > maximum_candidates:
-        return ({
-            "schema_version": 1,
-            "family": family,
-            "status": "no_parameter_proposal",
-            "reason": "candidate_budget_exceeded",
-            "candidate_count": candidate_count,
-            "candidate_budget": maximum_candidates,
-            "parent_config_hash": parent_config_hash,
-        }, None)
+        return no_proposal(
+            "candidate_budget_exceeded",
+            candidate_count=candidate_count,
+            candidate_budget=maximum_candidates,
+        )
     proposal = {
         "schema_version": 1,
         "family": family,
@@ -244,11 +382,6 @@ def propose_family_evolution(
         "proposed_value": stored_value,
         "candidate_count": candidate_count,
         "candidate_budget": maximum_candidates,
-        "parent_config_hash": parent_config_hash,
-        "source_run_id": monitor.get("run_id"),
-        "source_monitor_sha256": monitor_hash,
-        "source_summary_sha256": source_summary_hash,
-        "source_trial_ledger_sha256": source_ledger_hash,
-        "holdout_consumed": False,
+        **evidence,
     }
     return proposal, proposed

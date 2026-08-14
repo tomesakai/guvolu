@@ -18,6 +18,17 @@ _INTERVAL_SECONDS = {
     "4hour": 14_400.0,
 }
 
+_COMPARISON_METHOD_FIELDS = (
+    "pipeline_method_version",
+    "generator_method_version",
+    "p_value_method_version",
+    "pbo_method_version",
+    "block_bootstrap_method_version",
+    "deflated_sharpe_method_version",
+    "effective_trial_method_version",
+    "parameter_stability_method_version",
+)
+
 
 def _object(value: object, name: str) -> Mapping[str, object]:
     """验证 JSON 对象。"""
@@ -96,6 +107,9 @@ def _history_entry(
     summary: Mapping[str, object],
     evaluation: Mapping[str, object],
     identity: str,
+    summary_path: Path,
+    root: Path,
+    manifest_sha256: str,
 ) -> Mapping[str, object]:
     """构造可审计的跨运行历史条目。"""
     vintage_id, panel_sha256 = _data_vintage(summary)
@@ -107,11 +121,41 @@ def _history_entry(
         "data_vintage_id": vintage_id,
         "panel_sha256": panel_sha256,
         "config_hash": summary.get("config_hash"),
+        "config_lineage_root_hash": (
+            summary.get("config_lineage_root_hash") or summary.get("config_hash")
+        ),
         "code_tree_digest": code_identity.get("tree_digest"),
+        "comparison_cohort_id": _comparison_cohort_id(summary),
+        "source_summary_path": summary_path.resolve().relative_to(root).as_posix(),
+        "source_summary_sha256": sha256_file(summary_path),
+        "source_manifest_sha256": manifest_sha256,
         "adjusted_sharpe": evaluation.get("adjusted_sharpe"),
         "fdr_q": evaluation.get("fdr_q"),
         "eligible": evaluation.get("eligible"),
     }
+
+
+def _comparison_cohort_payload(
+    summary: Mapping[str, object],
+) -> Mapping[str, object]:
+    """定义可比较的市场、配置谱系、试验范围和指标方法。"""
+    raw_scope = summary.get("family_scope")
+    scope = sorted(str(item) for item in raw_scope) if isinstance(raw_scope, list) else []
+    return {
+        "market_id": summary.get("market_id"),
+        "family_scope": scope,
+        "config_lineage_root_hash": (
+            summary.get("config_lineage_root_hash") or summary.get("config_hash")
+        ),
+        "method_versions": {
+            field: summary.get(field) for field in _COMPARISON_METHOD_FIELDS
+        },
+    }
+
+
+def _comparison_cohort_id(summary: Mapping[str, object]) -> str:
+    """生成跨 vintage 指标可比性的内容身份。"""
+    return stable_identifier("evolution-cohort", _comparison_cohort_payload(summary))
 
 
 def _correlation(left: Sequence[float], right: Sequence[float]) -> float:
@@ -283,6 +327,8 @@ def monitor_family_run(
     )
     current_time = _decision_time(summary)
     current_vintage_id, current_panel_sha256 = _data_vintage(summary)
+    current_cohort_payload = _comparison_cohort_payload(summary)
+    current_cohort_id = _comparison_cohort_id(summary)
     interval = _text(config.get("bar_interval"), "bar_interval")
     interval_seconds = _INTERVAL_SECONDS.get(interval)
     if interval_seconds is None:
@@ -295,13 +341,23 @@ def monitor_family_run(
     history_by_identity: dict[str, Mapping[str, object]] = {}
     excluded_history: list[Mapping[str, object]] = []
     for path in prior_summary_paths:
-        prior, _prior_manifest_sha256 = _verified_summary_source(root, path)
+        prior, prior_manifest_sha256 = _verified_summary_source(root, path)
         identity = _text(
             prior.get("research_identity") or prior.get("run_id"),
             "prior.research_identity",
         )
         prior_evaluation = _family_evaluation(prior, family)
-        entry = _history_entry(prior, prior_evaluation, identity)
+        entry = _history_entry(
+            prior,
+            prior_evaluation,
+            identity,
+            path,
+            root,
+            prior_manifest_sha256,
+        )
+        if entry["comparison_cohort_id"] != current_cohort_id:
+            excluded_history.append({**entry, "reason": "incomparable_cohort"})
+            continue
         if identity == current_identity or identity in history_by_identity:
             excluded_history.append({**entry, "reason": "duplicate_research_identity"})
             continue
@@ -374,7 +430,7 @@ def monitor_family_run(
             direction = "stable"
     return {
         "schema_version": 1,
-        "monitor_method_version": "family-direction-monitor-v3",
+        "monitor_method_version": "family-direction-monitor-v4",
         "run_id": summary.get("run_id"),
         "research_identity": current_identity,
         "data_vintage_id": current_vintage_id,
@@ -393,6 +449,8 @@ def monitor_family_run(
         "excluded_history": excluded_history,
         "history_policy": {
             "method": "reverse_chronological_time_separated_vintages",
+            "comparison_cohort_id": current_cohort_id,
+            "comparison_cohort": current_cohort_payload,
             "minimum_history_runs": minimum_history,
             "minimum_spacing_bars": minimum_spacing_bars,
             "minimum_spacing_seconds": minimum_spacing_seconds,

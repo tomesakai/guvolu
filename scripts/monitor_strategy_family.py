@@ -73,6 +73,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         output = root / output
     path = output / f"family-monitor-sha256-{digest}.json"
     atomic_write_text(path, content)
+    atomic_write_text(output / "latest.json", canonical_json({
+        "schema_version": 1,
+        "family": arguments.family,
+        "monitor_method_version": payload["monitor_method_version"],
+        "monitor": path.name,
+        "monitor_sha256": digest,
+        "cross_run_direction": payload["cross_run_direction"],
+    }) + "\n")
     print(canonical_json({
         "path": path.as_posix(),
         "sha256": digest,

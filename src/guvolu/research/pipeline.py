@@ -10,6 +10,7 @@ from typing import Any, Mapping, Sequence
 
 from guvolu.data.durable_io import atomic_write_text
 from guvolu.research.allocator import allocate, allocation_payload, flat_allocation
+from guvolu.research.config_lineage import load_verified_config_lineage
 from guvolu.research.contracts import AllocationResult, PanelSnapshot, QualityVector
 from guvolu.research.features import (
     MarketState,
@@ -45,6 +46,7 @@ from guvolu.research.shadow import (
     l2_overlay_from_shadow,
     latest_common_l2_decision,
 )
+from guvolu.research.tuning import verify_evolution_config
 from guvolu.research.validation import (
     BLOCK_BOOTSTRAP_METHOD_VERSION,
     DEFLATED_SHARPE_METHOD_VERSION,
@@ -120,12 +122,6 @@ def _text(value: object, name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} 必须为非空文本")
     return value.strip()
-
-
-def _load_config(path: Path) -> Mapping[str, object]:
-    """读取版本化研究配置。"""
-    value = json.loads(path.read_text(encoding="utf-8"))
-    return _mapping(value, "root")
 
 
 def _governance_registry_path(
@@ -532,10 +528,15 @@ def run_research(
     """运行完整 CPU 策略研究闭环。"""
     root = repository_root.resolve()
     config_file = config_path.resolve()
-    config = _load_config(config_file)
+    (
+        config,
+        config_hash,
+        lineage_root_config_hash,
+        config_lineage_depth,
+    ) = load_verified_config_lineage(root, config_file)
+    verify_evolution_config(root, config_file, config)
     data_root = root / "data"
     output_base = (output_root or root / "reports" / "strategy-research").resolve()
-    config_hash = sha256_file(config_file)
     identity = code_identity(root, (config_file,))
     batches = build_family_batches(config, family_scope)
     resolved_family_scope = tuple(batch.family for batch in batches)
@@ -558,6 +559,8 @@ def run_research(
         "parameter_stability_method_version": PARAMETER_STABILITY_METHOD_VERSION,
         "position_contract_method_version": POSITION_CONTRACT_METHOD_VERSION,
         "config_hash": config_hash,
+        "config_lineage_root_hash": lineage_root_config_hash,
+        "config_lineage_depth": config_lineage_depth,
         "head_generation": inputs.head_generation,
         "attempt_ids": inputs.attempt_ids,
         "artifact_ids": inputs.artifact_ids,
@@ -892,6 +895,8 @@ def run_research(
         "decision_grade": identity.decision_grade,
         "code_identity": asdict(identity),
         "config_hash": config_hash,
+        "config_lineage_root_hash": lineage_root_config_hash,
+        "config_lineage_depth": config_lineage_depth,
         "data_governance": {
             "scope": data_scope,
             "exposure_id": exposure.exposure_id,
@@ -956,6 +961,8 @@ def run_research(
         "execution_evaluated_at": execution_evaluated_at.isoformat(),
         "code_identity": asdict(identity),
         "config_hash": config_hash,
+        "config_lineage_root_hash": lineage_root_config_hash,
+        "config_lineage_depth": config_lineage_depth,
         "data_scope": data_scope,
         "research_exposure_id": exposure.exposure_id,
         "input_head_generation": panel.head_generation,
