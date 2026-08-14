@@ -229,6 +229,13 @@ python scripts\upgrade_research_governance.py `
 .\.venv\Scripts\python.exe scripts\verify_strategy_research.py
 ```
 
+上述 verifier 始终从收据重建 panel、特征、walk-forward、trial ledger、成本回放与目标合同，是
+独立完整证明。readiness、family monitor 和 tuning 在第一次完整证明后可发布并复用
+`research-verification-attestation-v1` 性能收据；每次命中仍逐字节重算 manifest 和全部制品散列，
+并重新检查 operational gate 与 governance。manifest、任一制品、验证器代码树或 dirty 状态变化
+都会使收据失效并退回完整证明。该收据明确标记 `promotion_evidence=false`，冻结前向、holdout 和
+promotion 继续调用完整 verifier，不能用性能缓存替代一次性封存证据。
+
 在完整搜索前只读检查当前代码树、活动输入、连续特征成熟度和 holdout 状态：
 
 ```powershell
