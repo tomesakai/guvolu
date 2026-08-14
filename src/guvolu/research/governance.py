@@ -1032,8 +1032,15 @@ def _validate_pinned_read_schema(
         )
 
 
-def _connect(path: Path, *, write: bool = False) -> sqlite3.Connection:
-    """打开治理库；部署写入上限存在时允许兼容读取并拒绝新 writer。"""
+def _connect(
+    path: Path,
+    *,
+    write: bool = False,
+    compatible_schema: int | None = None,
+) -> sqlite3.Connection:
+    """打开治理库；版本固定时只允许已证明的向下兼容操作。"""
+    if compatible_schema is not None and not write:
+        raise ValueError("compatible_schema 只适用于治理写入")
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path, timeout=30.0, isolation_level=None)
     connection.row_factory = sqlite3.Row
@@ -1044,7 +1051,7 @@ def _connect(path: Path, *, write: bool = False) -> sqlite3.Connection:
             existing = connection.execute(
                 "SELECT value FROM governance_meta WHERE key='schema_version'"
             ).fetchone()
-            if write:
+            if write and compatible_schema != ceiling:
                 raise ValueError(
                     "治理库 schema 写入已冻结在版本 " + str(ceiling)
                 )
@@ -1053,6 +1060,8 @@ def _connect(path: Path, *, write: bool = False) -> sqlite3.Connection:
                 None if existing is None else str(existing["value"]),
                 ceiling,
             )
+            if write:
+                connection.execute("PRAGMA synchronous=FULL")
             return connection
     except BaseException:
         connection.close()
@@ -1189,7 +1198,11 @@ def register_research_exposure(
         "start_time": start.isoformat(),
         "end_time": end.isoformat(),
     })
-    connection = _connect(registry_path, write=True)
+    connection = _connect(
+        registry_path,
+        write=True,
+        compatible_schema=2,
+    )
     try:
         _begin(connection)
         protected = connection.execute(

@@ -588,21 +588,36 @@ def test_schema_write_ceiling_preserves_legacy_reader_deployment(
         ).fetchone()
     assert version == ("2",)
 
+    exposure = register_research_exposure(
+        registry,
+        "compatible-exposure",
+        "market-one",
+        _time("2026-01-01T00:00:00"),
+        _time("2026-02-01T00:00:00"),
+    )
+    assert exposure.research_identity == "compatible-exposure"
     with pytest.raises(ValueError, match="写入已冻结在版本 2"):
+        seal_holdout_vintage(
+            registry,
+            "market-two",
+            _time("2028-01-01T00:00:00"),
+            _time("2028-02-01T00:00:00"),
+        )
+    with pytest.raises(ValueError, match="未消费封存段重叠"):
         register_research_exposure(
             registry,
-            "must-not-write",
+            "overlapping-exposure",
             "market-one",
-            _time("2026-01-01T00:00:00"),
-            _time("2026-02-01T00:00:00"),
+            _time("2027-01-15T00:00:00"),
+            _time("2027-01-20T00:00:00"),
         )
     with sqlite3.connect(registry) as connection:
         assert connection.execute(
             "SELECT value FROM governance_meta WHERE key='schema_version'"
         ).fetchone() == ("2",)
         assert connection.execute(
-            "SELECT COUNT(*) FROM research_exposure"
-        ).fetchone() == (0,)
+            "SELECT research_identity FROM research_exposure"
+        ).fetchall() == [("compatible-exposure",)]
 
 
 def test_schema_write_ceiling_rejects_incompatible_physical_schema(
