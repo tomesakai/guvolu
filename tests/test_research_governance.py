@@ -12,12 +12,15 @@ from pathlib import Path
 
 import pytest
 
+import guvolu.research.governance as governance_module
 from guvolu.research import clock
 from guvolu.research.contracts import (
     FROZEN_FORWARD_METHOD_VERSION,
     FROZEN_FORWARD_SCHEMA_VERSION,
     HOLDOUT_MANIFEST_SCHEMA_VERSION,
     HOLDOUT_METHOD_VERSION,
+    INTERVAL_SUITE_FORWARD_METHOD_VERSION,
+    INTERVAL_SUITE_FORWARD_SCHEMA_VERSION,
     CodeIdentity,
     FrozenPanelInputs,
     PanelSnapshot,
@@ -39,10 +42,12 @@ from guvolu.research.governance import (
     get_holdout_vintage,
     get_frozen_forward_plan_for_vintage,
     get_frozen_forward_prediction_row_set,
+    get_interval_suite_forward_plan_for_vintage,
     list_frozen_forward_predictions,
     list_holdout_vintages,
     register_frozen_forward_plan,
     register_frozen_forward_prediction,
+    register_interval_suite_forward_plan,
     register_research_exposure,
     seal_holdout_vintage,
     start_holdout_evaluation_attempt,
@@ -308,6 +313,95 @@ def _write_forward_prediction_artifact(
         "unit": "risk_weighted_directional_target",
     }, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
     return path.relative_to(root).as_posix(), sha256_file(path)
+
+
+def _write_interval_suite_plan_artifact(
+    root: Path,
+    vintage_id: str,
+    suite_plan_id: str,
+    suite_evidence_id: str,
+    source_git_hash: str,
+    code_tree_digest: str,
+) -> tuple[str, str, str]:
+    """写入与治理登记合同一致的跨节拍冻结计划。"""
+    plan_id = stable_identifier("interval-suite-forward-plan", {
+        "governance_method_version": GOVERNANCE_METHOD_VERSION,
+        "vintage_id": vintage_id,
+        "suite_plan_id": suite_plan_id,
+        "suite_evidence_id": suite_evidence_id,
+        "source_git_hash": source_git_hash,
+        "code_tree_digest": code_tree_digest,
+    })
+    path = root / "reports" / plan_id / "plan.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    evidence_path = path.parent / "suite-evidence.json"
+    evidence_path.write_text(json.dumps({
+        "suite_plan_id": suite_plan_id,
+        "suite_evidence_id": suite_evidence_id,
+        "source_git_hash": source_git_hash,
+        "input_head_generation": "head-one",
+        "input_receipt_sha256": "r" * 64,
+        "alignment_interval_seconds": 14_400,
+        "sleeves": [{
+            "sleeve_id": "sleeve-one",
+            "member_id": "member-one",
+            "bar_interval": "1hour",
+            "family": "trend",
+            "deployment_candidate_id": _TEST_CANDIDATE_ID,
+            "suite_eligible": True,
+        }],
+        "suite_research_allocation": {
+            "weights": {"sleeve-one": 0.4},
+            "reserve": 0.6,
+            "shared_caps": {"maximum_gross_weight": 0.85},
+        },
+    }, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+    path.write_text(json.dumps({
+        "schema_version": INTERVAL_SUITE_FORWARD_SCHEMA_VERSION,
+        "method_version": INTERVAL_SUITE_FORWARD_METHOD_VERSION,
+        "governance_method_version": GOVERNANCE_METHOD_VERSION,
+        "scope": "INTERVAL_SUITE_FROZEN_FORWARD",
+        "governance_registry": "governance.sqlite3",
+        "plan_id": plan_id,
+        "suite_plan_id": suite_plan_id,
+        "suite_evidence_id": suite_evidence_id,
+        "source_git_hash": source_git_hash,
+        "code_tree_digest": code_tree_digest,
+        "vintage": {"vintage_id": vintage_id},
+        "source_evidence": {
+            "path": evidence_path.relative_to(root).as_posix(),
+            "sha256": sha256_file(evidence_path),
+        },
+        "input": {
+            "head_generation": "head-one", "receipt_sha256": "r" * 64,
+        },
+        "decision_grid": {
+            "interval_seconds": 14_400,
+            "utc_epoch_offset_seconds": 0,
+            "maximum_recording_lag_seconds": 3900,
+        },
+        "sleeves": [{
+            "sleeve_id": "sleeve-one",
+            "member_id": "member-one",
+            "bar_interval": "1hour",
+            "family": "trend",
+            "candidate": {
+                "candidate_id": _TEST_CANDIDATE_ID,
+                "family": "trend",
+                "mode": "paper",
+                "expression_id": _TEST_EXPRESSION_ID,
+                "parameters": _TEST_PARAMETERS,
+                "complexity": len(_TEST_PARAMETERS),
+            },
+            "weight": 0.4,
+        }],
+        "allocation": {
+            "weights": {"sleeve-one": 0.4},
+            "reserve": 0.6,
+            "shared_caps": {"maximum_gross_weight": 0.85},
+        },
+    }, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+    return plan_id, path.relative_to(root).as_posix(), sha256_file(path)
 
 
 def _write_holdout_evidence(
@@ -758,6 +852,10 @@ def test_explicit_schema_write_ceiling_upgrade_is_backed_up(
             "SELECT name FROM sqlite_master WHERE type='table' "
             "AND name='active_head_receipt'"
         ).fetchone() == ("active_head_receipt",)
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name='interval_suite_forward_plan'"
+        ).fetchone() == ("interval_suite_forward_plan",)
     with sqlite3.connect(backup) as connection:
         assert connection.execute("PRAGMA integrity_check").fetchall() == [
             ("ok",),
@@ -824,6 +922,82 @@ def test_governance_upgrade_rejects_malformed_receipt_table(
         assert connection.execute("PRAGMA integrity_check").fetchone() == (
             "ok",
         )
+
+
+def test_explicit_v5_to_v6_upgrade_creates_suite_plan_table(
+    tmp_path: Path,
+) -> None:
+    """真实 v5 形状须经备份后才获得套件计划写权限。"""
+    registry = tmp_path / "governance.sqlite3"
+    seal_holdout_vintage(
+        registry,
+        "market-one",
+        _time("2027-01-01T00:00:00"),
+        _time("2027-02-01T00:00:00"),
+    )
+    with sqlite3.connect(registry) as connection:
+        connection.execute("DROP TABLE interval_suite_forward_plan")
+        connection.execute(
+            "UPDATE governance_meta SET value='5' WHERE key='schema_version'"
+        )
+        connection.execute(
+            "INSERT INTO governance_meta(key,value) VALUES(?,?)",
+            ("schema_write_ceiling", "5"),
+        )
+    assert get_interval_suite_forward_plan_for_vintage(
+        registry, "missing",
+    ) is None
+    backup = tmp_path / "governance-v5.sqlite3.bak"
+    upgrade_governance_write_ceiling(
+        registry, backup, expected_version=5, expected_write_ceiling=5,
+    )
+    with sqlite3.connect(registry) as connection:
+        assert connection.execute(
+            "SELECT value FROM governance_meta WHERE key='schema_version'"
+        ).fetchone() == ("6",)
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name='interval_suite_forward_plan'"
+        ).fetchone() == ("interval_suite_forward_plan",)
+    with sqlite3.connect(backup) as connection:
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name='interval_suite_forward_plan'"
+        ).fetchone() is None
+
+
+def test_governance_upgrade_rejects_malformed_suite_plan_table(
+    tmp_path: Path,
+) -> None:
+    """迁移不得接受预存的同名弱约束套件计划表。"""
+    registry = tmp_path / "governance.sqlite3"
+    seal_holdout_vintage(
+        registry,
+        "market-one",
+        _time("2027-01-01T00:00:00"),
+        _time("2027-02-01T00:00:00"),
+    )
+    with sqlite3.connect(registry) as connection:
+        connection.execute("DROP TABLE interval_suite_forward_plan")
+        connection.execute(
+            "CREATE TABLE interval_suite_forward_plan(plan_id TEXT PRIMARY KEY)"
+        )
+        connection.execute(
+            "UPDATE governance_meta SET value='5' WHERE key='schema_version'"
+        )
+        connection.execute(
+            "INSERT INTO governance_meta(key,value) VALUES(?,?)",
+            ("schema_write_ceiling", "5"),
+        )
+    backup = tmp_path / "malformed-v5.sqlite3.bak"
+    with pytest.raises(ValueError, match="表结构不兼容"):
+        upgrade_governance_write_ceiling(
+            registry, backup, expected_version=5, expected_write_ceiling=5,
+        )
+    with sqlite3.connect(registry) as connection:
+        assert connection.execute(
+            "SELECT value FROM governance_meta WHERE key='schema_version'"
+        ).fetchone() == ("5",)
 
 
 def test_governance_upgrade_backup_includes_prior_concurrent_commit(
@@ -1626,6 +1800,16 @@ def test_frozen_forward_plan_and_predictions_are_precommitted_and_append_only(
         repository_root=tmp_path,
     )
     assert repeated == plan
+    _suite_id, suite_path, suite_sha = _write_interval_suite_plan_artifact(
+        tmp_path, vintage.vintage_id, "suite-plan", "suite-evidence",
+        "a" * 40, "tree-one",
+    )
+    with pytest.raises(ValueError, match="单成员冻结前向计划"):
+        register_interval_suite_forward_plan(
+            registry, vintage.vintage_id, "suite-plan", "suite-evidence",
+            "a" * 40, "tree-one", suite_path, suite_sha,
+            repository_root=tmp_path,
+        )
     _, different_path, different_sha256 = _write_forward_plan_artifact(
         tmp_path,
         vintage.vintage_id,
@@ -1745,6 +1929,145 @@ def test_frozen_forward_plan_and_predictions_are_precommitted_and_append_only(
             3900,
             repository_root=tmp_path,
         )
+
+
+def test_interval_suite_forward_plan_is_precommitted_and_attested(
+    tmp_path: Path,
+) -> None:
+    """跨节拍计划可与单成员计划并存，且同 vintage 不可改写。"""
+    registry = tmp_path / "governance.sqlite3"
+    vintage = seal_holdout_vintage(
+        registry,
+        "market-one",
+        _time("2027-01-01T00:00:00"),
+        _time("2027-02-01T00:00:00"),
+    )
+    plan_id, plan_path, plan_sha = _write_interval_suite_plan_artifact(
+        tmp_path, vintage.vintage_id, "suite-plan", "suite-evidence",
+        "a" * 40, "tree-one",
+    )
+    registered = register_interval_suite_forward_plan(
+        Path("governance.sqlite3"),
+        vintage.vintage_id,
+        "suite-plan",
+        "suite-evidence",
+        "a" * 40, "tree-one", plan_path, plan_sha,
+        repository_root=tmp_path,
+    )
+    assert registered.plan_id == plan_id
+    assert get_interval_suite_forward_plan_for_vintage(
+        registry, vintage.vintage_id,
+    ) == registered
+    assert register_interval_suite_forward_plan(
+        registry, vintage.vintage_id, "suite-plan", "suite-evidence",
+        "a" * 40, "tree-one", plan_path, plan_sha,
+        repository_root=tmp_path,
+    ) == registered
+    _legacy_id, legacy_path, legacy_sha = _write_forward_plan_artifact(
+        tmp_path,
+        vintage.vintage_id,
+        "manifest-hash",
+        "candidate-set-hash",
+        "config-hash",
+        "tree-hash",
+    )
+    with pytest.raises(ValueError, match="跨节拍冻结前向计划"):
+        register_frozen_forward_plan(
+            registry,
+            vintage.vintage_id,
+            "manifest-hash",
+            "candidate-set-hash",
+            "config-hash",
+            "tree-hash",
+            legacy_path,
+            legacy_sha,
+            repository_root=tmp_path,
+        )
+    _set_now(vintage.start_time)
+    with pytest.raises(ValueError, match="开始前"):
+        register_interval_suite_forward_plan(
+            registry, vintage.vintage_id, "suite-plan", "suite-evidence",
+            "a" * 40, "tree-one", plan_path, plan_sha,
+            repository_root=tmp_path,
+        )
+    _set_now(_time("2026-08-14T00:00:00"))
+
+    path = tmp_path / plan_path
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["allocation"]["reserve"] = 0.5
+    path.write_text(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="SHA-256 不匹配"):
+        register_interval_suite_forward_plan(
+            registry, vintage.vintage_id, "suite-plan", "suite-evidence",
+            "a" * 40, "tree-one", plan_path, plan_sha,
+            repository_root=tmp_path,
+        )
+    with pytest.raises(ValueError, match="allocation 与 evidence 不一致"):
+        register_interval_suite_forward_plan(
+            registry, vintage.vintage_id, "suite-plan", "suite-evidence",
+            "a" * 40, "tree-one", plan_path, sha256_file(path),
+            repository_root=tmp_path,
+        )
+
+    different_id, different_path, different_sha = (
+        _write_interval_suite_plan_artifact(
+            tmp_path, vintage.vintage_id, "different-suite", "suite-evidence",
+            "a" * 40, "tree-one",
+        )
+    )
+    assert different_id != plan_id
+    with pytest.raises(ValueError, match="不同的套件冻结前向计划"):
+        register_interval_suite_forward_plan(
+            registry, vintage.vintage_id, "different-suite", "suite-evidence",
+            "a" * 40, "tree-one", different_path, different_sha,
+            repository_root=tmp_path,
+        )
+
+
+def test_interval_suite_plan_artifact_is_validated_under_write_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """制品现场复核必须发生在 BEGIN IMMEDIATE 之后。"""
+    registry = tmp_path / "governance.sqlite3"
+    vintage = seal_holdout_vintage(
+        registry,
+        "market-one",
+        _time("2027-01-01T00:00:00"),
+        _time("2027-02-01T00:00:00"),
+    )
+    _plan_id, plan_path, plan_sha = _write_interval_suite_plan_artifact(
+        tmp_path, vintage.vintage_id, "suite-plan", "suite-evidence",
+        "a" * 40, "tree-one",
+    )
+    lock_state = {"held": False}
+    original_begin = governance_module._begin
+    original_validate = (
+        governance_module._validated_interval_suite_forward_plan_artifact
+    )
+
+    def begin(connection: object) -> None:
+        original_begin(connection)  # type: ignore[arg-type]
+        lock_state["held"] = True
+
+    def validate(*args: object, **kwargs: object) -> str:
+        assert lock_state["held"] is True
+        return original_validate(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(governance_module, "_begin", begin)
+    monkeypatch.setattr(
+        governance_module,
+        "_validated_interval_suite_forward_plan_artifact",
+        validate,
+    )
+    register_interval_suite_forward_plan(
+        registry, vintage.vintage_id, "suite-plan", "suite-evidence",
+        "a" * 40, "tree-one", plan_path, plan_sha,
+        repository_root=tmp_path,
+    )
 
 
 def test_holdout_attestation_rejects_self_reported_positive_metrics(

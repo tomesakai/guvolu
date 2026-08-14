@@ -254,7 +254,7 @@ def freeze_forward_plan(
     if vintage.status != "sealed":
         raise ValueError("冻结前向计划只能绑定未消费 vintage")
     timestamp = clock.utc_now()
-    if timestamp > vintage.start_time:
+    if timestamp >= vintage.start_time:
         raise ValueError("冻结前向计划必须在 vintage 开始前创建")
     candidate_set_hash = frozen_candidate_set_hash(
         source_manifest_path, summary_file, candidate_registry_path, candidates,
