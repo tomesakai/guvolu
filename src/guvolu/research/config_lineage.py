@@ -311,12 +311,28 @@ def load_governed_strategy_config(
     config_path: Path,
 ) -> tuple[Mapping[str, object], str, str, int]:
     """统一加载配置谱系，并重放派生配置的单轴演进合同。"""
-    config, config_hash, root_hash, depth = load_verified_config_lineage(
-        repository_root,
-        config_path,
+    config, config_hash, root_hash, depth, _source_paths = (
+        load_governed_strategy_config_with_paths(repository_root, config_path)
+    )
+    return config, config_hash, root_hash, depth
+
+
+def load_governed_strategy_config_with_paths(
+    repository_root: Path,
+    config_path: Path,
+) -> tuple[Mapping[str, object], str, str, int, tuple[Path, ...]]:
+    """单次读取配置谱系，同时返回已验证的叶到根源路径。"""
+    config, config_hash, root_hash, depth, entries = (
+        _load_verified_config_lineage_details(repository_root, config_path)
     )
     # 局部导入避免初始化环。
     from guvolu.research.tuning import verify_evolution_config
 
     verify_evolution_config(repository_root, config_path, config)
-    return config, config_hash, root_hash, depth
+    return (
+        config,
+        config_hash,
+        root_hash,
+        depth,
+        tuple(entry.path for entry in entries),
+    )

@@ -202,6 +202,7 @@ def test_compact_panel_enforces_pit_and_integer_projection(tmp_path: Path) -> No
 
 def test_registered_trade_inputs_rebuilds_control_plane_identity(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """历史 panel 输入必须由控制面和物理文件共同证明。"""
     data_root = tmp_path / "data"
@@ -301,6 +302,24 @@ def test_registered_trade_inputs_rebuilds_control_plane_identity(
         data_root, captured.receipt_path, require_current_head=True,
     )
     assert attested.head_generation == captured.head_generation
+    receipt_payload = json.loads(
+        captured.receipt_path.read_text(encoding="utf-8")
+    )
+    receipt_payload["entries"][0]["domain"] = "trade_realtime"
+    receipt_payload["entries"][0]["partition_key"] = "forged-partition"
+    receipt_payload["entries"][0]["normalization_version"] = "forged-v1"
+    receipt_payload["normalization_versions"] = ["forged-v1"]
+    forged_receipt = tmp_path / "forged-trade-input-receipt.json"
+    forged_receipt.write_text(
+        canonical_json(receipt_payload) + "\n", encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="控制面字段不匹配"):
+        attest_trade_input_receipt(
+            data_root, forged_receipt, require_current_head=False,
+        )
+    monkeypatch.setattr(
+        "guvolu.research.governance.clock.utc_now", lambda: _time(1),
+    )
     registration = register_active_head_receipt(
         tmp_path / "governance.sqlite3",
         "research",
@@ -311,13 +330,15 @@ def test_registered_trade_inputs_rebuilds_control_plane_identity(
         captured.receipt_sha256,
         repository_root=tmp_path,
         data_root=data_root,
-        recorded_at=_time(1),
     )
     assert get_active_head_receipt(
         tmp_path / "governance.sqlite3",
         "research",
         "research-identity-one",
     ) == registration
+    monkeypatch.setattr(
+        "guvolu.research.governance.clock.utc_now", lambda: _time(2),
+    )
     assert register_active_head_receipt(
         tmp_path / "governance.sqlite3",
         "research",
@@ -328,7 +349,6 @@ def test_registered_trade_inputs_rebuilds_control_plane_identity(
         captured.receipt_sha256,
         repository_root=tmp_path,
         data_root=data_root,
-        recorded_at=_time(2),
     ) == registration
     connection = store.connect(data_root)
     try:

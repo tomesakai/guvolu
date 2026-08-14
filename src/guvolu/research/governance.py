@@ -1088,6 +1088,84 @@ def _schema_write_ceiling(
     return ceiling
 
 
+def _validate_active_head_receipt_schema(
+    connection: sqlite3.Connection,
+    *,
+    probe_constraints: bool = False,
+) -> None:
+    """验证收据表列、复合主键和两项关键 CHECK 约束。"""
+    rows = connection.execute(
+        "PRAGMA table_info(active_head_receipt)"
+    ).fetchall()
+    expected = (
+        ("consumer_kind", "TEXT", 1, 1),
+        ("consumer_id", "TEXT", 1, 2),
+        ("market_id", "TEXT", 1, 0),
+        ("head_generation", "TEXT", 1, 0),
+        ("receipt_artifact_path", "TEXT", 1, 0),
+        ("receipt_artifact_sha256", "TEXT", 1, 0),
+        ("recorded_at", "TEXT", 1, 0),
+    )
+    actual = tuple(
+        (str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5]))
+        for row in rows
+    )
+    if actual != expected:
+        raise ValueError("治理库 active_head_receipt 表结构不兼容")
+    schema_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' "
+        "AND name='active_head_receipt'"
+    ).fetchone()
+    normalized_schema = "" if schema_row is None else "".join(
+        str(schema_row[0]).lower().split()
+    )
+    required_constraints = (
+        "check(consumer_kindin('research','frozen_forward','holdout'))",
+        "check(length(receipt_artifact_sha256)=64)",
+    )
+    if any(item not in normalized_schema for item in required_constraints):
+        raise ValueError("治理库 active_head_receipt 缺少必要约束")
+    if not probe_constraints:
+        return
+
+    def rejects(values: tuple[str, ...], suffix: str) -> bool:
+        savepoint = f"active_head_receipt_probe_{suffix}"
+        connection.execute(f"SAVEPOINT {savepoint}")
+        try:
+            try:
+                connection.execute(
+                    "INSERT INTO active_head_receipt("
+                    "consumer_kind,consumer_id,market_id,head_generation,"
+                    "receipt_artifact_path,receipt_artifact_sha256,recorded_at"
+                    ") VALUES(?,?,?,?,?,?,?)",
+                    values,
+                )
+            except sqlite3.IntegrityError:
+                return True
+            return False
+        finally:
+            connection.execute(f"ROLLBACK TO {savepoint}")
+            connection.execute(f"RELEASE {savepoint}")
+
+    probe = f"__guvolu_schema_probe_{id(connection)}"
+    common = (probe, probe, probe)
+    try:
+        kind_rejected = rejects(
+            ("invalid", f"{probe}_kind", *common, "0" * 64, probe),
+            "kind",
+        )
+        hash_rejected = rejects(
+            ("research", f"{probe}_hash", *common, "short", probe),
+            "hash",
+        )
+    except sqlite3.DatabaseError as error:
+        raise ValueError(
+            "治理库 active_head_receipt 约束探针失败"
+        ) from error
+    if not kind_rejected or not hash_rejected:
+        raise ValueError("治理库 active_head_receipt 缺少必要约束")
+
+
 def upgrade_governance_write_ceiling(
     registry_path: Path,
     backup_path: Path,
@@ -1143,6 +1221,11 @@ def upgrade_governance_write_ceiling(
             backup_connection = sqlite3.connect(backup)
             try:
                 backup_source.backup(backup_connection)
+                integrity = backup_connection.execute(
+                    "PRAGMA integrity_check"
+                ).fetchall()
+                if integrity != [("ok",)]:
+                    raise ValueError("治理库备份完整性检查失败")
             except BaseException:
                 backup_connection.close()
                 backup_source.close()
@@ -1170,6 +1253,9 @@ def upgrade_governance_write_ceiling(
                   PRIMARY KEY(consumer_kind,consumer_id)
                 )
                 """
+            )
+            _validate_active_head_receipt_schema(
+                connection, probe_constraints=True,
             )
             _upgrade_governance_state(connection, str(actual_version))
             connection.execute(
@@ -1367,6 +1453,7 @@ def _connect(
         );
         """
     )
+    _validate_active_head_receipt_schema(connection)
     existing = connection.execute(
         "SELECT value FROM governance_meta WHERE key='schema_version'"
     ).fetchone()
@@ -1474,7 +1561,6 @@ def register_active_head_receipt(
     *,
     repository_root: Path,
     data_root: Path,
-    recorded_at: datetime | None = None,
 ) -> ActiveHeadReceiptRegistration:
     """仅在收据等于完整当前 head 时将其不可改写地绑定消费者。"""
     if consumer_kind not in {"research", "frozen_forward", "holdout"}:
@@ -1498,7 +1584,7 @@ def register_active_head_receipt(
         or inputs.head_generation != head_generation
     ):
         raise ValueError("活动输入收据与消费者声明的市场或 head 不一致")
-    recorded = _utc(recorded_at or clock.utc_now())
+    recorded = _utc(clock.utc_now())
     expected = ActiveHeadReceiptRegistration(
         consumer_kind=consumer_kind,
         consumer_id=consumer_id,

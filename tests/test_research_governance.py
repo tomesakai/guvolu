@@ -758,6 +758,9 @@ def test_explicit_schema_write_ceiling_upgrade_is_backed_up(
             "AND name='active_head_receipt'"
         ).fetchone() == ("active_head_receipt",)
     with sqlite3.connect(backup) as connection:
+        assert connection.execute("PRAGMA integrity_check").fetchall() == [
+            ("ok",),
+        ]
         assert connection.execute(
             "SELECT value FROM governance_meta WHERE key='schema_version'"
         ).fetchone() == ("2",)
@@ -772,6 +775,53 @@ def test_explicit_schema_write_ceiling_upgrade_is_backed_up(
             backup,
             expected_version=2,
             expected_write_ceiling=2,
+        )
+
+
+def test_governance_upgrade_rejects_malformed_receipt_table(
+    tmp_path: Path,
+) -> None:
+    """同名坏表不得被 IF NOT EXISTS 静默接受或推进版本。"""
+    registry = tmp_path / "governance.sqlite3"
+    seal_holdout_vintage(
+        registry,
+        "market-one",
+        _time("2027-01-01T00:00:00"),
+        _time("2027-02-01T00:00:00"),
+    )
+    with sqlite3.connect(registry) as connection:
+        connection.execute("DROP TABLE active_head_receipt")
+        connection.execute(
+            "CREATE TABLE active_head_receipt("
+            "consumer_kind TEXT NOT NULL,consumer_id TEXT NOT NULL,"
+            "market_id TEXT NOT NULL,head_generation TEXT NOT NULL,"
+            "receipt_artifact_path TEXT NOT NULL,"
+            "receipt_artifact_sha256 TEXT NOT NULL,recorded_at TEXT NOT NULL,"
+            "PRIMARY KEY(consumer_kind,consumer_id))"
+        )
+        connection.execute(
+            "UPDATE governance_meta SET value='2' WHERE key='schema_version'"
+        )
+        connection.execute(
+            "INSERT INTO governance_meta(key,value) VALUES(?,?)",
+            ("schema_write_ceiling", "2"),
+        )
+
+    backup = tmp_path / "governance-malformed-v2.sqlite3.bak"
+    with pytest.raises(ValueError, match="缺少必要约束"):
+        upgrade_governance_write_ceiling(
+            registry,
+            backup,
+            expected_version=2,
+            expected_write_ceiling=2,
+        )
+    with sqlite3.connect(registry) as connection:
+        assert connection.execute(
+            "SELECT value FROM governance_meta WHERE key='schema_version'"
+        ).fetchone() == ("2",)
+    with sqlite3.connect(backup) as connection:
+        assert connection.execute("PRAGMA integrity_check").fetchone() == (
+            "ok",
         )
 
 

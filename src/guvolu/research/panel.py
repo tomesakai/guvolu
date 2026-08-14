@@ -227,9 +227,12 @@ def attest_trade_input_receipt(
             (market_id,),
         ).fetchone()
         output_rows = connection.execute(
-            "SELECT o.attempt_id,o.dataset,o.artifact_id,o.row_count,"
+            "SELECT p.market_id,p.domain,p.partition_key,"
+            "p.normalization_version,p.status,o.attempt_id,o.dataset,"
+            "o.artifact_id,o.row_count,"
             "o.min_event_time,o.max_event_time,a.storage_path,a.sha256,"
             "a.byte_count FROM materialization_output o "
+            "JOIN partition_attempt p ON p.attempt_id=o.attempt_id "
             "JOIN artifact a ON a.artifact_id=o.artifact_id "
             f"WHERE o.artifact_id IN ({marks}) "
             f"AND o.attempt_id IN ({attempt_marks})",
@@ -260,6 +263,20 @@ def attest_trade_input_receipt(
         output = outputs_by_identity.get(identity_key)
         if output is None:
             raise ValueError("活动成交输入收据不能由历史控制面输出重建")
+        if (
+            str(output["market_id"]) != market_id
+            or str(output["domain"]) != str(entry.get("domain") or "")
+            or str(output["domain"]) not in {"trade", "trade_realtime"}
+            or str(output["partition_key"])
+            != str(entry.get("partition_key") or "")
+            or str(output["normalization_version"])
+            != str(entry.get("normalization_version") or "")
+            or str(output["status"])
+            not in {"complete", "complete_with_rejections"}
+        ):
+            raise ValueError(
+                f"活动成交输入收据控制面字段不匹配: {index}"
+            )
         path = (root / str(entry.get("storage_path") or "")).resolve()
         if not path.is_relative_to(root) or not path.is_file():
             raise ValueError("活动成交输入收据物理路径无效")

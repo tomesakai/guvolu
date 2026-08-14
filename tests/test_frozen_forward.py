@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -9,7 +10,7 @@ import pytest
 
 from guvolu.research import clock
 from guvolu.research.config_lineage import snapshot_verified_config_lineage
-from guvolu.research.contracts import CodeIdentity, FrozenPanelInputs, PanelSnapshot
+from guvolu.research.contracts import FrozenPanelInputs, PanelSnapshot
 from guvolu.research.frozen_forward import (
     attest_frozen_prediction_artifact,
     run_frozen_forward_prediction,
@@ -20,7 +21,12 @@ from guvolu.research.governance import (
     register_frozen_forward_plan,
     seal_holdout_vintage,
 )
-from guvolu.research.provenance import canonical_json, sha256_file, stable_identifier
+from guvolu.research.provenance import (
+    canonical_json,
+    code_identity,
+    sha256_file,
+    stable_identifier,
+)
 from guvolu.strategy.contracts import FeatureRow, ResearchBar
 from guvolu.strategy.expression import candidate_identity, expression_id, strategy_expression
 
@@ -43,6 +49,26 @@ def _authoritative_test_clock(monkeypatch: pytest.MonkeyPatch) -> None:
 def _set_now(value: datetime) -> None:
     global _TEST_NOW
     _TEST_NOW = value
+
+
+def _commit_test_repository(root: Path) -> None:
+    """提交配置，并让运行制品保持在 Git 身份之外。"""
+    (root / ".gitignore").write_text("data/\nreports/\n", encoding="utf-8")
+    for command in (
+        ("git", "init"),
+        ("git", "config", "user.email", "test@example.invalid"),
+        ("git", "config", "user.name", "Guvolu Test"),
+        ("git", "add", "--all"),
+        ("git", "commit", "-m", "test fixture"),
+    ):
+        subprocess.run(
+            command,
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
 
 
 def test_frozen_forward_uses_fixed_weight_and_is_idempotent(
@@ -83,13 +109,17 @@ def test_frozen_forward_uses_fixed_weight_and_is_idempotent(
     config_snapshot = snapshot_verified_config_lineage(
         tmp_path, config_path, tmp_path / "reports" / "config-artifacts",
     )
+    _commit_test_repository(tmp_path)
+    identity = code_identity(tmp_path, config_snapshot.source_paths)
+    assert identity.decision_grade
+    assert identity.git_hash is not None
     plan_id = stable_identifier("frozen-forward-plan", {
         "governance_method_version": GOVERNANCE_METHOD_VERSION,
         "vintage_id": vintage.vintage_id,
         "source_manifest_sha256": "manifest-hash",
         "candidate_set_hash": "candidate-set-hash",
         "config_hash": config_hash,
-        "code_tree_digest": "tree-one",
+        "code_tree_digest": identity.tree_digest,
     })
     template = strategy_expression("trend")
     parameters: dict[str, int | float] = {
@@ -113,8 +143,11 @@ def test_frozen_forward_uses_fixed_weight_and_is_idempotent(
         "source": {"manifest_sha256": "manifest-hash"},
         "candidate_set_hash": "candidate-set-hash",
         "config_hash": config_hash,
-        "code_identity": {"git_hash": "commit-one", "tree_digest": "tree-one"},
-        "code_tree_digest": "tree-one",
+        "code_identity": {
+            "git_hash": identity.git_hash,
+            "tree_digest": identity.tree_digest,
+        },
+        "code_tree_digest": identity.tree_digest,
         "config_path": config_snapshot.leaf_config_path.relative_to(
             tmp_path
         ).as_posix(),
@@ -139,7 +172,7 @@ def test_frozen_forward_uses_fixed_weight_and_is_idempotent(
         "manifest-hash",
         "candidate-set-hash",
         config_hash,
-        "tree-one",
+        identity.tree_digest,
         plan_path.relative_to(tmp_path).as_posix(),
         sha256_file(plan_path),
         repository_root=tmp_path,
@@ -159,9 +192,9 @@ def test_frozen_forward_uses_fixed_weight_and_is_idempotent(
         signed_base_volume=0.2,
         trade_count=1,
     )
-    panel_file = tmp_path / "panel.parquet"
+    panel_file = tmp_path / "data" / "research" / "panel.parquet"
     panel_file.write_bytes(b"panel")
-    receipt_file = tmp_path / "receipt.json"
+    receipt_file = tmp_path / "data" / "research" / "receipt.json"
     receipt_file.write_text("{}\n", encoding="utf-8")
     panel = PanelSnapshot(
         market={"market_id": "market-one"},
@@ -188,20 +221,6 @@ def test_frozen_forward_uses_fixed_weight_and_is_idempotent(
         volume_score=0.1,
         jump_score=0.0,
         contiguous=True,
-    )
-    def frozen_code_identity(
-        _root: Path,
-        config_paths: tuple[Path, ...],
-    ) -> CodeIdentity:
-        assert config_paths == config_snapshot.source_paths
-        return CodeIdentity(
-            git_hash="commit-one", tree_digest="tree-one", dirty_digest="",
-            dirty=False, decision_grade=True, reason=None,
-        )
-
-    monkeypatch.setattr(
-        "guvolu.research.frozen_forward.code_identity",
-        frozen_code_identity,
     )
     monkeypatch.setattr(
         "guvolu.research.frozen_forward.capture_trade_input_receipt",

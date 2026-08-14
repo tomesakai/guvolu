@@ -11,9 +11,8 @@ from typing import Any, Mapping, Sequence
 from guvolu.data.durable_io import atomic_write_text
 from guvolu.research.allocator import allocate, allocation_payload, flat_allocation
 from guvolu.research.config_lineage import (
-    load_governed_strategy_config,
+    load_governed_strategy_config_with_paths,
     snapshot_verified_config_lineage,
-    verified_config_lineage_paths,
 )
 from guvolu.research.contracts import AllocationResult, PanelSnapshot, QualityVector
 from guvolu.research.data_location import data_root_locator
@@ -585,12 +584,12 @@ def run_research(
         config_hash,
         lineage_root_config_hash,
         config_lineage_depth,
-    ) = load_governed_strategy_config(root, config_file)
+        config_source_paths,
+    ) = load_governed_strategy_config_with_paths(root, config_file)
     research_data_root = root / "data"
     source_data_root = (data_root or research_data_root).resolve()
     source_data_root_record = data_root_locator(root, source_data_root)
     output_base = (output_root or root / "reports" / "strategy-research").resolve()
-    config_source_paths = verified_config_lineage_paths(root, config_file)
     identity = code_identity(root, config_source_paths)
     batches = build_family_batches(config, family_scope)
     resolved_family_scope = tuple(batch.family for batch in batches)
@@ -659,7 +658,6 @@ def run_research(
         inputs.receipt_sha256,
         repository_root=root,
         data_root=source_data_root,
-        recorded_at=execution_evaluated_at,
     )
     panel = build_panel_snapshot(
         inputs,

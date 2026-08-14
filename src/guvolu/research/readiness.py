@@ -7,8 +7,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from guvolu.research.config_lineage import (
-    load_governed_strategy_config,
-    verified_config_lineage_paths,
+    load_governed_strategy_config_with_paths,
 )
 from guvolu.research.data_location import resolve_data_root_locator
 from guvolu.research.features import compute_features
@@ -122,8 +121,8 @@ def strategy_readiness(
         config_hash,
         config_lineage_root_hash,
         config_lineage_depth,
-    ) = load_governed_strategy_config(root, config_file)
-    config_source_paths = verified_config_lineage_paths(root, config_file)
+        config_source_paths,
+    ) = load_governed_strategy_config_with_paths(root, config_file)
     verified = verify_research_run(root, manifest_path)
     manifest = _read_object(verified.manifest_path, "research manifest")
     source_data_root = resolve_data_root_locator(
