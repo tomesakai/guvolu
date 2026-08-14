@@ -596,6 +596,10 @@ def _verify_run_identity(
         identity_payload["input_receipt_sha256"] = manifest.get(
             "input_receipt_sha256"
         )
+        if "source_data_snapshot" in manifest:
+            identity_payload["source_data_snapshot"] = manifest.get(
+                "source_data_snapshot"
+            )
     research_identity = stable_identifier("research-identity", identity_payload)
     if manifest.get("research_identity") != research_identity:
         raise ValueError("manifest.research_identity 无法由受保护证据重建")
