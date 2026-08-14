@@ -288,13 +288,34 @@ SHA-256 为 `599c3ca3bc92e8ebc215ceec7fe445223584667883ceb4319a1d9e4dbee69e1f`�
 来源提交为 `90bad6bccadcab0f79feb717e6627423c6dec6eb`，研究代码树散列为
 `4a7211661c151a841134b8be784181ce64210118dc35d154e65e0e9bb3be113f`。
 
-监视器只允许突破与趋势各扩展一个预登记边界轴到 264 小时。趋势派生候选把拼接 OOS
-Sharpe 从 0.772 提高到 0.866、PBO 从 0.320 降到 0.121；突破则把 Sharpe 从 1.114 降到
-1.081、PBO 从 0.066 升到 0.188。两者部署冠军都仍是原 168 小时候选，因此这些结果只进入
-adaptive 比较，不自动改写基准配置。`family-direction-monitor-v2` 用当前运行回放五个既有
-summary 后，五个流派均没有可计入的时间历史：每个流派排除三个重复面板 vintage，并排除
-两个没有早于当前策略决策时点的累计面板。当前数据只能支持参数轴诊断，不能支持跨时期
-稳定、改善或衰减结论，因此跨运行状态保持 `insufficient_history`。
+监视器只允许突破与趋势各扩展一个预登记边界轴到 264 小时。随后在隔离开发分支实际运行
+趋势、突破、量价趋势、均值回归与网格五条单流派管线；五次运行使用同一冻结面板
+`e4da5823ed03ca43ba65472873e1705a54336a6e9df3a2be3e109b9c4dd7a23c`，并分别通过九类
+manifest 制品复核。结果如下：
+
+| 独立流派 | 配置 | OOS Sharpe | 净收益 | FDR q | PBO | 监视动作 |
+|---|---|---:|---:|---:|---:|---|
+| 趋势 | 预登记 264 challenger | 0.866 | 1.452 | 0.032 | 0.121 | eligible axis refinement |
+| 突破 | 预登记 264 challenger | 1.081 | 1.614 | 0.006 | 0.188 | eligible axis refinement |
+| 量价趋势 | 基准配置 | 0.741 | 1.234 | 0.033 | 0.330 | eligible axis refinement |
+| 均值回归 | 基准配置 | -0.523 | -0.697 | 1.000 | 0.002 | revise hypothesis or cost model |
+| 网格 shadow | 基准配置 | -1.495 | -1.953 | 1.000 | 0.000 | improve fill model before evolution |
+
+派生配置没有替换部署冠军。在同一输入内，趋势 264 小时固定候选的最好 Sharpe 为 `0.650`，
+低于 168 小时的 `0.971`；突破 264 小时最好为 `1.190`，也略低于 168 小时的 `1.214`。
+因此趋势停止沿长周期边界外推，转为在 168 小时附近精炼；突破虽然候选中位数仍指向更长周期，
+但本次 challenger 未胜出，只能形成下一次预登记方向，不能改写基准配置。量价趋势保留独立的
+entry 与 flow confirmation 方向；均值回归和网格的失败动作分别是修订假设/成本逻辑和先补被动
+成交模型，不以扩大参数网格掩盖结构性失败。
+
+五个 `family-direction-monitor-v4` 制品均保持 `insufficient_history`。当前只有一个可比较的
+时间 vintage；同面板重复运行、不同试验范围和不足一个 walk-forward step 的结果都不能凑足
+improving、stable 或 decaying。该结论同时证明“独立运行”与“独立时间证据”是两件事：前者已
+跑通，后者必须等待未来数据自然到达。
+
+基于这五个监视制品生成的下一代提案全部返回 `no_parameter_proposal`：趋势没有新的边界方向；
+突破与量价趋势已经到达当前配置允许的轴边界；均值回归要求修订假设或成本逻辑；网格要求先
+改进成交模型。这是预期的停止条件，不应在同一数据 vintage 上继续扩轴来制造“进化”。
 
 隔离开发分支的 `family-direction-monitor-v4` 进一步要求在监视时实际复核 trial ledger 散列，
 并把 summary 与 ledger 的项目内路径写入监视制品；`family-evolution-proposal-v2` 只读取文件名与
