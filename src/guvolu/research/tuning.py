@@ -6,7 +6,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from guvolu.research.config_lineage import load_verified_config_lineage
-from guvolu.research.evolution import monitor_family_run
+from guvolu.research.evolution import _monitor_family_run, monitor_family_run
 from guvolu.research.provenance import canonical_json, sha256_file
 from guvolu.research.verification_attestation import (
     verify_research_run_cached as verify_research_run,
@@ -303,7 +303,20 @@ def _recompute_monitor_sources(
         raise ValueError("monitor trial ledger 身份与 summary 不一致")
     family = _text(monitor.get("family"), "monitor.family")
     monitor_method = monitor.get("monitor_method_version")
-    return monitor_family_run(
+    if monitor_method in {
+        "family-direction-monitor-v7",
+        "family-direction-monitor-v8",
+    }:
+        return monitor_family_run(
+            root,
+            summary_path,
+            family,
+            config,
+            parent_config_hash,
+            prior_paths,
+            monitor_method_version=str(monitor_method),
+        )
+    return _monitor_family_run(
         root,
         summary_path,
         family,

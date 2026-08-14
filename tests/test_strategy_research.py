@@ -13,6 +13,7 @@ import duckdb
 import pytest
 
 import guvolu.research.allocator as allocator_module
+import guvolu.research.tuning as tuning_module
 from guvolu.data import store
 from guvolu.data.materialize import ensure_markets
 from guvolu.research.allocator import _covariance, allocate
@@ -1993,6 +1994,68 @@ def test_monitor_source_verification_recomputes_consumed_direction(
     }
     with pytest.raises(ValueError, match="cross_run_direction"):
         verify_monitor_sources(tmp_path, {}, forged_direction, "c" * 64)
+
+
+def test_legacy_monitor_replay_does_not_discover_later_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """v5/v6 必须按原登记历史重放，不能吸收事后新增 canonical 运行。"""
+    summary = tmp_path / "summary.json"
+    ledger = tmp_path / "ledger.jsonl"
+    summary.write_text("{}", encoding="utf-8")
+    ledger.write_text("{}\n", encoding="utf-8")
+    ledger_hash = hashlib.sha256(ledger.read_bytes()).hexdigest()
+    monitor = {
+        "monitor_method_version": "family-direction-monitor-v5",
+        "family": "trend",
+        "run_id": "run",
+        "research_identity": "research",
+        "source": {
+            "summary_path": "summary.json",
+            "summary_sha256": hashlib.sha256(summary.read_bytes()).hexdigest(),
+            "trial_ledger_path": "ledger.jsonl",
+            "trial_ledger_sha256": ledger_hash,
+            "config_hash": "c" * 64,
+        },
+    }
+    protected_summary = {
+        "run_id": "run",
+        "research_identity": "research",
+        "config_hash": "c" * 64,
+        "artifacts": {
+            "trial_ledger": {"path": "ledger.jsonl", "sha256": ledger_hash},
+        },
+    }
+    monkeypatch.setattr(tuning_module, "verify_research_run", lambda *_args: None)
+    monkeypatch.setattr(
+        tuning_module.json,
+        "loads",
+        lambda *_args, **_kwargs: protected_summary,
+    )
+    observed: dict[str, object] = {}
+
+    def replay(*args: object, **kwargs: object) -> dict[str, object]:
+        observed["prior_paths"] = args[5]
+        observed["method"] = kwargs["monitor_method_version"]
+        return {"monitor_method_version": kwargs["monitor_method_version"]}
+
+    monkeypatch.setattr(tuning_module, "_monitor_family_run", replay)
+    monkeypatch.setattr(
+        tuning_module,
+        "monitor_family_run",
+        lambda *_args, **_kwargs: pytest.fail(
+            "legacy monitor 不得自动发现后来新增的 canonical 历史"
+        ),
+    )
+    rebuilt = tuning_module._recompute_monitor_sources(
+        tmp_path, {}, monitor, "c" * 64, (),
+    )
+    assert rebuilt["monitor_method_version"] == "family-direction-monitor-v5"
+    assert observed == {
+        "prior_paths": (),
+        "method": "family-direction-monitor-v5",
+    }
 
 
 def test_content_addressed_config_lineage_survives_source_changes_and_binds_git(
