@@ -480,16 +480,24 @@ manifest SHA-256 为 `14b7ffdc5f87dab2f271fbbab21cc78487bca21b434c8cc3d543ca6caa
 独立 verifier。`strategy_data_stale` 已消失；最新结构断点是
 `2026-08-13T17:00:00+09:00`，之后只有 29 根连续小时柱，距最长特征所需 169 根还差 140 根，
 所以唯一运行门禁是 `feature_snapshot_stale`。持续采集且不再断流时，最早在约
-`2026-08-20T17:00:00+09:00` 形成成熟特征；在此之前 operational 仓位必须保持全零。
+`2026-08-20T18:00:00+09:00` 形成成熟特征；在此之前 operational 仓位必须保持全零。
 
-就绪检查接入同一数据根合同后，当前 HEAD 的组合运行
-`research-run-e9ac32d667077acbb119f809b47ebd602146ae770bd3b3c0c290913b56e86dea`
-及 manifest `bfcee9e23781c3cb6d1a107d2a6ead5c76807158f8e951d9c4536698892158d0` 通过完整来源重建。
-`strategy-readiness-v3` 确认代码树与配置均匹配，published panel 有 29 根尾部连续柱，尚差
-140 根；按整点柱连续到达估算，最早成熟时点为 `2026-08-20T18:00:00+09:00`。检查期间活动
-head 已继续推进，因此同时报告 `active_input_head_changed`；成熟后应在整点收盘窗口重跑研究，
-而不是复用旧快照。promotion 状态独立为 `sealed_holdout_vintage_incomplete`，等待
-`2026-08-21` 至 `2026-11-29` 的封存窗口完成。
+决策代码提交 `336cee0a7372f925fbece726823a1c61b047cc63` 的组合运行
+`research-run-68590dfea08b7367fcbf6c3d6708eb351129b6d350430c1134d5c8da761b71d7`
+及 manifest `9b79f980dacf2499dd14b1dcf17d86885746c0e807c2a3ae687531fbd1c9c99f` 通过完整来源重建。
+`strategy-readiness-v3` 确认代码树、配置与外部数据根均匹配；published panel 有 30 根尾部连续柱，
+尚差 139 根，最早成熟时点仍为 `2026-08-20T18:00:00+09:00`。检查期间活动 head 已继续推进，
+因此同时报告 `active_input_head_changed`；成熟后应在整点收盘窗口重跑研究，而不是复用旧快照。
+promotion 状态独立为 `sealed_holdout_vintage_incomplete`，等待 `2026-08-21` 至 `2026-11-29`
+的封存窗口完成。
+
+该轮真实重建还暴露了旧面板查询的资源伸缩缺陷：762 个活动文件、约 1,945 万行被一次性送入
+全局 `ROW_NUMBER`，DuckDB 在 2 GB 和 4 GB 上限下都于同一去重算子耗尽内存。控制面证明 761 个
+非空文件的事件覆盖互不相交，最大单文件为 460,837 行。现在只把事件覆盖相交的文件组成联合
+去重组，再确定性合并同一小时的局部片段；同一旧收据重建出的 66,104 行面板与旧实现双向
+`EXCEPT ALL` 均为零，并逐字节复现原 SHA-256 `4185b7dff6d363105c60b4a9fb653d544bfa45548beef8ee63800075d32d0e0e`。
+DuckDB 同时固定为 4 GB、2 线程并启用自动清理的磁盘溢出目录，使峰值内存随最大事件重叠组，
+而不是随全历史行数增长。
 
 已经启动的 2026-08-21 至 2026-11-29 冻结窗口固定在主树的 v1 plan/v3 holdout 兼容合同上，
 继续由原执行器完成，研究分支不得改写。该窗口可作为 legacy 前向证据，但缺少 v2/v4 所需的
