@@ -509,6 +509,16 @@ producer 用时 286 秒，独立 verifier 用时 271 秒并重建核对全部 12
 相邻冻结 vintage 至少间隔 2,160 根小时柱。以当前单流派决策时点计，持续采集时最早约在
 `2026-11-06T06:00:00+09:00` 才可能形成第二条可比较历史，且仍需实际来源复核。
 
+生成器 v4 进一步把五个流派的规范 AST 编译为带完整执行类型、候选参数列、每流派预算和
+子节点优先顺序的公共 DAG SearchPlan。提交 `71f0dfcafe4d4e23f764bd7bfbc183b2f3acf43a`
+的组合运行 `research-run-a540ba0dedcb18a29713e8969b3f1efffa151fbb46e990be9383bc9305ed04f0`
+发布 manifest `4b1a5a36d375c9831be67048eeb2160cda8b3acc027f41177d7965efdcf3e065`；
+registry schema v2 含 34 个候选、36 个公共节点，计划身份为
+`search-plan-53405f31bf96906d4f39acd8cb1626828ee5798481e1b07e91b3b12f6bb5433b`。
+独立 verifier 再次核对全部 12 类制品；五个流派的 Sharpe、净收益、FDR 与准入状态相对 v3
+逐项零漂移。v3 注册表仍可按旧方法逐字节重建，历史 monitor 不因生成器升级失去复核能力。
+五个单流派生成脚本分别发布独立计划，候选数为 6、12、4、6、6，均在 24 个候选预算内。
+
 该轮真实重建还暴露了旧面板查询的资源伸缩缺陷：762 个活动文件、约 1,945 万行被一次性送入
 全局 `ROW_NUMBER`，DuckDB 在 2 GB 和 4 GB 上限下都于同一去重算子耗尽内存。控制面证明 761 个
 非空文件的事件覆盖互不相交，最大单文件为 460,837 行。现在只把事件覆盖相交的文件组成联合
@@ -577,8 +587,9 @@ python scripts/run_passive_grid_shadow.py `
 
 CPU 阶段应先于 GPU 完成以下收敛：
 
-1. 类型化表达式注册表、规范身份和 CPU reference 已完成；下一步是把当前模板展开器升级为
-   公共子表达式 DAG 和有界 typed mutation/crossover，同时保持公式身份与参数身份分离。
+1. 类型化表达式注册表、规范身份、CPU reference 和公共子表达式 DAG SearchPlan 已完成；
+   v4 注册表在生成阶段即约束每流派候选预算，独立 CPU 解释器与递归 Exact 参考逐根对照。
+   下一步是在该 DAG 上加入有界 typed mutation/crossover，同时保持公式身份与参数身份分离。
 2. 增加 5 分钟、1 小时和 4 小时多节拍，但每个候选只使用预先登记的决策节拍与成本模型；
    不把同一参数在所有节拍无边界复制。
 3. 现有门禁已包括非正态 Probabilistic Sharpe、循环折块 percentile bootstrap、折块
@@ -613,6 +624,7 @@ GPU 接入遵循 [GPU 因子挖掘规格](../gpu-factor-mining-v1.1/README.md)�
 ```text
 PIT PanelManifest
   -> typed DSL / canonical AST
+  -> typed common-subexpression DAG SearchPlan
   -> CPU Reference
   -> GPU SearchFast 批量生成与粗筛
   -> GPU/CPU ValidationExact 数值对照
@@ -622,7 +634,8 @@ PIT PanelManifest
   -> 人工 promotion
 ```
 
-GPU 的职责是并行计算大量表达式、参数、bootstrap 和截面排序，不负责解析原始 JSON、修补
+GPU 的职责是消费同一 SearchPlan 的拓扑、候选参数列和 typed 节点，并行计算大量表达式、参数、
+bootstrap 和截面排序，不负责解析原始 JSON、修补
 数据缺口、决定统计阈值或写入交易路径。初期按 E0/E1 时序算子建立目标机微基准，再扩展
 E2/E3 截面后端。SearchFast 可用 float32 和近似排序，但最终候选必须由 ValidationExact 与
 CPU reference 在登记容差内复算。遗传搜索、NSGA-II 或 MAP-Elites 只在 typed DSL 上运行，
@@ -692,11 +705,17 @@ flowchart TB
     micro --> registry
     cross --> registry
 
-    gpu["可选 GPU SearchFast<br/>typed DSL / 批量粗筛 / 独立繁殖池"]
-    gpu --> registry
+    plan["Typed SearchPlan<br/>公共子表达式 DAG / 参数列 / 家族预算"]
+    registry --> plan
+    cpuFast["CPU SearchFast reference<br/>独立 DAG 解释器"]
+    gpu["可选 GPU SearchFast<br/>批量粗筛 / 独立繁殖池"]
+    plan --> cpuFast
+    plan --> gpu
 
     exact["ValidationExact<br/>CPU reference + GPU 数值对照"]
     registry --> exact
+    cpuFast --> exact
+    gpu --> exact
     exact --> cost["流派专属成本/成交模型<br/>taker / passive bounds / leg risk"]
     cost --> wf["统一 walk-forward<br/>embargo + champion switching cost"]
     wf --> robust["稳健门禁<br/>BH-FDR + positive folds + CSCV/PBO<br/>PSR + block bootstrap + DSR + parameter neighbors"]
