@@ -14,6 +14,7 @@ from guvolu.research.contracts import (
     HOLDOUT_MANIFEST_SCHEMA_VERSION,
     HOLDOUT_METHOD_VERSION,
 )
+from guvolu.research.data_location import resolve_data_root_locator
 from guvolu.research.features import compute_features
 from guvolu.research.governance import (
     GOVERNANCE_METHOD_VERSION,
@@ -342,6 +343,9 @@ def attest_holdout_terminal_artifacts(
     """从冻结候选、面板、前向目标和成本配置现场重算终局指标。"""
     root = repository_root.resolve()
     manifest = _load(manifest_path)
+    source_data_root = resolve_data_root_locator(
+        root, manifest.get("source_data_root"),
+    )
     artifacts = _object(manifest.get("artifacts"), "manifest.artifacts")
     source_manifest_path = _attested_artifact_path(
         root, artifacts, "source_manifest",
@@ -425,7 +429,7 @@ def attest_holdout_terminal_artifacts(
     ):
         raise ValueError("holdout 活动输入收据与治理登记不一致")
     registered_inputs = attest_trade_input_receipt(
-        root / "data", receipt_path, require_current_head=False,
+        source_data_root, receipt_path, require_current_head=False,
     )
     if (
         registered_inputs.head_generation != manifest.get("input_head_generation")
@@ -645,6 +649,10 @@ def run_holdout_validation(
         raise ValueError("holdout 调用配置与来源研究配置快照不一致")
     if source_summary.get("config_hash") != config_hash:
         raise ValueError("holdout 配置与来源研究冻结配置不一致")
+    source_data_root_record = source_summary.get("source_data_root")
+    source_data_root = resolve_data_root_locator(
+        repository, source_data_root_record,
+    )
     candidates, candidate_registry_path = load_frozen_candidates(
         repository,
         source_summary,
@@ -663,7 +671,7 @@ def run_holdout_validation(
     if vintage.status != "sealed":
         raise ValueError("vintage 已经消费，禁止重跑 holdout")
     inputs = capture_trade_input_receipt(
-        repository / "data",
+        source_data_root,
         market_id,
         repository / "data" / "research" / "input-receipts",
     )
@@ -743,7 +751,7 @@ def run_holdout_validation(
         inputs.receipt_path.resolve().relative_to(repository).as_posix(),
         inputs.receipt_sha256,
         repository_root=repository,
-        data_root=repository / "data",
+        data_root=source_data_root,
     )
     start_holdout_evaluation_attempt(
         registry_path,
@@ -913,6 +921,7 @@ def run_holdout_validation(
         "source_summary_sha256": sha256_file(summary_file),
         "config_hash": sha256_file(config_file),
         "code_identity": asdict(identity),
+        "source_data_root": source_data_root_record,
         "panel_sha256": panel.panel_sha256,
         "score_schedule_sha256": schedule_sha256,
         "score_start": score_schedule[0],
@@ -940,6 +949,7 @@ def run_holdout_validation(
         "input_artifact_ids": list(inputs.artifact_ids),
         "normalization_versions": list(inputs.normalization_versions),
         "input_receipt_sha256": receipt_registration.receipt_artifact_sha256,
+        "source_data_root": source_data_root_record,
         "frozen_forward_row_set_hash": forward_prediction_row_set_hash,
         "artifacts": {
             "source_manifest": {

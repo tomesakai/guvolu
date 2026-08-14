@@ -17,6 +17,7 @@ from guvolu.research.contracts import (
     PanelSnapshot,
     QualityVector,
 )
+from guvolu.research.data_location import resolve_data_root_locator
 from guvolu.research.features import compute_features
 from guvolu.research.governance import (
     GOVERNANCE_METHOD_VERSION,
@@ -236,6 +237,8 @@ def freeze_forward_plan(
             raise ValueError("已登记冻结前向计划制品散列不匹配")
         return FrozenPlanResult(existing.plan_id, path, existing.plan_artifact_sha256)
     summary = _load(summary_file)
+    source_data_root_record = summary.get("source_data_root")
+    resolve_data_root_locator(repository, source_data_root_record)
     candidates, candidate_registry_path = load_frozen_candidates(
         repository, summary, source_manifest,
     )
@@ -298,6 +301,7 @@ def freeze_forward_plan(
         "config_hash": config_hash,
         "code_identity": asdict(identity),
         "code_tree_digest": identity.tree_digest,
+        "source_data_root": source_data_root_record,
         "candidate_set_hash": candidate_set_hash,
         "candidates": [asdict(candidate) for candidate in candidates],
         "allocation": {"weights": weights, "reserve": reserve},
@@ -372,6 +376,9 @@ def attest_frozen_prediction_artifact(
     """从绑定面板、配置和候选公式现场重算冻结预测全部决策字段。"""
     root = repository_root.resolve()
     plan = _load(plan_path)
+    source_data_root = resolve_data_root_locator(
+        root, plan.get("source_data_root"),
+    )
     prediction = _load(prediction_path)
     config_path = _project_path(
         root,
@@ -441,7 +448,7 @@ def attest_frozen_prediction_artifact(
     ):
         raise ValueError("冻结预测输入收据 SHA-256 不一致")
     registered_inputs = attest_trade_input_receipt(
-        root / "data",
+        source_data_root,
         receipt_path,
         require_current_head=require_current_head,
     )
@@ -594,6 +601,9 @@ def run_frozen_forward_prediction(
     if sha256_file(plan_path) != plan.plan_artifact_sha256:
         raise ValueError("冻结前向计划制品散列不匹配")
     payload = _load(plan_path)
+    source_data_root = resolve_data_root_locator(
+        repository, payload.get("source_data_root"),
+    )
     if payload.get("plan_id") != plan_id or payload.get("scope") != "FROZEN_FORWARD":
         raise ValueError("冻结前向计划合同不一致")
     config_path = _project_path(
@@ -631,7 +641,7 @@ def run_frozen_forward_prediction(
         raise ValueError("已消费 vintage 不得追加前向预测")
     market_id = _text(config.get("market_id"), "market_id")
     inputs = capture_trade_input_receipt(
-        repository / "data",
+        source_data_root,
         market_id,
         repository / "data" / "research" / "input-receipts",
     )

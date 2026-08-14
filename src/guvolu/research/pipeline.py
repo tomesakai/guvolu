@@ -16,6 +16,7 @@ from guvolu.research.config_lineage import (
     verified_config_lineage_paths,
 )
 from guvolu.research.contracts import AllocationResult, PanelSnapshot, QualityVector
+from guvolu.research.data_location import data_root_locator
 from guvolu.research.features import (
     MarketState,
     classify_market_state,
@@ -574,6 +575,7 @@ def run_research(
     config_path: Path,
     output_root: Path | None = None,
     family_scope: Sequence[str] | None = None,
+    data_root: Path | None = None,
 ) -> ResearchRunResult:
     """运行完整 CPU 策略研究闭环。"""
     root = repository_root.resolve()
@@ -584,7 +586,9 @@ def run_research(
         lineage_root_config_hash,
         config_lineage_depth,
     ) = load_governed_strategy_config(root, config_file)
-    data_root = root / "data"
+    research_data_root = root / "data"
+    source_data_root = (data_root or research_data_root).resolve()
+    source_data_root_record = data_root_locator(root, source_data_root)
     output_base = (output_root or root / "reports" / "strategy-research").resolve()
     config_source_paths = verified_config_lineage_paths(root, config_file)
     identity = code_identity(root, config_source_paths)
@@ -595,9 +599,9 @@ def run_research(
     )
     market_id = _text(config.get("market_id"), "market_id")
     inputs = capture_trade_input_receipt(
-        data_root,
+        source_data_root,
         market_id,
-        data_root / "research" / "input-receipts",
+        research_data_root / "research" / "input-receipts",
     )
     if inputs.receipt_path is None or inputs.receipt_sha256 is None:
         raise AssertionError("研究输入没有生成活动 head 收据")
@@ -654,12 +658,12 @@ def run_research(
         _relative(inputs.receipt_path, root),
         inputs.receipt_sha256,
         repository_root=root,
-        data_root=data_root,
+        data_root=source_data_root,
         recorded_at=execution_evaluated_at,
     )
     panel = build_panel_snapshot(
         inputs,
-        data_root / "research" / "physical" / market_id,
+        research_data_root / "research" / "physical" / market_id,
         _text(config.get("bar_interval"), "bar_interval"),
         exposure_start,
         input_event,
@@ -756,12 +760,12 @@ def run_research(
     if not isinstance(raw_market_ids, list):
         raise ValueError("cross_venue_shadow.market_ids 必须为数组")
     l2_decision = latest_common_l2_decision(
-        data_root,
+        source_data_root,
         tuple(str(value) for value in raw_market_ids),
     )
-    shadow = cross_venue_shadow(data_root, l2_decision, cross_config)
+    shadow = cross_venue_shadow(source_data_root, l2_decision, cross_config)
     decision_shadow = cross_venue_shadow(
-        data_root,
+        source_data_root,
         strategy_decision_time,
         cross_config,
     )
@@ -983,6 +987,7 @@ def run_research(
         "market_id": market_id,
         "decision_time": strategy_decision_time.isoformat(),
         "execution_evaluated_at": execution_evaluated_at.isoformat(),
+        "source_data_root": source_data_root_record,
         "decision_grade": identity.decision_grade,
         "code_identity": asdict(identity),
         "config_hash": config_hash,
@@ -1053,6 +1058,7 @@ def run_research(
         "family_scope": list(resolved_family_scope),
         "decision_time": strategy_decision_time.isoformat(),
         "execution_evaluated_at": execution_evaluated_at.isoformat(),
+        "source_data_root": source_data_root_record,
         "code_identity": asdict(identity),
         "config_hash": config_hash,
         "config_lineage_root_hash": lineage_root_config_hash,

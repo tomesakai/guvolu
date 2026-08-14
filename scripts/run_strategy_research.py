@@ -20,6 +20,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--output", type=Path)
     parser.add_argument(
+        "--data-root",
+        type=Path,
+        help="只读权威市场数据根；研究治理与制品仍写入项目目录",
+    )
+    parser.add_argument(
         "--family",
         action="append",
         dest="families",
@@ -33,7 +38,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     output = arguments.output
     if output is not None and not output.is_absolute():
         output = root / output
-    result = run_research(root, config, output, arguments.families)
+    data_root = arguments.data_root
+    if data_root is not None and not data_root.is_absolute():
+        data_root = root / data_root
+    result = run_research(
+        root, config, output, arguments.families, data_root=data_root,
+    )
     print(json.dumps({
         "run_id": result.run_id,
         "manifest": str(result.manifest_path),

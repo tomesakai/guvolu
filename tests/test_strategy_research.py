@@ -26,6 +26,10 @@ from guvolu.research.contracts import (
     QualityVector,
     TrialRecord,
 )
+from guvolu.research.data_location import (
+    data_root_locator,
+    resolve_data_root_locator,
+)
 from guvolu.research.config_lineage import (
     attest_config_lineage_snapshot,
     snapshot_verified_config_lineage,
@@ -921,6 +925,36 @@ def test_dirty_git_identity_is_not_decision_grade(
     assert identity.dirty
     assert not identity.decision_grade
     assert identity.reason == "repository_dirty"
+
+
+def test_data_root_locator_separates_external_market_data_from_state(
+    tmp_path: Path,
+) -> None:
+    """外部只读数据根可定位，研究状态仍保留在仓库内。"""
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    internal = repository / "data"
+    external = tmp_path / "market-data"
+    internal.mkdir()
+    external.mkdir()
+
+    internal_record = data_root_locator(repository, internal)
+    external_record = data_root_locator(repository, external)
+    assert internal_record == {
+        "schema_version": 1,
+        "kind": "repository_relative",
+        "path": "data",
+    }
+    assert external_record["kind"] == "absolute"
+    assert resolve_data_root_locator(repository, internal_record) == internal
+    assert resolve_data_root_locator(repository, external_record) == external
+    assert resolve_data_root_locator(repository, None) == internal
+    with pytest.raises(ValueError, match="越出项目目录"):
+        resolve_data_root_locator(repository, {
+            "schema_version": 1,
+            "kind": "repository_relative",
+            "path": "../market-data",
+        })
 
 
 def test_code_identity_includes_wrappers_native_sources_and_build_contracts(

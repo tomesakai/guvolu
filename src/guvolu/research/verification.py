@@ -10,6 +10,7 @@ from tempfile import TemporaryDirectory
 from guvolu.research.allocator import allocate, allocation_payload
 from guvolu.research.config_lineage import attest_config_lineage_snapshot
 from guvolu.research.contracts import PanelSnapshot
+from guvolu.research.data_location import resolve_data_root_locator
 from guvolu.research.features import classify_market_state, compute_features
 from guvolu.research.governance import (
     get_active_head_receipt,
@@ -62,6 +63,7 @@ _RUN_IDENTITY_FIELDS = (
     "family_scope",
     "decision_time",
     "execution_evaluated_at",
+    "source_data_root",
     "code_identity",
     "config_hash",
     "config_lineage_root_hash",
@@ -357,6 +359,7 @@ def _verify_run_identity(
     summary: Mapping[str, object],
     candidate_registry: Mapping[str, object] | None,
     artifact_paths: Mapping[str, Path],
+    source_data_root: Path,
 ) -> None:
     """绑定摘要、manifest、代码身份与 v11/v12 研究身份。"""
     for field in _RUN_IDENTITY_FIELDS:
@@ -460,7 +463,7 @@ def _verify_run_identity(
         ):
             raise ValueError("v12 输入收据未由治理库绑定研究身份")
         registered = attest_trade_input_receipt(
-            root / "data", receipt_path, require_current_head=False,
+            source_data_root, receipt_path, require_current_head=False,
         )
         if (
             registered.head_generation != manifest.get("input_head_generation")
@@ -617,6 +620,9 @@ def verify_research_run(
     if expected_manifest_hash is not None and manifest_hash != expected_manifest_hash:
         raise ValueError("latest 指针中的 manifest 散列不匹配")
     manifest = _read_json(resolved_manifest)
+    source_data_root = resolve_data_root_locator(
+        resolved_root, manifest.get("source_data_root"),
+    )
     run_id = _text(manifest.get("run_id"), "manifest.run_id")
     artifacts = _object(manifest.get("artifacts"), "manifest.artifacts")
     checked: list[str] = []
@@ -645,7 +651,12 @@ def verify_research_run(
     if summary is None:
         raise ValueError("manifest 缺少 summary_json 制品")
     _verify_run_identity(
-        resolved_root, manifest, summary, candidate_registry, artifact_paths,
+        resolved_root,
+        manifest,
+        summary,
+        candidate_registry,
+        artifact_paths,
+        source_data_root,
     )
     _verify_operational_gate(summary)
     _verify_data_governance(resolved_root, summary)
