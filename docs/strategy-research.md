@@ -491,6 +491,24 @@ manifest SHA-256 为 `14b7ffdc5f87dab2f271fbbab21cc78487bca21b434c8cc3d543ca6caa
 promotion 状态独立为 `sealed_holdout_vintage_incomplete`，等待 `2026-08-21` 至 `2026-11-29`
 的封存窗口完成。
 
+审计收口把 trial ledger、成本回放、市场状态、流派摘要和组合目标的规范序列化提炼到无 I/O
+公共合同；producer 只负责原子发布，verifier 直接重建规范字节，不再调用 pipeline 私有写入
+helper。提交 `dfe023e60f98dc6136997ff46e56be0cc209a4b4` 的真实组合运行
+`research-run-3bb5b09726c47d59a4ebe06bf2a4656f4fcc32f5527d31eda12224f42afc9159`
+发布 manifest `7537bad884c7d905a6076a477003f285e9eb2d3a3f723742b7e4f0f9b56064e1`；
+producer 用时 286 秒，独立 verifier 用时 271 秒并重建核对全部 12 类制品。代码身份为 clean、
+`decision_grade=true`，eligible 家族仍为突破、量价趋势和趋势；当前目标因
+`feature_snapshot_stale` 保持全零与百分之百储备。
+
+2026-08-15 的 `strategy-readiness-v3` 复核显示：发布面板决策时点为
+`2026-08-14T23:00:00+09:00`，尾部连续覆盖仍为 30/169 根、尚差 139 根；持续无断流时最早在
+`2026-08-20T18:00:00+09:00` 成熟。活动 head 在复核期间继续前移到
+`2026-08-15T00:00:03.780000+09:00`，所以同时保留 `active_input_head_changed`，成熟后必须基于
+新 head 重跑。该运行与现有五条单流派 run 属于同一数据 vintage，不进入 monitor 历史，也不
+产生新的调参提案。8 月 20 日是 operational 特征成熟点，不是跨运行演进成熟点；monitor 要求
+相邻冻结 vintage 至少间隔 2,160 根小时柱。以当前单流派决策时点计，持续采集时最早约在
+`2026-11-06T06:00:00+09:00` 才可能形成第二条可比较历史，且仍需实际来源复核。
+
 该轮真实重建还暴露了旧面板查询的资源伸缩缺陷：762 个活动文件、约 1,945 万行被一次性送入
 全局 `ROW_NUMBER`，DuckDB 在 2 GB 和 4 GB 上限下都于同一去重算子耗尽内存。控制面证明 761 个
 非空文件的事件覆盖互不相交，最大单文件为 460,837 行。现在只把事件覆盖相交的文件组成联合
