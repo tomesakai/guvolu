@@ -61,6 +61,8 @@ from guvolu.research.pipeline import _research_output_paths
 from guvolu.research.provenance import canonical_json, stable_identifier
 from guvolu.research.quality import gate_feature_snapshot, panel_quality
 from guvolu.research.validation import (
+    BLOCK_BOOTSTRAP_METHOD_VERSION,
+    LEGACY_BLOCK_BOOTSTRAP_METHOD_VERSION,
     ValidationResult,
     WalkForwardFold,
     _circular_block_bootstrap_sharpe,
@@ -70,6 +72,7 @@ from guvolu.research.validation import (
     _parameter_neighbors,
     _probabilistic_sharpe_p_value,
     _probability_backtest_overfitting,
+    _studentized_circular_block_bootstrap_sharpe,
     strategy_returns,
 )
 from guvolu.research.verification import _verify_operational_gate, verify_research_run
@@ -591,6 +594,59 @@ def test_circular_block_bootstrap_sharpe_is_deterministic() -> None:
     assert first[2] == 128
     with pytest.raises(ValueError, match="折块长度"):
         _circular_block_bootstrap_sharpe(values, 141, 10, 0.05, 19)
+
+
+def test_studentized_block_bootstrap_is_deterministic_and_one_sided() -> None:
+    """bootstrap-t 必须逐样本重估误差并保守处理非正收益。"""
+    positive = tuple(
+        0.001 + (index % 7 - 3) * 0.0001 for index in range(280)
+    )
+    first = _studentized_circular_block_bootstrap_sharpe(
+        positive, 14, 128, 0.05, 19,
+    )
+    second = _studentized_circular_block_bootstrap_sharpe(
+        positive, 14, 128, 0.05, 19,
+    )
+    assert first == second
+    assert first[0] > 0.0
+    assert first[1] == pytest.approx(1.0 / 129.0)
+    negative = tuple(-value for value in positive)
+    lower, p_value, count = _studentized_circular_block_bootstrap_sharpe(
+        negative, 14, 128, 0.05, 19,
+    )
+    assert lower < 0.0
+    assert p_value == 1.0
+    assert count == 128
+    assert _studentized_circular_block_bootstrap_sharpe(
+        (0.0,) * 280, 14, 128, 0.05, 19,
+    ) == (0.0, 1.0, 128)
+    with pytest.raises(ValueError, match="折块长度"):
+        _studentized_circular_block_bootstrap_sharpe(
+            positive, 141, 10, 0.05, 19,
+        )
+
+
+def test_trial_ledger_binds_actual_bootstrap_method_version() -> None:
+    """历史 verifier 重建 v1 时不得被当前 v2 常量改写 header。"""
+    legacy = ValidationResult(
+        families=(),
+        trials=(),
+        candidate_targets={},
+        folds=(),
+        block_bootstrap_method_version=LEGACY_BLOCK_BOOTSTRAP_METHOD_VERSION,
+    )
+    current = replace(
+        legacy,
+        block_bootstrap_method_version=BLOCK_BOOTSTRAP_METHOD_VERSION,
+    )
+    legacy_header = json.loads(trial_ledger_body(legacy, "research").splitlines()[0])
+    current_header = json.loads(trial_ledger_body(current, "research").splitlines()[0])
+    assert legacy_header["block_bootstrap_method_version"] == (
+        LEGACY_BLOCK_BOOTSTRAP_METHOD_VERSION
+    )
+    assert current_header["block_bootstrap_method_version"] == (
+        BLOCK_BOOTSTRAP_METHOD_VERSION
+    )
 
 
 def test_deflated_sharpe_penalizes_more_trials_and_reports_effective_count() -> None:

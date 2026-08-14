@@ -22,7 +22,8 @@ from guvolu.strategy.contracts import CandidateSpec, FeatureRow, ResearchBar
 SECONDS_PER_YEAR = 365.0 * 24.0 * 60.0 * 60.0
 P_VALUE_METHOD_VERSION = "probabilistic-sharpe-nonnormal-v1"
 PBO_METHOD_VERSION = "cscv-recent-even-window-tie-average-v4"
-BLOCK_BOOTSTRAP_METHOD_VERSION = "circular-block-bootstrap-sharpe-v1"
+LEGACY_BLOCK_BOOTSTRAP_METHOD_VERSION = "circular-block-bootstrap-sharpe-v1"
+BLOCK_BOOTSTRAP_METHOD_VERSION = "studentized-circular-block-sharpe-v2"
 DEFLATED_SHARPE_METHOD_VERSION = "deflated-sharpe-family-effective-gate-v3"
 EFFECTIVE_TRIAL_METHOD_VERSION = "fold-score-correlation-participation-v1"
 PARAMETER_STABILITY_METHOD_VERSION = "one-axis-nearest-neighbor-v1"
@@ -56,6 +57,7 @@ class ValidationResult:
     family_validation_targets: Mapping[str, tuple[float, ...]] = field(
         default_factory=dict,
     )
+    block_bootstrap_method_version: str = BLOCK_BOOTSTRAP_METHOD_VERSION
 
 
 @dataclass(frozen=True)
@@ -413,6 +415,180 @@ def _circular_block_bootstrap_sharpe(
     )
 
 
+def _sharpe_from_moments(
+    mean: float,
+    second_moment: float,
+    periods_per_year: float,
+) -> float:
+    """由一阶、二阶总体矩计算年化 Sharpe 点估计。"""
+    variance = max(second_moment - mean * mean, 0.0)
+    if variance <= 0.0:
+        return 0.0
+    return mean / math.sqrt(variance) * math.sqrt(periods_per_year)
+
+
+def _sharpe_standard_error(
+    mean: float,
+    second_moment: float,
+    covariance: tuple[float, float, float],
+    count: int,
+    periods_per_year: float,
+) -> float:
+    """以矩函数梯度和长程协方差计算 Sharpe 标准误。"""
+    variance = second_moment - mean * mean
+    if variance <= 0.0 or count <= 0:
+        return 0.0
+    scale = math.sqrt(periods_per_year)
+    gradient_mean = scale * second_moment / (variance ** 1.5)
+    gradient_second = -scale * mean / (2.0 * variance ** 1.5)
+    covariance_mean, covariance_cross, covariance_second = covariance
+    long_run_variance = (
+        gradient_mean * gradient_mean * covariance_mean
+        + 2.0 * gradient_mean * gradient_second * covariance_cross
+        + gradient_second * gradient_second * covariance_second
+    )
+    return math.sqrt(max(long_run_variance / count, 0.0))
+
+
+def _circular_block_moment_covariance(
+    values: Sequence[float],
+    block_bars: int,
+    mean: float,
+    second_moment: float,
+) -> tuple[float, float, float]:
+    """以所有循环块的矩和估计原序列长程协方差。"""
+    count = len(values)
+    doubled = tuple(values) + tuple(values)
+    prefix = [0.0]
+    prefix_square = [0.0]
+    for value in doubled:
+        prefix.append(prefix[-1] + value)
+        prefix_square.append(prefix_square[-1] + value * value)
+    covariance_mean = 0.0
+    covariance_cross = 0.0
+    covariance_second = 0.0
+    normalization = math.sqrt(block_bars)
+    for start in range(count):
+        end = start + block_bars
+        centered_mean = (
+            prefix[end] - prefix[start] - block_bars * mean
+        ) / normalization
+        centered_second = (
+            prefix_square[end]
+            - prefix_square[start]
+            - block_bars * second_moment
+        ) / normalization
+        covariance_mean += centered_mean * centered_mean
+        covariance_cross += centered_mean * centered_second
+        covariance_second += centered_second * centered_second
+    return (
+        covariance_mean / count,
+        covariance_cross / count,
+        covariance_second / count,
+    )
+
+
+def _studentized_circular_block_bootstrap_sharpe(
+    values: Sequence[float],
+    block_bars: int,
+    samples: int,
+    one_sided_alpha: float,
+    seed: int,
+    periods_per_year: float = 365.0 * 24.0,
+) -> tuple[float, float, int]:
+    """以循环块和逐样本自然标准误构造一侧 bootstrap-t 门禁。"""
+    count = len(values)
+    if count < 2:
+        raise ValueError("studentized bootstrap 需要至少两个收益观测")
+    if block_bars <= 0 or block_bars * 2 > count:
+        raise ValueError("studentized bootstrap 折块长度超出收益序列")
+    if samples <= 0:
+        raise ValueError("studentized bootstrap 样本数必须为正")
+    if one_sided_alpha <= 0.0 or one_sided_alpha >= 0.5:
+        raise ValueError("studentized bootstrap 单侧 alpha 必须位于 (0, 0.5)")
+    mean = statistics.fmean(values)
+    second_moment = statistics.fmean(value * value for value in values)
+    sharpe = _sharpe_from_moments(mean, second_moment, periods_per_year)
+    covariance = _circular_block_moment_covariance(
+        values, block_bars, mean, second_moment,
+    )
+    standard_error = _sharpe_standard_error(
+        mean, second_moment, covariance, count, periods_per_year,
+    )
+    if standard_error <= 0.0:
+        return 0.0, 1.0, samples
+    doubled = tuple(values) + tuple(values)
+    prefix = [0.0]
+    prefix_square = [0.0]
+    for value in doubled:
+        prefix.append(prefix[-1] + value)
+        prefix_square.append(prefix_square[-1] + value * value)
+    full_blocks, remainder = divmod(count, block_bars)
+    generator = random.Random(seed)
+    statistics_t: list[float] = []
+    normalization = math.sqrt(block_bars)
+    for _sample in range(samples):
+        block_moments: list[tuple[float, float]] = []
+        total = 0.0
+        total_square = 0.0
+        for _block in range(full_blocks):
+            start = generator.randrange(count)
+            end = start + block_bars
+            block_sum = prefix[end] - prefix[start]
+            block_square = prefix_square[end] - prefix_square[start]
+            block_moments.append((block_sum, block_square))
+            total += block_sum
+            total_square += block_square
+        if remainder:
+            start = generator.randrange(count)
+            end = start + remainder
+            total += prefix[end] - prefix[start]
+            total_square += prefix_square[end] - prefix_square[start]
+        bootstrap_mean = total / count
+        bootstrap_second = total_square / count
+        bootstrap_sharpe = _sharpe_from_moments(
+            bootstrap_mean, bootstrap_second, periods_per_year,
+        )
+        covariance_mean = 0.0
+        covariance_cross = 0.0
+        covariance_second = 0.0
+        for block_sum, block_square in block_moments:
+            centered_mean = (
+                block_sum - block_bars * bootstrap_mean
+            ) / normalization
+            centered_second = (
+                block_square - block_bars * bootstrap_second
+            ) / normalization
+            covariance_mean += centered_mean * centered_mean
+            covariance_cross += centered_mean * centered_second
+            covariance_second += centered_second * centered_second
+        divisor = max(len(block_moments), 1)
+        bootstrap_error = _sharpe_standard_error(
+            bootstrap_mean,
+            bootstrap_second,
+            (
+                covariance_mean / divisor,
+                covariance_cross / divisor,
+                covariance_second / divisor,
+            ),
+            count,
+            periods_per_year,
+        )
+        statistic = (
+            (bootstrap_sharpe - sharpe) / bootstrap_error
+            if bootstrap_error > 0.0 else 0.0
+        )
+        statistics_t.append(statistic)
+    observed = sharpe / standard_error
+    upper_quantile = _quantile(statistics_t, 1.0 - one_sided_alpha)
+    exceedances = sum(value >= observed for value in statistics_t)
+    return (
+        sharpe - upper_quantile * standard_error,
+        (exceedances + 1) / (samples + 1),
+        samples,
+    )
+
+
 def make_folds(bar_count: int, config: Mapping[str, object]) -> tuple[WalkForwardFold, ...]:
     """生成带 embargo 的扩展 walk-forward。"""
     minimum_train = _integer(config.get("minimum_train_bars"), "minimum_train_bars")
@@ -694,8 +870,15 @@ def walk_forward_validate(
     candidates: Sequence[CandidateSpec],
     config: Mapping[str, object],
     decision_index: int | None = None,
+    *,
+    block_bootstrap_method_version: str = BLOCK_BOOTSTRAP_METHOD_VERSION,
 ) -> ValidationResult:
     """按家族训练选择并只消费被选测试路径。"""
+    if block_bootstrap_method_version not in {
+        LEGACY_BLOCK_BOOTSTRAP_METHOD_VERSION,
+        BLOCK_BOOTSTRAP_METHOD_VERSION,
+    }:
+        raise ValueError("block bootstrap 方法版本不受支持")
     cost = _mapping(config.get("cost_model"), "cost_model")
     cost_bps = sum(_number(cost.get(name), name) for name in (
         "fee_bps_assumption",
@@ -933,7 +1116,7 @@ def walk_forward_validate(
         })
         bootstrap_seed = block_bootstrap_seed ^ int(
             hashlib.sha256(
-                f"{family}:{BLOCK_BOOTSTRAP_METHOD_VERSION}".encode("utf-8")
+                f"{family}:{block_bootstrap_method_version}".encode("utf-8")
             ).hexdigest()[:16],
             16,
         )
@@ -942,8 +1125,14 @@ def walk_forward_validate(
             for index in range(1, len(bars))
             if oos_mask[index]
         )
+        bootstrap_function = (
+            _circular_block_bootstrap_sharpe
+            if block_bootstrap_method_version
+            == LEGACY_BLOCK_BOOTSTRAP_METHOD_VERSION
+            else _studentized_circular_block_bootstrap_sharpe
+        )
         bootstrap_lower, bootstrap_p, bootstrap_count = (
-            _circular_block_bootstrap_sharpe(
+            bootstrap_function(
                 compact_oos_returns,
                 block_bootstrap_bars,
                 block_bootstrap_samples,
@@ -1194,6 +1383,7 @@ def walk_forward_validate(
         candidate_targets=candidate_targets,
         folds=folds,
         family_validation_targets=family_validation_targets,
+        block_bootstrap_method_version=block_bootstrap_method_version,
     )
 
 

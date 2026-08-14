@@ -245,6 +245,7 @@ def _attest_v12_decision_evidence(
     research_identity: str,
     summary: Mapping[str, object],
     artifact_paths: Mapping[str, Path],
+    block_bootstrap_method_version: str,
 ) -> None:
     """从受保护 panel/config 重建候选选择、资格、资金权重和回放。"""
     batches = build_family_batches(config, family_scope)
@@ -285,6 +286,7 @@ def _attest_v12_decision_evidence(
         candidates,
         config,
         decision_index=decision_index,
+        block_bootstrap_method_version=block_bootstrap_method_version,
     )
     interval = _text(config.get("bar_interval"), "bar_interval")
     interval_seconds = INTERVAL_SECONDS.get(interval)
@@ -506,6 +508,10 @@ def _verify_run_identity(
             _text(manifest.get("research_identity"), "research_identity"),
             summary,
             artifact_paths,
+            _text(
+                manifest.get("block_bootstrap_method_version"),
+                "block_bootstrap_method_version",
+            ),
         )
         if decision_grade:
             assert isinstance(git_hash, str)

@@ -8,7 +8,6 @@ from guvolu.research.contracts import AllocationResult, PanelSnapshot
 from guvolu.research.features import MarketState
 from guvolu.research.provenance import canonical_json
 from guvolu.research.validation import (
-    BLOCK_BOOTSTRAP_METHOD_VERSION,
     PBO_METHOD_VERSION,
     P_VALUE_METHOD_VERSION,
     ValidationResult,
@@ -67,7 +66,9 @@ def trial_ledger_body(
         "candidate_evaluations": len(validation.trials),
         "p_value_method_version": P_VALUE_METHOD_VERSION,
         "pbo_method_version": PBO_METHOD_VERSION,
-        "block_bootstrap_method_version": BLOCK_BOOTSTRAP_METHOD_VERSION,
+        "block_bootstrap_method_version": (
+            validation.block_bootstrap_method_version
+        ),
     })]
     for trial in sorted(validation.trials, key=lambda item: item.evaluation_id):
         selection_role = "none"
