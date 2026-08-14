@@ -4,6 +4,8 @@ from __future__ import annotations
 import inspect
 import json
 import sqlite3
+import threading
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -18,17 +20,25 @@ from guvolu.research.contracts import (
     HOLDOUT_METHOD_VERSION,
     CodeIdentity,
     FrozenPanelInputs,
+    PanelSnapshot,
+    PerformanceMetrics,
 )
+from guvolu.research.config_lineage import snapshot_verified_config_lineage
 from guvolu.research.frozen_forward import (
+    attest_frozen_forward_batch,
+    attest_frozen_prediction_artifact as _actual_forward_attestation,
     freeze_forward_plan,
     run_frozen_forward_prediction,
 )
 from guvolu.research.governance import (
+    ActiveHeadReceiptRegistration,
     GOVERNANCE_METHOD_VERSION,
+    GOVERNANCE_SCHEMA_VERSION,
     finalize_holdout_evaluation,
     get_holdout_evaluation_attempt,
     get_holdout_vintage,
     get_frozen_forward_plan_for_vintage,
+    get_frozen_forward_prediction_row_set,
     list_frozen_forward_predictions,
     list_holdout_vintages,
     register_frozen_forward_plan,
@@ -36,8 +46,13 @@ from guvolu.research.governance import (
     register_research_exposure,
     seal_holdout_vintage,
     start_holdout_evaluation_attempt,
+    upgrade_governance_write_ceiling,
 )
-from guvolu.research.holdout import _score_decision_times, run_holdout_validation
+from guvolu.research.holdout import (
+    _score_decision_times,
+    attest_holdout_terminal_artifacts as _actual_holdout_attestation,
+    run_holdout_validation,
+)
 from guvolu.research.provenance import sha256_file, stable_identifier
 from guvolu.research.verification import VerificationResult
 from guvolu.strategy.expression import (
@@ -46,6 +61,7 @@ from guvolu.strategy.expression import (
     expression_id,
     strategy_expression,
 )
+from guvolu.strategy.contracts import CandidateSpec
 
 
 _TEST_PARAMETERS: dict[str, int | float] = {
@@ -79,6 +95,16 @@ def _authoritative_test_clock(monkeypatch: pytest.MonkeyPatch) -> None:
     global _TEST_NOW
     _TEST_NOW = _time("2026-08-14T00:00:00")
     monkeypatch.setattr(clock, "utc_now", lambda: _TEST_NOW)
+    # 低层测试使用最小伪制品。
+    # 完整重算由专项测试覆盖。
+    monkeypatch.setattr(
+        "guvolu.research.frozen_forward.attest_frozen_prediction_artifact",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "guvolu.research.holdout.attest_holdout_terminal_artifacts",
+        lambda *_args: None,
+    )
 
 
 def _set_now(value: datetime) -> None:
@@ -129,6 +155,12 @@ def _test_evaluation_identity(
     config_path.write_text(json.dumps({
         "data_governance": {"holdout_policy": policy},
     }, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+    receipt_path = (
+        root / "data" / "research" / "input-receipts" / "holdout-test.json"
+    )
+    receipt_path.parent.mkdir(parents=True, exist_ok=True)
+    receipt_path.write_text("{}\n", encoding="utf-8")
+    receipt_sha256 = sha256_file(receipt_path)
     identity: dict[str, object] = {
         "holdout_method_version": HOLDOUT_METHOD_VERSION,
         "governance_method_version": GOVERNANCE_METHOD_VERSION,
@@ -137,9 +169,34 @@ def _test_evaluation_identity(
         "config_hash": sha256_file(config_path),
         "code_tree_digest": "tree-one",
         "input_head_generation": "head-one",
+        "input_attempt_ids": ["attempt-one"],
         "input_artifact_ids": ["artifact-one"],
+        "normalization_versions": ["normalization-one"],
+        "input_receipt_sha256": receipt_sha256,
     }
-    return identity, stable_identifier("holdout-evaluation", identity)
+    evaluation_id = stable_identifier("holdout-evaluation", identity)
+    registry_path = root / "governance.sqlite3"
+    if registry_path.exists():
+        connection = sqlite3.connect(registry_path)
+        try:
+            connection.execute(
+                "INSERT OR REPLACE INTO active_head_receipt("
+                "consumer_kind,consumer_id,market_id,head_generation,"
+                "receipt_artifact_path,receipt_artifact_sha256,recorded_at"
+                ") VALUES('holdout',?,?,?,?,?,?)",
+                (
+                    evaluation_id,
+                    "market-one",
+                    "head-one",
+                    receipt_path.relative_to(root).as_posix(),
+                    receipt_sha256,
+                    _TEST_NOW.isoformat(),
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+    return identity, evaluation_id
 
 
 def _write_forward_plan_artifact(
@@ -171,6 +228,7 @@ def _write_forward_plan_artifact(
         "source": {"manifest_sha256": source_manifest_sha256},
         "candidate_set_hash": candidate_set_hash,
         "config_hash": config_hash,
+        "code_identity": {"tree_digest": code_tree_digest},
         "code_tree_digest": code_tree_digest,
         "candidates": [{
             "candidate_id": _TEST_CANDIDATE_ID,
@@ -204,6 +262,12 @@ def _write_forward_prediction_artifact(
     stamp = decision_time.strftime("%Y%m%dT%H%M%SZ")
     path = root / "reports" / plan_id / "predictions" / f"{stamp}.json"
     path.parent.mkdir(parents=True, exist_ok=True)
+    receipt_path = (
+        root / "data" / "research" / "input-receipts" / f"receipt-{stamp}.json"
+    )
+    receipt_path.parent.mkdir(parents=True, exist_ok=True)
+    receipt_path.write_text("{}\n", encoding="utf-8")
+    receipt_sha256 = sha256_file(receipt_path)
     path.write_text(json.dumps({
         "schema_version": FROZEN_FORWARD_SCHEMA_VERSION,
         "method_version": FROZEN_FORWARD_METHOD_VERSION,
@@ -215,6 +279,12 @@ def _write_forward_prediction_artifact(
         "input_head_generation": input_head_generation,
         "panel_sha256": panel_sha256,
         "config_hash": config_hash,
+        "input_receipt_sha256": receipt_sha256,
+        "input_receipt": {
+            "path": receipt_path.relative_to(root).as_posix(),
+            "sha256": receipt_sha256,
+            "bytes": receipt_path.stat().st_size,
+        },
         "code_identity": {"tree_digest": code_tree_digest},
         "quality": {
             "integrity": True,
@@ -280,6 +350,13 @@ def _write_holdout_evidence(
     policy = config["data_governance"]["holdout_policy"]
     config_hash = sha256_file(config_path)
     require_forward = policy["require_frozen_forward_predictions"] is True
+    forward_row_set_hash = (
+        get_frozen_forward_prediction_row_set(
+            root / "governance.sqlite3", str(forward_plan_id),
+        )[0]
+        if require_forward and forward_plan_id is not None
+        else None
+    )
     passed = verdict == "passed"
     passed_families = ["trend"] if passed else []
     metrics = {
@@ -323,12 +400,17 @@ def _write_holdout_evidence(
         "frozen_forward_prediction_count": (
             forward_prediction_count if require_forward else 0
         ),
+        "frozen_forward_row_set_hash": forward_row_set_hash,
         "policy": policy,
         "passed_families": passed_families,
         "verdict": verdict,
     }, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
     result_sha256 = sha256_file(result_path)
     manifest_path = run_directory / "manifest.json"
+    receipt_path = (
+        root / "data" / "research" / "input-receipts" / "holdout-test.json"
+    )
+    receipt_sha256 = sha256_file(receipt_path)
     manifest_path.write_text(json.dumps({
         "schema_version": HOLDOUT_MANIFEST_SCHEMA_VERSION,
         "holdout_method_version": HOLDOUT_METHOD_VERSION,
@@ -337,6 +419,16 @@ def _write_holdout_evidence(
         "candidate_set_hash": candidate_set_hash,
         "candidate_set_identity": candidate_set_identity,
         "evaluation_identity": evaluation_identity,
+        "input_head_generation": evaluation_identity[
+            "input_head_generation"
+        ],
+        "input_attempt_ids": evaluation_identity["input_attempt_ids"],
+        "input_artifact_ids": evaluation_identity["input_artifact_ids"],
+        "normalization_versions": evaluation_identity[
+            "normalization_versions"
+        ],
+        "frozen_forward_row_set_hash": forward_row_set_hash,
+        "input_receipt_sha256": receipt_sha256,
         "verdict": verdict,
         "artifacts": {
             "config": {
@@ -344,6 +436,12 @@ def _write_holdout_evidence(
                 "path": config_path.relative_to(root).as_posix(),
                 "sha256": config_hash,
                 "bytes": config_path.stat().st_size,
+            },
+            "input_receipt": {
+                "kind": "active_trade_head_receipt",
+                "path": receipt_path.relative_to(root).as_posix(),
+                "sha256": receipt_sha256,
+                "bytes": receipt_path.stat().st_size,
             },
             "panel": {
                 "kind": "holdout_panel",
@@ -557,7 +655,7 @@ def test_legacy_consumed_vintage_is_migrated_to_incomplete_attempt(
         version = connection.execute(
             "SELECT value FROM governance_meta WHERE key='schema_version'"
         ).fetchone()
-    assert version == ("4",)
+    assert version == (str(GOVERNANCE_SCHEMA_VERSION),)
 
 
 def test_schema_write_ceiling_preserves_legacy_reader_deployment(
@@ -618,6 +716,128 @@ def test_schema_write_ceiling_preserves_legacy_reader_deployment(
         assert connection.execute(
             "SELECT research_identity FROM research_exposure"
         ).fetchall() == [("compatible-exposure",)]
+
+
+def test_explicit_schema_write_ceiling_upgrade_is_backed_up(
+    tmp_path: Path,
+) -> None:
+    """显式旧版本预期匹配时才可备份并开放当前 writer。"""
+    registry = tmp_path / "governance.sqlite3"
+    seal_holdout_vintage(
+        registry,
+        "market-one",
+        _time("2027-01-01T00:00:00"),
+        _time("2027-02-01T00:00:00"),
+    )
+    with sqlite3.connect(registry) as connection:
+        connection.execute("DROP TABLE active_head_receipt")
+        connection.execute(
+            "UPDATE governance_meta SET value='2' WHERE key='schema_version'"
+        )
+        connection.execute(
+            "INSERT INTO governance_meta(key,value) VALUES(?,?)",
+            ("schema_write_ceiling", "2"),
+        )
+
+    backup = tmp_path / "governance-v2.sqlite3.bak"
+    assert upgrade_governance_write_ceiling(
+        registry,
+        backup,
+        expected_version=2,
+        expected_write_ceiling=2,
+    ) == backup.resolve()
+    with sqlite3.connect(registry) as connection:
+        assert connection.execute(
+            "SELECT key,value FROM governance_meta ORDER BY key"
+        ).fetchall() == [
+            ("schema_version", str(GOVERNANCE_SCHEMA_VERSION)),
+            ("schema_write_ceiling", str(GOVERNANCE_SCHEMA_VERSION)),
+        ]
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name='active_head_receipt'"
+        ).fetchone() == ("active_head_receipt",)
+    with sqlite3.connect(backup) as connection:
+        assert connection.execute(
+            "SELECT value FROM governance_meta WHERE key='schema_version'"
+        ).fetchone() == ("2",)
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name='active_head_receipt'"
+        ).fetchone() is None
+
+    with pytest.raises(FileExistsError):
+        upgrade_governance_write_ceiling(
+            registry,
+            backup,
+            expected_version=2,
+            expected_write_ceiling=2,
+        )
+
+
+def test_governance_upgrade_backup_includes_prior_concurrent_commit(
+    tmp_path: Path,
+) -> None:
+    """迁移锁等待期间完成的旧 writer 提交必须进入恢复副本。"""
+    registry = tmp_path / "governance.sqlite3"
+    seal_holdout_vintage(
+        registry,
+        "market-one",
+        _time("2027-01-01T00:00:00"),
+        _time("2027-02-01T00:00:00"),
+    )
+    with sqlite3.connect(registry) as connection:
+        connection.execute(
+            "UPDATE governance_meta SET value='2' WHERE key='schema_version'"
+        )
+        connection.execute(
+            "INSERT INTO governance_meta(key,value) VALUES(?,?)",
+            ("schema_write_ceiling", "2"),
+        )
+
+    writer = sqlite3.connect(registry, timeout=30.0, isolation_level=None)
+    writer.execute("BEGIN IMMEDIATE")
+    writer.execute(
+        "INSERT INTO research_exposure VALUES(?,?,?,?,?,?)",
+        (
+            "late-exposure-id",
+            "late-research-identity",
+            "market-one",
+            _time("2026-01-01T00:00:00").isoformat(),
+            _time("2026-02-01T00:00:00").isoformat(),
+            _time("2026-02-02T00:00:00").isoformat(),
+        ),
+    )
+    backup = tmp_path / "concurrent-v2.sqlite3.bak"
+    started = threading.Event()
+    errors: list[BaseException] = []
+
+    def migrate() -> None:
+        started.set()
+        try:
+            upgrade_governance_write_ceiling(
+                registry,
+                backup,
+                expected_version=2,
+                expected_write_ceiling=2,
+            )
+        except BaseException as error:
+            errors.append(error)
+
+    migration = threading.Thread(target=migrate)
+    migration.start()
+    assert started.wait(timeout=1.0)
+    time.sleep(0.1)
+    writer.execute("COMMIT")
+    writer.close()
+    migration.join(timeout=5.0)
+    assert not migration.is_alive()
+    assert errors == []
+    with sqlite3.connect(backup) as connection:
+        assert connection.execute(
+            "SELECT research_identity FROM research_exposure "
+            "WHERE exposure_id='late-exposure-id'"
+        ).fetchone() == ("late-research-identity",)
 
 
 def test_schema_write_ceiling_rejects_incompatible_physical_schema(
@@ -1136,6 +1356,22 @@ def test_forward_required_finalize_matches_registered_prediction_coverage(
         3900,
         repository_root=tmp_path,
     )
+    no_replay = pytest.MonkeyPatch()
+    no_replay.setattr(
+        "guvolu.research.frozen_forward.attest_frozen_prediction_artifact",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("批量复核不得重放多年 panel")
+        ),
+    )
+    try:
+        batch = attest_frozen_forward_batch(
+            tmp_path, plan.plan_id, registry_path=registry,
+        )
+    finally:
+        no_replay.undo()
+    assert batch.verification.prediction_count == 2
+    assert batch.decision_times == (vintage.start_time, second_decision)
+    assert batch.row_set_hash.startswith("frozen-forward-row-set-")
     _set_now(_time("2027-02-02T00:00:00"))
     start_holdout_evaluation_attempt(
         registry,
@@ -1229,6 +1465,68 @@ def test_governance_timestamps_are_not_caller_controlled(tmp_path: Path) -> None
             "candidate-set-hash",
             "evaluation-id",
         )
+
+
+def test_prediction_registration_rejects_unattested_self_reported_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """公开注册 API 不得接受缺少绑定面板与配置的自报目标。"""
+    monkeypatch.setattr(
+        "guvolu.research.frozen_forward.attest_frozen_prediction_artifact",
+        _actual_forward_attestation,
+    )
+    registry = tmp_path / "governance.sqlite3"
+    vintage = seal_holdout_vintage(
+        registry,
+        "market-one",
+        _time("2027-01-01T00:00:00"),
+        _time("2027-02-01T00:00:00"),
+    )
+    _, plan_path, plan_sha256 = _write_forward_plan_artifact(
+        tmp_path,
+        vintage.vintage_id,
+        "manifest-hash",
+        "candidate-set-hash",
+        "config-hash",
+        "tree-hash",
+    )
+    plan = register_frozen_forward_plan(
+        registry,
+        vintage.vintage_id,
+        "manifest-hash",
+        "candidate-set-hash",
+        "config-hash",
+        "tree-hash",
+        plan_path,
+        plan_sha256,
+        repository_root=tmp_path,
+    )
+    decision = _time("2027-01-02T01:00:00")
+    prediction_path, prediction_sha256 = _write_forward_prediction_artifact(
+        tmp_path,
+        plan.plan_id,
+        vintage.vintage_id,
+        decision,
+        "sha256-head",
+        "panel-hash",
+        "config-hash",
+        "tree-hash",
+    )
+    _set_now(decision + timedelta(minutes=1))
+    with pytest.raises(ValueError, match="plan.config_path"):
+        register_frozen_forward_prediction(
+            registry,
+            plan.plan_id,
+            decision,
+            "sha256-head",
+            "panel-hash",
+            prediction_path,
+            prediction_sha256,
+            3900,
+            repository_root=tmp_path,
+        )
+    assert list_frozen_forward_predictions(registry, plan.plan_id) == ()
 
 
 def test_frozen_forward_plan_and_predictions_are_precommitted_and_append_only(
@@ -1395,6 +1693,201 @@ def test_frozen_forward_plan_and_predictions_are_precommitted_and_append_only(
         )
 
 
+def test_holdout_attestation_rejects_self_reported_positive_metrics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """终局指标必须由绑定面板、目标和成本模型重算。"""
+    source_manifest = tmp_path / "source-manifest.json"
+    source_summary = tmp_path / "source-summary.json"
+    candidate_registry = tmp_path / "candidate-registry.json"
+    panel = tmp_path / "panel.parquet"
+    for path in (source_manifest, source_summary, candidate_registry):
+        path.write_text("{}", encoding="utf-8")
+    panel.write_bytes(b"panel")
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({
+        "market_id": "market-one",
+        "bar_interval": "1hour",
+        "from_time": "2026-01-01T00:00:00+00:00",
+        "notional_scale": 100_000_000,
+        "features": {
+            "lookbacks": [1],
+            "volume_lookback": 1,
+            "maximum_structural_gap_bars_assumption": 1,
+        },
+        "cost_model": {
+            "fee_bps_assumption": 1.0,
+            "half_spread_bps_assumption": 1.0,
+            "slippage_bps_assumption": 1.0,
+            "impact_bps_assumption": 1.0,
+            "capacity_notional_quote": 1_000.0,
+        },
+        "data_governance": {
+            "registry": "governance.sqlite3",
+            "holdout_policy": {
+                "minimum_bars": 1,
+                "minimum_sharpe": 0.0,
+                "maximum_drawdown": 0.5,
+                "maximum_fdr_q": 0.2,
+                "require_frozen_forward_predictions": False,
+            },
+        },
+    }), encoding="utf-8")
+    config_snapshot = snapshot_verified_config_lineage(
+        tmp_path, config, tmp_path / "config-artifacts",
+    )
+    start = _time("2027-01-01T01:00:00")
+    end = _time("2027-01-01T02:00:00")
+    schedule = tmp_path / "schedule.json"
+    schedule.write_text(json.dumps({
+        "decision_times": [start.isoformat()],
+    }), encoding="utf-8")
+    result = tmp_path / "result.json"
+    result.write_text(json.dumps({
+        "vintage": {
+            "start_time": start.isoformat(),
+            "end_time": end.isoformat(),
+        },
+        "frozen_forward_plan_id": None,
+        "candidate_results": [{
+            "candidate_id": "candidate-one",
+            "family": "trend",
+            "parameters": {"lookback": 1},
+            "metrics": {
+                "net_return": 1.0,
+                "sharpe": 9.0,
+                "maximum_drawdown": 0.0,
+                "p_value": 0.001,
+            },
+            "fdr_q": 0.001,
+            "passed": True,
+            "rejection_reasons": [],
+        }],
+        "passed_families": ["trend"],
+        "verdict": "passed",
+    }), encoding="utf-8")
+
+    def artifact(path: Path) -> dict[str, object]:
+        return {
+            "path": path.relative_to(tmp_path).as_posix(),
+            "sha256": sha256_file(path),
+            "bytes": path.stat().st_size,
+        }
+
+    receipt = tmp_path / "input-receipt.json"
+    receipt.write_text("{}\n", encoding="utf-8")
+    registry = tmp_path / "governance.sqlite3"
+    registry.write_bytes(b"")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({
+        "evaluation_id": "evaluation-one",
+        "candidate_set_identity": {
+            "source_manifest_sha256": sha256_file(source_manifest),
+            "source_summary_sha256": sha256_file(source_summary),
+            "candidate_registry_sha256": sha256_file(candidate_registry),
+        },
+        "evaluation_identity": {
+            "config_hash": config_snapshot.leaf_config_sha256,
+        },
+        "input_head_generation": "head-one",
+        "input_attempt_ids": ["attempt-one"],
+        "input_artifact_ids": ["artifact-one"],
+        "normalization_versions": ["normalization-one"],
+        "input_receipt_sha256": sha256_file(receipt),
+        "artifacts": {
+            "source_manifest": artifact(source_manifest),
+            "source_summary": artifact(source_summary),
+            "candidate_registry": artifact(candidate_registry),
+            "config": artifact(config_snapshot.leaf_config_path),
+            "config_lineage": artifact(config_snapshot.bundle_path),
+            "input_receipt": artifact(receipt),
+            "panel": artifact(panel),
+            "score_schedule": artifact(schedule),
+            "result": artifact(result),
+        },
+    }), encoding="utf-8")
+    candidate = CandidateSpec(
+        "candidate-one", "trend", "paper", {"lookback": 1}, 1,
+    )
+    monkeypatch.setattr(
+        "guvolu.research.holdout.load_frozen_candidates",
+        lambda *_args: ((candidate,), candidate_registry),
+    )
+    monkeypatch.setattr(
+        "guvolu.research.holdout.get_active_head_receipt",
+        lambda *_args: ActiveHeadReceiptRegistration(
+            consumer_kind="holdout",
+            consumer_id="evaluation-one",
+            market_id="market-one",
+            head_generation="head-one",
+            receipt_artifact_path="input-receipt.json",
+            receipt_artifact_sha256=sha256_file(receipt),
+            recorded_at=end,
+        ),
+    )
+    monkeypatch.setattr(
+        "guvolu.research.holdout.attest_trade_input_receipt",
+        lambda *_args, **_kwargs: FrozenPanelInputs(
+            market={"market_id": "market-one"},
+            paths=(),
+            head_generation="head-one",
+            attempt_ids=("attempt-one",),
+            artifact_ids=("artifact-one",),
+            normalization_versions=("normalization-one",),
+            maximum_event_time=end,
+        ),
+    )
+    monkeypatch.setattr(
+        "guvolu.research.holdout.build_panel_snapshot",
+        lambda *_args: PanelSnapshot(
+            market={"market_id": "market-one"},
+            bars=(),
+            head_generation="head-one",
+            attempt_ids=("attempt-one",),
+            artifact_ids=("artifact-one",),
+            normalization_versions=("normalization-one",),
+            panel_path=panel,
+            panel_sha256=sha256_file(panel),
+            decision_time=end,
+            latest_available_time=end,
+        ),
+    )
+    monkeypatch.setattr(
+        "guvolu.research.holdout.load_panel_bars",
+        lambda *_args: (_DecisionBar(start), _DecisionBar(end)),
+    )
+    monkeypatch.setattr(
+        "guvolu.research.holdout.compute_features",
+        lambda *_args: (object(), object()),
+    )
+    monkeypatch.setattr(
+        "guvolu.research.holdout.generate_targets",
+        lambda *_args: (0.0, 0.0),
+    )
+    recomputed = PerformanceMetrics(
+        bars=1,
+        net_return=-0.1,
+        annual_return=-0.1,
+        annual_volatility=0.2,
+        sharpe=-0.5,
+        maximum_drawdown=0.1,
+        turnover=1.0,
+        annual_turnover=8_760.0,
+        hit_rate=0.0,
+        exposure=0.0,
+        cost=0.01,
+        p_value=0.8,
+        capacity_score=1.0,
+    )
+    monkeypatch.setattr(
+        "guvolu.research.holdout.evaluate_targets",
+        lambda *_args: recomputed,
+    )
+    with pytest.raises(ValueError, match="candidate metrics"):
+        _actual_holdout_attestation(tmp_path, manifest)
+
+
 def test_holdout_is_consumed_before_market_data_is_opened(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1416,6 +1909,9 @@ def test_holdout_is_consumed_before_market_data_is_opened(
         encoding="utf-8",
     )
     config_hash = sha256_file(config)
+    config_snapshot = snapshot_verified_config_lineage(
+        tmp_path, config, tmp_path / "reports" / "config-artifacts",
+    )
     template = strategy_expression("trend")
     parameters: dict[str, int | float] = {
         "annual_volatility_target": 0.4,
@@ -1426,7 +1922,7 @@ def test_holdout_is_consumed_before_market_data_is_opened(
     }
     candidate_id = candidate_identity(template, parameters)
     candidate_registry = tmp_path / "reports" / "candidate-registry.json"
-    candidate_registry.parent.mkdir(parents=True)
+    candidate_registry.parent.mkdir(parents=True, exist_ok=True)
     registry_text = json.dumps({
         "config_hash": config_hash,
         "expression_method_version": EXPRESSION_METHOD_VERSION,
@@ -1450,7 +1946,7 @@ def test_holdout_is_consumed_before_market_data_is_opened(
     }
     summary = tmp_path / "reports" / "summary.json"
     summary.write_text(json.dumps({
-        "pipeline_method_version": "strategy-research-pipeline-v9",
+        "pipeline_method_version": "strategy-research-pipeline-v12",
         "run_id": "run-one",
         "research_identity": "research-one",
         "config_hash": config_hash,
@@ -1472,6 +1968,18 @@ def test_holdout_is_consumed_before_market_data_is_opened(
         "research_identity": "research-one",
         "config_hash": config_hash,
         "artifacts": {
+            "config": {
+                "path": config_snapshot.leaf_config_path.relative_to(
+                    tmp_path
+                ).as_posix(),
+                "sha256": config_snapshot.leaf_config_sha256,
+                "bytes": config_snapshot.leaf_config_path.stat().st_size,
+            },
+            "config_lineage": {
+                "path": config_snapshot.bundle_path.relative_to(tmp_path).as_posix(),
+                "sha256": config_snapshot.bundle_sha256,
+                "bytes": config_snapshot.bundle_path.stat().st_size,
+            },
             "candidate_registry": registry_record,
             "summary_json": {
                 "path": "reports/summary.json",
@@ -1491,9 +1999,13 @@ def test_holdout_is_consumed_before_market_data_is_opened(
             checked_artifacts=("candidate_registry", "summary_json"),
         ),
     )
+    receipt_path = tmp_path / "data" / "research" / "input-receipts" / "test.json"
+    receipt_path.parent.mkdir(parents=True, exist_ok=True)
+    receipt_path.write_text("{}\n", encoding="utf-8")
+    receipt_sha256 = sha256_file(receipt_path)
     monkeypatch.setattr(
-        "guvolu.research.holdout.freeze_trade_inputs",
-        lambda _root, _market: FrozenPanelInputs(
+        "guvolu.research.holdout.capture_trade_input_receipt",
+        lambda _root, _market, _output: FrozenPanelInputs(
             market={"market_id": "market-one"},
             paths=(),
             head_generation="head-one",
@@ -1501,6 +2013,21 @@ def test_holdout_is_consumed_before_market_data_is_opened(
             artifact_ids=("artifact-one",),
             normalization_versions=("normalization-one",),
             maximum_event_time=_time("2027-03-01T00:00:00"),
+            receipt_path=receipt_path,
+            receipt_sha256=receipt_sha256,
+        ),
+    )
+    monkeypatch.setattr(
+        "guvolu.research.holdout.register_active_head_receipt",
+        lambda _registry, kind, consumer_id, market_id, head, path, sha, **_kwargs:
+        ActiveHeadReceiptRegistration(
+            consumer_kind=kind,
+            consumer_id=consumer_id,
+            market_id=market_id,
+            head_generation=head,
+            receipt_artifact_path=path,
+            receipt_artifact_sha256=sha,
+            recorded_at=_TEST_NOW,
         ),
     )
     monkeypatch.setattr(

@@ -9,9 +9,9 @@ from typing import Mapping
 from guvolu.strategy.contracts import CandidateSpec, ResearchBar
 
 HOLDOUT_MANIFEST_SCHEMA_VERSION = 1
-HOLDOUT_METHOD_VERSION = "frozen-candidate-holdout-v3"
+HOLDOUT_METHOD_VERSION = "frozen-candidate-holdout-v4"
 FROZEN_FORWARD_SCHEMA_VERSION = 1
-FROZEN_FORWARD_METHOD_VERSION = "frozen-forward-v1"
+FROZEN_FORWARD_METHOD_VERSION = "frozen-forward-v2"
 
 
 @dataclass(frozen=True)
@@ -37,6 +37,8 @@ class FrozenPanelInputs:
     artifact_ids: tuple[str, ...]
     normalization_versions: tuple[str, ...]
     maximum_event_time: datetime
+    receipt_path: Path | None = None
+    receipt_sha256: str | None = None
 
 
 @dataclass(frozen=True)

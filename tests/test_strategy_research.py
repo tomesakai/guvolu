@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import subprocess
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -12,6 +13,8 @@ import duckdb
 import pytest
 
 import guvolu.research.allocator as allocator_module
+from guvolu.data import store
+from guvolu.data.materialize import ensure_markets
 from guvolu.research.allocator import _covariance, allocate
 from guvolu.research import provenance
 from guvolu.research.contracts import (
@@ -23,10 +26,24 @@ from guvolu.research.contracts import (
     QualityVector,
     TrialRecord,
 )
-from guvolu.research.config_lineage import verify_config_lineage
+from guvolu.research.config_lineage import (
+    attest_config_lineage_snapshot,
+    snapshot_verified_config_lineage,
+    verify_config_lineage,
+)
 from guvolu.research.features import MarketState, classify_market_state, compute_features
+from guvolu.research.governance import (
+    get_active_head_receipt,
+    register_active_head_receipt,
+)
 from guvolu.research.evolution import monitor_family_run
-from guvolu.research.panel import compact_trade_panel, load_panel_bars
+from guvolu.research.panel import (
+    attest_trade_input_receipt,
+    capture_trade_input_receipt,
+    compact_trade_panel,
+    load_panel_bars,
+    registered_trade_inputs,
+)
 from guvolu.research.pipeline import (
     _cost_replay_artifact,
     _position_contract_payload,
@@ -47,7 +64,7 @@ from guvolu.research.validation import (
     _probability_backtest_overfitting,
     strategy_returns,
 )
-from guvolu.research.verification import verify_research_run
+from guvolu.research.verification import _verify_operational_gate, verify_research_run
 from guvolu.research.tuning import (
     propose_family_evolution,
     verify_evolution_config,
@@ -55,6 +72,7 @@ from guvolu.research.tuning import (
 from guvolu.strategy.baselines import build_candidates, generate_targets
 from guvolu.strategy.contracts import CandidateSpec, FeatureRow, ResearchBar
 from guvolu.strategy.generation import build_family_batches
+from guvolu.venues import registry
 
 
 def _time(hour: int, minute: int = 0) -> datetime:
@@ -176,6 +194,162 @@ def test_compact_panel_enforces_pit_and_integer_projection(tmp_path: Path) -> No
     finally:
         check.close()
     assert row == (100, 10, 10_000_000_000)
+
+
+def test_registered_trade_inputs_rebuilds_control_plane_identity(
+    tmp_path: Path,
+) -> None:
+    """历史 panel 输入必须由控制面和物理文件共同证明。"""
+    data_root = tmp_path / "data"
+    source = data_root / "materialized" / "trade.parquet"
+    source.parent.mkdir(parents=True)
+    database = duckdb.connect()
+    try:
+        database.execute("""
+            CREATE TABLE source(
+              observation_id VARCHAR,event_time TIMESTAMPTZ,
+              available_time TIMESTAMPTZ,ingest_time TIMESTAMPTZ,
+              side VARCHAR,source_side_basis VARCHAR,price VARCHAR,size VARCHAR,
+              source_artifact_id VARCHAR,source_row_index BIGINT,
+              market_id VARCHAR
+            )
+        """)
+        database.execute(
+            "INSERT INTO source VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "observation-one", _time(0, 10), _time(0, 10), _time(0, 11),
+                "buy", "taker", "100", "1", "source-one", 0,
+                "mkt__gmo__btc__r0",
+            ),
+        )
+        escaped = str(source.resolve()).replace("'", "''")
+        database.execute(f"COPY source TO '{escaped}' (FORMAT PARQUET)")
+    finally:
+        database.close()
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    artifact_id = f"sha256-{digest}"
+    attempt_id = "attempt-research-input-one"
+    low = "2026-01-01T00:00:00+00:00"
+    high = "2026-01-01T01:00:00+00:00"
+    connection = store.connect(data_root)
+    try:
+        registry.register_all(connection)
+        ensure_markets(connection)
+        connection.execute(
+            "INSERT INTO partition_attempt "
+            "(attempt_id,market_id,domain,partition_key,normalization_version,"
+            "input_set_hash,status,source_rows,normalized_rows,ignored_rows,"
+            "rejected_rows,started_at,finished_at,code_version,config_hash) "
+            "VALUES (?,?,?,?,?,?,'complete',1,1,0,0,?,?,?,?)",
+            (
+                attempt_id, "mkt__gmo__btc__r0", "trade", "2026-01-01",
+                "trade-test-v1", "input-one", low, high, "test", "config",
+            ),
+        )
+        relative = source.relative_to(data_root).as_posix()
+        connection.execute(
+            "INSERT INTO artifact VALUES "
+            "(?,'materialized_parquet',?,?,?,?,?,'sha256-file-v1',1)",
+            (
+                artifact_id, relative, digest, source.stat().st_size,
+                high, high,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO artifact_location VALUES (?,?,?,1)",
+            (artifact_id, relative, high),
+        )
+        connection.execute(
+            "INSERT INTO materialization_output VALUES (?,?,?,?,?,?,?)",
+            (
+                attempt_id, artifact_id, "trade_observation", 1,
+                low, high, high,
+            ),
+        )
+        connection.execute(
+            "INSERT INTO materialization_partition_head VALUES (?,?,?,?,?,?)",
+            (
+                "mkt__gmo__btc__r0", "trade", "2026-01-01",
+                "trade-test-v1", attempt_id, high,
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    rebuilt = registered_trade_inputs(
+        data_root, "mkt__gmo__btc__r0", (artifact_id,), (attempt_id,),
+    )
+    assert rebuilt.paths == (source.resolve(),)
+    assert rebuilt.artifact_ids == (artifact_id,)
+    assert rebuilt.attempt_ids == (attempt_id,)
+    assert rebuilt.normalization_versions == ("trade-test-v1",)
+    assert rebuilt.maximum_event_time == _time(1)
+    assert rebuilt.head_generation.startswith("sha256-")
+
+    captured = capture_trade_input_receipt(
+        data_root,
+        "mkt__gmo__btc__r0",
+        tmp_path / "receipts",
+    )
+    assert captured.receipt_path is not None
+    assert captured.receipt_sha256 is not None
+    attested = attest_trade_input_receipt(
+        data_root, captured.receipt_path, require_current_head=True,
+    )
+    assert attested.head_generation == captured.head_generation
+    registration = register_active_head_receipt(
+        tmp_path / "governance.sqlite3",
+        "research",
+        "research-identity-one",
+        "mkt__gmo__btc__r0",
+        captured.head_generation,
+        captured.receipt_path.relative_to(tmp_path).as_posix(),
+        captured.receipt_sha256,
+        repository_root=tmp_path,
+        data_root=data_root,
+        recorded_at=_time(1),
+    )
+    assert get_active_head_receipt(
+        tmp_path / "governance.sqlite3",
+        "research",
+        "research-identity-one",
+    ) == registration
+    assert register_active_head_receipt(
+        tmp_path / "governance.sqlite3",
+        "research",
+        "research-identity-one",
+        "mkt__gmo__btc__r0",
+        captured.head_generation,
+        captured.receipt_path.relative_to(tmp_path).as_posix(),
+        captured.receipt_sha256,
+        repository_root=tmp_path,
+        data_root=data_root,
+        recorded_at=_time(2),
+    ) == registration
+    connection = store.connect(data_root)
+    try:
+        connection.execute(
+            "UPDATE materialization_partition_head "
+            "SET normalization_version='trade-test-v2' "
+            "WHERE market_id='mkt__gmo__btc__r0' AND domain='trade'",
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    historical = attest_trade_input_receipt(
+        data_root, captured.receipt_path, require_current_head=False,
+    )
+    assert historical.receipt_sha256 == captured.receipt_sha256
+    with pytest.raises(ValueError, match="不是登记时的完整当前 head"):
+        attest_trade_input_receipt(
+            data_root, captured.receipt_path, require_current_head=True,
+        )
+
+    source.write_bytes(source.read_bytes() + b"tampered")
+    with pytest.raises(ValueError, match="字节数与控制面不一致"):
+        registered_trade_inputs(
+            data_root, "mkt__gmo__btc__r0", (artifact_id,), (attempt_id,),
+        )
 
 
 def test_feature_windows_reject_large_gap_and_allow_structural_gap() -> None:
@@ -749,6 +923,44 @@ def test_dirty_git_identity_is_not_decision_grade(
     assert identity.reason == "repository_dirty"
 
 
+def test_code_identity_includes_wrappers_native_sources_and_build_contracts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """冻结身份必须覆盖 PowerShell、未来 GPU/native 源码与构建合同。"""
+    included = (
+        tmp_path / "src" / "guvolu" / "research.py",
+        tmp_path / "src" / "gpu" / "kernel.cu",
+        tmp_path / "src" / "native" / "worker.rs",
+        tmp_path / "scripts" / "run_frozen_forward_task.ps1",
+        tmp_path / "tests" / "test_research.py",
+        tmp_path / "pyproject.toml",
+        tmp_path / "config.json",
+    )
+    for path in included:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(path.name, encoding="utf-8")
+    ignored = tmp_path / "scripts" / "notes.txt"
+    ignored.write_text("not executable", encoding="utf-8")
+    captured: tuple[Path, ...] = ()
+
+    def capture_paths(_root: Path, paths: tuple[Path, ...]) -> str:
+        nonlocal captured
+        captured = paths
+        return "tree"
+
+    monkeypatch.setattr(provenance, "hash_paths", capture_paths)
+    monkeypatch.setattr(
+        provenance,
+        "_git_output",
+        lambda _root, arguments: "abc123" if arguments[0] == "rev-parse" else "",
+    )
+    identity = provenance.code_identity(tmp_path, (included[-1],))
+    assert identity.decision_grade
+    assert set(included).issubset(set(captured))
+    assert ignored not in captured
+
+
 def test_position_contract_combines_family_direction_and_risk_weight() -> None:
     """发布目标必须是分配权重与家族方向目标的乘积。"""
     family = FamilyEvaluation(
@@ -774,16 +986,136 @@ def test_position_contract_combines_family_direction_and_risk_weight() -> None:
     assert rows[0]["portfolio_target_contribution"] == pytest.approx(-0.1)
 
 
-def test_manifest_verifier_checks_hashes_and_flat_gate(tmp_path: Path) -> None:
+def test_operational_gate_requires_flat_position_for_non_decision_grade() -> None:
+    """代码身份不可信时必须零权重、全余量且聚合目标为零。"""
+    payload: dict[str, object] = {
+        "decision_grade": False,
+        "operational_quality": {"eligible": True},
+        "operational_position": {
+            "weights": {"trend": 0.1},
+            "reserve": 0.9,
+        },
+        "operational_target_contract": {
+            "aggregate_target": 0.1,
+            "families": [{
+                "family": "trend",
+                "family_target": 1.0,
+                "allocation_weight": 0.1,
+                "portfolio_target_contribution": 0.1,
+            }],
+        },
+    }
+    with pytest.raises(ValueError, match="非决策级但存在非零仓位"):
+        _verify_operational_gate(payload)
+    payload["operational_position"] = {
+        "weights": {"trend": 0.0},
+        "reserve": 1.0,
+    }
+    payload["operational_target_contract"] = {
+        "aggregate_target": 0.0,
+        "families": [{
+            "family": "trend",
+            "family_target": 1.0,
+            "allocation_weight": 0.0,
+            "portfolio_target_contribution": 0.0,
+        }],
+    }
+    _verify_operational_gate(payload)
+
+
+def test_manifest_verifier_checks_hashes_and_flat_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """复核器须按 manifest 对象形状检查散列与质量清仓不变量。"""
+    monkeypatch.setattr(
+        "guvolu.research.verification._verify_data_governance",
+        lambda _root, _summary: None,
+    )
     report = tmp_path / "reports" / "strategy-research" / "run"
     report.mkdir(parents=True)
+    candidate_registry = report / "candidate-registry.json"
+    candidate_registry.write_text(json.dumps({
+        "candidates": [{"candidate_id": "candidate-one"}],
+    }), encoding="utf-8")
+    code_identity = {
+        "git_hash": "abc123",
+        "tree_digest": "t" * 64,
+        "dirty_digest": "d" * 64,
+        "dirty": False,
+        "decision_grade": True,
+        "reason": None,
+    }
+    identity_fields: dict[str, object] = {
+        "schema_version": 11,
+        "pipeline_method_version": "strategy-research-pipeline-v11",
+        "p_value_method_version": "p-value-test",
+        "pbo_method_version": "pbo-test",
+        "block_bootstrap_method_version": "bootstrap-test",
+        "deflated_sharpe_method_version": "dsr-test",
+        "effective_trial_method_version": "trial-test",
+        "parameter_stability_method_version": "stability-test",
+        "position_contract_method_version": "position-test",
+        "governance_method_version": "governance-test",
+        "generator_method_version": "generator-test",
+        "family_scope": ["trend"],
+        "decision_time": "2026-01-01T01:00:00+00:00",
+        "execution_evaluated_at": "2026-01-01T01:01:00+00:00",
+        "code_identity": code_identity,
+        "config_hash": "c" * 64,
+        "config_lineage_root_hash": "c" * 64,
+        "config_lineage_depth": 0,
+    }
+    research_identity = stable_identifier("research-identity", {
+        "pipeline_method_version": identity_fields["pipeline_method_version"],
+        "p_value_method_version": identity_fields["p_value_method_version"],
+        "pbo_method_version": identity_fields["pbo_method_version"],
+        "block_bootstrap_method_version": identity_fields[
+            "block_bootstrap_method_version"
+        ],
+        "deflated_sharpe_method_version": identity_fields[
+            "deflated_sharpe_method_version"
+        ],
+        "effective_trial_method_version": identity_fields[
+            "effective_trial_method_version"
+        ],
+        "parameter_stability_method_version": identity_fields[
+            "parameter_stability_method_version"
+        ],
+        "position_contract_method_version": identity_fields[
+            "position_contract_method_version"
+        ],
+        "config_hash": identity_fields["config_hash"],
+        "config_lineage_root_hash": identity_fields["config_lineage_root_hash"],
+        "config_lineage_depth": identity_fields["config_lineage_depth"],
+        "head_generation": "head-one",
+        "attempt_ids": [],
+        "artifact_ids": [],
+        "code_tree_digest": code_identity["tree_digest"],
+        "dirty_digest": code_identity["dirty_digest"],
+        "generator_method_version": identity_fields["generator_method_version"],
+        "family_scope": identity_fields["family_scope"],
+        "candidate_ids": ("candidate-one",),
+        "governance_method_version": identity_fields["governance_method_version"],
+        "data_scope": "DEV_ADAPTIVE",
+    })
+    run_id = stable_identifier("research-run", {
+        "research_identity": research_identity,
+        "execution_evaluated_at": identity_fields["execution_evaluated_at"],
+    })
+    identity_fields.update({
+        "run_id": run_id,
+        "research_identity": research_identity,
+    })
     summary = report / "summary.json"
-    summary.write_text(json.dumps({
-        "run_id": "run",
-        "decision_grade": False,
+    summary_payload = {
+        **identity_fields,
+        "decision_grade": True,
         "operational_quality": {"eligible": False},
-        "operational_position": {"weights": {"trend": 0.0}},
+        "operational_position": {
+            "weights": {"trend": 0.0},
+            "reserve": 1.0,
+        },
         "operational_target_contract": {
             "aggregate_target": 0.0,
             "families": [{
@@ -793,21 +1125,44 @@ def test_manifest_verifier_checks_hashes_and_flat_gate(tmp_path: Path) -> None:
                 "portfolio_target_contribution": 0.0,
             }],
         },
-    }), encoding="utf-8")
+    }
+    summary.write_text(json.dumps(summary_payload), encoding="utf-8")
     summary_bytes = summary.read_bytes()
     manifest = report / "manifest.json"
-    manifest.write_text(json.dumps({
-        "run_id": "run",
+    manifest_payload = {
+        **identity_fields,
+        "input_head_generation": "head-one",
+        "input_attempt_ids": [],
+        "input_artifact_ids": [],
+        "data_scope": "DEV_ADAPTIVE",
         "artifacts": {
             "summary_json": {
                 "path": summary.relative_to(tmp_path).as_posix(),
                 "sha256": hashlib.sha256(summary_bytes).hexdigest(),
                 "bytes": len(summary_bytes),
             },
+            "candidate_registry": {
+                "path": candidate_registry.relative_to(tmp_path).as_posix(),
+                "sha256": hashlib.sha256(
+                    candidate_registry.read_bytes()
+                ).hexdigest(),
+                "bytes": candidate_registry.stat().st_size,
+            },
         },
-    }), encoding="utf-8")
+    }
+    manifest.write_text(json.dumps(manifest_payload), encoding="utf-8")
     result = verify_research_run(tmp_path, manifest)
-    assert result.run_id == "run"
+    assert result.run_id == run_id
+    summary_payload["research_identity"] = "research-identity-forged"
+    summary.write_text(json.dumps(summary_payload), encoding="utf-8")
+    manifest_payload["artifacts"]["summary_json"] = {  # type: ignore[index]
+        "path": summary.relative_to(tmp_path).as_posix(),
+        "sha256": hashlib.sha256(summary.read_bytes()).hexdigest(),
+        "bytes": summary.stat().st_size,
+    }
+    manifest.write_text(json.dumps(manifest_payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="research_identity"):
+        verify_research_run(tmp_path, manifest)
     summary.write_text("{}", encoding="utf-8")
     with pytest.raises(ValueError, match="散列不匹配"):
         verify_research_run(tmp_path, manifest)
@@ -894,7 +1249,7 @@ def test_family_monitor_reports_parameter_search_direction(
         (second_prior, first_prior),
     )
     assert deduplicated == deduplicated_reversed
-    assert deduplicated["monitor_method_version"] == "family-direction-monitor-v6"
+    assert deduplicated["monitor_method_version"] == "family-direction-monitor-v7"
     assert len(deduplicated["source"]["history_summaries"]) == 2
     assert len(deduplicated["history"]) == 0
     assert {
@@ -977,6 +1332,21 @@ def test_family_monitor_reports_parameter_search_direction(
     assert cohort_filtered["excluded_history"][0]["reason"] == "incomparable_cohort"
     assert cohort_filtered["excluded_history"][0]["source_summary_sha256"]
     assert cohort_filtered["excluded_history"][0]["source_manifest_sha256"] == "m" * 64
+
+    canonical_directory = (
+        tmp_path / "reports" / "strategy-research" / "families" / "trend"
+        / "research-run-canonical"
+    )
+    canonical_directory.mkdir(parents=True)
+    canonical_summary = canonical_directory / "summary.json"
+    canonical_summary.write_text(json.dumps(recent_prior), encoding="utf-8")
+    canonical = monitor_family_run(
+        tmp_path, summary, "trend", config, "c" * 64,
+    )
+    assert len(canonical["history"]) == 1
+    assert canonical["history"][0]["source_summary_path"] == (
+        canonical_summary.relative_to(tmp_path).as_posix()
+    )
 
     ledger.write_text(ledger.read_text(encoding="utf-8") + "{}\n", encoding="utf-8")
     with pytest.raises(ValueError, match="trial ledger 散列"):
@@ -1267,6 +1637,7 @@ def test_monitor_source_verification_recomputes_consumed_direction(
     summary.write_text("{}", encoding="utf-8")
     ledger.write_text("{}\n", encoding="utf-8")
     monitor = {
+        "monitor_method_version": "family-direction-monitor-v7",
         "family": "trend",
         "run_id": "run",
         "research_identity": "research",
@@ -1330,6 +1701,102 @@ def test_monitor_source_verification_recomputes_consumed_direction(
     }
     with pytest.raises(ValueError, match="cross_run_direction"):
         verify_monitor_sources(tmp_path, {}, forged_direction, "c" * 64)
+
+
+def test_content_addressed_config_lineage_survives_source_changes_and_binds_git(
+    tmp_path: Path,
+) -> None:
+    """历史运行使用完整快照，决策级配置逐字节绑定记录 commit。"""
+    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "config", "core.autocrlf", "false"],
+        cwd=tmp_path,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "research@example.invalid"],
+        cwd=tmp_path,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Research Test"],
+        cwd=tmp_path,
+        check=True,
+    )
+    config_directory = tmp_path / "config"
+    config_directory.mkdir()
+    root_config = config_directory / "root.json"
+    root_raw = b'{"market_id":"market-one","value":1}\n'
+    root_config.write_bytes(root_raw)
+    root_hash = hashlib.sha256(root_raw).hexdigest()
+    leaf_config = config_directory / "leaf.json"
+    leaf_payload = {
+        "market_id": "market-one",
+        "value": 2,
+        "evolution_parent": {
+            "parent_config_path": "config/root.json",
+            "parent_config_hash": root_hash,
+            "lineage_root_config_hash": root_hash,
+            "lineage_depth": 1,
+        },
+    }
+    leaf_config.write_bytes(
+        (json.dumps(leaf_payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    )
+    subprocess.run(
+        ["git", "add", "config/root.json", "config/leaf.json"],
+        cwd=tmp_path,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "freeze config"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+    )
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    snapshot = snapshot_verified_config_lineage(
+        tmp_path, leaf_config, tmp_path / "reports" / "artifacts-one",
+    )
+    config, config_hash, lineage_root, depth, sources, artifacts = (
+        attest_config_lineage_snapshot(
+            tmp_path, snapshot.bundle_path, snapshot.leaf_config_path,
+        )
+    )
+    assert config["value"] == 2
+    assert config_hash == snapshot.leaf_config_sha256
+    assert lineage_root == root_hash
+    assert depth == 1
+    provenance.verify_artifacts_match_commit(
+        tmp_path, commit, tuple(zip(sources, artifacts, strict=True)),
+    )
+
+    leaf_payload["value"] = 3
+    leaf_config.write_bytes(
+        (json.dumps(leaf_payload, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    )
+    historical = attest_config_lineage_snapshot(
+        tmp_path, snapshot.bundle_path, snapshot.leaf_config_path,
+    )
+    assert historical[0]["value"] == 2
+    changed_snapshot = snapshot_verified_config_lineage(
+        tmp_path, leaf_config, tmp_path / "reports" / "artifacts-two",
+    )
+    changed = attest_config_lineage_snapshot(
+        tmp_path, changed_snapshot.bundle_path, changed_snapshot.leaf_config_path,
+    )
+    with pytest.raises(ValueError, match="Git blob 不一致"):
+        provenance.verify_artifacts_match_commit(
+            tmp_path,
+            commit,
+            tuple(zip(changed[4], changed[5], strict=True)),
+        )
 
 
 def test_config_lineage_rejects_invalid_and_excessive_chains(

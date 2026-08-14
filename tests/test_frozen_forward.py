@@ -8,8 +8,10 @@ from pathlib import Path
 import pytest
 
 from guvolu.research import clock
+from guvolu.research.config_lineage import snapshot_verified_config_lineage
 from guvolu.research.contracts import CodeIdentity, FrozenPanelInputs, PanelSnapshot
 from guvolu.research.frozen_forward import (
+    attest_frozen_prediction_artifact,
     run_frozen_forward_prediction,
     verify_frozen_forward,
 )
@@ -78,6 +80,9 @@ def test_frozen_forward_uses_fixed_weight_and_is_idempotent(
     )
     plan_path.parent.mkdir(parents=True)
     config_hash = sha256_file(config_path)
+    config_snapshot = snapshot_verified_config_lineage(
+        tmp_path, config_path, tmp_path / "reports" / "config-artifacts",
+    )
     plan_id = stable_identifier("frozen-forward-plan", {
         "governance_method_version": GOVERNANCE_METHOD_VERSION,
         "vintage_id": vintage.vintage_id,
@@ -96,17 +101,27 @@ def test_frozen_forward_uses_fixed_weight_and_is_idempotent(
     }
     plan_payload = {
         "schema_version": 1,
-        "method_version": "frozen-forward-v1",
+        "method_version": "frozen-forward-v2",
         "governance_method_version": GOVERNANCE_METHOD_VERSION,
         "scope": "FROZEN_FORWARD",
         "plan_id": plan_id,
-        "vintage": {"vintage_id": vintage.vintage_id},
+        "vintage": {
+            "vintage_id": vintage.vintage_id,
+            "start_time": vintage.start_time.isoformat(),
+            "end_time": vintage.end_time.isoformat(),
+        },
         "source": {"manifest_sha256": "manifest-hash"},
         "candidate_set_hash": "candidate-set-hash",
         "config_hash": config_hash,
         "code_identity": {"git_hash": "commit-one", "tree_digest": "tree-one"},
         "code_tree_digest": "tree-one",
-        "config_path": "config/strategy.json",
+        "config_path": config_snapshot.leaf_config_path.relative_to(
+            tmp_path
+        ).as_posix(),
+        "config_lineage_path": config_snapshot.bundle_path.relative_to(
+            tmp_path
+        ).as_posix(),
+        "config_lineage_sha256": config_snapshot.bundle_sha256,
         "candidates": [{
             "candidate_id": candidate_identity(template, parameters),
             "family": "trend",
@@ -146,6 +161,8 @@ def test_frozen_forward_uses_fixed_weight_and_is_idempotent(
     )
     panel_file = tmp_path / "panel.parquet"
     panel_file.write_bytes(b"panel")
+    receipt_file = tmp_path / "receipt.json"
+    receipt_file.write_text("{}\n", encoding="utf-8")
     panel = PanelSnapshot(
         market={"market_id": "market-one"},
         bars=(bar,),
@@ -154,7 +171,7 @@ def test_frozen_forward_uses_fixed_weight_and_is_idempotent(
         artifact_ids=("artifact-one",),
         normalization_versions=("normalization-one",),
         panel_path=panel_file,
-        panel_sha256="a" * 64,
+        panel_sha256=sha256_file(panel_file),
         decision_time=decision,
         latest_available_time=decision,
     )
@@ -172,26 +189,51 @@ def test_frozen_forward_uses_fixed_weight_and_is_idempotent(
         jump_score=0.0,
         contiguous=True,
     )
-    monkeypatch.setattr(
-        "guvolu.research.frozen_forward.code_identity",
-        lambda *_args: CodeIdentity(
+    def frozen_code_identity(
+        _root: Path,
+        config_paths: tuple[Path, ...],
+    ) -> CodeIdentity:
+        assert config_paths == config_snapshot.source_paths
+        return CodeIdentity(
             git_hash="commit-one", tree_digest="tree-one", dirty_digest="",
             dirty=False, decision_grade=True, reason=None,
-        ),
+        )
+
+    monkeypatch.setattr(
+        "guvolu.research.frozen_forward.code_identity",
+        frozen_code_identity,
     )
     monkeypatch.setattr(
-        "guvolu.research.frozen_forward.freeze_trade_inputs",
+        "guvolu.research.frozen_forward.capture_trade_input_receipt",
         lambda *_args: FrozenPanelInputs(
             market={"market_id": "market-one"}, paths=(),
             head_generation="sha256-head", attempt_ids=("attempt-one",),
             artifact_ids=("artifact-one",),
             normalization_versions=("normalization-one",),
             maximum_event_time=decision,
+            receipt_path=receipt_file,
+            receipt_sha256=sha256_file(receipt_file),
+        ),
+    )
+    monkeypatch.setattr(
+        "guvolu.research.frozen_forward.attest_trade_input_receipt",
+        lambda *_args, **_kwargs: FrozenPanelInputs(
+            market={"market_id": "market-one"}, paths=(),
+            head_generation="sha256-head", attempt_ids=("attempt-one",),
+            artifact_ids=("artifact-one",),
+            normalization_versions=("normalization-one",),
+            maximum_event_time=decision,
+            receipt_path=receipt_file,
+            receipt_sha256=sha256_file(receipt_file),
         ),
     )
     monkeypatch.setattr(
         "guvolu.research.frozen_forward.build_panel_snapshot",
         lambda *_args: panel,
+    )
+    monkeypatch.setattr(
+        "guvolu.research.frozen_forward.load_panel_bars",
+        lambda *_args: (bar,),
     )
     monkeypatch.setattr(
         "guvolu.research.frozen_forward.compute_features",
@@ -212,6 +254,20 @@ def test_frozen_forward_uses_fixed_weight_and_is_idempotent(
     assert run_frozen_forward_prediction(tmp_path, plan.plan_id) == result
     verification = verify_frozen_forward(tmp_path, plan.plan_id)
     assert verification.prediction_count == 1
+
+    forged = json.loads(result.prediction_path.read_text(encoding="utf-8"))
+    forged["families"][0]["family_target"] = 0.75
+    forged["families"][0]["portfolio_target_contribution"] = 0.3
+    forged["aggregate_target"] = 0.3
+    forged_path = result.prediction_path.parent / "forged.json"
+    forged_path.write_text(canonical_json(forged) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="目标不能由候选公式"):
+        attest_frozen_prediction_artifact(
+            tmp_path,
+            plan_path,
+            forged_path,
+            decision + timedelta(minutes=1),
+        )
 
     content["aggregate_target"] = 0.3
     result.prediction_path.write_text(

@@ -22,7 +22,7 @@ from guvolu.strategy.expression import (
     strategy_expression,
 )
 
-GOVERNANCE_SCHEMA_VERSION = 4
+GOVERNANCE_SCHEMA_VERSION = 5
 SCHEMA_WRITE_CEILING_KEY = "schema_write_ceiling"
 GOVERNANCE_METHOD_VERSION = "research-data-governance-v2"
 _VINTAGE_STATUSES = ("sealed", "consumed")
@@ -104,6 +104,19 @@ class FrozenForwardPrediction:
 
 
 @dataclass(frozen=True)
+class ActiveHeadReceiptRegistration:
+    """治理库中绑定某个消费者的完整活动输入收据。"""
+
+    consumer_kind: str
+    consumer_id: str
+    market_id: str
+    head_generation: str
+    receipt_artifact_path: str
+    receipt_artifact_sha256: str
+    recorded_at: datetime
+
+
+@dataclass(frozen=True)
 class _TerminalEvidence:
     """已经现场复核、可与治理注册表交叉核对的终态证据。"""
 
@@ -111,9 +124,13 @@ class _TerminalEvidence:
     candidate_set_hash: str
     candidate_ids: tuple[str, ...]
     config_hash: str
+    input_head_generation: str
+    input_receipt_path: str
+    input_receipt_sha256: str
     require_forward_predictions: bool
     forward_plan_id: str | None
     forward_prediction_count: int
+    forward_prediction_row_set_hash: str | None
     score_start: datetime
     score_end: datetime
     score_bars: int
@@ -352,7 +369,8 @@ def _validated_forward_prediction_artifact(
     plan_evidence: _ForwardPlanEvidence,
     artifact_path: str,
     artifact_sha256: str,
-) -> tuple[Path, str]:
+    reference_time: datetime,
+) -> tuple[Path, str, str, str]:
     """现场复核冻结预测制品的计划、时点、输入和代码身份。"""
     if not _canonical_sha256(artifact_sha256):
         raise ValueError("冻结前向预测 SHA-256 无效")
@@ -450,7 +468,31 @@ def _validated_forward_prediction_artifact(
         raise ValueError("冻结前向预测质量失败但组合目标非零")
     if payload.get("unit") != "risk_weighted_directional_target":
         raise ValueError("冻结前向预测 unit 不受支持")
-    return path, normalized
+    from guvolu.research.frozen_forward import attest_frozen_prediction_artifact
+
+    attest_frozen_prediction_artifact(
+        repository_root,
+        plan_evidence.path,
+        path,
+        reference_time,
+        require_current_head=True,
+    )
+    receipt = payload.get("input_receipt")
+    if not isinstance(receipt, dict):
+        raise ValueError("冻结前向预测缺少活动输入收据")
+    receipt_path, normalized_receipt = _evidence_file(
+        repository_root,
+        str(receipt.get("path") or ""),
+        "冻结预测活动输入收据",
+    )
+    receipt_sha256 = str(receipt.get("sha256") or "")
+    if (
+        not _canonical_sha256(receipt_sha256)
+        or sha256_file(receipt_path) != receipt_sha256
+        or payload.get("input_receipt_sha256") != receipt_sha256
+    ):
+        raise ValueError("冻结前向预测活动输入收据散列不匹配")
+    return path, normalized, normalized_receipt, receipt_sha256
 
 
 def _validated_candidate_set_identity(
@@ -515,7 +557,10 @@ def _validated_evaluation_identity(
         "config_hash",
         "code_tree_digest",
         "input_head_generation",
+        "input_attempt_ids",
         "input_artifact_ids",
+        "normalization_versions",
+        "input_receipt_sha256",
     }
     if set(identity) != required:
         raise ValueError("holdout evaluation_identity 字段不完整")
@@ -534,15 +579,21 @@ def _validated_evaluation_identity(
         item = identity.get(name)
         if not isinstance(item, str) or not item:
             raise ValueError(f"holdout evaluation_identity.{name} 无效")
-    input_artifact_ids = identity.get("input_artifact_ids")
-    if (
-        not isinstance(input_artifact_ids, (list, tuple))
-        or not input_artifact_ids
-        or any(not isinstance(item, str) or not item for item in input_artifact_ids)
+    receipt_sha256 = identity.get("input_receipt_sha256")
+    if not isinstance(receipt_sha256, str) or not _canonical_sha256(receipt_sha256):
+        raise ValueError("holdout evaluation_identity.input_receipt_sha256 无效")
+    for name in (
+        "input_attempt_ids", "input_artifact_ids", "normalization_versions",
     ):
-        raise ValueError("holdout evaluation_identity input_artifact_ids 无效")
-    if len(set(input_artifact_ids)) != len(input_artifact_ids):
-        raise ValueError("holdout evaluation_identity input_artifact_ids 重复")
+        values = identity.get(name)
+        if (
+            not isinstance(values, (list, tuple))
+            or not values
+            or any(not isinstance(item, str) or not item for item in values)
+        ):
+            raise ValueError(f"holdout evaluation_identity {name} 无效")
+        if list(values) != sorted(values) or len(set(values)) != len(values):
+            raise ValueError(f"holdout evaluation_identity {name} 必须有序且不重复")
     if stable_identifier("holdout-evaluation", identity) != evaluation_id:
         raise ValueError("holdout evaluation_id 现场复算不匹配")
     return config_hash
@@ -620,6 +671,14 @@ def _validated_terminal_evidence(
     config_hash = _validated_evaluation_identity(
         manifest, vintage_id, evaluation_id, candidate_set_hash,
     )
+    evaluation_identity = manifest["evaluation_identity"]
+    assert isinstance(evaluation_identity, dict)
+    for name in (
+        "input_head_generation", "input_attempt_ids", "input_artifact_ids",
+        "normalization_versions",
+    ):
+        if manifest.get(name) != evaluation_identity.get(name):
+            raise ValueError(f"holdout manifest 的 {name} 未绑定 evaluation_identity")
     if terminal.get("candidate_ids") != candidate_ids:
         raise ValueError("holdout verdict 未绑定冻结 candidate IDs")
     artifacts = manifest.get("artifacts")
@@ -630,6 +689,17 @@ def _validated_terminal_evidence(
     )
     if config_artifact_sha256 != config_hash:
         raise ValueError("holdout config 制品与 evaluation_identity 不匹配")
+    receipt_path, receipt_sha256 = _validated_artifact(
+        repository_root,
+        artifacts,
+        "input_receipt",
+        "active_trade_head_receipt",
+    )
+    if (
+        receipt_sha256 != evaluation_identity.get("input_receipt_sha256")
+        or receipt_sha256 != manifest.get("input_receipt_sha256")
+    ):
+        raise ValueError("holdout 活动输入收据未绑定 evaluation_identity")
     _, panel_sha256 = _validated_artifact(
         repository_root, artifacts, "panel", "holdout_panel",
     )
@@ -730,6 +800,12 @@ def _validated_terminal_evidence(
     target_source = result.get("target_source")
     forward_plan_id = result.get("frozen_forward_plan_id")
     forward_prediction_count = result.get("frozen_forward_prediction_count")
+    forward_prediction_row_set_hash = result.get("frozen_forward_row_set_hash")
+    if (
+        forward_prediction_row_set_hash
+        != manifest.get("frozen_forward_row_set_hash")
+    ):
+        raise ValueError("holdout 冻结预测 row-set 未绑定 manifest")
     if (
         not isinstance(forward_prediction_count, int)
         or isinstance(forward_prediction_count, bool)
@@ -743,11 +819,20 @@ def _validated_terminal_evidence(
             raise ValueError("holdout 缺少冻结前向 plan_id")
         if forward_prediction_count != score_bars:
             raise ValueError("holdout 冻结预测数量必须完整等于评分柱数")
+        if (
+            not isinstance(forward_prediction_row_set_hash, str)
+            or not forward_prediction_row_set_hash.startswith(
+                "frozen-forward-row-set-"
+            )
+        ):
+            raise ValueError("holdout 缺少冻结预测 row-set 身份")
     else:
         if target_source != "end_of_vintage_recompute":
             raise ValueError("holdout target_source 与冻结 policy 不一致")
         if forward_plan_id is not None or forward_prediction_count != 0:
             raise ValueError("holdout 非冻结前向模式不得声称预测覆盖")
+        if forward_prediction_row_set_hash is not None:
+            raise ValueError("holdout 非冻结前向模式不得绑定预测 row-set")
     minimum_sharpe = _finite_number(
         policy.get("minimum_sharpe"), "holdout policy.minimum_sharpe",
     )
@@ -831,14 +916,23 @@ def _validated_terminal_evidence(
         raise ValueError("holdout result 的 passed_families 不一致")
     if terminal.get("passed_families") != passed_families:
         raise ValueError("holdout verdict 的 passed_families 不一致")
+    from guvolu.research.holdout import attest_holdout_terminal_artifacts
+
+    attest_holdout_terminal_artifacts(repository_root, manifest_path)
     return _TerminalEvidence(
         manifest_path=normalized_path,
         candidate_set_hash=candidate_set_hash,
         candidate_ids=tuple(candidate_ids),
         config_hash=config_hash,
+        input_head_generation=str(evaluation_identity["input_head_generation"]),
+        input_receipt_path=receipt_path.resolve().relative_to(
+            repository_root.resolve()
+        ).as_posix(),
+        input_receipt_sha256=receipt_sha256,
         require_forward_predictions=require_forward_predictions,
         forward_plan_id=forward_plan_id,
         forward_prediction_count=forward_prediction_count,
+        forward_prediction_row_set_hash=forward_prediction_row_set_hash,
         score_start=score_start,
         score_end=score_end,
         score_bars=score_bars,
@@ -887,7 +981,7 @@ def _upgrade_governance_state(
     existing_version: str | None,
 ) -> None:
     """原子升级治理库，并把旧 consumed 记录变成可解释 incomplete 尝试。"""
-    supported = {None, "1", "2", "3", str(GOVERNANCE_SCHEMA_VERSION)}
+    supported = {None, "1", "2", "3", "4", str(GOVERNANCE_SCHEMA_VERSION)}
     if existing_version not in supported:
         raise ValueError("不支持的研究治理注册表 schema_version")
     orphan_count = int(connection.execute(
@@ -901,7 +995,9 @@ def _upgrade_governance_state(
     ).fetchone()[0])
     needs_upgrade = existing_version != str(GOVERNANCE_SCHEMA_VERSION)
     if needs_upgrade or orphan_count:
-        connection.execute("BEGIN IMMEDIATE")
+        owns_transaction = not connection.in_transaction
+        if owns_transaction:
+            connection.execute("BEGIN IMMEDIATE")
         try:
             invalid_legacy = connection.execute(
                 """
@@ -953,9 +1049,10 @@ def _upgrade_governance_state(
                     "UPDATE governance_meta SET value=? WHERE key='schema_version'",
                     (str(GOVERNANCE_SCHEMA_VERSION),),
                 )
-            connection.execute("COMMIT")
+            if owns_transaction:
+                connection.execute("COMMIT")
         except BaseException:
-            if connection.in_transaction:
+            if owns_transaction and connection.in_transaction:
                 connection.execute("ROLLBACK")
             raise
     violation = _terminal_invariant_violation(connection)
@@ -989,6 +1086,107 @@ def _schema_write_ceiling(
     if ceiling < 1 or ceiling > GOVERNANCE_SCHEMA_VERSION:
         raise ValueError("治理库 schema 写入上限超出支持范围")
     return ceiling
+
+
+def upgrade_governance_write_ceiling(
+    registry_path: Path,
+    backup_path: Path,
+    *,
+    expected_version: int,
+    expected_write_ceiling: int,
+) -> Path:
+    """备份并显式升级一个被旧部署固定写入版本的治理库。"""
+    registry = registry_path.resolve()
+    backup = backup_path.resolve()
+    if not registry.is_file():
+        raise FileNotFoundError(f"治理库不存在: {registry}")
+    if backup == registry:
+        raise ValueError("治理库备份路径不得指向原库")
+    if backup.exists():
+        raise FileExistsError(f"治理库备份已存在: {backup}")
+    if expected_version < 1 or expected_version >= GOVERNANCE_SCHEMA_VERSION:
+        raise ValueError("expected_version 必须是低于当前版本的正整数")
+    if expected_write_ceiling != expected_version:
+        raise ValueError("旧 schema 版本与写入上限必须一致")
+
+    backup.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(registry, timeout=30.0, isolation_level=None)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys=ON")
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            existing = connection.execute(
+                "SELECT value FROM governance_meta WHERE key='schema_version'"
+            ).fetchone()
+            actual_version = (
+                None if existing is None else int(str(existing["value"]))
+            )
+            actual_ceiling = _schema_write_ceiling(connection)
+            if actual_version != expected_version:
+                raise ValueError(
+                    "治理库 schema 版本与显式预期不一致: "
+                    f"expected={expected_version}, actual={actual_version}"
+                )
+            if actual_ceiling != expected_write_ceiling:
+                raise ValueError(
+                    "治理库写入上限与显式预期不一致: "
+                    f"expected={expected_write_ceiling}, actual={actual_ceiling}"
+                )
+            _validate_pinned_read_schema(
+                connection,
+                str(actual_version),
+                actual_ceiling,
+            )
+
+            backup_source = sqlite3.connect(registry, timeout=30.0)
+            backup_connection = sqlite3.connect(backup)
+            try:
+                backup_source.backup(backup_connection)
+            except BaseException:
+                backup_connection.close()
+                backup_source.close()
+                if backup.exists():
+                    backup.unlink()
+                raise
+            else:
+                backup_connection.close()
+                backup_source.close()
+
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS active_head_receipt (
+                  consumer_kind TEXT NOT NULL CHECK(
+                    consumer_kind IN ('research','frozen_forward','holdout')
+                  ),
+                  consumer_id TEXT NOT NULL,
+                  market_id TEXT NOT NULL,
+                  head_generation TEXT NOT NULL,
+                  receipt_artifact_path TEXT NOT NULL,
+                  receipt_artifact_sha256 TEXT NOT NULL CHECK(
+                    length(receipt_artifact_sha256)=64
+                  ),
+                  recorded_at TEXT NOT NULL,
+                  PRIMARY KEY(consumer_kind,consumer_id)
+                )
+                """
+            )
+            _upgrade_governance_state(connection, str(actual_version))
+            connection.execute(
+                "UPDATE governance_meta SET value=? WHERE key=?",
+                (str(GOVERNANCE_SCHEMA_VERSION), SCHEMA_WRITE_CEILING_KEY),
+            )
+            connection.execute("COMMIT")
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+    finally:
+        connection.close()
+
+    verified = _connect(registry)
+    verified.close()
+    return backup
 
 
 def _validate_pinned_read_schema(
@@ -1153,6 +1351,20 @@ def _connect(
           FOREIGN KEY(vintage_id) REFERENCES holdout_vintage(vintage_id),
           UNIQUE(plan_id,decision_time)
         );
+        CREATE TABLE IF NOT EXISTS active_head_receipt (
+          consumer_kind TEXT NOT NULL CHECK(
+            consumer_kind IN ('research','frozen_forward','holdout')
+          ),
+          consumer_id TEXT NOT NULL,
+          market_id TEXT NOT NULL,
+          head_generation TEXT NOT NULL,
+          receipt_artifact_path TEXT NOT NULL,
+          receipt_artifact_sha256 TEXT NOT NULL CHECK(
+            length(receipt_artifact_sha256)=64
+          ),
+          recorded_at TEXT NOT NULL,
+          PRIMARY KEY(consumer_kind,consumer_id)
+        );
         """
     )
     existing = connection.execute(
@@ -1177,6 +1389,186 @@ def _begin(connection: sqlite3.Connection) -> None:
 def _overlap_clause() -> str:
     """返回左闭右开区间重叠条件。"""
     return "market_id=? AND start_time<? AND end_time>?"
+
+
+def _active_head_receipt_from_row(
+    row: sqlite3.Row,
+) -> ActiveHeadReceiptRegistration:
+    """把治理库行转换为活动输入收据登记。"""
+    return ActiveHeadReceiptRegistration(
+        consumer_kind=str(row["consumer_kind"]),
+        consumer_id=str(row["consumer_id"]),
+        market_id=str(row["market_id"]),
+        head_generation=str(row["head_generation"]),
+        receipt_artifact_path=str(row["receipt_artifact_path"]),
+        receipt_artifact_sha256=str(row["receipt_artifact_sha256"]),
+        recorded_at=_parse_timestamp(str(row["recorded_at"])),
+    )
+
+
+def _frozen_forward_prediction_row_set(
+    connection: sqlite3.Connection,
+    plan_id: str,
+) -> tuple[str, tuple[datetime, ...]]:
+    """从不可改写预测行及其活动收据生成确定性 row-set 身份。"""
+    rows = connection.execute(
+        "SELECT * FROM frozen_forward_prediction WHERE plan_id=? "
+        "ORDER BY decision_time",
+        (plan_id,),
+    ).fetchall()
+    records: list[dict[str, object]] = []
+    decision_times: list[datetime] = []
+    for row in rows:
+        prediction_id = str(row["prediction_id"])
+        receipt = connection.execute(
+            "SELECT * FROM active_head_receipt "
+            "WHERE consumer_kind='frozen_forward' AND consumer_id=?",
+            (prediction_id,),
+        ).fetchone()
+        if receipt is None:
+            raise ValueError("冻结预测 row-set 缺少活动输入收据")
+        decision_time = _parse_timestamp(str(row["decision_time"]))
+        decision_times.append(decision_time)
+        records.append({
+            "prediction_id": prediction_id,
+            "decision_time": decision_time.isoformat(),
+            "input_head_generation": str(row["input_head_generation"]),
+            "panel_sha256": str(row["panel_sha256"]),
+            "prediction_artifact_path": str(row["prediction_artifact_path"]),
+            "prediction_artifact_sha256": str(row["prediction_artifact_sha256"]),
+            "recorded_at": _parse_timestamp(str(row["recorded_at"])).isoformat(),
+            "receipt_artifact_path": str(receipt["receipt_artifact_path"]),
+            "receipt_artifact_sha256": str(receipt["receipt_artifact_sha256"]),
+        })
+    identity = {
+        "method_version": "frozen-forward-registered-row-set-v1",
+        "plan_id": plan_id,
+        "rows": records,
+    }
+    return stable_identifier("frozen-forward-row-set", identity), tuple(decision_times)
+
+
+def get_frozen_forward_prediction_row_set(
+    registry_path: Path,
+    plan_id: str,
+) -> tuple[str, int, tuple[datetime, ...]]:
+    """读取已登记预测全集的确定性散列、数量与有序决策时点。"""
+    connection = _connect(registry_path)
+    try:
+        row_set_hash, decision_times = _frozen_forward_prediction_row_set(
+            connection, plan_id,
+        )
+    finally:
+        connection.close()
+    return row_set_hash, len(decision_times), decision_times
+
+
+def register_active_head_receipt(
+    registry_path: Path,
+    consumer_kind: str,
+    consumer_id: str,
+    market_id: str,
+    head_generation: str,
+    receipt_artifact_path: str,
+    receipt_artifact_sha256: str,
+    *,
+    repository_root: Path,
+    data_root: Path,
+    recorded_at: datetime | None = None,
+) -> ActiveHeadReceiptRegistration:
+    """仅在收据等于完整当前 head 时将其不可改写地绑定消费者。"""
+    if consumer_kind not in {"research", "frozen_forward", "holdout"}:
+        raise ValueError("活动输入收据 consumer_kind 不受支持")
+    if not consumer_id:
+        raise ValueError("活动输入收据 consumer_id 不能为空")
+    if not _canonical_sha256(receipt_artifact_sha256):
+        raise ValueError("活动输入收据 SHA-256 必须为规范小写文本")
+    receipt_path, normalized_path = _evidence_file(
+        repository_root, receipt_artifact_path, "活动输入收据",
+    )
+    if sha256_file(receipt_path) != receipt_artifact_sha256:
+        raise ValueError("活动输入收据现场 SHA-256 不匹配")
+    from guvolu.research.panel import attest_trade_input_receipt
+
+    inputs = attest_trade_input_receipt(
+        data_root, receipt_path, require_current_head=True,
+    )
+    if (
+        str(inputs.market.get("market_id")) != market_id
+        or inputs.head_generation != head_generation
+    ):
+        raise ValueError("活动输入收据与消费者声明的市场或 head 不一致")
+    recorded = _utc(recorded_at or clock.utc_now())
+    expected = ActiveHeadReceiptRegistration(
+        consumer_kind=consumer_kind,
+        consumer_id=consumer_id,
+        market_id=market_id,
+        head_generation=head_generation,
+        receipt_artifact_path=normalized_path,
+        receipt_artifact_sha256=receipt_artifact_sha256,
+        recorded_at=recorded,
+    )
+    connection = _connect(registry_path, write=True)
+    try:
+        _begin(connection)
+        existing = connection.execute(
+            "SELECT * FROM active_head_receipt "
+            "WHERE consumer_kind=? AND consumer_id=?",
+            (consumer_kind, consumer_id),
+        ).fetchone()
+        if existing is not None:
+            registered = _active_head_receipt_from_row(existing)
+            if (
+                registered.consumer_kind != expected.consumer_kind
+                or registered.consumer_id != expected.consumer_id
+                or registered.market_id != expected.market_id
+                or registered.head_generation != expected.head_generation
+                or registered.receipt_artifact_path
+                != expected.receipt_artifact_path
+                or registered.receipt_artifact_sha256
+                != expected.receipt_artifact_sha256
+            ):
+                raise ValueError("消费者已绑定另一份活动输入收据")
+            connection.execute("COMMIT")
+            return registered
+        connection.execute(
+            "INSERT INTO active_head_receipt("
+            "consumer_kind,consumer_id,market_id,head_generation,"
+            "receipt_artifact_path,receipt_artifact_sha256,recorded_at"
+            ") VALUES(?,?,?,?,?,?,?)",
+            (
+                consumer_kind, consumer_id, market_id, head_generation,
+                normalized_path, receipt_artifact_sha256, _timestamp(recorded),
+            ),
+        )
+        connection.execute("COMMIT")
+        return expected
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+    finally:
+        connection.close()
+
+
+def get_active_head_receipt(
+    registry_path: Path,
+    consumer_kind: str,
+    consumer_id: str,
+) -> ActiveHeadReceiptRegistration:
+    """读取消费者已经不可改写登记的活动输入收据。"""
+    connection = _connect(registry_path)
+    try:
+        row = connection.execute(
+            "SELECT * FROM active_head_receipt "
+            "WHERE consumer_kind=? AND consumer_id=?",
+            (consumer_kind, consumer_id),
+        ).fetchone()
+    finally:
+        connection.close()
+    if row is None:
+        raise LookupError("消费者没有登记活动输入收据")
+    return _active_head_receipt_from_row(row)
 
 
 def register_research_exposure(
@@ -1477,6 +1869,19 @@ def finalize_holdout_evaluation(
             or attempt["candidate_set_hash"] != evidence.candidate_set_hash
         ):
             raise ValueError("holdout manifest 的 candidate_set_hash 与注册表不匹配")
+        receipt = connection.execute(
+            "SELECT * FROM active_head_receipt "
+            "WHERE consumer_kind='holdout' AND consumer_id=?",
+            (evaluation_id,),
+        ).fetchone()
+        if (
+            receipt is None
+            or receipt["market_id"] != vintage["market_id"]
+            or receipt["head_generation"] != evidence.input_head_generation
+            or receipt["receipt_artifact_path"] != evidence.input_receipt_path
+            or receipt["receipt_artifact_sha256"] != evidence.input_receipt_sha256
+        ):
+            raise ValueError("holdout 终态缺少匹配的活动输入收据登记")
         vintage_start = _parse_timestamp(str(vintage["start_time"]))
         vintage_end = _parse_timestamp(str(vintage["end_time"]))
         if evidence.score_start < vintage_start or evidence.score_end > vintage_end:
@@ -1491,12 +1896,13 @@ def finalize_holdout_evaluation(
                 or plan["plan_id"] != evidence.forward_plan_id
             ):
                 raise ValueError("holdout 冻结前向 plan 与注册表不一致")
+            assert evidence.forward_plan_id is not None
             if (
                 plan["candidate_set_hash"] != evidence.candidate_set_hash
                 or plan["config_hash"] != evidence.config_hash
             ):
                 raise ValueError("holdout 冻结前向 plan 身份不匹配")
-            plan_evidence = _validated_forward_plan_artifact(
+            _validated_forward_plan_artifact(
                 repository_root,
                 str(plan["plan_id"]),
                 vintage_id,
@@ -1508,33 +1914,15 @@ def finalize_holdout_evaluation(
                 str(plan["plan_artifact_sha256"]),
                 evidence.candidate_ids,
             )
-            prediction_rows = connection.execute(
-                "SELECT * FROM frozen_forward_prediction WHERE plan_id=? "
-                "ORDER BY decision_time",
-                (evidence.forward_plan_id,),
-            ).fetchall()
-            if len(prediction_rows) != evidence.forward_prediction_count:
+            row_set_hash, prediction_times = _frozen_forward_prediction_row_set(
+                connection, evidence.forward_plan_id,
+            )
+            if len(prediction_times) != evidence.forward_prediction_count:
                 raise ValueError("holdout 冻结预测数量与注册表不一致")
-            prediction_times: list[datetime] = []
-            for prediction in prediction_rows:
-                decision_time = _parse_timestamp(str(prediction["decision_time"]))
-                prediction_times.append(decision_time)
-                _validated_forward_prediction_artifact(
-                    repository_root,
-                    str(prediction["prediction_id"]),
-                    str(prediction["plan_id"]),
-                    str(prediction["vintage_id"]),
-                    decision_time,
-                    str(prediction["input_head_generation"]),
-                    str(prediction["panel_sha256"]),
-                    evidence.config_hash,
-                    str(plan["code_tree_digest"]),
-                    plan_evidence,
-                    str(prediction["prediction_artifact_path"]),
-                    str(prediction["prediction_artifact_sha256"]),
-                )
-            if tuple(prediction_times) != evidence.score_decision_times:
+            if prediction_times != evidence.score_decision_times:
                 raise ValueError("holdout 冻结预测时点未逐柱匹配评分面板")
+            if row_set_hash != evidence.forward_prediction_row_set_hash:
+                raise ValueError("holdout 冻结预测 row-set 与注册表不一致")
         elif evidence.require_forward_predictions:
             raise ValueError("holdout 要求冻结前向预测但注册表没有 plan")
         if vintage["verdict"] is not None or attempt["status"] != "incomplete":
@@ -1798,7 +2186,12 @@ def register_frozen_forward_prediction(
             "plan_id": plan_id,
             "decision_time": decision.isoformat(),
         })
-        _, normalized_artifact_path = _validated_forward_prediction_artifact(
+        (
+            _,
+            normalized_artifact_path,
+            normalized_receipt_path,
+            receipt_sha256,
+        ) = _validated_forward_prediction_artifact(
             repository_root,
             prediction_id,
             plan_id,
@@ -1811,6 +2204,7 @@ def register_frozen_forward_prediction(
             plan_evidence,
             prediction_artifact_path,
             prediction_artifact_sha256,
+            recorded,
         )
         values = (
             input_head_generation,
@@ -1832,8 +2226,29 @@ def register_frozen_forward_prediction(
             )
             if actual != expected:
                 raise ValueError("该决策时间的冻结前向预测不可改写")
+            receipt = connection.execute(
+                "SELECT * FROM active_head_receipt "
+                "WHERE consumer_kind='frozen_forward' AND consumer_id=?",
+                (prediction_id,),
+            ).fetchone()
+            if (
+                receipt is None
+                or receipt["receipt_artifact_path"] != normalized_receipt_path
+                or receipt["receipt_artifact_sha256"] != receipt_sha256
+            ):
+                raise ValueError("冻结预测登记缺少匹配的活动输入收据")
             connection.execute("COMMIT")
             return _prediction_from_row(existing)
+        connection.execute(
+            "INSERT INTO active_head_receipt("
+            "consumer_kind,consumer_id,market_id,head_generation,"
+            "receipt_artifact_path,receipt_artifact_sha256,recorded_at"
+            ") VALUES('frozen_forward',?,?,?,?,?,?)",
+            (
+                prediction_id, str(vintage["market_id"]), input_head_generation,
+                normalized_receipt_path, receipt_sha256, _timestamp(recorded),
+            ),
+        )
         connection.execute(
             "INSERT INTO frozen_forward_prediction("
             "prediction_id,plan_id,vintage_id,decision_time,"

@@ -5,9 +5,68 @@ import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
-from guvolu.research.governance import get_research_exposure
-from guvolu.research.provenance import sha256_file
+from guvolu.research.allocator import allocate, allocation_payload
+from guvolu.research.config_lineage import attest_config_lineage_snapshot
+from guvolu.research.contracts import PanelSnapshot
+from guvolu.research.features import classify_market_state, compute_features
+from guvolu.research.governance import (
+    get_active_head_receipt,
+    get_research_exposure,
+)
+from guvolu.research.panel import (
+    attest_trade_input_receipt,
+    build_panel_snapshot,
+    parse_time,
+)
+from guvolu.research.pipeline import (
+    SECONDS_PER_YEAR,
+    _INTERVAL_SECONDS,
+    _cost_replay_artifact,
+    _family_payload,
+    _market_state_payload,
+    _position_contract_payload,
+    _trial_artifact,
+)
+from guvolu.research.provenance import (
+    canonical_json,
+    code_tree_digest_at_commit,
+    sha256_file,
+    sha256_text,
+    stable_identifier,
+    verify_artifacts_match_commit,
+)
+from guvolu.research.quality import panel_quality, quality_payload
+from guvolu.research.validation import walk_forward_validate
+from guvolu.strategy.generation import (
+    build_family_batches,
+    candidate_registry_payload,
+)
+
+
+_RUN_IDENTITY_FIELDS = (
+    "schema_version",
+    "pipeline_method_version",
+    "p_value_method_version",
+    "pbo_method_version",
+    "block_bootstrap_method_version",
+    "deflated_sharpe_method_version",
+    "effective_trial_method_version",
+    "parameter_stability_method_version",
+    "position_contract_method_version",
+    "governance_method_version",
+    "run_id",
+    "research_identity",
+    "generator_method_version",
+    "family_scope",
+    "decision_time",
+    "execution_evaluated_at",
+    "code_identity",
+    "config_hash",
+    "config_lineage_root_hash",
+    "config_lineage_depth",
+)
 
 
 @dataclass(frozen=True)
@@ -39,6 +98,33 @@ def _number(value: object, name: str) -> float:
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         raise ValueError(f"{name} 必须为数值")
     return float(value)
+
+
+def _integer(value: object, name: str) -> int:
+    """验证 JSON 整数。"""
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(f"{name} 必须为整数")
+    return value
+
+
+def _text_tuple(value: object, name: str) -> tuple[str, ...]:
+    """验证有序且不重复的非空文本数组。"""
+    if not isinstance(value, (list, tuple)) or not value:
+        raise ValueError(f"{name} 必须为非空文本数组")
+    result = tuple(_text(item, name) for item in value)
+    if result != tuple(sorted(result)) or len(set(result)) != len(result):
+        raise ValueError(f"{name} 必须有序且不重复")
+    return result
+
+
+def _text_sequence(value: object, name: str) -> tuple[str, ...]:
+    """验证保持业务顺序且不重复的非空文本数组。"""
+    if not isinstance(value, (list, tuple)) or not value:
+        raise ValueError(f"{name} 必须为非空文本数组")
+    result = tuple(_text(item, name) for item in value)
+    if len(set(result)) != len(result):
+        raise ValueError(f"{name} 不能重复")
+    return result
 
 
 def _read_json(path: Path) -> Mapping[str, object]:
@@ -81,6 +167,9 @@ def _verify_operational_gate(summary: Mapping[str, object]) -> None:
     eligible = quality.get("eligible")
     if not isinstance(eligible, bool):
         raise ValueError("operational_quality.eligible 必须为布尔值")
+    reserve = _number(
+        position.get("reserve"), "operational_position.reserve",
+    )
     numeric_weights: list[float] = []
     for family, value in weights.items():
         if not isinstance(value, (int, float)) or isinstance(value, bool):
@@ -93,6 +182,8 @@ def _verify_operational_gate(summary: Mapping[str, object]) -> None:
         raise ValueError("decision_grade 必须为布尔值")
     if not decision_grade and any(abs(value) > 1e-12 for value in numeric_weights):
         raise ValueError("代码身份非决策级但存在非零仓位")
+    if (not eligible or not decision_grade) and abs(reserve - 1.0) > 1e-12:
+        raise ValueError("运行门禁失败但风险余量不是一")
     contract = _object(
         summary.get("operational_target_contract"),
         "operational_target_contract",
@@ -131,6 +222,346 @@ def _verify_operational_gate(summary: Mapping[str, object]) -> None:
         raise ValueError("代码身份非决策级但组合目标非零")
 
 
+def _attest_v12_decision_evidence(
+    panel: PanelSnapshot,
+    config: Mapping[str, object],
+    family_scope: tuple[str, ...],
+    research_identity: str,
+    summary: Mapping[str, object],
+    artifact_paths: Mapping[str, Path],
+) -> None:
+    """从受保护 panel/config 重建候选选择、资格、资金权重和回放。"""
+    batches = build_family_batches(config, family_scope)
+    candidates = tuple(
+        candidate for batch in batches for candidate in batch.candidates
+    )
+    feature_config = _object(config.get("features"), "features")
+    raw_lookbacks = feature_config.get("lookbacks")
+    if not isinstance(raw_lookbacks, list):
+        raise ValueError("v12 features.lookbacks 必须为数组")
+    lookbacks = tuple(_integer(value, "features.lookbacks") for value in raw_lookbacks)
+    features = compute_features(
+        panel.bars,
+        lookbacks,
+        _integer(feature_config.get("volume_lookback"), "volume_lookback"),
+        _integer(
+            feature_config.get("maximum_structural_gap_bars_assumption"),
+            "maximum_structural_gap_bars_assumption",
+        ),
+    )
+    state_lookback = _integer(
+        feature_config.get("state_lookback"), "state_lookback",
+    )
+    valid_indices = [
+        index for index, feature in enumerate(features)
+        if feature.contiguous
+        and feature.volume_score is not None
+        and feature.trend_scores.get(state_lookback) is not None
+    ]
+    if not valid_indices:
+        raise ValueError("v12 受保护 panel 没有可用决策时点")
+    decision_index = valid_indices[-1]
+    decision_time = features[decision_index].decision_time
+    validation = walk_forward_validate(
+        research_identity,
+        panel.bars,
+        features,
+        candidates,
+        config,
+        decision_index=decision_index,
+    )
+    interval = _text(config.get("bar_interval"), "bar_interval")
+    interval_seconds = _INTERVAL_SECONDS.get(interval)
+    if interval_seconds is None:
+        raise ValueError("v12 bar_interval 不受支持")
+    periods_per_year = SECONDS_PER_YEAR / interval_seconds
+    minimum_bars = _integer(
+        _object(config.get("validation"), "validation").get("minimum_oos_bars"),
+        "minimum_oos_bars",
+    )
+    research_quality = panel_quality(
+        panel,
+        decision_time,
+        _integer(
+            config.get("strategy_decision_max_age_seconds"),
+            "strategy_decision_max_age_seconds",
+        ),
+        minimum_bars,
+    )
+    market_state = classify_market_state(
+        features[decision_index],
+        state_lookback,
+        features[decision_index].volume_score,
+        periods_per_year,
+    )
+    research_position = allocate(
+        validation.families,
+        market_state,
+        research_quality,
+        _object(config.get("allocation"), "allocation"),
+        l2_overlay=0.0,
+    )
+    expected = {
+        "decision_time": decision_time.isoformat(),
+        "market_state": _market_state_payload(market_state),
+        "research_quality": quality_payload(research_quality),
+        "family_evaluations": _family_payload(validation),
+        "research_position": allocation_payload(research_position),
+        "research_target_contract": _position_contract_payload(
+            validation, research_position,
+        ),
+    }
+    for name, value in expected.items():
+        if canonical_json(summary.get(name)) != canonical_json(value):
+            raise ValueError(f"v12 {name} 不能由受保护决策证据重建")
+    strategy_decision = _object(
+        summary.get("strategy_decision"), "strategy_decision",
+    )
+    if (
+        strategy_decision.get("feature_index") != decision_index
+        or strategy_decision.get("decision_time") != decision_time.isoformat()
+    ):
+        raise ValueError("v12 strategy_decision 不能由受保护特征重建")
+    target_path = artifact_paths.get("target_position")
+    trial_path = artifact_paths.get("trial_ledger")
+    replay_path = artifact_paths.get("label_cost_replay")
+    if target_path is None or trial_path is None or replay_path is None:
+        raise ValueError("v12 缺少决策、trial 或成本回放制品")
+    target = _read_json(target_path)
+    for name, value in (
+        ("research_replay", allocation_payload(research_position)),
+        (
+            "research_target_contract",
+            _position_contract_payload(validation, research_position),
+        ),
+    ):
+        if canonical_json(target.get(name)) != canonical_json(value):
+            raise ValueError(f"v12 target_position.{name} 现场重建不一致")
+    with TemporaryDirectory(prefix="guvolu-decision-evidence-") as temporary:
+        evidence_directory = Path(temporary)
+        rebuilt_trial, _ = _trial_artifact(
+            evidence_directory, validation, research_identity,
+        )
+        rebuilt_replay, _ = _cost_replay_artifact(
+            evidence_directory, panel, validation, config, research_identity,
+        )
+        if rebuilt_trial.read_bytes() != trial_path.read_bytes():
+            raise ValueError("v12 trial ledger 不能由验证结果重建")
+        if rebuilt_replay.read_bytes() != replay_path.read_bytes():
+            raise ValueError("v12 成本回放不能由验证路径重建")
+
+
+def _verify_run_identity(
+    root: Path,
+    manifest: Mapping[str, object],
+    summary: Mapping[str, object],
+    candidate_registry: Mapping[str, object] | None,
+    artifact_paths: Mapping[str, Path],
+) -> None:
+    """绑定摘要、manifest、代码身份与 v11/v12 研究身份。"""
+    for field in _RUN_IDENTITY_FIELDS:
+        if manifest.get(field) != summary.get(field):
+            raise ValueError(f"summary 与 manifest 的 {field} 不一致")
+    code = _object(manifest.get("code_identity"), "manifest.code_identity")
+    dirty = code.get("dirty")
+    decision_grade = code.get("decision_grade")
+    if not isinstance(dirty, bool) or not isinstance(decision_grade, bool):
+        raise ValueError("code_identity 的 dirty/decision_grade 必须为布尔值")
+    git_hash = code.get("git_hash")
+    if git_hash is not None and (not isinstance(git_hash, str) or not git_hash):
+        raise ValueError("code_identity.git_hash 必须为空或非空字符串")
+    expected_grade = git_hash is not None and not dirty
+    if decision_grade is not expected_grade:
+        raise ValueError("code_identity.decision_grade 与 Git/dirty 状态不一致")
+    if summary.get("decision_grade") is not decision_grade:
+        raise ValueError("summary.decision_grade 与 code_identity 不一致")
+    method = manifest.get("pipeline_method_version")
+    if method not in {
+        "strategy-research-pipeline-v11",
+        "strategy-research-pipeline-v12",
+    }:
+        return
+    if candidate_registry is None:
+        raise ValueError("v11/v12 manifest 缺少 candidate_registry 制品")
+    if method == "strategy-research-pipeline-v12":
+        config_path = artifact_paths.get("config")
+        config_lineage_path = artifact_paths.get("config_lineage")
+        panel_path = artifact_paths.get("panel")
+        receipt_path = artifact_paths.get("input_receipt")
+        if (
+            config_path is None
+            or config_lineage_path is None
+            or panel_path is None
+            or receipt_path is None
+        ):
+            raise ValueError("v12 manifest 缺少配置谱系、panel 或输入收据制品")
+        artifacts = _object(manifest.get("artifacts"), "manifest.artifacts")
+        expected_kinds = {
+            "config": "research_config_snapshot",
+            "config_lineage": "research_config_lineage",
+            "panel": "research_physical_panel",
+            "candidate_registry": "candidate_registry",
+            "input_receipt": "active_trade_head_receipt",
+        }
+        for name, kind in expected_kinds.items():
+            record = _object(artifacts.get(name), f"artifacts.{name}")
+            if record.get("kind") != kind:
+                raise ValueError(f"v12 {name} 制品类型不匹配")
+        (
+            config,
+            config_hash,
+            lineage_root_hash,
+            lineage_depth,
+            config_source_paths,
+            config_artifact_paths,
+        ) = attest_config_lineage_snapshot(
+            root, config_lineage_path, config_path,
+        )
+        if (
+            manifest.get("config_hash") != config_hash
+            or manifest.get("config_lineage_root_hash") != lineage_root_hash
+            or manifest.get("config_lineage_depth") != lineage_depth
+        ):
+            raise ValueError("v12 配置身份不能由受保护配置谱系重建")
+        family_scope = _text_sequence(manifest.get("family_scope"), "family_scope")
+        expected_registry = candidate_registry_payload(
+            build_family_batches(config, family_scope), config_hash,
+        )
+        if canonical_json(candidate_registry) != canonical_json(expected_registry):
+            raise ValueError("v12 candidate registry 不能由配置与公式注册表重建")
+        attempt_ids = _text_tuple(
+            manifest.get("input_attempt_ids"), "input_attempt_ids",
+        )
+        artifact_ids = _text_tuple(
+            manifest.get("input_artifact_ids"), "input_artifact_ids",
+        )
+        normalizations = _text_tuple(
+            manifest.get("normalization_versions"), "normalization_versions",
+        )
+        receipt_sha256 = _text(
+            manifest.get("input_receipt_sha256"), "input_receipt_sha256",
+        )
+        if sha256_file(receipt_path) != receipt_sha256:
+            raise ValueError("v12 输入收据制品与 manifest 身份不一致")
+        governance = _object(config.get("data_governance"), "data_governance")
+        registry_path = _artifact_path(
+            root,
+            {"path": _text(governance.get("registry"), "registry")},
+            "governance registry",
+        )
+        registration = get_active_head_receipt(
+            registry_path, "research",
+            _text(manifest.get("research_identity"), "research_identity"),
+        )
+        relative_receipt = receipt_path.relative_to(root).as_posix()
+        if (
+            registration.receipt_artifact_path != relative_receipt
+            or registration.receipt_artifact_sha256 != receipt_sha256
+        ):
+            raise ValueError("v12 输入收据未由治理库绑定研究身份")
+        registered = attest_trade_input_receipt(
+            root / "data", receipt_path, require_current_head=False,
+        )
+        if (
+            registered.head_generation != manifest.get("input_head_generation")
+            or registered.attempt_ids != attempt_ids
+            or registered.artifact_ids != artifact_ids
+            or registered.normalization_versions != normalizations
+        ):
+            raise ValueError("v12 panel 输入身份不能由控制面注册表重建")
+        with TemporaryDirectory(prefix="guvolu-research-attest-") as temporary:
+            rebuilt = build_panel_snapshot(
+                registered,
+                Path(temporary),
+                _text(config.get("bar_interval"), "bar_interval"),
+                parse_time(config.get("from_time"), "from_time"),
+                registered.maximum_event_time,
+                _integer(config.get("notional_scale"), "notional_scale"),
+            )
+        if rebuilt.panel_sha256 != sha256_file(panel_path):
+            raise ValueError("v12 panel 不能由注册输入和版本化查询重建")
+        _attest_v12_decision_evidence(
+            rebuilt,
+            config,
+            family_scope,
+            _text(manifest.get("research_identity"), "research_identity"),
+            summary,
+            artifact_paths,
+        )
+        if decision_grade:
+            assert isinstance(git_hash, str)
+            commit_digest = code_tree_digest_at_commit(
+                root, git_hash, config_source_paths,
+            )
+            if code.get("tree_digest") != commit_digest:
+                raise ValueError("v12 code tree 不能由记录的 clean commit 重建")
+            if code.get("dirty_digest") != sha256_text(""):
+                raise ValueError("v12 clean run 的 dirty digest 不为空")
+            verify_artifacts_match_commit(
+                root,
+                git_hash,
+                tuple(zip(config_source_paths, config_artifact_paths, strict=True)),
+            )
+    raw_candidates = candidate_registry.get("candidates")
+    if not isinstance(raw_candidates, list):
+        raise ValueError("candidate_registry.candidates 必须为数组")
+    candidate_ids = tuple(
+        _text(
+            _object(candidate, f"candidate_registry.candidates.{index}").get(
+                "candidate_id"
+            ),
+            f"candidate_registry.candidates.{index}.candidate_id",
+        )
+        for index, candidate in enumerate(raw_candidates)
+    )
+    identity_payload: dict[str, object] = {
+        "pipeline_method_version": manifest.get("pipeline_method_version"),
+        "p_value_method_version": manifest.get("p_value_method_version"),
+        "pbo_method_version": manifest.get("pbo_method_version"),
+        "block_bootstrap_method_version": manifest.get(
+            "block_bootstrap_method_version"
+        ),
+        "deflated_sharpe_method_version": manifest.get(
+            "deflated_sharpe_method_version"
+        ),
+        "effective_trial_method_version": manifest.get(
+            "effective_trial_method_version"
+        ),
+        "parameter_stability_method_version": manifest.get(
+            "parameter_stability_method_version"
+        ),
+        "position_contract_method_version": manifest.get(
+            "position_contract_method_version"
+        ),
+        "config_hash": manifest.get("config_hash"),
+        "config_lineage_root_hash": manifest.get("config_lineage_root_hash"),
+        "config_lineage_depth": manifest.get("config_lineage_depth"),
+        "head_generation": manifest.get("input_head_generation"),
+        "attempt_ids": manifest.get("input_attempt_ids"),
+        "artifact_ids": manifest.get("input_artifact_ids"),
+        "code_tree_digest": code.get("tree_digest"),
+        "dirty_digest": code.get("dirty_digest"),
+        "generator_method_version": manifest.get("generator_method_version"),
+        "family_scope": manifest.get("family_scope"),
+        "candidate_ids": candidate_ids,
+        "governance_method_version": manifest.get("governance_method_version"),
+        "data_scope": manifest.get("data_scope"),
+    }
+    if method == "strategy-research-pipeline-v12":
+        identity_payload["input_receipt_sha256"] = manifest.get(
+            "input_receipt_sha256"
+        )
+    research_identity = stable_identifier("research-identity", identity_payload)
+    if manifest.get("research_identity") != research_identity:
+        raise ValueError("manifest.research_identity 无法由受保护证据重建")
+    run_id = stable_identifier("research-run", {
+        "research_identity": research_identity,
+        "execution_evaluated_at": manifest.get("execution_evaluated_at"),
+    })
+    if manifest.get("run_id") != run_id:
+        raise ValueError("manifest.run_id 无法由研究身份和执行时点重建")
+
+
 def _verify_data_governance(root: Path, summary: Mapping[str, object]) -> None:
     """复核 v8 开发运行绑定的不可变数据暴露。"""
     if summary.get("pipeline_method_version") not in (
@@ -138,6 +569,7 @@ def _verify_data_governance(root: Path, summary: Mapping[str, object]) -> None:
         "strategy-research-pipeline-v9",
         "strategy-research-pipeline-v10",
         "strategy-research-pipeline-v11",
+        "strategy-research-pipeline-v12",
     ):
         return
     governance = _object(summary.get("data_governance"), "data_governance")
@@ -189,6 +621,8 @@ def verify_research_run(
     artifacts = _object(manifest.get("artifacts"), "manifest.artifacts")
     checked: list[str] = []
     summary: Mapping[str, object] | None = None
+    candidate_registry: Mapping[str, object] | None = None
+    artifact_paths: dict[str, Path] = {}
     for name, raw_record in sorted(artifacts.items()):
         record = _object(raw_record, f"artifacts.{name}")
         path = _artifact_path(resolved_root, record, name)
@@ -204,11 +638,15 @@ def verify_research_run(
             raise ValueError(f"制品字节数不匹配: {name}")
         if name == "summary_json":
             summary = _read_json(path)
+        elif name == "candidate_registry":
+            candidate_registry = _read_json(path)
+        artifact_paths[name] = path
         checked.append(name)
     if summary is None:
         raise ValueError("manifest 缺少 summary_json 制品")
-    if summary.get("run_id") != run_id:
-        raise ValueError("summary 与 manifest 的 run_id 不一致")
+    _verify_run_identity(
+        resolved_root, manifest, summary, candidate_registry, artifact_paths,
+    )
     _verify_operational_gate(summary)
     _verify_data_governance(resolved_root, summary)
     return VerificationResult(

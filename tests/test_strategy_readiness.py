@@ -42,8 +42,8 @@ def test_readiness_reports_data_waits_without_mutating_governance(
     monkeypatch: object,
 ) -> None:
     """预检须区分特征成熟、活动 head 和未封存 holdout。"""
-    config = tmp_path / "config.json"
-    config.write_text(json.dumps({
+    parent_config = tmp_path / "parent-config.json"
+    parent_config.write_text(json.dumps({
         "bar_interval": "1hour",
         "strategy_decision_max_age_seconds": 120,
         "features": {
@@ -54,6 +54,15 @@ def test_readiness_reports_data_waits_without_mutating_governance(
         },
         "data_governance": {"registry": "data/research/governance.sqlite3"},
     }), encoding="utf-8")
+    config = tmp_path / "config.json"
+    config_body = json.loads(parent_config.read_text(encoding="utf-8"))
+    config_body["evolution_parent"] = {
+        "parent_config_path": parent_config.relative_to(tmp_path).as_posix(),
+        "parent_config_hash": sha256_file(parent_config),
+        "lineage_root_config_hash": sha256_file(parent_config),
+        "lineage_depth": 1,
+    }
+    config.write_text(json.dumps(config_body), encoding="utf-8")
     reports = tmp_path / "reports"
     reports.mkdir()
     summary = reports / "summary.json"
@@ -62,6 +71,8 @@ def test_readiness_reports_data_waits_without_mutating_governance(
         "market_id": "market-one",
         "decision_grade": True,
         "config_hash": sha256_file(config),
+        "config_lineage_root_hash": sha256_file(parent_config),
+        "config_lineage_depth": 1,
         "code_identity": {"git_hash": "source", "tree_digest": "tree-one"},
         "input": {"head_generation": "published-head"},
         "family_evaluations": [{
@@ -100,15 +111,27 @@ def test_readiness_reports_data_waits_without_mutating_governance(
         ),
     )
     monkeypatch.setattr(  # type: ignore[attr-defined]
-        "guvolu.research.readiness.code_identity",
-        lambda _root, _paths: CodeIdentity(
+        "guvolu.research.tuning.verify_evolution_config",
+        lambda *_args: None,
+    )
+
+    def current_identity(
+        _root: Path,
+        paths: tuple[Path, ...],
+    ) -> CodeIdentity:
+        assert paths == (config.resolve(), parent_config.resolve())
+        return CodeIdentity(
             git_hash="current",
             tree_digest="tree-one",
             dirty_digest="clean",
             dirty=False,
             decision_grade=True,
             reason=None,
-        ),
+        )
+
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        "guvolu.research.readiness.code_identity",
+        current_identity,
     )
     bars = tuple(_bar(hour) for hour in (0, 1, 2, 10, 11))
     monkeypatch.setattr(  # type: ignore[attr-defined]
@@ -140,3 +163,95 @@ def test_readiness_reports_data_waits_without_mutating_governance(
     assert promotion["blockers"] == ["no_sealed_holdout_vintage"]
     assert promotion["next_action"] == "seal_future_vintage_before_its_start"
     assert result["read_only"] is True
+
+
+def test_readiness_blocks_operational_config_mismatch(
+    tmp_path: Path,
+    monkeypatch: object,
+) -> None:
+    """旧运行配置不得被当前配置误报为可执行就绪。"""
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps({
+        "bar_interval": "1hour",
+        "strategy_decision_max_age_seconds": 7_200,
+        "features": {
+            "lookbacks": [2],
+            "volume_lookback": 2,
+            "state_lookback": 2,
+            "maximum_structural_gap_bars_assumption": 1,
+        },
+        "data_governance": {"registry": "data/research/governance.sqlite3"},
+    }), encoding="utf-8")
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    summary = reports / "summary.json"
+    summary.write_text(json.dumps({
+        "run_id": "run-one",
+        "market_id": "market-one",
+        "decision_grade": True,
+        "config_hash": "different-config",
+        "config_lineage_root_hash": sha256_file(config),
+        "config_lineage_depth": 0,
+        "code_identity": {"git_hash": "source", "tree_digest": "tree-one"},
+        "input": {"head_generation": "current-head"},
+        "family_evaluations": [{
+            "family": "trend",
+            "eligible": True,
+            "mode": "paper",
+        }],
+    }), encoding="utf-8")
+    manifest = reports / "manifest.json"
+    manifest.write_text(json.dumps({
+        "run_id": "run-one",
+        "artifacts": {
+            "summary_json": {"path": "reports/summary.json"},
+            "panel": {"path": "reports/panel.parquet", "sha256": "panel-one"},
+        },
+    }), encoding="utf-8")
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        "guvolu.research.readiness.verify_research_run",
+        lambda _root, _manifest: VerificationResult(
+            run_id="run-one",
+            manifest_path=manifest,
+            manifest_sha256="manifest-one",
+            checked_artifacts=("panel", "summary_json"),
+        ),
+    )
+    current_inputs = FrozenPanelInputs(
+        market={"market_id": "market-one"},
+        paths=(),
+        head_generation="current-head",
+        attempt_ids=(),
+        artifact_ids=(),
+        normalization_versions=(),
+        maximum_event_time=_bar(4).decision_time,
+    )
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        "guvolu.research.readiness.freeze_trade_inputs",
+        lambda _root, _market: current_inputs,
+    )
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        "guvolu.research.readiness.code_identity",
+        lambda _root, _paths: CodeIdentity(
+            git_hash="current",
+            tree_digest="tree-one",
+            dirty_digest="clean",
+            dirty=False,
+            decision_grade=True,
+            reason=None,
+        ),
+    )
+    bars = tuple(_bar(hour) for hour in range(5))
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        "guvolu.research.readiness.load_panel_bars", lambda _path: bars,
+    )
+    monkeypatch.setattr(  # type: ignore[attr-defined]
+        "guvolu.research.readiness.list_holdout_vintages", lambda _path: (),
+    )
+    result = strategy_readiness(
+        tmp_path, config, manifest, reference_time=_bar(4).decision_time,
+    )
+    operational = result["operational"]
+    assert isinstance(operational, dict)
+    assert operational["ready"] is False
+    assert operational["blockers"] == ["source_config_mismatch"]

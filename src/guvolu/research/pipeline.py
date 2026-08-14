@@ -10,7 +10,11 @@ from typing import Any, Mapping, Sequence
 
 from guvolu.data.durable_io import atomic_write_text
 from guvolu.research.allocator import allocate, allocation_payload, flat_allocation
-from guvolu.research.config_lineage import load_verified_config_lineage
+from guvolu.research.config_lineage import (
+    load_governed_strategy_config,
+    snapshot_verified_config_lineage,
+    verified_config_lineage_paths,
+)
 from guvolu.research.contracts import AllocationResult, PanelSnapshot, QualityVector
 from guvolu.research.features import (
     MarketState,
@@ -20,11 +24,12 @@ from guvolu.research.features import (
 )
 from guvolu.research.governance import (
     GOVERNANCE_METHOD_VERSION,
+    register_active_head_receipt,
     register_research_exposure,
 )
 from guvolu.research.panel import (
     build_panel_snapshot,
-    freeze_trade_inputs,
+    capture_trade_input_receipt,
     panel_inputs_payload,
     parse_time,
 )
@@ -46,7 +51,6 @@ from guvolu.research.shadow import (
     l2_overlay_from_shadow,
     latest_common_l2_decision,
 )
-from guvolu.research.tuning import verify_evolution_config
 from guvolu.research.validation import (
     BLOCK_BOOTSTRAP_METHOD_VERSION,
     DEFLATED_SHARPE_METHOD_VERSION,
@@ -68,7 +72,7 @@ from guvolu.strategy.generation import (
 )
 
 PIPELINE_SCHEMA_VERSION = 1
-PIPELINE_METHOD_VERSION = "strategy-research-pipeline-v11"
+PIPELINE_METHOD_VERSION = "strategy-research-pipeline-v12"
 POSITION_CONTRACT_METHOD_VERSION = "risk-weighted-family-target-v1"
 SECONDS_PER_YEAR = 365.0 * 24.0 * 60.0 * 60.0
 _INTERVAL_SECONDS = {
@@ -579,18 +583,24 @@ def run_research(
         config_hash,
         lineage_root_config_hash,
         config_lineage_depth,
-    ) = load_verified_config_lineage(root, config_file)
-    verify_evolution_config(root, config_file, config)
+    ) = load_governed_strategy_config(root, config_file)
     data_root = root / "data"
     output_base = (output_root or root / "reports" / "strategy-research").resolve()
-    identity = code_identity(root, (config_file,))
+    config_source_paths = verified_config_lineage_paths(root, config_file)
+    identity = code_identity(root, config_source_paths)
     batches = build_family_batches(config, family_scope)
     resolved_family_scope = tuple(batch.family for batch in batches)
     candidates = tuple(
         candidate for batch in batches for candidate in batch.candidates
     )
     market_id = _text(config.get("market_id"), "market_id")
-    inputs = freeze_trade_inputs(data_root, market_id)
+    inputs = capture_trade_input_receipt(
+        data_root,
+        market_id,
+        data_root / "research" / "input-receipts",
+    )
+    if inputs.receipt_path is None or inputs.receipt_sha256 is None:
+        raise AssertionError("研究输入没有生成活动 head 收据")
     input_event = inputs.maximum_event_time
     execution_evaluated_at = datetime.now(UTC)
     exposure_start = parse_time(config.get("from_time"), "from_time")
@@ -610,6 +620,7 @@ def run_research(
         "head_generation": inputs.head_generation,
         "attempt_ids": inputs.attempt_ids,
         "artifact_ids": inputs.artifact_ids,
+        "input_receipt_sha256": inputs.receipt_sha256,
         "code_tree_digest": identity.tree_digest,
         "dirty_digest": identity.dirty_digest,
         "generator_method_version": GENERATOR_METHOD_VERSION,
@@ -623,12 +634,27 @@ def run_research(
         research_identity,
         execution_evaluated_at,
     )
+    config_snapshot = snapshot_verified_config_lineage(
+        root, config_file, artifact_directory,
+    )
     exposure = register_research_exposure(
         governance_path,
         research_identity,
         market_id,
         exposure_start,
         input_event,
+        recorded_at=execution_evaluated_at,
+    )
+    receipt_registration = register_active_head_receipt(
+        governance_path,
+        "research",
+        research_identity,
+        market_id,
+        inputs.head_generation,
+        _relative(inputs.receipt_path, root),
+        inputs.receipt_sha256,
+        repository_root=root,
+        data_root=data_root,
         recorded_at=execution_evaluated_at,
     )
     panel = build_panel_snapshot(
@@ -749,7 +775,11 @@ def run_research(
         market_state,
         research_quality,
         allocation_config,
-        l2_overlay=overlay,
+        # L2 尚无成交 head 的历史收据。
+        # 研究和冻结权重只使用
+        # 受保护的成交 panel，
+        # 并采用可重建的零 overlay。
+        l2_overlay=0.0,
     )
     operational_position = allocate(
         validation.families,
@@ -878,6 +908,22 @@ def run_research(
         canonical_json(shadow) + "\n",
     )
     artifacts = {
+        "input_receipt": {
+            **artifact_record(inputs.receipt_path, "active_trade_head_receipt"),
+            "path": _relative(inputs.receipt_path, root),
+        },
+        "config": {
+            **artifact_record(
+                config_snapshot.leaf_config_path, "research_config_snapshot",
+            ),
+            "path": _relative(config_snapshot.leaf_config_path, root),
+        },
+        "config_lineage": {
+            **artifact_record(
+                config_snapshot.bundle_path, "research_config_lineage",
+            ),
+            "path": _relative(config_snapshot.bundle_path, root),
+        },
         "panel": {
             **artifact_record(panel.panel_path, "research_physical_panel"),
             "path": _relative(panel.panel_path, root),
@@ -948,6 +994,9 @@ def run_research(
             "from_time": exposure.start_time.isoformat(),
             "to_time": exposure.end_time.isoformat(),
             "registry": _relative(governance_path, root),
+            "input_receipt_sha256": (
+                receipt_registration.receipt_artifact_sha256
+            ),
         },
         "input": panel_inputs_payload(inputs),
         "panel": {
@@ -1011,6 +1060,7 @@ def run_research(
         "data_scope": data_scope,
         "research_exposure_id": exposure.exposure_id,
         "input_head_generation": panel.head_generation,
+        "input_receipt_sha256": inputs.receipt_sha256,
         "input_attempt_ids": list(panel.attempt_ids),
         "input_artifact_ids": list(panel.artifact_ids),
         "normalization_versions": list(panel.normalization_versions),

@@ -5,9 +5,11 @@ import json
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Mapping, Sequence
 
 from guvolu.data.durable_io import atomic_write_text
+from guvolu.research.config_lineage import attest_config_lineage_snapshot
 from guvolu.research.contracts import (
     HOLDOUT_MANIFEST_SCHEMA_VERSION,
     HOLDOUT_METHOD_VERSION,
@@ -17,12 +19,20 @@ from guvolu.research.governance import (
     GOVERNANCE_METHOD_VERSION,
     HoldoutVintage,
     finalize_holdout_evaluation,
+    get_active_head_receipt,
     get_frozen_forward_plan_for_vintage,
     get_holdout_vintage,
+    register_active_head_receipt,
     start_holdout_evaluation_attempt,
     update_holdout_evaluation_attempt,
 )
-from guvolu.research.panel import build_panel_snapshot, freeze_trade_inputs, parse_time
+from guvolu.research.panel import (
+    attest_trade_input_receipt,
+    build_panel_snapshot,
+    capture_trade_input_receipt,
+    load_panel_bars,
+    parse_time,
+)
 from guvolu.research.provenance import (
     artifact_record,
     canonical_json,
@@ -133,12 +143,8 @@ def load_frozen_candidates(
     source_manifest: Mapping[str, object],
 ) -> tuple[tuple[CandidateSpec, ...], Path]:
     """从已发布组合运行冻结 paper eligible 部署候选。"""
-    if source_summary.get("pipeline_method_version") not in {
-        "strategy-research-pipeline-v9",
-        "strategy-research-pipeline-v10",
-        "strategy-research-pipeline-v11",
-    }:
-        raise ValueError("holdout 只接受带表达式身份的 v9/v10/v11 来源运行")
+    if source_summary.get("pipeline_method_version") != "strategy-research-pipeline-v12":
+        raise ValueError("holdout v4 只接受可现场重建全部证据的 v12 来源运行")
     for field in ("run_id", "research_identity", "config_hash"):
         if source_summary.get(field) != source_manifest.get(field):
             raise ValueError(f"source summary 与 manifest 的 {field} 不一致")
@@ -305,6 +311,291 @@ def _score_decision_times(
     return tuple(decisions)
 
 
+def _attested_artifact_path(
+    root: Path,
+    artifacts: Mapping[str, object],
+    name: str,
+) -> Path:
+    """解析并复核 holdout manifest 中的一个内容寻址制品。"""
+    record = _object(artifacts.get(name), f"manifest.artifacts.{name}")
+    path = _project_path(
+        root,
+        Path(_text(record.get("path"), f"manifest.artifacts.{name}.path")),
+        f"holdout {name}",
+    )
+    if sha256_file(path) != record.get("sha256"):
+        raise ValueError(f"holdout {name} 制品 SHA-256 不匹配")
+    size = record.get("bytes")
+    if (
+        not isinstance(size, int)
+        or isinstance(size, bool)
+        or size != path.stat().st_size
+    ):
+        raise ValueError(f"holdout {name} 制品字节数不匹配")
+    return path
+
+
+def attest_holdout_terminal_artifacts(
+    repository_root: Path,
+    manifest_path: Path,
+) -> None:
+    """从冻结候选、面板、前向目标和成本配置现场重算终局指标。"""
+    root = repository_root.resolve()
+    manifest = _load(manifest_path)
+    artifacts = _object(manifest.get("artifacts"), "manifest.artifacts")
+    source_manifest_path = _attested_artifact_path(
+        root, artifacts, "source_manifest",
+    )
+    source_summary_path = _attested_artifact_path(
+        root, artifacts, "source_summary",
+    )
+    candidate_registry_path = _attested_artifact_path(
+        root, artifacts, "candidate_registry",
+    )
+    candidate_set_identity = _object(
+        manifest.get("candidate_set_identity"), "candidate_set_identity",
+    )
+    source_hashes = {
+        "source_manifest_sha256": sha256_file(source_manifest_path),
+        "source_summary_sha256": sha256_file(source_summary_path),
+        "candidate_registry_sha256": sha256_file(candidate_registry_path),
+    }
+    for name, value in source_hashes.items():
+        if candidate_set_identity.get(name) != value:
+            raise ValueError(f"holdout {name} 未直接绑定冻结候选集合")
+    config_path = _attested_artifact_path(root, artifacts, "config")
+    config_lineage_path = _attested_artifact_path(
+        root, artifacts, "config_lineage",
+    )
+    receipt_path = _attested_artifact_path(root, artifacts, "input_receipt")
+    panel_path = _attested_artifact_path(root, artifacts, "panel")
+    schedule_path = _attested_artifact_path(root, artifacts, "score_schedule")
+    result_path = _attested_artifact_path(root, artifacts, "result")
+    source_manifest = _load(source_manifest_path)
+    source_summary = _load(source_summary_path)
+    candidates, protected_registry_path = load_frozen_candidates(
+        root, source_summary, source_manifest,
+    )
+    if protected_registry_path != candidate_registry_path:
+        raise ValueError("holdout candidate registry 与冻结来源不一致")
+    config, config_hash, _root_hash, _depth, _sources, _snapshots = (
+        attest_config_lineage_snapshot(root, config_lineage_path, config_path)
+    )
+    evaluation_identity = _object(
+        manifest.get("evaluation_identity"), "evaluation_identity",
+    )
+    if config_hash != evaluation_identity.get("config_hash"):
+        raise ValueError("holdout 配置谱系与 evaluation_identity 不一致")
+    result = _load(result_path)
+    schedule = _load(schedule_path)
+    raw_attempt_ids = manifest.get("input_attempt_ids")
+    raw_artifact_ids = manifest.get("input_artifact_ids")
+    raw_normalizations = manifest.get("normalization_versions")
+    if (
+        not isinstance(raw_attempt_ids, list)
+        or not isinstance(raw_artifact_ids, list)
+        or not isinstance(raw_normalizations, list)
+    ):
+        raise ValueError("holdout manifest 缺少完整 panel 输入身份")
+    attempt_ids = tuple(_text(item, "input_attempt_id") for item in raw_attempt_ids)
+    artifact_ids = tuple(_text(item, "input_artifact_id") for item in raw_artifact_ids)
+    normalizations = tuple(
+        _text(item, "normalization_version") for item in raw_normalizations
+    )
+    market_id = _text(config.get("market_id"), "market_id")
+    governance = _object(config.get("data_governance"), "data_governance")
+    registry_path = _project_path(
+        root,
+        Path(_text(governance.get("registry"), "data_governance.registry")),
+        "governance registry",
+    )
+    evaluation_id = _text(manifest.get("evaluation_id"), "evaluation_id")
+    receipt_sha256 = sha256_file(receipt_path)
+    if manifest.get("input_receipt_sha256") != receipt_sha256:
+        raise ValueError("holdout manifest 活动输入收据散列不匹配")
+    registration = get_active_head_receipt(
+        registry_path, "holdout", evaluation_id,
+    )
+    normalized_receipt_path = receipt_path.relative_to(root).as_posix()
+    if (
+        registration.market_id != market_id
+        or registration.head_generation != manifest.get("input_head_generation")
+        or registration.receipt_artifact_path != normalized_receipt_path
+        or registration.receipt_artifact_sha256 != receipt_sha256
+    ):
+        raise ValueError("holdout 活动输入收据与治理登记不一致")
+    registered_inputs = attest_trade_input_receipt(
+        root / "data", receipt_path, require_current_head=False,
+    )
+    if (
+        registered_inputs.head_generation != manifest.get("input_head_generation")
+        or registered_inputs.attempt_ids != attempt_ids
+        or registered_inputs.artifact_ids != artifact_ids
+        or registered_inputs.normalization_versions != normalizations
+    ):
+        raise ValueError("holdout panel 血缘不能由控制面注册表重建")
+    raw_vintage = _object(result.get("vintage"), "result.vintage")
+    vintage_start = parse_time(raw_vintage.get("start_time"), "vintage.start_time")
+    vintage_end = parse_time(raw_vintage.get("end_time"), "vintage.end_time")
+    with TemporaryDirectory(prefix="guvolu-holdout-attest-") as temporary:
+        rebuilt = build_panel_snapshot(
+            registered_inputs,
+            Path(temporary),
+            _text(config.get("bar_interval"), "bar_interval"),
+            parse_time(config.get("from_time"), "from_time"),
+            vintage_end,
+            _integer(config.get("notional_scale"), "notional_scale"),
+        )
+    if rebuilt.panel_sha256 != sha256_file(panel_path):
+        raise ValueError("holdout panel 不能由注册输入和版本化查询重建")
+    bars = load_panel_bars(panel_path)
+    feature_config = _object(config.get("features"), "features")
+    raw_lookbacks = feature_config.get("lookbacks")
+    if not isinstance(raw_lookbacks, list):
+        raise ValueError("features.lookbacks 必须为数组")
+    features = compute_features(
+        bars,
+        tuple(_integer(value, "lookback") for value in raw_lookbacks),
+        _integer(feature_config.get("volume_lookback"), "volume_lookback"),
+        _integer(
+            feature_config.get("maximum_structural_gap_bars_assumption"),
+            "maximum_structural_gap_bars_assumption",
+        ),
+    )
+    indices = [
+        index for index in range(1, len(bars))
+        if bars[index - 1].decision_time >= vintage_start
+        and bars[index].decision_time <= vintage_end
+    ]
+    if not indices or indices != list(range(indices[0], indices[-1] + 1)):
+        raise ValueError("holdout 绑定面板没有连续可评分区间")
+    start, end = indices[0], indices[-1] + 1
+    expected_schedule = [
+        value.isoformat() for value in _score_decision_times(bars, start, end)
+    ]
+    if schedule.get("decision_times") != expected_schedule:
+        raise ValueError("holdout score schedule 不能由绑定面板重建")
+    governance = _object(config.get("data_governance"), "data_governance")
+    policy = _object(governance.get("holdout_policy"), "holdout_policy")
+    if end - start < _integer(policy.get("minimum_bars"), "minimum_bars"):
+        raise ValueError("holdout 绑定面板低于预登记评分柱门槛")
+    interval = _text(config.get("bar_interval"), "bar_interval")
+    interval_seconds = _INTERVAL_SECONDS.get(interval)
+    if interval_seconds is None:
+        raise ValueError("holdout 配置的研究节拍不受支持")
+    periods_per_year = SECONDS_PER_YEAR / interval_seconds
+    maximum_gap = interval_seconds * _integer(
+        feature_config.get("maximum_structural_gap_bars_assumption"),
+        "maximum_structural_gap_bars_assumption",
+    )
+    cost_config = _object(config.get("cost_model"), "cost_model")
+    cost_rate = sum(_number(cost_config.get(name), name) for name in (
+        "fee_bps_assumption",
+        "half_spread_bps_assumption",
+        "slippage_bps_assumption",
+        "impact_bps_assumption",
+    )) / 10_000.0
+    capacity = _number(
+        cost_config.get("capacity_notional_quote"),
+        "capacity_notional_quote",
+    )
+    frozen_targets: Mapping[datetime, Mapping[str, float]] | None = None
+    if policy.get("require_frozen_forward_predictions") is True:
+        from guvolu.research.frozen_forward import load_verified_prediction_targets
+
+        registry_path = _project_path(
+            root,
+            Path(_text(governance.get("registry"), "data_governance.registry")),
+            "governance registry",
+        )
+        frozen_targets = load_verified_prediction_targets(
+            root,
+            _text(result.get("frozen_forward_plan_id"), "frozen_forward_plan_id"),
+            registry_path=registry_path,
+        )
+    raw_results: list[dict[str, object]] = []
+    p_values: dict[str, float] = {}
+    for candidate in candidates:
+        if frozen_targets is None:
+            targets = generate_targets(candidate, bars, features, periods_per_year)
+        else:
+            missing = [
+                bars[index - 1].decision_time
+                for index in range(start, end)
+                if candidate.candidate_id not in frozen_targets.get(
+                    bars[index - 1].decision_time, {},
+                )
+            ]
+            if missing:
+                raise ValueError("holdout 冻结前向目标未覆盖绑定评分区间")
+            mutable_targets = [0.0] * len(bars)
+            for index in range(start, end):
+                target_time = bars[index - 1].decision_time
+                mutable_targets[index - 1] = frozen_targets[target_time][
+                    candidate.candidate_id
+                ]
+            targets = tuple(mutable_targets)
+        metrics = evaluate_targets(
+            bars,
+            targets,
+            start,
+            end,
+            cost_rate,
+            capacity,
+            maximum_gap,
+            periods_per_year,
+        )
+        p_values[candidate.candidate_id] = metrics.p_value
+        raw_results.append({
+            "candidate_id": candidate.candidate_id,
+            "family": candidate.family,
+            "parameters": dict(candidate.parameters),
+            "metrics": metrics_payload(metrics),
+        })
+    q_values = _fdr(p_values)
+    candidate_results: list[dict[str, object]] = []
+    passed_families: list[str] = []
+    for raw_result in raw_results:
+        metric_record = _object(raw_result.get("metrics"), "metrics")
+        candidate_id = _text(raw_result.get("candidate_id"), "candidate_id")
+        reasons: list[str] = []
+        if _number(metric_record.get("net_return"), "net_return") <= 0:
+            reasons.append("non_positive_holdout_net_return")
+        if _number(metric_record.get("sharpe"), "sharpe") < _number(
+            policy.get("minimum_sharpe"), "minimum_sharpe",
+        ):
+            reasons.append("holdout_sharpe_failed")
+        if _number(
+            metric_record.get("maximum_drawdown"), "maximum_drawdown",
+        ) > _number(policy.get("maximum_drawdown"), "maximum_drawdown"):
+            reasons.append("holdout_drawdown_failed")
+        if q_values[candidate_id] > _number(
+            policy.get("maximum_fdr_q"), "maximum_fdr_q",
+        ):
+            reasons.append("holdout_fdr_failed")
+        passed = not reasons
+        if passed:
+            passed_families.append(_text(raw_result.get("family"), "family"))
+        candidate_results.append({
+            **raw_result,
+            "fdr_q": q_values[candidate_id],
+            "passed": passed,
+            "rejection_reasons": reasons,
+        })
+    expected_passed = sorted(passed_families)
+    expected_verdict = (
+        "passed" if len(expected_passed) == len(candidates) else "failed"
+    )
+    if canonical_json(result.get("candidate_results")) != canonical_json(
+        candidate_results
+    ):
+        raise ValueError("holdout candidate metrics 不能由冻结证据现场重建")
+    if result.get("passed_families") != expected_passed:
+        raise ValueError("holdout passed_families 不能由重算指标推导")
+    if result.get("verdict") != expected_verdict:
+        raise ValueError("holdout verdict 不能由重算指标推导")
+
+
 def run_holdout_validation(
     root: Path,
     config_path: Path,
@@ -314,15 +605,44 @@ def run_holdout_validation(
 ) -> HoldoutRunResult:
     """先原子消费 vintage，再只评估冻结的部署候选，绝不重新选择。"""
     repository = root.resolve()
-    config_file = _project_path(repository, config_path, "holdout config")
+    requested_config_file = _project_path(repository, config_path, "holdout config")
     summary_file = _project_path(repository, source_summary_path, "source summary")
-    config = _load(config_file)
-    config_hash = sha256_file(config_file)
     source_manifest, source_manifest_path = verified_source_manifest(
         repository,
         summary_file,
     )
     source_summary = _load(summary_file)
+    source_artifacts = _object(
+        source_manifest.get("artifacts"), "source manifest artifacts",
+    )
+    source_config_record = _object(
+        source_artifacts.get("config"), "source config artifact",
+    )
+    source_lineage_record = _object(
+        source_artifacts.get("config_lineage"), "source config lineage artifact",
+    )
+    config_file = _project_path(
+        repository,
+        Path(_text(source_config_record.get("path"), "source config path")),
+        "source config artifact",
+    )
+    config_lineage_file = _project_path(
+        repository,
+        Path(_text(source_lineage_record.get("path"), "source lineage path")),
+        "source config lineage artifact",
+    )
+    (
+        config,
+        config_hash,
+        _lineage_root_hash,
+        _lineage_depth,
+        config_source_paths,
+        _config_artifact_paths,
+    ) = attest_config_lineage_snapshot(
+        repository, config_lineage_file, config_file,
+    )
+    if sha256_file(requested_config_file) != config_hash:
+        raise ValueError("holdout 调用配置与来源研究配置快照不一致")
     if source_summary.get("config_hash") != config_hash:
         raise ValueError("holdout 配置与来源研究冻结配置不一致")
     candidates, candidate_registry_path = load_frozen_candidates(
@@ -342,10 +662,16 @@ def run_holdout_validation(
         raise ValueError("vintage 与配置市场不一致")
     if vintage.status != "sealed":
         raise ValueError("vintage 已经消费，禁止重跑 holdout")
-    inputs = freeze_trade_inputs(repository / "data", market_id)
+    inputs = capture_trade_input_receipt(
+        repository / "data",
+        market_id,
+        repository / "data" / "research" / "input-receipts",
+    )
+    if inputs.receipt_path is None or inputs.receipt_sha256 is None:
+        raise RuntimeError("holdout 活动输入收据未生成")
     if inputs.maximum_event_time < vintage.end_time:
         raise ValueError("封存段尚未完整到达，不能提前消费")
-    identity = code_identity(repository, (config_file,))
+    identity = code_identity(repository, config_source_paths)
     if not identity.decision_grade:
         raise ValueError("holdout 只允许 clean commit 的决策级代码")
     source_code_identity = _object(
@@ -369,10 +695,10 @@ def run_holdout_validation(
     frozen_targets: Mapping[datetime, Mapping[str, float]] | None = None
     forward_plan_id: str | None = None
     forward_prediction_count = 0
+    forward_prediction_row_set_hash: str | None = None
     if require_forward_predictions:
         from guvolu.research.frozen_forward import (
-            load_verified_prediction_targets,
-            verify_frozen_forward,
+            attest_frozen_forward_batch,
         )
 
         plan = get_frozen_forward_plan_for_vintage(registry_path, vintage_id)
@@ -385,15 +711,15 @@ def run_holdout_validation(
             raise ValueError("前向计划与 holdout 候选集合不一致")
         if plan.config_hash != config_hash or plan.code_tree_digest != identity.tree_digest:
             raise ValueError("前向计划与 holdout 配置或代码树不一致")
-        verification = verify_frozen_forward(
+        batch = attest_frozen_forward_batch(
             repository, plan.plan_id, registry_path=registry_path,
         )
+        verification = batch.verification
         if verification.prediction_count == 0:
             raise ValueError("holdout 没有预先记录的冻结前向预测")
         forward_prediction_count = verification.prediction_count
-        frozen_targets = load_verified_prediction_targets(
-            repository, plan.plan_id, registry_path=registry_path,
-        )
+        frozen_targets = batch.targets
+        forward_prediction_row_set_hash = batch.row_set_hash
     evaluation_identity = {
         "holdout_method_version": HOLDOUT_METHOD_VERSION,
         "governance_method_version": GOVERNANCE_METHOD_VERSION,
@@ -402,9 +728,23 @@ def run_holdout_validation(
         "config_hash": config_hash,
         "code_tree_digest": identity.tree_digest,
         "input_head_generation": inputs.head_generation,
+        "input_attempt_ids": inputs.attempt_ids,
         "input_artifact_ids": inputs.artifact_ids,
+        "normalization_versions": inputs.normalization_versions,
+        "input_receipt_sha256": inputs.receipt_sha256,
     }
     evaluation_id = stable_identifier("holdout-evaluation", evaluation_identity)
+    receipt_registration = register_active_head_receipt(
+        registry_path,
+        "holdout",
+        evaluation_id,
+        market_id,
+        inputs.head_generation,
+        inputs.receipt_path.resolve().relative_to(repository).as_posix(),
+        inputs.receipt_sha256,
+        repository_root=repository,
+        data_root=repository / "data",
+    )
     start_holdout_evaluation_attempt(
         registry_path,
         vintage_id,
@@ -569,6 +909,7 @@ def run_holdout_validation(
         ),
         "frozen_forward_plan_id": forward_plan_id,
         "frozen_forward_prediction_count": forward_prediction_count,
+        "frozen_forward_row_set_hash": forward_prediction_row_set_hash,
         "source_summary_sha256": sha256_file(summary_file),
         "config_hash": sha256_file(config_file),
         "code_identity": asdict(identity),
@@ -594,10 +935,42 @@ def run_holdout_validation(
         "candidate_set_identity": candidate_set_identity,
         "evaluation_identity": evaluation_identity,
         "verdict": verdict,
+        "input_head_generation": inputs.head_generation,
+        "input_attempt_ids": list(inputs.attempt_ids),
+        "input_artifact_ids": list(inputs.artifact_ids),
+        "normalization_versions": list(inputs.normalization_versions),
+        "input_receipt_sha256": receipt_registration.receipt_artifact_sha256,
+        "frozen_forward_row_set_hash": forward_prediction_row_set_hash,
         "artifacts": {
+            "source_manifest": {
+                **artifact_record(source_manifest_path, "research_manifest"),
+                "path": source_manifest_path.resolve().relative_to(
+                    repository
+                ).as_posix(),
+            },
+            "source_summary": {
+                **artifact_record(summary_file, "research_summary"),
+                "path": summary_file.resolve().relative_to(repository).as_posix(),
+            },
+            "candidate_registry": {
+                **artifact_record(candidate_registry_path, "candidate_registry"),
+                "path": candidate_registry_path.resolve().relative_to(
+                    repository
+                ).as_posix(),
+            },
             "config": {
                 **artifact_record(config_file, "holdout_config"),
                 "path": config_file.resolve().relative_to(repository).as_posix(),
+            },
+            "config_lineage": {
+                **artifact_record(config_lineage_file, "holdout_config_lineage"),
+                "path": config_lineage_file.resolve().relative_to(
+                    repository
+                ).as_posix(),
+            },
+            "input_receipt": {
+                **artifact_record(inputs.receipt_path, "active_trade_head_receipt"),
+                "path": receipt_registration.receipt_artifact_path,
             },
             "panel": {
                 **artifact_record(panel.panel_path, "holdout_panel"),

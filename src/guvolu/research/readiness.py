@@ -6,6 +6,10 @@ from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from guvolu.research.config_lineage import (
+    load_governed_strategy_config,
+    verified_config_lineage_paths,
+)
 from guvolu.research.features import compute_features
 from guvolu.research.governance import (
     HoldoutVintage,
@@ -13,11 +17,11 @@ from guvolu.research.governance import (
     list_holdout_vintages,
 )
 from guvolu.research.panel import freeze_trade_inputs, load_panel_bars
-from guvolu.research.provenance import code_identity, sha256_file
+from guvolu.research.provenance import code_identity
 from guvolu.research.verification import verify_research_run
 from guvolu.strategy.contracts import ResearchBar
 
-READINESS_METHOD_VERSION = "strategy-readiness-v2"
+READINESS_METHOD_VERSION = "strategy-readiness-v3"
 _INTERVAL_SECONDS = {
     "5min": 300,
     "15min": 900,
@@ -112,7 +116,13 @@ def strategy_readiness(
     """验证当前研究来源，并报告 operational 与 holdout 就绪度。"""
     root = repository_root.resolve()
     config_file = config_path if config_path.is_absolute() else root / config_path
-    config = _read_object(config_file, "strategy config")
+    (
+        config,
+        config_hash,
+        config_lineage_root_hash,
+        config_lineage_depth,
+    ) = load_governed_strategy_config(root, config_file)
+    config_source_paths = verified_config_lineage_paths(root, config_file)
     verified = verify_research_run(root, manifest_path)
     manifest = _read_object(verified.manifest_path, "research manifest")
     artifacts = _object(manifest.get("artifacts"), "manifest.artifacts")
@@ -123,13 +133,18 @@ def strategy_readiness(
     summary = _read_object(summary_path, "research summary")
     market_id = _text(summary.get("market_id"), "summary.market_id")
     current_inputs = freeze_trade_inputs(root / "data", market_id)
-    identity = code_identity(root, (config_file,))
+    identity = code_identity(root, config_source_paths)
     source_identity = _object(summary.get("code_identity"), "summary.code_identity")
     source_tree_digest = _text(
         source_identity.get("tree_digest"), "source tree digest",
     )
     tree_matches = source_tree_digest == identity.tree_digest
-    config_matches = summary.get("config_hash") == sha256_file(config_file)
+    config_matches = (
+        summary.get("config_hash") == config_hash
+        and summary.get("config_lineage_root_hash")
+        == config_lineage_root_hash
+        and summary.get("config_lineage_depth") == config_lineage_depth
+    )
 
     panel_record = _object(artifacts.get("panel"), "manifest.artifacts.panel")
     panel_path = _resolve(root, panel_record.get("path"), "panel path")
@@ -198,6 +213,8 @@ def strategy_readiness(
         operational_blockers.append("current_code_not_decision_grade")
     if not tree_matches:
         operational_blockers.append("source_code_tree_mismatch")
+    if not config_matches:
+        operational_blockers.append("source_config_mismatch")
 
     governance = _object(config.get("data_governance"), "data_governance")
     registry_path = _resolve(root, governance.get("registry"), "governance registry")
@@ -277,6 +294,14 @@ def strategy_readiness(
             "decision_grade": summary.get("decision_grade"),
             "eligible_families": list(eligible_families),
             "config_matches": config_matches,
+            "source_config_hash": summary.get("config_hash"),
+            "current_config_hash": config_hash,
+            "source_config_lineage_root_hash": (
+                summary.get("config_lineage_root_hash")
+            ),
+            "current_config_lineage_root_hash": config_lineage_root_hash,
+            "source_config_lineage_depth": summary.get("config_lineage_depth"),
+            "current_config_lineage_depth": config_lineage_depth,
             "source_git_hash": source_identity.get("git_hash"),
             "current_git_hash": identity.git_hash,
             "source_tree_digest": source_tree_digest,
