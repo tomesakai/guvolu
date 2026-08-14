@@ -653,7 +653,15 @@ CPU 阶段应先于 GPU 完成以下收敛：
    极少数结构提案，再通过源码登记、clean commit 和完整 Exact 复核激活，而不是在同一 vintage
    自动繁殖并反复挑选。
 2. 增加 5 分钟、1 小时和 4 小时多节拍，但每个候选只使用预先登记的决策节拍与成本模型；
-   不把同一参数在所有节拍无边界复制。
+   不把同一参数在所有节拍无边界复制。首个
+   `pre-registered-multi-interval-suite-v1` 已把 1 小时与 4 小时配置绑定为同一墙钟合同：1/3/7
+   天特征窗、一年训练、90 天测试/步长和一天 embargo；两套 34 候选加十条家族选择路径形成
+   78 项全局试验域。4 小时真实 clean 运行含 16,672 根柱，只有突破通过；其 Sharpe 0.85、
+   FDR 0.05、PBO 0.31、block p 0.02、effective DSR 0.98。趋势虽有 1.19 净对数收益，仍因
+   FDR 0.12、block p 0.06、DSR 0.90 被拒；量价趋势 PBO 0.68、block p 0.21，表明失败来自
+   节拍稳定性而非候选数量不足。套件消费者会完整复核成员、执行一次全局 BH-FDR，并把 stitched
+   OOS 收益无前视地对齐到最粗栅格；首次真实组合因两次运行的活动 head 收据不同被硬拒绝。
+   在 suite-owned 冻结输入状态机完成前，不发布跨节拍权重，也不把这两份 summary 手工拼接。
 3. 现有门禁已包括非正态 Probabilistic Sharpe、studentized 循环折块 bootstrap、折块
    CSCV/PBO、Deflated Sharpe 和单轴最近参数邻域稳定性。DSR 同时发布全量候选原始试验数与
    基于折级得分相关矩阵参与率的有效试验数。DSR 的试验域是实际参与该流派冠军选择的候选；
@@ -728,9 +736,9 @@ CUDA v2 仍须在隔离环境重新测量，不能沿用 v1 性能数字冒充�
 
 | 管线 | 当前状态 | 专属逻辑与回测边界 | 演进动作 |
 |---|---|---|---|
-| 趋势 | paper eligible | 时序趋势分数、波动目标、主动成交成本 | 独立扩展 lookback/entry 轴 |
-| 量价趋势 | paper eligible | 趋势加 signed flow/volume 确认，同一方向风险桶 | 独立演进 flow confirmation |
-| 突破 | paper eligible | 区间突破加 flow 确认，最新信号允许空仓 | 监视冠军集中度与边界轴 |
+| 趋势 | 1h paper eligible；4h rejected | 时序趋势分数、波动目标、主动成交成本 | 独立扩展 lookback/entry 轴 |
+| 量价趋势 | 1h paper eligible；4h rejected | 趋势加 signed flow/volume 确认，同一方向风险桶 | 独立演进 flow confirmation |
+| 突破 | 1h/4h paper eligible | 区间突破加 flow 确认，最新信号允许空仓 | 监视冠军集中度与边界轴 |
 | 均值回归 | rejected | range 假设、逆势入场、主动成本后评估 | 当前先修订假设，不扩大亏损网格 |
 | 网格 | L2 shadow rejected | snapshot 成交上下界、库存与逆向选择只用于否证 | 待私有 fill/撤单生命周期校准后再演进 |
 | 微观结构/做市/queue | disabled | 缺 L3、MBO、私有成交生命周期 | 不生成伪候选，先补事实合同 |
@@ -740,8 +748,12 @@ CUDA v2 仍须在隔离环境重新测量，不能沿用 v1 性能数字冒充�
 ```mermaid
 flowchart TB
     raw["冻结源事实<br/>trade / OHLCV / L2 shadow / lineage"]
-    pit["PIT PanelManifest<br/>三时间、gap、质量向量"]
-    raw --> pit
+    suiteReceipt["Suite-owned 输入收据<br/>一次冻结 / 多节拍只读复用"]
+    raw --> suiteReceipt
+    pit1h["1h PIT PanelManifest<br/>三时间、gap、质量向量"]
+    pit4h["4h PIT PanelManifest<br/>等价墙钟窗口"]
+    suiteReceipt --> pit1h
+    suiteReceipt --> pit4h
     l2["L2 事件重放<br/>snapshot bounds / inventory / markout"]
     raw --> l2
 
@@ -761,11 +773,13 @@ flowchart TB
         monitors --> challengers
     end
 
-    pit --> direction
-    pit --> reversion
+    pit1h --> direction
+    pit4h --> direction
+    pit1h --> reversion
+    pit4h --> reversion
     l2 --> grid
-    pit -. "事实不足则 disabled" .-> micro
-    pit -. "universe 未闭合" .-> cross
+    pit1h -. "事实不足则 disabled" .-> micro
+    pit1h -. "universe 未闭合" .-> cross
 
     registry["Candidate Registry<br/>typed identity + family scope"]
     direction --> registry
@@ -794,10 +808,13 @@ flowchart TB
     ledger --> evolution["SelectionView<br/>仅反馈本流派下一代"]
     evolution --> monitors
 
+    suiteFdr["多节拍套件证据<br/>统一 78 项 BH-FDR / 最粗栅格相关性"]
+    ledger --> suiteFdr
+
     privateFill["未来私有委托/成交生命周期<br/>queue calibration"]
     privateFill -. "未闭合前权重为零" .-> grid
 
-    robust --> eligible{"paper eligible?"}
+    suiteFdr --> eligible{"suite paper eligible?"}
     eligible -- "否" --> reject["reject / shadow / disabled<br/>权重固定为零"]
     eligible -- "是" --> aggregate["组合聚合器<br/>相关性、regime、容量与方向共享上限"]
     aggregate --> contract["目标合同<br/>family target × allocation weight"]
