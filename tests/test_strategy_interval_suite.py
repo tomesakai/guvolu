@@ -19,6 +19,7 @@ from guvolu.research.interval_suite_evidence import (
 )
 from guvolu.research.interval_suite_readiness import (
     aggregate_interval_suite_readiness,
+    persist_interval_suite_readiness,
 )
 
 
@@ -337,10 +338,12 @@ def test_interval_suite_readiness_aggregates_selected_members() -> None:
     readiness = {
         "hour": {
             "run_id": "run-hour",
+            "manifest_sha256": "h" * 64,
             "operational": {
                 "ready": False,
                 "blockers": ["feature_snapshot_stale"],
                 "next_action": "wait_for_feature_maturity",
+                "current_maximum_event_time": "2026-08-15T00:00:00+00:00",
             },
             "promotion": {
                 "ready": False,
@@ -350,10 +353,12 @@ def test_interval_suite_readiness_aggregates_selected_members() -> None:
         },
         "four": {
             "run_id": "run-four",
+            "manifest_sha256": "f" * 64,
             "operational": {
                 "ready": False,
                 "blockers": ["source_code_tree_mismatch"],
                 "next_action": "repair_operational_blockers",
+                "current_maximum_event_time": "2026-08-15T00:00:00+00:00",
             },
             "promotion": {
                 "ready": False,
@@ -362,8 +367,19 @@ def test_interval_suite_readiness_aggregates_selected_members() -> None:
             },
         },
     }
+    suite_vintages = ({
+        "vintage_id": "suite-vintage",
+        "market_id": "market",
+        "start_time": "2026-07-01T00:00:00+00:00",
+        "end_time": "2026-08-14T00:00:00+00:00",
+        "sealed_at": "2026-06-01T00:00:00+00:00",
+    },)
     blocked = aggregate_interval_suite_readiness(
-        plan, evidence, readiness, datetime(2026, 8, 15, tzinfo=UTC),
+        plan,
+        evidence,
+        readiness,
+        datetime(2026, 8, 15, tzinfo=UTC),
+        suite_vintages=suite_vintages,
     )
     operational = blocked["operational"]
     promotion = blocked["promotion"]
@@ -372,7 +388,6 @@ def test_interval_suite_readiness_aggregates_selected_members() -> None:
     assert operational["ready"] is False
     assert operational["blockers"] == ["selected_member_operational_not_ready"]
     assert promotion["blockers"] == [
-        "selected_member_promotion_not_ready",
         "suite_frozen_forward_plan_not_registered",
     ]
     assert blocked["selected_member_ids"] == ["hour"]
@@ -380,8 +395,13 @@ def test_interval_suite_readiness_aggregates_selected_members() -> None:
     ready = copy.deepcopy(readiness)
     ready["hour"]["operational"]["ready"] = True
     ready["hour"]["promotion"]["ready"] = True
+    ready["hour"]["promotion"]["blockers"] = []
     aggregated = aggregate_interval_suite_readiness(
-        plan, evidence, ready, datetime(2026, 8, 15, tzinfo=UTC),
+        plan,
+        evidence,
+        ready,
+        datetime(2026, 8, 15, tzinfo=UTC),
+        suite_vintages=suite_vintages,
     )
     operational = aggregated["operational"]
     promotion = aggregated["promotion"]
@@ -390,3 +410,88 @@ def test_interval_suite_readiness_aggregates_selected_members() -> None:
     assert operational["ready"] is True
     assert promotion["ready"] is False
     assert promotion["next_action"] == "register_suite_frozen_forward_plan"
+
+    planned = aggregate_interval_suite_readiness(
+        plan,
+        evidence,
+        ready,
+        datetime(2026, 8, 15, tzinfo=UTC),
+        ({
+            "plan_id": "suite-forward",
+            "vintage_id": "suite-vintage",
+            "suite_plan_id": "plan",
+            "suite_evidence_id": "evidence",
+            "source_git_hash": "a" * 40,
+            "plan_artifact_sha256": "p" * 64,
+        },),
+        suite_vintages,
+    )
+    planned_promotion = planned["promotion"]
+    assert isinstance(planned_promotion, Mapping)
+    assert planned_promotion["ready"] is False
+    assert planned_promotion["blockers"] == [
+        "suite_frozen_forward_prediction_pipeline_not_implemented",
+    ]
+    assert (
+        planned_promotion["next_action"]
+        == "implement_suite_frozen_forward_predictions"
+    )
+    assert planned["suite_frozen_forward_plan_ids"] == ["suite-forward"]
+
+
+def test_suite_readiness_identity_binds_member_facts(tmp_path: Path) -> None:
+    """blocker 名不变时，活动 head 与成熟度变化仍必须产生新身份。"""
+    plan = {"suite_plan_id": "plan"}
+    evidence = {
+        "suite_plan_id": "plan",
+        "suite_evidence_id": "evidence",
+        "source_git_hash": "a" * 40,
+        "market_id": "market",
+        "input_head_generation": "head",
+        "input_receipt_sha256": "receipt",
+        "operational_status": "disabled_pending_suite_readiness_and_holdout",
+        "members": [{
+            "member_id": "hour", "bar_interval": "1hour",
+            "run_id": "run", "manifest_sha256": "m" * 64,
+        }],
+        "sleeves": [{
+            "sleeve_id": "selected", "member_id": "hour",
+            "suite_eligible": True,
+        }],
+        "suite_research_allocation": {
+            "status": "research_only", "aggregate_target": 0.1,
+            "reserve": 0.9,
+        },
+    }
+    readiness = {"hour": {
+        "run_id": "run",
+        "manifest_sha256": "m" * 64,
+        "source": {"current_git_hash": "a" * 40},
+        "operational": {
+            "ready": False,
+            "blockers": ["latest_panel_feature_not_mature"],
+            "next_action": "wait_for_feature_maturity",
+            "current_head_generation": "head-1",
+            "trailing_contiguous_bars": 10,
+        },
+        "promotion": {
+            "ready": False,
+            "blockers": ["sealed_holdout_vintage_incomplete"],
+            "next_action": "wait_for_sealed_vintage_end",
+        },
+    }}
+    first = aggregate_interval_suite_readiness(
+        plan, evidence, readiness, datetime(2026, 8, 15, tzinfo=UTC),
+    )
+    changed = copy.deepcopy(readiness)
+    changed["hour"]["operational"]["current_head_generation"] = "head-2"
+    changed["hour"]["operational"]["trailing_contiguous_bars"] = 11
+    second = aggregate_interval_suite_readiness(
+        plan, evidence, changed, datetime(2026, 8, 15, tzinfo=UTC),
+    )
+    assert first["operational"] == second["operational"]
+    assert first["suite_readiness_id"] != second["suite_readiness_id"]
+    output = persist_interval_suite_readiness(tmp_path, first)
+    assert output.is_file()
+    assert persist_interval_suite_readiness(tmp_path, first) == output
+    assert json.loads(output.read_text(encoding="utf-8")) == first

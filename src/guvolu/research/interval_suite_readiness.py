@@ -5,13 +5,19 @@ from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
+from guvolu.data.durable_io import atomic_write_text
 from guvolu.research.interval_suite import build_interval_suite_plan
 from guvolu.research.interval_suite_evidence import evaluate_interval_suite
-from guvolu.research.provenance import stable_identifier
+from guvolu.research.provenance import canonical_json, stable_identifier
 from guvolu.research.readiness import strategy_readiness
 
 
-INTERVAL_SUITE_READINESS_METHOD_VERSION = "interval-suite-readiness-v1"
+INTERVAL_SUITE_READINESS_METHOD_VERSION = "interval-suite-readiness-v2"
+_LEGACY_MEMBER_GOVERNANCE_BLOCKERS = {
+    "no_sealed_holdout_vintage",
+    "sealed_vintage_has_no_frozen_forward_plan",
+    "sealed_holdout_vintage_incomplete",
+}
 
 
 def _mapping(value: object, name: str) -> Mapping[str, object]:
@@ -47,6 +53,9 @@ def aggregate_interval_suite_readiness(
     evidence: Mapping[str, object],
     member_readiness: Mapping[str, Mapping[str, object]],
     evaluated_at: datetime,
+    suite_forward_plans: Sequence[Mapping[str, object]] = (),
+    suite_vintages: Sequence[Mapping[str, object]] = (),
+    suite_registry: str | None = None,
 ) -> Mapping[str, object]:
     """从已验证 evidence 与成员 readiness 构造纯套件门禁。"""
     if evidence.get("suite_plan_id") != plan.get("suite_plan_id"):
@@ -99,13 +108,31 @@ def aggregate_interval_suite_readiness(
         )
         operational = _mapping(readiness.get("operational"), "operational")
         promotion = _mapping(readiness.get("promotion"), "promotion")
+        raw_promotion_blockers = _list(
+            promotion.get("blockers"), "promotion.blockers",
+        )
+        suite_promotion_blockers = sorted(
+            _text(item, "promotion.blocker")
+            for item in raw_promotion_blockers
+            if item not in _LEGACY_MEMBER_GOVERNANCE_BLOCKERS
+        )
         selected = member_id in selected_member_ids
         if readiness.get("run_id") != member.get("run_id"):
             raise ValueError("成员 readiness 与 evidence run_id 不一致")
+        if readiness.get("manifest_sha256") != member.get("manifest_sha256"):
+            raise ValueError("成员 readiness 与 evidence manifest_sha256 不一致")
         if selected and not _boolean(operational.get("ready"), "operational.ready"):
             operational_blockers.append("selected_member_operational_not_ready")
-        if selected and not _boolean(promotion.get("ready"), "promotion.ready"):
+        _boolean(promotion.get("ready"), "promotion.ready")
+        if selected and suite_promotion_blockers:
             promotion_blockers.append("selected_member_promotion_not_ready")
+        readiness_facts = {
+            "run_id": readiness.get("run_id"),
+            "manifest_sha256": readiness.get("manifest_sha256"),
+            "source": readiness.get("source"),
+            "operational": readiness.get("operational"),
+            "promotion": readiness.get("promotion"),
+        }
         member_payloads.append({
             "member_id": member_id,
             "bar_interval": member.get("bar_interval"),
@@ -118,11 +145,51 @@ def aggregate_interval_suite_readiness(
             "promotion_ready": promotion.get("ready"),
             "promotion_blockers": promotion.get("blockers"),
             "promotion_next_action": promotion.get("next_action"),
+            "suite_promotion_ready": not suite_promotion_blockers,
+            "suite_promotion_blockers": suite_promotion_blockers,
+            "readiness_facts_id": stable_identifier(
+                "strategy-readiness-facts", readiness_facts,
+            ),
         })
 
-    # 单成员计划不能证明跨节拍权重。
-    # 共同决策时点也未被冻结。
-    promotion_blockers.append("suite_frozen_forward_plan_not_registered")
+    valid_suite_plans = [
+        plan_record for plan_record in suite_forward_plans
+        if plan_record.get("suite_plan_id") == plan.get("suite_plan_id")
+        and plan_record.get("suite_evidence_id")
+        == evidence.get("suite_evidence_id")
+        and plan_record.get("source_git_hash")
+        == evidence.get("source_git_hash")
+    ]
+    if not valid_suite_plans:
+        promotion_blockers.append("suite_frozen_forward_plan_not_registered")
+    suite_vintage_payloads: list[Mapping[str, object]] = []
+    for raw_vintage in suite_vintages:
+        vintage = _mapping(raw_vintage, "suite vintage")
+        suite_vintage_payloads.append({
+            **vintage,
+            "data_complete": None,
+            "data_completion_basis": (
+                "suite_forward_prediction_receipts_not_implemented"
+            ),
+        })
+    if not suite_vintage_payloads:
+        promotion_blockers.append("no_sealed_suite_holdout_vintage")
+    planned_vintage_ids = {
+        _text(item.get("vintage_id"), "suite plan vintage_id")
+        for item in valid_suite_plans
+    }
+    suite_vintage_ids = {
+        _text(item.get("vintage_id"), "suite vintage_id")
+        for item in suite_vintage_payloads
+    }
+    if suite_vintage_ids - planned_vintage_ids:
+        promotion_blockers.append("suite_frozen_forward_plan_not_registered")
+    if any(item.get("data_complete") is False for item in suite_vintage_payloads):
+        promotion_blockers.append("sealed_suite_holdout_vintage_incomplete")
+    if valid_suite_plans and not (suite_vintage_ids - planned_vintage_ids):
+        promotion_blockers.append(
+            "suite_frozen_forward_prediction_pipeline_not_implemented"
+        )
     operational_blockers = _unique(operational_blockers)
     promotion_blockers = _unique(promotion_blockers)
     if "selected_member_operational_not_ready" in operational_blockers:
@@ -133,8 +200,17 @@ def aggregate_interval_suite_readiness(
         operational_next_action = "publish_fresh_suite_operational_snapshot"
     if "selected_member_promotion_not_ready" in promotion_blockers:
         promotion_next_action = "wait_for_member_holdout_readiness"
+    elif "no_sealed_suite_holdout_vintage" in promotion_blockers:
+        promotion_next_action = "seal_new_suite_vintage_in_successor_registry"
     elif "suite_frozen_forward_plan_not_registered" in promotion_blockers:
         promotion_next_action = "register_suite_frozen_forward_plan"
+    elif (
+        "suite_frozen_forward_prediction_pipeline_not_implemented"
+        in promotion_blockers
+    ):
+        promotion_next_action = "implement_suite_frozen_forward_predictions"
+    elif "sealed_suite_holdout_vintage_incomplete" in promotion_blockers:
+        promotion_next_action = "wait_for_sealed_suite_vintage_end"
     else:
         promotion_next_action = "run_suite_holdout_validation_once"
 
@@ -161,6 +237,30 @@ def aggregate_interval_suite_readiness(
             "reserve": allocation.get("reserve"),
         },
         "members": member_payloads,
+        "suite_frozen_forward_plan_ids": sorted(
+            _text(item.get("plan_id"), "suite forward plan_id")
+            for item in valid_suite_plans
+        ),
+        "suite_frozen_forward_plans": sorted(
+            (
+                {
+                    "plan_id": item.get("plan_id"),
+                    "vintage_id": item.get("vintage_id"),
+                    "plan_artifact_sha256": item.get(
+                        "plan_artifact_sha256"
+                    ),
+                }
+                for item in valid_suite_plans
+            ),
+            key=lambda item: str(item["plan_id"]),
+        ),
+        "suite_governance": {
+            "registry": suite_registry,
+            "sealed_vintages": sorted(
+                suite_vintage_payloads,
+                key=lambda item: str(item.get("start_time")),
+            ),
+        },
         "operational": {
             "ready": not operational_blockers,
             "blockers": operational_blockers,
@@ -186,6 +286,7 @@ def interval_suite_readiness(
     config_paths: Sequence[Path],
     manifest_paths: Sequence[Path],
     reference_time: datetime | None = None,
+    suite_registry_path: Path | None = None,
 ) -> Mapping[str, object]:
     """完整复核 suite evidence，再聚合每个成员的只读 readiness。"""
     root = repository_root.resolve()
@@ -212,6 +313,56 @@ def interval_suite_readiness(
         readiness[member_id] = strategy_readiness(
             root, config_path, manifest_path, evaluated_at,
         )
-    return aggregate_interval_suite_readiness(
-        plan, evidence, readiness, evaluated_at,
+    from guvolu.research.interval_suite_forward import (
+        verified_interval_suite_forward_state,
     )
+
+    suite_forward_state = verified_interval_suite_forward_state(
+        root, config_paths, plan, evidence, suite_registry_path,
+        reference_time=evaluated_at,
+    )
+    raw_plans = suite_forward_state.get("plans")
+    raw_vintages = suite_forward_state.get("sealed_vintages")
+    if not isinstance(raw_plans, tuple) or not isinstance(raw_vintages, tuple):
+        raise AssertionError("suite forward state 合同无效")
+    return aggregate_interval_suite_readiness(
+        plan,
+        evidence,
+        readiness,
+        evaluated_at,
+        raw_plans,
+        raw_vintages,
+        _text(suite_forward_state.get("registry"), "suite registry"),
+    )
+
+
+def persist_interval_suite_readiness(
+    repository_root: Path,
+    readiness: Mapping[str, object],
+    output_directory: Path | None = None,
+) -> Path:
+    """把只读结果写成内容寻址证据，不覆盖既有身份。"""
+    root = repository_root.resolve()
+    readiness_id = _text(
+        readiness.get("suite_readiness_id"), "suite_readiness_id",
+    )
+    body = dict(readiness)
+    body.pop("suite_readiness_id", None)
+    if readiness_id != stable_identifier("interval-suite-readiness", body):
+        raise ValueError("suite_readiness_id 与规范 readiness 内容不一致")
+    directory = (
+        output_directory.resolve()
+        if output_directory is not None and output_directory.is_absolute()
+        else root / (
+            output_directory
+            or Path("reports/strategy-research/interval-suite-readiness")
+        )
+    )
+    output = directory / f"{readiness_id}.json"
+    payload = canonical_json(readiness) + "\n"
+    if output.exists():
+        if output.read_text(encoding="utf-8") != payload:
+            raise ValueError("相同 suite_readiness_id 的制品内容不一致")
+        return output
+    atomic_write_text(output, payload)
+    return output
