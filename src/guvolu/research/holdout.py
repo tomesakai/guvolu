@@ -136,8 +136,9 @@ def load_frozen_candidates(
     if source_summary.get("pipeline_method_version") not in {
         "strategy-research-pipeline-v9",
         "strategy-research-pipeline-v10",
+        "strategy-research-pipeline-v11",
     }:
-        raise ValueError("holdout 只接受带表达式身份的 v9/v10 来源运行")
+        raise ValueError("holdout 只接受带表达式身份的 v9/v10/v11 来源运行")
     for field in ("run_id", "research_identity", "config_hash"):
         if source_summary.get(field) != source_manifest.get(field):
             raise ValueError(f"source summary 与 manifest 的 {field} 不一致")

@@ -21,16 +21,23 @@ from guvolu.research.contracts import (
     PanelSnapshot,
     PerformanceMetrics,
     QualityVector,
+    TrialRecord,
 )
 from guvolu.research.config_lineage import verify_config_lineage
 from guvolu.research.features import MarketState, classify_market_state, compute_features
 from guvolu.research.evolution import monitor_family_run
 from guvolu.research.panel import compact_trade_panel, load_panel_bars
-from guvolu.research.pipeline import _position_contract_payload
+from guvolu.research.pipeline import (
+    _cost_replay_artifact,
+    _position_contract_payload,
+    _research_output_paths,
+    _trial_artifact,
+)
 from guvolu.research.provenance import canonical_json, stable_identifier
 from guvolu.research.quality import gate_feature_snapshot, panel_quality
 from guvolu.research.validation import (
     ValidationResult,
+    WalkForwardFold,
     _circular_block_bootstrap_sharpe,
     _deflated_sharpe_probability,
     _effective_trial_count,
@@ -232,7 +239,9 @@ def test_strategy_return_uses_prior_decision_and_cost() -> None:
         },
         complexity=5,
     )
-    targets = generate_targets(candidate, bars, features)
+    targets = generate_targets(
+        candidate, bars, features, periods_per_year=365.0 * 24.0,
+    )
     returns = strategy_returns(bars, targets, 0.001)
     assert targets[0] > 0
     assert returns[1] == pytest.approx(
@@ -257,15 +266,19 @@ def test_nonnormal_sharpe_and_pbo_diagnostics_are_deterministic() -> None:
     first = _probability_backtest_overfitting(scores, 10, 7)
     second = _probability_backtest_overfitting(scores, 10, 7)
     assert first == second
-    assert first == (1.0, 0.5, 3)
-    with pytest.raises(ValueError, match="偶数个测试折"):
-        _probability_backtest_overfitting(
-            {"a": (1.0,) * 5, "b": (-1.0,) * 5}, 10, 7
-        )
+    assert first == (1.0 / 3.0, 0.5, 3)
+    odd = _probability_backtest_overfitting(
+        {"a": (9.0, 1.0, 1.0, -1.0, -1.0),
+         "b": (9.0, -1.0, -1.0, 1.0, 1.0)},
+        10,
+        7,
+    )
+    recent_even = _probability_backtest_overfitting(scores, 10, 7)
+    assert odd == recent_even
     tied = _probability_backtest_overfitting(
         {"a": (1.0,) * 4, "b": (1.0,) * 4}, 10, 7
     )
-    assert tied == (1.0, 0.5, 3)
+    assert tied == (0.0, 0.5, 3)
     identity_first = _probability_backtest_overfitting({
         "a": (-1.0, -1.0, -1.0, -1.0),
         "b": (-1.0, -1.0, -1.0, 0.0),
@@ -436,6 +449,109 @@ def test_candidate_registry_and_identifiers_are_deterministic() -> None:
     assert stable_identifier("x", value) == stable_identifier("x", value)
 
 
+def test_execution_snapshots_share_research_artifact_directory(
+    tmp_path: Path,
+) -> None:
+    """同一研究身份的墙钟快照不得复制大体积研究制品。"""
+    first = _research_output_paths(tmp_path, "research-one", _time(1))
+    second = _research_output_paths(tmp_path, "research-one", _time(2))
+    assert first[0] != second[0]
+    assert first[1] != second[1]
+    assert first[2] == second[2]
+    assert first[2] == tmp_path / "research-artifacts" / "research-one"
+
+
+def test_trial_roles_and_stitched_replay_are_explicitly_bounded(
+    tmp_path: Path,
+) -> None:
+    """台账须区分冠军角色，stitched 回放只覆盖声明的 OOS 折。"""
+    bars = tuple(_bar(index, 100.0 + index) for index in range(6))
+    candidate = CandidateSpec("candidate", "trend", "paper", {}, 1)
+    family = FamilyEvaluation(
+        family="trend",
+        mode="paper",
+        deployment_candidate=candidate,
+        latest_target=0.5,
+        deployment_oos_metrics=_metrics(),
+        deployment_oos_returns=(0.01, 0.02),
+        metrics=_metrics(),
+        adjusted_sharpe=0.5,
+        fdr_q=0.1,
+        eligible=True,
+        rejection_reasons=(),
+        oos_returns=(0.01, 0.02),
+        fold_selected_candidate_ids=(candidate.candidate_id,),
+    )
+    fold = WalkForwardFold("fold-001", 0, 2, 2, 4)
+    trials = (
+        TrialRecord(
+            "fold-evaluation", candidate, fold.fold_id, "testing",
+            bars[2].decision_time, bars[3].decision_time, True, _metrics(),
+        ),
+        TrialRecord(
+            "full-evaluation", candidate, "full", "training",
+            bars[1].decision_time, bars[-1].decision_time, True, _metrics(),
+        ),
+    )
+    deployment_targets = (0.0, 0.5, 0.5, 0.5, 0.5, 0.5)
+    stitched_targets = (0.0, 0.5, 0.5, 0.5, 0.0, 0.0)
+    validation = ValidationResult(
+        families=(family,),
+        trials=trials,
+        candidate_targets={candidate.candidate_id: deployment_targets},
+        folds=(fold,),
+        family_validation_targets={"trend": stitched_targets},
+    )
+    ledger_path, _ledger_hash = _trial_artifact(
+        tmp_path, validation, "research-one",
+    )
+    ledger_rows = [
+        json.loads(line) for line in ledger_path.read_text(encoding="utf-8").splitlines()
+    ]
+    roles = {
+        row["evaluation_id"]: row["selection_role"]
+        for row in ledger_rows if row["record_type"] == "trial"
+    }
+    assert roles == {
+        "fold-evaluation": "fold_training_champion",
+        "full-evaluation": "deployment_champion",
+    }
+
+    panel_path = tmp_path / "panel.parquet"
+    panel_path.write_bytes(b"panel")
+    panel = PanelSnapshot(
+        market={"market_id": "m"},
+        bars=bars,
+        head_generation="sha256-" + "1" * 64,
+        attempt_ids=("attempt",),
+        artifact_ids=("artifact",),
+        normalization_versions=("v1",),
+        panel_path=panel_path,
+        panel_sha256="2" * 64,
+        decision_time=bars[-1].decision_time,
+        latest_available_time=bars[-1].latest_available_time,
+    )
+    config = json.loads(Path("config/strategy_research.json").read_text())
+    replay_path, _replay_hash = _cost_replay_artifact(
+        tmp_path, panel, validation, config, "research-one",
+    )
+    replay_rows = [
+        json.loads(line) for line in replay_path.read_text(encoding="utf-8").splitlines()
+        if json.loads(line)["record_type"] == "label_cost"
+    ]
+    assert [row["in_walk_forward_oos"] for row in replay_rows] == [
+        False, True, True, False, False,
+    ]
+    assert [row["walk_forward_fold_id"] for row in replay_rows] == [
+        None, "fold-001", "fold-001", None, None,
+    ]
+    assert all(
+        (row["replays"]["walk_forward_stitched"] is not None)
+        == row["in_walk_forward_oos"]
+        for row in replay_rows
+    )
+
+
 def test_family_generators_are_independently_scoped() -> None:
     """单流派生成不得携带其他流派候选。"""
     config = json.loads(Path("config/strategy_research.json").read_text())
@@ -473,8 +589,8 @@ def test_true_quality_respects_family_caps() -> None:
     assert result.reserve >= 0.15
 
 
-def test_allocator_uses_fixed_deployment_oos_evidence() -> None:
-    """组合器不得用逐折冠军路径替代固定部署候选的收益证据。"""
+def test_allocator_uses_stitched_validation_evidence() -> None:
+    """组合器收益证据必须复现逐折选择过程，不能事后挑固定冠军。"""
     quality = QualityVector(True, True, True, True, True, True, ())
     candidate = CandidateSpec("candidate", "trend", "paper", {}, 1)
     family = FamilyEvaluation(
@@ -500,13 +616,44 @@ def test_allocator_uses_fixed_deployment_oos_evidence() -> None:
     )
     config = json.loads(Path("config/strategy_research.json").read_text())["allocation"]
     result = allocate((family,), state, quality, config)
-    assert result.weights["trend"] == 0.0
+    assert result.weights["trend"] > 0.0
 
 
-def test_allocator_covariance_uses_deployment_oos_returns(
+def test_allocator_weight_is_independent_of_current_family_signal() -> None:
+    """当前信号为零时仍估计长期资本权重，最终贡献保持为零。"""
+    quality = QualityVector(True, True, True, True, True, True, ())
+    candidate = CandidateSpec("candidate", "trend", "paper", {}, 1)
+    family = FamilyEvaluation(
+        family="trend",
+        mode="paper",
+        deployment_candidate=candidate,
+        latest_target=0.0,
+        deployment_oos_metrics=_metrics(),
+        deployment_oos_returns=(0.01, 0.02, 0.01),
+        metrics=replace(_metrics(), annual_return=1.0),
+        adjusted_sharpe=0.5,
+        fdr_q=0.1,
+        eligible=True,
+        rejection_reasons=(),
+        oos_returns=(0.01, 0.02, 0.01),
+    )
+    state = MarketState(
+        1.0, 0.2, 0.0, 0.0, None, None, None, 0.0, "positive_trend", 0.0,
+    )
+    config = json.loads(Path("config/strategy_research.json").read_text())["allocation"]
+    result = allocate((family,), state, quality, config)
+    contract = _position_contract_payload(
+        ValidationResult((family,), (), {}, ()), result,
+    )
+    assert result.weights["trend"] > 0.0
+    assert contract["families"][0]["portfolio_target_contribution"] == 0.0
+    assert contract["aggregate_target"] == 0.0
+
+
+def test_allocator_covariance_uses_stitched_oos_returns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """跨家族协方差不得读取逐折冠军拼接收益。"""
+    """跨家族协方差必须与逐折选择后的收益证据对齐。"""
     quality = QualityVector(True, True, True, True, True, True, ())
     deployment_returns = {
         "trend": (0.01, -0.02, 0.03),
@@ -550,13 +697,13 @@ def test_allocator_covariance_uses_deployment_oos_returns(
 
     expected = {
         (left, right)
-        for left in deployment_returns.values()
-        for right in deployment_returns.values()
+        for left in stitched_returns.values()
+        for right in stitched_returns.values()
     }
     assert len(observed) == 4
     assert set(observed) == expected
     assert not any(
-        left in stitched_returns.values() or right in stitched_returns.values()
+        left in deployment_returns.values() or right in deployment_returns.values()
         for left, right in observed
     )
 
@@ -738,7 +885,16 @@ def test_family_monitor_reports_parameter_search_direction(
         "c" * 64,
         (first_prior, second_prior),
     )
-    assert deduplicated["monitor_method_version"] == "family-direction-monitor-v4"
+    deduplicated_reversed = monitor_family_run(
+        tmp_path,
+        summary,
+        "trend",
+        config,
+        "c" * 64,
+        (second_prior, first_prior),
+    )
+    assert deduplicated == deduplicated_reversed
+    assert deduplicated["monitor_method_version"] == "family-direction-monitor-v5"
     assert len(deduplicated["history"]) == 0
     assert {
         item["reason"] for item in deduplicated["excluded_history"]
@@ -754,6 +910,34 @@ def test_family_monitor_reports_parameter_search_direction(
     recent_prior["family_evaluations"][0]["fdr_q"] = 0.2
     recent_path = tmp_path / "time-separated-one.json"
     recent_path.write_text(json.dumps(recent_prior), encoding="utf-8")
+    recent_duplicate = json.loads(json.dumps(recent_prior))
+    recent_duplicate["run_id"] = "time-separated-duplicate"
+    recent_duplicate["research_identity"] = "time-separated-duplicate-research"
+    recent_duplicate_path = tmp_path / "time-separated-duplicate.json"
+    recent_duplicate_path.write_text(
+        json.dumps(recent_duplicate), encoding="utf-8",
+    )
+    vintage_forward = monitor_family_run(
+        tmp_path,
+        summary,
+        "trend",
+        config,
+        "c" * 64,
+        (recent_path, recent_duplicate_path),
+    )
+    vintage_reversed = monitor_family_run(
+        tmp_path,
+        summary,
+        "trend",
+        config,
+        "c" * 64,
+        (recent_duplicate_path, recent_path),
+    )
+    assert vintage_forward == vintage_reversed
+    assert len(vintage_forward["history"]) == 1
+    assert vintage_forward["excluded_history"][0]["reason"] == (
+        "duplicate_data_vintage"
+    )
     older_prior = json.loads(json.dumps(recent_prior))
     older_prior["run_id"] = "time-separated-two"
     older_prior["research_identity"] = "time-separated-research-two"
@@ -815,7 +999,7 @@ def test_evolution_proposal_updates_strategy_and_feature_dependencies(
     monitor = {
         "family": "trend",
         "run_id": "run",
-        "monitor_method_version": "family-direction-monitor-v4",
+        "monitor_method_version": "family-direction-monitor-v5",
         "source": {
             "summary_sha256": "a" * 64,
             "trial_ledger_sha256": "b" * 64,

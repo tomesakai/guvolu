@@ -68,7 +68,9 @@ trial ledger，不删除失败候选（G-07）。准入同时要求：
 折级归属和重复样本统计合同，间隔测试窗需要显式退出成本合同；两者在另行版本化前都会被拒绝。
 摘要中的 `validation_metrics` 表示逐折冠军拼接验证路径，`deployment_oos_metrics` 表示固定部署
 候选在统一 OOS mask 上的证据。旧 `metrics` 仅是 v10 对 `validation_metrics` 的兼容别名，在下次
-摘要 schema 升级时移除；组合器只消费固定部署候选的指标和收益序列。
+摘要 schema 升级时移除。v11 组合器只消费逐折冠军拼接路径的指标和收益序列，因为它复现了
+“每折只在训练段选参数”的部署选择过程；固定部署候选的统一 OOS 指标只作诊断，不能作为事后
+选中该候选后再估计组合权重的依据。
 
 - 样本外柱数达到配置下限；
 - 成本后净收益与 Sharpe 为正；
@@ -83,8 +85,9 @@ trial ledger，不删除失败候选（G-07）。准入同时要求：
 报告还保留 turnover、drawdown、capacity、cost、hit rate、exposure 与质量归因。
 家族摘要另记录正收益折比例、训练冠军最大占比和被选测试折 Sharpe 中位数，以区分“长期由
 少数时期撑起”和“跨时期可重复”的候选。单侧 p 值使用偏度、峰度修正的非正态
-Probabilistic Sharpe 近似。CSCV 只接受偶数个 walk-forward 测试折，将其对称平分为训练/验证
-折块；奇数折因两个方向样本数不等而被拒绝。全部组合过多时按配置种子固定抽取 512 个分割；
+Probabilistic Sharpe 近似。CSCV 使用最近的偶数个 walk-forward 测试折并将其对称平分为训练/
+验证折块；测试折为奇数时只从 PBO 诊断中排除最旧一折，主 walk-forward 路径仍使用全部折，
+避免数据自然增长一折就让整条研究管线失败。全部组合过多时按配置种子固定抽取 512 个分割；
 每个分割把所有折内并列冠军的折外平均并列秩作为该分割结果，候选 ID 不参与统计选择。
 `PBO` 是选择稳定性诊断，不是盈利性指标：一个稳定亏损的流派也可能有很低 PBO，仍会被净
 收益、Sharpe、回撤或正收益折比例门禁拒绝。另以 1,024 次固定种子循环折块重采样保留一周
@@ -227,10 +230,10 @@ vintage，防止失败重跑窥视，但注册表会保留最后成功阶段，�
 | 制品 | 位置 | 用途 |
 |---|---|---|
 | 紧凑面板 | `data/research/physical/<market_id>/` | Decimal 与整数双表示 |
-| candidate registry | `reports/strategy-research/<run_id>/artifacts/` | 流派范围、生成方法和全部候选身份 |
-| 特征面板 | `reports/strategy-research/<run_id>/artifacts/` | PIT 特征与输入血缘 |
-| label/cost/replay | 同上 | 标签可得时点、成本和策略净收益 |
-| trial ledger | 同上 | 全候选、全折、全结果台账 |
+| candidate registry | `reports/strategy-research/research-artifacts/<research_identity>/` | 流派范围、生成方法和全部候选身份 |
+| 特征面板 | 同上 | PIT 特征与输入血缘 |
+| label/cost/replay | 同上 | 标签可得时点、成本和策略净收益；stitched 路径显式限定 OOS 折 |
+| trial ledger | 同上 | 全候选、全折、全结果台账及冠军角色 |
 | target position | 同上 | 研究回放与运行快照目标位置 |
 | manifest | `reports/strategy-research/<run_id>/manifest.json` | 代码、配置、输入和输出散列 |
 | 活动指针 | `reports/strategy-research/latest.json` | 原子更新的最近完成运行位置 |
@@ -331,7 +334,16 @@ improving、stable 或 decaying。该结论同时证明“独立运行”与“�
 `research-run-1850b2768e6c250fbe7ebb73957c5c633ecf8f86f4cbd587e34883df7132fca1`，manifest
 SHA-256 为 `d0360e6d06ea107596a4f5bccd19aebfaa8259aa9a18f852a646b7ada709c255`。
 
-隔离开发分支的 `family-direction-monitor-v4` 进一步要求在监视时实际复核 trial ledger 散列，
+`pipeline-v11` 保留 v10 的部署候选与验证路径双合同，但组合器改用 stitched walk-forward
+收益、风险和容量证据，避免用全历史事后选出的固定冠军反向估计资本权重。资本权重只由长期
+验证证据决定，不再因当前家族信号恰好为零而移除；最终组合贡献仍严格等于权重乘当前目标。
+PBO 改用最近偶数折窗口，奇数增长只排除最旧一折并显式报告排除数量；平均 OOS 排名恰好位于
+中位数或全部候选完全并列时不计为低于中位数的过拟合事件。重复执行仍产生带墙钟的轻量快照身份，
+特征、试验台账、候选注册表和成本回放则按稳定 `research_identity` 共用内容寻址目录，防止
+同一数据、配置和代码反复复制大体积制品。v11 只在隔离研究分支验证，不改写已冻结的 v10
+主树或 100 天前向计划。
+
+隔离开发分支的 `family-direction-monitor-v5` 进一步要求在监视时实际复核 trial ledger 散列，
 并把 summary 与 ledger 的项目内路径写入监视制品；`family-evolution-proposal-v2` 只读取文件名与
 实际内容 SHA-256 一致的监视制品，生成下一代提案前还会完整复核来源 manifest，并从来源事实重算
 实际消费的行动与参数方向，同时证明 monitor、summary、ledger 与父配置散列一致。拒绝提案也保留
@@ -341,6 +353,8 @@ SHA-256 为 `d0360e6d06ea107596a4f5bccd19aebfaa8259aa9a18f852a646b7ada709c255`�
 验证还会从父配置和 source monitor 现场重建允许的单轴变换，并要求完整子配置逐字段相等；结构上
 自洽但包含额外手工改动的配置会被拒绝。该增强只收紧证据链，不改变上述
 历史不足结论，也不进入已经冻结的前向执行器代码树。
+v5 对相同研究身份和相同数据 vintage 先按配置、代码树、summary 与 manifest 内容散列选择
+唯一代表，再按时间排序和间隔过滤；因此颠倒 CLI 历史路径顺序不会改变监视方向或消费的证据。
 
 ## 8. 被动网格与 L2 shadow
 

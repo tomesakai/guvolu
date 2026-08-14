@@ -68,7 +68,7 @@ from guvolu.strategy.generation import (
 )
 
 PIPELINE_SCHEMA_VERSION = 1
-PIPELINE_METHOD_VERSION = "strategy-research-pipeline-v10"
+PIPELINE_METHOD_VERSION = "strategy-research-pipeline-v11"
 POSITION_CONTRACT_METHOD_VERSION = "risk-weighted-family-target-v1"
 SECONDS_PER_YEAR = 365.0 * 24.0 * 60.0 * 60.0
 _INTERVAL_SECONDS = {
@@ -165,6 +165,23 @@ def _write_content_text(
     return path, digest
 
 
+def _research_output_paths(
+    output_base: Path,
+    research_identity: str,
+    execution_evaluated_at: datetime,
+) -> tuple[str, Path, Path]:
+    """分离执行快照目录与可复用的研究制品目录。"""
+    run_id = stable_identifier("research-run", {
+        "research_identity": research_identity,
+        "execution_evaluated_at": execution_evaluated_at.isoformat(),
+    })
+    return (
+        run_id,
+        output_base / run_id,
+        output_base / "research-artifacts" / research_identity,
+    )
+
+
 def _feature_artifact(
     directory: Path,
     features: Sequence[FeatureRow],
@@ -196,19 +213,26 @@ def _feature_artifact(
 def _trial_artifact(
     directory: Path,
     validation: ValidationResult,
-    run_id: str,
+    research_identity: str,
 ) -> tuple[Path, str]:
     """发布包含所有候选事实的追加式台账。"""
     rows = [canonical_json({
         "record_type": "trial_ledger_header",
         "schema_version": PIPELINE_SCHEMA_VERSION,
-        "run_id": run_id,
+        "research_identity": research_identity,
         "candidate_evaluations": len(validation.trials),
         "p_value_method_version": P_VALUE_METHOD_VERSION,
         "pbo_method_version": PBO_METHOD_VERSION,
         "block_bootstrap_method_version": BLOCK_BOOTSTRAP_METHOD_VERSION,
     })]
     for trial in sorted(validation.trials, key=lambda item: item.evaluation_id):
+        selection_role = "none"
+        if trial.selected:
+            selection_role = (
+                "deployment_champion"
+                if trial.fold_id == "full"
+                else "fold_training_champion"
+            )
         rows.append(canonical_json({
             "record_type": "trial",
             "evaluation_id": trial.evaluation_id,
@@ -222,6 +246,7 @@ def _trial_artifact(
             "start_time": trial.start_time.isoformat(),
             "end_time": trial.end_time.isoformat(),
             "selected": trial.selected,
+            "selection_role": selection_role,
             "metrics": metrics_payload(trial.metrics),
         }))
     return _write_content_text(
@@ -237,7 +262,7 @@ def _cost_replay_artifact(
     panel: PanelSnapshot,
     validation: ValidationResult,
     config: Mapping[str, object],
-    run_id: str,
+    research_identity: str,
 ) -> tuple[Path, str]:
     """发布与特征隔离的 label、成本和回放事实。"""
     cost_config = _mapping(config.get("cost_model"), "cost_model")
@@ -283,10 +308,15 @@ def _cost_replay_artifact(
     }
     if set(deployment_targets) != set(validation_targets):
         raise ValueError("部署与 walk-forward 流派范围不一致")
+    fold_id_by_return_index = {
+        index: fold.fold_id
+        for fold in validation.folds
+        for index in range(fold.test_start, fold.test_end)
+    }
     rows = [canonical_json({
         "record_type": "label_cost_header",
         "schema_version": PIPELINE_SCHEMA_VERSION,
-        "run_id": run_id,
+        "research_identity": research_identity,
         "panel_sha256": panel.panel_sha256,
         "cost_bps": cost_bps,
         "maximum_gap_seconds": maximum_gap,
@@ -300,7 +330,10 @@ def _cost_replay_artifact(
         },
         "replay_semantics": {
             "deployment": "one full-history deployment candidate per family",
-            "walk_forward_stitched": "fold-selected validation path used by gates",
+            "walk_forward_stitched": (
+                "fold-selected validation path used by gates; null outside "
+                "the declared walk-forward OOS return indices"
+            ),
         },
     })]
     for index in range(1, len(panel.bars)):
@@ -311,8 +344,12 @@ def _cost_replay_artifact(
         market_return = (
             None if hard_gap else math.log(current.close / previous.close)
         )
+        walk_forward_fold_id = fold_id_by_return_index.get(index)
         replay_rows: dict[str, object] = {}
         for replay, targets in replay_targets.items():
+            if replay == "walk_forward_stitched" and walk_forward_fold_id is None:
+                replay_rows[replay] = None
+                continue
             family_rows: dict[str, object] = {}
             for family in sorted(targets):
                 target = targets[family][index - 1]
@@ -333,6 +370,8 @@ def _cost_replay_artifact(
             "label_available_time": current.decision_time.isoformat(),
             "gap_seconds": gap_seconds,
             "hard_gap": hard_gap,
+            "in_walk_forward_oos": walk_forward_fold_id is not None,
+            "walk_forward_fold_id": walk_forward_fold_id,
             "next_market_log_return": market_return,
             "replays": replay_rows,
         }))
@@ -382,6 +421,7 @@ def _family_payload(validation: ValidationResult) -> list[Mapping[str, object]]:
         "cscv_split_count": item.cscv_split_count,
         "cscv_in_sample_fold_count": item.cscv_in_sample_fold_count,
         "cscv_out_sample_fold_count": item.cscv_out_sample_fold_count,
+        "cscv_excluded_fold_count": item.cscv_excluded_fold_count,
         "block_bootstrap_sharpe_lower_bound": (
             item.block_bootstrap_sharpe_lower_bound
         ),
@@ -498,14 +538,18 @@ def _markdown_summary(summary: Mapping[str, Any]) -> str:
         )
     research = summary["research_position"]
     operational = summary["operational_position"]
+    research_contract = summary["research_target_contract"]
+    operational_contract = summary["operational_target_contract"]
     lines.extend([
         "",
-        "## 3. 目标位置",
+        "## 3. 资本分配与组合目标",
         "",
         "```json",
         json.dumps({
-            "research_replay": research,
-            "operational": operational,
+            "research_allocation_weights": research,
+            "operational_allocation_weights": operational,
+            "research_target_contract": research_contract,
+            "operational_target_contract": operational_contract,
         }, ensure_ascii=False, indent=2),
         "```",
         "",
@@ -574,12 +618,11 @@ def run_research(
         "governance_method_version": GOVERNANCE_METHOD_VERSION,
         "data_scope": data_scope,
     })
-    run_id = stable_identifier("research-run", {
-        "research_identity": research_identity,
-        "execution_evaluated_at": execution_evaluated_at.isoformat(),
-    })
-    run_directory = output_base / run_id
-    artifact_directory = run_directory / "artifacts"
+    run_id, run_directory, artifact_directory = _research_output_paths(
+        output_base,
+        research_identity,
+        execution_evaluated_at,
+    )
     exposure = register_research_exposure(
         governance_path,
         research_identity,
@@ -629,7 +672,7 @@ def run_research(
         raise ValueError("不支持的研究节拍")
     periods_per_year = SECONDS_PER_YEAR / interval_seconds
     validation = walk_forward_validate(
-        run_id,
+        research_identity,
         panel.bars,
         features,
         candidates,
@@ -787,14 +830,14 @@ def run_research(
     trial_path, trial_hash = _trial_artifact(
         artifact_directory,
         validation,
-        run_id,
+        research_identity,
     )
     replay_path, replay_hash = _cost_replay_artifact(
         artifact_directory,
         panel,
         validation,
         config,
-        run_id,
+        research_identity,
     )
     registry_path, registry_hash = _write_content_text(
         artifact_directory,
@@ -1006,8 +1049,11 @@ def run_research(
             item.family for item in validation.families if item.eligible
         ),
         operational_nonzero_families=tuple(
-            family for family, weight in operational_position.weights.items()
-            if weight > 0
+            item.family for item in validation.families
+            if abs(
+                operational_position.weights.get(item.family, 0.0)
+                * item.latest_target
+            ) > 1e-12
         ),
         family_scope=resolved_family_scope,
     )

@@ -21,7 +21,7 @@ from guvolu.strategy.contracts import CandidateSpec, FeatureRow, ResearchBar
 
 SECONDS_PER_YEAR = 365.0 * 24.0 * 60.0 * 60.0
 P_VALUE_METHOD_VERSION = "probabilistic-sharpe-nonnormal-v1"
-PBO_METHOD_VERSION = "cscv-even-fold-tie-average-v3"
+PBO_METHOD_VERSION = "cscv-recent-even-window-tie-average-v4"
 BLOCK_BOOTSTRAP_METHOD_VERSION = "circular-block-bootstrap-sharpe-v1"
 DEFLATED_SHARPE_METHOD_VERSION = "deflated-sharpe-family-effective-gate-v3"
 EFFECTIVE_TRIAL_METHOD_VERSION = "fold-score-correlation-participation-v1"
@@ -279,8 +279,11 @@ def _probability_backtest_overfitting(
         len(fold_scores[identifier]) != fold_count for identifier in identifiers
     ):
         raise ValueError("PBO 需要至少四个同长测试折")
-    if fold_count % 2 != 0:
-        raise ValueError("PBO 需要偶数个测试折以形成对称 CSCV 分割")
+    usable_scores = {
+        identifier: tuple(fold_scores[identifier][fold_count % 2 :])
+        for identifier in identifiers
+    }
+    fold_count -= fold_count % 2
     half = fold_count // 2
     total_unique = math.comb(fold_count, half) // 2
     target = min(split_budget, total_unique)
@@ -307,13 +310,13 @@ def _probability_backtest_overfitting(
         )
         in_sample = {
             identifier: statistics.fmean(
-                fold_scores[identifier][index] for index in subset
+                usable_scores[identifier][index] for index in subset
             )
             for identifier in identifiers
         }
         out_sample = {
             identifier: statistics.fmean(
-                fold_scores[identifier][index] for index in complement
+                usable_scores[identifier][index] for index in complement
             )
             for identifier in identifiers
         }
@@ -332,7 +335,7 @@ def _probability_backtest_overfitting(
             )
         relative_rank = statistics.fmean(winner_ranks)
         ranks.append(relative_rank)
-        below_median += int(relative_rank <= 0.5)
+        below_median += int(relative_rank < 0.5)
     return (
         below_median / len(subsets),
         statistics.median(ranks),
@@ -763,6 +766,7 @@ def walk_forward_validate(
     if resolved_decision_index < 0 or resolved_decision_index >= len(bars):
         raise ValueError("策略决策索引超出面板")
     common_oos_mask = [False] * len(bars)
+    cscv_used_fold_count = len(folds) - len(folds) % 2
     for fold in folds:
         for index in range(fold.test_start, fold.test_end):
             common_oos_mask[index] = True
@@ -1179,8 +1183,9 @@ def walk_forward_validate(
                 median_neighbor_retention
             ),
             fold_selected_candidate_ids=item.fold_selected_candidate_ids,
-            cscv_in_sample_fold_count=len(folds) // 2,
-            cscv_out_sample_fold_count=len(folds) - len(folds) // 2,
+            cscv_in_sample_fold_count=cscv_used_fold_count // 2,
+            cscv_out_sample_fold_count=cscv_used_fold_count // 2,
+            cscv_excluded_fold_count=len(folds) - cscv_used_fold_count,
             periods_per_year=periods_per_year,
         ))
     return ValidationResult(

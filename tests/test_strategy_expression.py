@@ -221,4 +221,4 @@ def test_generate_targets_rejects_tampered_expression_identity() -> None:
     tampered = replace(candidate, expression_id="expression-" + "0" * 64)
     bar, feature = _row(trend=10.0, price_score=1.0, prior_high=100.0)
     with pytest.raises(ValueError, match="候选表达式身份"):
-        generate_targets(tampered, (bar,), (feature,))
+        generate_targets(tampered, (bar,), (feature,), periods_per_year=1.0)

@@ -135,6 +135,18 @@ def _history_entry(
     }
 
 
+def _history_selection_key(entry: Mapping[str, object]) -> tuple[str, ...]:
+    """用内容事实确定重复历史的唯一代表，不依赖 CLI 输入顺序。"""
+    return (
+        str(entry.get("config_hash")),
+        str(entry.get("code_tree_digest")),
+        str(entry.get("research_identity")),
+        str(entry.get("source_summary_sha256")),
+        str(entry.get("source_manifest_sha256")),
+        str(entry.get("source_summary_path")),
+    )
+
+
 def _comparison_cohort_payload(
     summary: Mapping[str, object],
 ) -> Mapping[str, object]:
@@ -338,7 +350,7 @@ def monitor_family_run(
         walk_forward.get("step_bars"), "walk_forward.step_bars",
     )
     minimum_spacing_seconds = minimum_spacing_bars * interval_seconds
-    history_by_identity: dict[str, Mapping[str, object]] = {}
+    comparable_by_identity: dict[str, list[Mapping[str, object]]] = defaultdict(list)
     excluded_history: list[Mapping[str, object]] = []
     for path in prior_summary_paths:
         prior, prior_manifest_sha256 = _verified_summary_source(root, path)
@@ -358,24 +370,42 @@ def monitor_family_run(
         if entry["comparison_cohort_id"] != current_cohort_id:
             excluded_history.append({**entry, "reason": "incomparable_cohort"})
             continue
-        if identity == current_identity or identity in history_by_identity:
+        if identity == current_identity:
             excluded_history.append({**entry, "reason": "duplicate_research_identity"})
             continue
-        history_by_identity[identity] = entry
-    candidates = sorted(
-        history_by_identity.values(),
-        key=lambda item: (str(item.get("decision_time")), str(item.get("run_id"))),
-        reverse=True,
-    )
-    accepted_reverse: list[Mapping[str, object]] = []
-    anchor_time = current_time
-    seen_vintages = {current_vintage_id}
-    for entry in candidates:
+        comparable_by_identity[identity].append(entry)
+    history_by_identity: dict[str, Mapping[str, object]] = {}
+    for identity in sorted(comparable_by_identity):
+        entries = sorted(
+            comparable_by_identity[identity], key=_history_selection_key,
+        )
+        history_by_identity[identity] = entries[0]
+        excluded_history.extend(
+            {**entry, "reason": "duplicate_research_identity"}
+            for entry in entries[1:]
+        )
+    comparable_by_vintage: dict[str, list[Mapping[str, object]]] = defaultdict(list)
+    for entry in history_by_identity.values():
         vintage_id = _text(entry.get("data_vintage_id"), "data_vintage_id")
-        if vintage_id in seen_vintages:
+        if vintage_id == current_vintage_id:
             excluded_history.append({**entry, "reason": "duplicate_data_vintage"})
             continue
-        seen_vintages.add(vintage_id)
+        comparable_by_vintage[vintage_id].append(entry)
+    candidates: list[Mapping[str, object]] = []
+    for vintage_id in sorted(comparable_by_vintage):
+        entries = sorted(
+            comparable_by_vintage[vintage_id], key=_history_selection_key,
+        )
+        candidates.append(entries[0])
+        excluded_history.extend(
+            {**entry, "reason": "duplicate_data_vintage"}
+            for entry in entries[1:]
+        )
+    candidates.sort(key=_history_selection_key)
+    candidates.sort(key=lambda item: str(item.get("decision_time")), reverse=True)
+    accepted_reverse: list[Mapping[str, object]] = []
+    anchor_time = current_time
+    for entry in candidates:
         entry_time = datetime.fromisoformat(
             _text(entry.get("decision_time"), "history.decision_time"),
         )
@@ -399,8 +429,8 @@ def monitor_family_run(
     excluded_history.sort(
         key=lambda item: (
             str(item.get("decision_time")),
-            str(item.get("run_id")),
             str(item.get("reason")),
+            _history_selection_key(item),
         ),
     )
     current_sharpe = _number(
@@ -430,7 +460,7 @@ def monitor_family_run(
             direction = "stable"
     return {
         "schema_version": 1,
-        "monitor_method_version": "family-direction-monitor-v4",
+        "monitor_method_version": "family-direction-monitor-v5",
         "run_id": summary.get("run_id"),
         "research_identity": current_identity,
         "data_vintage_id": current_vintage_id,
@@ -448,7 +478,10 @@ def monitor_family_run(
         "history": history,
         "excluded_history": excluded_history,
         "history_policy": {
-            "method": "reverse_chronological_time_separated_vintages",
+            "method": (
+                "content_deduplicated_reverse_chronological_"
+                "time_separated_vintages"
+            ),
             "comparison_cohort_id": current_cohort_id,
             "comparison_cohort": current_cohort_payload,
             "minimum_history_runs": minimum_history,

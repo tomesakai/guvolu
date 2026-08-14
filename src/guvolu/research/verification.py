@@ -137,6 +137,7 @@ def _verify_data_governance(root: Path, summary: Mapping[str, object]) -> None:
         "strategy-research-pipeline-v8",
         "strategy-research-pipeline-v9",
         "strategy-research-pipeline-v10",
+        "strategy-research-pipeline-v11",
     ):
         return
     governance = _object(summary.get("data_governance"), "data_governance")

@@ -218,7 +218,7 @@ def generate_targets(
     candidate: CandidateSpec,
     bars: Sequence[ResearchBar],
     features: Sequence[FeatureRow],
-    periods_per_year: float = 365.0 * 24.0,
+    periods_per_year: float,
 ) -> tuple[float, ...]:
     """以同一纯函数生成回测与当前目标。"""
     if len(bars) != len(features):

@@ -150,6 +150,7 @@ class FamilyEvaluation:
     fold_selected_candidate_ids: tuple[str, ...] = ()
     cscv_in_sample_fold_count: int = 0
     cscv_out_sample_fold_count: int = 0
+    cscv_excluded_fold_count: int = 0
     periods_per_year: float = 365.0 * 24.0
 
 
