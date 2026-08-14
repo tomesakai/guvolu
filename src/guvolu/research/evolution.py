@@ -547,14 +547,13 @@ def _monitor_family_run(
 
 
 def _canonical_summary_paths(root: Path, family: str) -> tuple[Path, ...]:
-    """发现组合运行与单流派目录中的 canonical 研究摘要。"""
+    """发现单流派目录中的 canonical 研究摘要。"""
     if Path(family).name != family:
         raise ValueError("family 不能用于 canonical 历史目录")
     reports = root / "reports" / "strategy-research"
-    paths = {
-        *reports.glob("research-run-*/summary.json"),
-        *(reports / "families" / family).glob("research-run-*/summary.json"),
-    }
+    paths = set(
+        (reports / "families" / family).glob("research-run-*/summary.json"),
+    )
     return tuple(sorted(
         (path.resolve() for path in paths),
         key=lambda path: path.as_posix(),

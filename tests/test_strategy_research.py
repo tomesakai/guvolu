@@ -1395,6 +1395,12 @@ def test_family_monitor_reports_parameter_search_direction(
     canonical_directory.mkdir(parents=True)
     canonical_summary = canonical_directory / "summary.json"
     canonical_summary.write_text(json.dumps(recent_prior), encoding="utf-8")
+    combined_directory = (
+        tmp_path / "reports" / "strategy-research" / "research-run-combined"
+    )
+    combined_directory.mkdir(parents=True)
+    combined_summary = combined_directory / "summary.json"
+    combined_summary.write_text(json.dumps(older_prior), encoding="utf-8")
     canonical = monitor_family_run(
         tmp_path, summary, "trend", config, "c" * 64,
     )
@@ -1402,6 +1408,11 @@ def test_family_monitor_reports_parameter_search_direction(
     assert canonical["history"][0]["source_summary_path"] == (
         canonical_summary.relative_to(tmp_path).as_posix()
     )
+    assert canonical["source"]["history_summaries"] == [{
+        "summary_path": canonical_summary.relative_to(tmp_path).as_posix(),
+        "summary_sha256": hashlib.sha256(canonical_summary.read_bytes()).hexdigest(),
+        "manifest_sha256": "m" * 64,
+    }]
 
     ledger.write_text(ledger.read_text(encoding="utf-8") + "{}\n", encoding="utf-8")
     with pytest.raises(ValueError, match="trial ledger 散列"):
