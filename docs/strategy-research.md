@@ -698,9 +698,14 @@ CPU 阶段应先于 GPU 完成以下收敛：
    趋势 1h、量价趋势 1h 权重约为 0.35/0.10/0.08/0.06，gross 0.60、reserve 0.40。突破 1h
    最新目标为零，故当前 aggregate research target 约 0.246。该结果仍是 `research_only`；
    suite readiness、冻结前向和 sealed holdout 未完成前，operational target 固定禁用。成员 manifest
-   绑定快照身份与 manifest 散列；快照复用会重新散列控制库和全部硬链接制品。v2 套件制品为
-   `interval-suite-evidence-e772fd5152fd304227a6174e22b4b25c629f4d717c3349d4d756dbbbca3b6274`，
-   缓存复跑 SHA-256 逐字节相同。
+   绑定快照身份与 manifest 散列；快照复用会重新散列控制库和全部硬链接制品。加入同 clean commit
+   门后的 v3 套件制品为
+   `interval-suite-evidence-45b32294766b31ab9675ccf5203f17e3bbca3f87f23851689864b2c511be75c1`。
+   首次套件 readiness 为
+   `interval-suite-readiness-17a258a2bf20875c018f4120e906126e7785255aa904787b89799e3f0b6bb008`：
+   research ready，operational 因两成员未成熟及来源代码落后而拒绝，promotion 因成员 holdout 与
+   suite frozen-forward 缺失而拒绝。成熟窗口到达后应在同一最终 clean commit 重跑两个成员，
+   不能把当前历史 evidence 直接升级为执行目标。
 3. 现有门禁已包括非正态 Probabilistic Sharpe、studentized 循环折块 bootstrap、折块
    CSCV/PBO、Deflated Sharpe 和单轴最近参数邻域稳定性。DSR 同时发布全量候选原始试验数与
    基于折级得分相关矩阵参与率的有效试验数。DSR 的试验域是实际参与该流派冠军选择的候选；
