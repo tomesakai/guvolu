@@ -235,6 +235,9 @@ python scripts\upgrade_research_governance.py `
 并重新检查 operational gate 与 governance。manifest、任一制品、验证器代码树或 dirty 状态变化
 都会使收据失效并退回完整证明。该收据明确标记 `promotion_evidence=false`，冻结前向、holdout 和
 promotion 继续调用完整 verifier，不能用性能缓存替代一次性封存证据。
+在 clean 提交 `22fa2724bb1130633a210c40eaaef32dc02faa16` 上，首次完整复核 12 类制品耗时
+`301.355s`；同 manifest 的缓存复核耗时 `8.063s`，包含当前验证器代码身份和全部制品重散列；
+随后完整 readiness 耗时 `19.162s`。这些数值只描述当前本机运行，不是跨机器性能承诺。
 
 在完整搜索前只读检查当前代码树、活动输入、连续特征成熟度和 holdout 状态：
 
@@ -511,13 +514,17 @@ producer 用时 286 秒，独立 verifier 用时 271 秒并重建核对全部 12
 `feature_snapshot_stale` 保持全零与百分之百储备。
 
 2026-08-15 的 `strategy-readiness-v3` 复核显示：发布面板决策时点为
-`2026-08-14T23:00:00+09:00`，尾部连续覆盖仍为 30/169 根、尚差 139 根；持续无断流时最早在
+`2026-08-15T00:00:00+09:00`，尾部连续覆盖为 31/169 根、尚差 138 根；持续无断流时最早在
 `2026-08-20T18:00:00+09:00` 成熟。活动 head 在复核期间继续前移到
-`2026-08-15T00:00:03.780000+09:00`，所以同时保留 `active_input_head_changed`，成熟后必须基于
+`2026-08-15T01:05:46.441000+09:00`，所以同时保留 `active_input_head_changed`，成熟后必须基于
 新 head 重跑。该运行与现有五条单流派 run 属于同一数据 vintage，不进入 monitor 历史，也不
 产生新的调参提案。8 月 20 日是 operational 特征成熟点，不是跨运行演进成熟点；monitor 要求
 相邻冻结 vintage 至少间隔 2,160 根小时柱。以当前单流派决策时点计，持续采集时最早约在
 `2026-11-06T06:00:00+09:00` 才可能形成第二条可比较历史，且仍需实际来源复核。
+当前发布研究来自 `71f0dfcafe4d4e23f764bd7bfbc183b2f3acf43a`，而验证器和结构搜索已推进到
+`22fa2724bb1130633a210c40eaaef32dc02faa16`，因此 readiness 还明确保留
+`source_code_tree_mismatch`。即使尾部特征成熟，也必须先基于当前 clean tree 和新活动 head
+重跑五流派组合研究，不能把旧运行直接解释为 operational snapshot。
 
 生成器 v4 进一步把五个流派的规范 AST 编译为带完整执行类型、候选参数列、每流派预算和
 子节点优先顺序的公共 DAG SearchPlan。提交 `71f0dfcafe4d4e23f764bd7bfbc183b2f3acf43a`
