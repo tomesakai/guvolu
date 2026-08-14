@@ -20,7 +20,7 @@ from guvolu.research.verification import (
 from guvolu.research.verification_attestation import verify_research_run_cached
 
 INTERVAL_SUITE_EVIDENCE_METHOD_VERSION = (
-    "verified-global-fdr-aligned-oos-v3"
+    "verified-global-fdr-aligned-oos-v4"
 )
 
 
@@ -534,6 +534,10 @@ def evaluate_interval_suite(
                 "family_trial_id": trial_id,
                 "member_eligible": row.get("eligible") is True,
                 "member_fdr_q": _number(row.get("fdr_q"), "family.fdr_q"),
+                "deployment_candidate_id": _text(
+                    row.get("deployment_candidate_id"),
+                    "family.deployment_candidate_id",
+                ),
                 "maximum_fdr_q": maximum_q,
                 "latest_unallocated_target": _number(
                     row.get("latest_unallocated_target"), "latest target",
