@@ -363,24 +363,36 @@ fold training champion 和 5 个 deployment champion。decision-grade 运行是
 `research-run-4f063c8484635fb976014b4e0a36e9042c8ad81e23159424d61931dc3a97225f`，manifest
 SHA-256 为 `ddd628821e2a2abf2edd2ccd541d9d8f5d3eb880e6eec14359c7de13f2a6cdda`。
 
-v5 监视器对五个流派都保持 `insufficient_history`，因为方法版本升级后仍只有一个独立数据
-vintage。单 vintage 的候选轴诊断再次为突破和趋势生成 264 小时预登记提案；量价趋势的更低
+v6 监视器对五个流派都保持 `insufficient_history`，因为方法版本升级后仍只有一个独立数据
+vintage。单 vintage 的候选轴诊断再次指向突破和趋势的 264 小时 challenger；量价趋势的更低
 entry 方向触及配置边界；均值回归要求修订假设或成本模型；网格要求先完善被动成交模型。
-264 小时 challenger 已在同一面板的上一轮隔离试验中输给 168 小时冠军，因此本轮不重复运行
-同一数据上的相同 challenger，也不把提案当成新时间证据或 promotion。只有未来时间分离的
-v11 vintage 才能推动 improving、stable 或 decaying，并决定是否重新开启该轴。
+264 小时 challenger 已在同一面板的上一轮隔离试验中输给 168 小时冠军；v3 提案器自动扫描
+内容寻址历史后，以 `duplicate_axis_value_proposal` 同时拒绝两个重复提案，因此本轮不重复运行
+相同 challenger，也不把提案当成新时间证据或 promotion。只有未来时间分离的 v11 vintage
+才能推动 improving、stable 或 decaying，并决定是否重新开启该轴。
 
-隔离开发分支的 `family-direction-monitor-v5` 进一步要求在监视时实际复核 trial ledger 散列，
-并把 summary 与 ledger 的项目内路径写入监视制品；`family-evolution-proposal-v2` 只读取文件名与
-实际内容 SHA-256 一致的监视制品，生成下一代提案前还会完整复核来源 manifest，并从来源事实重算
-实际消费的行动与参数方向，同时证明 monitor、summary、ledger 与父配置散列一致。拒绝提案也保留
-同一证据链。跨运行比较另绑定市场、流派试验范围、配置谱系根和全部验证方法版本；不同 cohort
+隔离开发分支的 `family-direction-monitor-v6` 进一步要求在监视时实际复核 trial ledger 散列，
+并把 summary 与 ledger 的项目内路径写入监视制品；它还登记每个历史 summary 的项目内路径、
+内容 SHA-256 与 manifest SHA-256，验证器据此重放完整历史并重算方向，而不是信任制品中的
+`cross_run_direction`。`family-evolution-proposal-v3` 只读取文件名与实际内容 SHA-256 一致的监视
+制品，生成下一代提案前还会完整复核来源 manifest，并从来源事实重算实际消费的行动与参数方向，
+同时证明 monitor、summary、ledger 与父配置散列一致。拒绝提案也保留同一证据链。跨运行比较另
+绑定市场、流派试验范围、配置谱系根和全部验证方法版本；不同 cohort
 写入 `incomparable_cohort`，不参与 improving/stable/decaying。派生配置必须保存项目内父配置路径、
 父文件真实 SHA、谱系根和深度；研究运行与下一代提案都会递归验证整条父链，不能自行声明谱系根。
 验证还会从父配置和 source monitor 现场重建允许的单轴变换，并要求完整子配置逐字段相等；结构上
 自洽但包含额外手工改动的配置会被拒绝。该增强只收紧证据链，不改变上述
 历史不足结论，也不进入已经冻结的前向执行器代码树。
-v5 对相同研究身份和相同数据 vintage 先按配置、代码树、summary 与 manifest 内容散列选择
+公开提案 API 始终发现同流派 canonical 目录中的历史，命令行参数只能追加来源，不能用空列表或
+自定义输出目录关闭门禁。它在 `proposal_history` 中记录全部 `proposed` 历史挑战的路径与散列；
+既有拒绝结论不会改变下一次拒绝制品的身份。每个潜在阻断项还必须复核 monitor 来源，并从父配置
+和 monitor 重新推导同一参数、方向和值；损坏、早期无版本或语义自声明不一致的制品记入
+`excluded_proposal_history`，既不能阻断新搜索，也
+不会被静默当成可信证据。同父配置、参数轴和值若来自相同
+面板，或当前仍缺少新的时间分离历史，就返回 `duplicate_axis_value_proposal`。未来真正形成
+stable、improving 或 decaying 的新 vintage 仍可重新提出同值 challenger，不会被永久封死。
+历史提案读取限制为 1 MiB，并把无效或过深 JSON 作为单文件排除，避免损坏制品中断整条演进管线。
+v6 对相同研究身份和相同数据 vintage 先按配置、代码树、summary 与 manifest 内容散列选择
 唯一代表，再按时间排序和间隔过滤；因此颠倒 CLI 历史路径顺序不会改变监视方向或消费的证据。
 
 ## 8. 被动网格与 L2 shadow

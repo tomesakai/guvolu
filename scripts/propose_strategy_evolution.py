@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 from typing import Sequence
 
@@ -26,23 +27,48 @@ def main(argv: Sequence[str] | None = None) -> int:
         metavar="DIRECTORY",
         help="内容寻址提案与派生配置的输出目录（不是 JSON 文件路径）",
     )
+    parser.add_argument(
+        "--prior-proposal",
+        action="append",
+        type=Path,
+        default=[],
+        help="额外纳入去重门禁的历史提案；可重复传入",
+    )
     arguments = parser.parse_args(argv)
     root = arguments.root.resolve()
     config_path = arguments.config if arguments.config.is_absolute() else root / arguments.config
     monitor_path = arguments.monitor if arguments.monitor.is_absolute() else root / arguments.monitor
+    monitor_payload = json.loads(monitor_path.read_text(encoding="utf-8"))
+    family = monitor_payload.get("family")
+    if not isinstance(family, str) or not family or Path(family).name != family:
+        raise ValueError("monitor.family 不能用于提案目录")
+    canonical_history = (
+        root / "reports" / "strategy-research" / "evolution-proposals"
+        / family
+    )
+    output = arguments.output
+    if output is None:
+        output = canonical_history
+    elif not output.is_absolute():
+        output = root / output
+    discovered = sorted({
+        *canonical_history.glob("proposal-sha256-*.json"),
+        *output.glob("proposal-sha256-*.json"),
+    })
+    explicit = [
+        path if path.is_absolute() else root / path
+        for path in arguments.prior_proposal
+    ]
+    prior_paths = tuple(sorted(
+        {path.resolve() for path in (*discovered, *explicit)},
+        key=lambda path: path.as_posix(),
+    ))
     proposal, proposed_config = propose_family_evolution(
         root,
         config_path,
         monitor_path,
+        prior_paths,
     )
-    output = arguments.output
-    if output is None:
-        output = (
-            root / "reports" / "strategy-research" / "evolution-proposals"
-            / str(proposal["family"])
-        )
-    elif not output.is_absolute():
-        output = root / output
     proposal_content = canonical_json(proposal) + "\n"
     proposal_hash = sha256_text(proposal_content)
     proposal_path = output / f"proposal-sha256-{proposal_hash}.json"

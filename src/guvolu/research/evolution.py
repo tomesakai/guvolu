@@ -351,9 +351,19 @@ def monitor_family_run(
     )
     minimum_spacing_seconds = minimum_spacing_bars * interval_seconds
     comparable_by_identity: dict[str, list[Mapping[str, object]]] = defaultdict(list)
+    history_sources: dict[tuple[str, str, str], Mapping[str, object]] = {}
     excluded_history: list[Mapping[str, object]] = []
     for path in prior_summary_paths:
         prior, prior_manifest_sha256 = _verified_summary_source(root, path)
+        source_relative = path.resolve().relative_to(root).as_posix()
+        source_sha256 = sha256_file(path)
+        history_sources[
+            (source_relative, source_sha256, prior_manifest_sha256)
+        ] = {
+            "summary_path": source_relative,
+            "summary_sha256": source_sha256,
+            "manifest_sha256": prior_manifest_sha256,
+        }
         identity = _text(
             prior.get("research_identity") or prior.get("run_id"),
             "prior.research_identity",
@@ -460,7 +470,7 @@ def monitor_family_run(
             direction = "stable"
     return {
         "schema_version": 1,
-        "monitor_method_version": "family-direction-monitor-v5",
+        "monitor_method_version": "family-direction-monitor-v6",
         "run_id": summary.get("run_id"),
         "research_identity": current_identity,
         "data_vintage_id": current_vintage_id,
@@ -498,6 +508,9 @@ def monitor_family_run(
             "code_identity": summary.get("code_identity"),
             "trial_ledger_path": ledger_relative,
             "trial_ledger_sha256": expected_ledger_hash,
+            "history_summaries": [
+                history_sources[key] for key in sorted(history_sources)
+            ],
         },
         "parameter_directions": _parameter_directions(
             rows,

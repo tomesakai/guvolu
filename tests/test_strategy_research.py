@@ -894,7 +894,8 @@ def test_family_monitor_reports_parameter_search_direction(
         (second_prior, first_prior),
     )
     assert deduplicated == deduplicated_reversed
-    assert deduplicated["monitor_method_version"] == "family-direction-monitor-v5"
+    assert deduplicated["monitor_method_version"] == "family-direction-monitor-v6"
+    assert len(deduplicated["source"]["history_summaries"]) == 2
     assert len(deduplicated["history"]) == 0
     assert {
         item["reason"] for item in deduplicated["excluded_history"]
@@ -999,11 +1000,14 @@ def test_evolution_proposal_updates_strategy_and_feature_dependencies(
     monitor = {
         "family": "trend",
         "run_id": "run",
-        "monitor_method_version": "family-direction-monitor-v5",
+        "monitor_method_version": "family-direction-monitor-v6",
         "source": {
             "summary_sha256": "a" * 64,
             "trial_ledger_sha256": "b" * 64,
             "config_hash": parent_hash,
+            "panel_sha256": "p" * 64,
+            "manifest_sha256": "c" * 64,
+            "code_identity": {"tree_digest": "d" * 64},
         },
         "evolution_action": "eligible_axis_refinement",
         "cross_run_direction": "insufficient_history",
@@ -1019,9 +1023,10 @@ def test_evolution_proposal_updates_strategy_and_feature_dependencies(
     monitor_path = tmp_path / f"family-monitor-sha256-{monitor_hash}.json"
     monitor_path.write_bytes(monitor_content.encode("utf-8"))
     proposal, proposed = propose_family_evolution(
-        tmp_path, config_path, monitor_path,
+        tmp_path, config_path, monitor_path, (),
     )
     assert proposal["status"] == "proposed"
+    assert proposal["proposal_method_version"] == "family-evolution-proposal-v3"
     assert proposed is not None
     assert 264 in proposed["strategies"]["trend"]["lookbacks"]
     assert 264 in proposed["features"]["lookbacks"]
@@ -1034,6 +1039,150 @@ def test_evolution_proposal_updates_strategy_and_feature_dependencies(
     assert proposed["evolution_parent"]["parent_config_path"] == config_path.name
     assert proposed["evolution_parent"]["lineage_depth"] == 1
     assert proposed["evolution_parent"]["lineage_root_config_hash"] == parent_hash
+    prior_content = canonical_json(proposal) + "\n"
+    prior_hash = hashlib.sha256(prior_content.encode("utf-8")).hexdigest()
+    prior_path = tmp_path / f"proposal-sha256-{prior_hash}.json"
+    prior_path.write_bytes(prior_content.encode("utf-8"))
+    unsupported_prior = {**proposal}
+    unsupported_prior.pop("proposal_method_version")
+    unsupported_content = canonical_json(unsupported_prior) + "\n"
+    unsupported_hash = hashlib.sha256(
+        unsupported_content.encode("utf-8"),
+    ).hexdigest()
+    unsupported_path = tmp_path / (
+        f"proposal-sha256-{unsupported_hash}.json"
+    )
+    unsupported_path.write_bytes(unsupported_content.encode("utf-8"))
+    forged_variants = (
+        ("direction", "explore_lower_after_preregistration"),
+        ("schema_version", True),
+        ("candidate_count", float(proposal["candidate_count"])),
+        ("candidate_budget", float(proposal["candidate_budget"])),
+        ("proposed_value", float(proposal["proposed_value"])),
+        ("holdout_consumed", 0),
+    )
+    forged_paths: list[Path] = []
+    for field, value in forged_variants:
+        forged_content = canonical_json({**proposal, field: value}) + "\n"
+        forged_hash = hashlib.sha256(
+            forged_content.encode("utf-8"),
+        ).hexdigest()
+        forged_path = tmp_path / f"proposal-sha256-{forged_hash}.json"
+        forged_path.write_bytes(forged_content.encode("utf-8"))
+        forged_paths.append(forged_path)
+    duplicate, duplicate_config = propose_family_evolution(
+        tmp_path,
+        config_path,
+        monitor_path,
+        (unsupported_path, *forged_paths, prior_path),
+    )
+    assert duplicate_config is None
+    assert duplicate["status"] == "no_parameter_proposal"
+    assert duplicate["reason"] == "duplicate_axis_value_proposal"
+    assert duplicate["duplicate_basis"] == "same_data_vintage"
+    assert duplicate["prior_proposal_sha256"] == prior_hash
+    exclusions = duplicate["excluded_proposal_history"]
+    assert any(
+        item["path"] == unsupported_path.name
+        and item["detail"] == "历史提案方法版本不受支持"
+        for item in exclusions
+    )
+    excluded_paths = {
+        item["path"] for item in exclusions
+        if "不能由父配置与 monitor 重建" in item.get("detail", "")
+    }
+    assert excluded_paths.issuperset(path.name for path in forged_paths)
+    rejection_content = canonical_json(duplicate) + "\n"
+    rejection_hash = hashlib.sha256(
+        rejection_content.encode("utf-8"),
+    ).hexdigest()
+    rejection_path = tmp_path / (
+        f"proposal-sha256-{rejection_hash}.json"
+    )
+    rejection_path.write_bytes(rejection_content.encode("utf-8"))
+    repeated, repeated_config = propose_family_evolution(
+        tmp_path,
+        config_path,
+        monitor_path,
+        (unsupported_path, *forged_paths, prior_path, rejection_path),
+    )
+    assert repeated_config is None
+    assert repeated == duplicate
+
+    canonical_history = (
+        tmp_path / "reports" / "strategy-research" / "evolution-proposals"
+        / "trend"
+    )
+    canonical_history.mkdir(parents=True)
+    canonical_prior = canonical_history / prior_path.name
+    canonical_prior.write_bytes(prior_content.encode("utf-8"))
+    corrupt_content = "{"
+    corrupt_hash = hashlib.sha256(corrupt_content.encode("utf-8")).hexdigest()
+    corrupt_path = canonical_history / f"proposal-sha256-{corrupt_hash}.json"
+    corrupt_path.write_text(corrupt_content, encoding="utf-8")
+    nested_content = "[" * 2000 + "0" + "]" * 2000
+    nested_hash = hashlib.sha256(nested_content.encode("utf-8")).hexdigest()
+    nested_path = canonical_history / f"proposal-sha256-{nested_hash}.json"
+    nested_path.write_text(nested_content, encoding="utf-8")
+    canonical_duplicate, canonical_config = propose_family_evolution(
+        tmp_path, config_path, monitor_path, (),
+    )
+    assert canonical_config is None
+    assert canonical_duplicate["reason"] == "duplicate_axis_value_proposal"
+    assert canonical_duplicate["prior_proposal_path"] == (
+        canonical_prior.relative_to(tmp_path).as_posix()
+    )
+    assert any(
+        item["path"] == corrupt_path.relative_to(tmp_path).as_posix()
+        and item["reason"] == "unreadable_or_invalid_proposal_artifact"
+        for item in canonical_duplicate["excluded_proposal_history"]
+    )
+    assert any(
+        item["path"] == nested_path.relative_to(tmp_path).as_posix()
+        and item["reason"] == "unreadable_or_invalid_proposal_artifact"
+        for item in canonical_duplicate["excluded_proposal_history"]
+    )
+
+    future_monitor = json.loads(json.dumps(monitor))
+    future_monitor["cross_run_direction"] = "stable"
+    future_monitor["source"]["panel_sha256"] = "q" * 64
+    future_content = canonical_json(future_monitor) + "\n"
+    future_hash = hashlib.sha256(future_content.encode("utf-8")).hexdigest()
+    future_path = tmp_path / f"family-monitor-sha256-{future_hash}.json"
+    future_path.write_bytes(future_content.encode("utf-8"))
+    future_proposal, future_config = propose_family_evolution(
+        tmp_path, config_path, future_path, (prior_path,),
+    )
+    assert future_proposal["status"] == "proposed"
+    assert future_config is not None
+
+    unseparated_monitor = json.loads(json.dumps(future_monitor))
+    unseparated_monitor["cross_run_direction"] = "insufficient_history"
+    unseparated_content = canonical_json(unseparated_monitor) + "\n"
+    unseparated_hash = hashlib.sha256(
+        unseparated_content.encode("utf-8"),
+    ).hexdigest()
+    unseparated_path = tmp_path / (
+        f"family-monitor-sha256-{unseparated_hash}.json"
+    )
+    unseparated_path.write_bytes(unseparated_content.encode("utf-8"))
+    unseparated, unseparated_config = propose_family_evolution(
+        tmp_path, config_path, unseparated_path, (prior_path,),
+    )
+    assert unseparated_config is None
+    assert unseparated["duplicate_basis"] == "insufficient_new_history"
+
+    invalid_prior_path = tmp_path / "proposal-invalid-name.json"
+    invalid_prior_path.write_bytes(prior_content.encode("utf-8"))
+    invalid_history, invalid_config = propose_family_evolution(
+        tmp_path, config_path, monitor_path, (invalid_prior_path,),
+    )
+    assert invalid_config is None
+    assert any(
+        item["path"] == invalid_prior_path.name
+        and item["reason"] == "unreadable_or_invalid_proposal_artifact"
+        for item in invalid_history["excluded_proposal_history"]
+    )
     derived_path = tmp_path / "derived.json"
     derived_path.write_bytes((canonical_json(proposed) + "\n").encode("utf-8"))
     assert verify_config_lineage(tmp_path, derived_path) == (parent_hash, 1)
@@ -1080,7 +1229,7 @@ def test_evolution_proposal_updates_strategy_and_feature_dependencies(
     changed_config["strategies"]["trend"]["lookbacks"] = [24, 72]
     config_path.write_bytes((canonical_json(changed_config) + "\n").encode("utf-8"))
     with pytest.raises(ValueError, match="来源配置"):
-        propose_family_evolution(tmp_path, config_path, monitor_path)
+        propose_family_evolution(tmp_path, config_path, monitor_path, ())
     config_path.write_bytes(config_content.encode("utf-8"))
 
     rejected_monitor = json.loads(monitor_content)
@@ -1090,7 +1239,7 @@ def test_evolution_proposal_updates_strategy_and_feature_dependencies(
     rejected_path = tmp_path / f"family-monitor-sha256-{rejected_hash}.json"
     rejected_path.write_bytes(rejected_content.encode("utf-8"))
     rejected, rejected_config = propose_family_evolution(
-        tmp_path, config_path, rejected_path,
+        tmp_path, config_path, rejected_path, (),
     )
     assert rejected_config is None
     assert rejected["status"] == "no_parameter_proposal"
@@ -1105,7 +1254,7 @@ def test_evolution_proposal_updates_strategy_and_feature_dependencies(
     )
     monitor_path.write_bytes((canonical_json(tampered) + "\n").encode("utf-8"))
     with pytest.raises(ValueError, match="文件名与实际制品散列"):
-        propose_family_evolution(tmp_path, config_path, monitor_path)
+        propose_family_evolution(tmp_path, config_path, monitor_path, ())
 
 
 def test_monitor_source_verification_recomputes_consumed_direction(
@@ -1127,7 +1276,12 @@ def test_monitor_source_verification_recomputes_consumed_direction(
             "trial_ledger_path": "ledger.jsonl",
             "trial_ledger_sha256": hashlib.sha256(ledger.read_bytes()).hexdigest(),
             "config_hash": "c" * 64,
+            "history_summaries": [],
         },
+        "cross_run_direction": "insufficient_history",
+        "history": [],
+        "excluded_history": [],
+        "history_policy": {"method": "test"},
     }
     protected_summary = {
         "run_id": "run",
@@ -1170,6 +1324,12 @@ def test_monitor_source_verification_recomputes_consumed_direction(
 
     with pytest.raises(ValueError, match="parameter_directions"):
         verify_monitor_sources(tmp_path, {}, forged, "c" * 64)
+    forged_direction = {
+        **recomputed,
+        "cross_run_direction": "stable",
+    }
+    with pytest.raises(ValueError, match="cross_run_direction"):
+        verify_monitor_sources(tmp_path, {}, forged_direction, "c" * 64)
 
 
 def test_config_lineage_rejects_invalid_and_excessive_chains(

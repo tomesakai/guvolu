@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from guvolu.research.config_lineage import load_verified_config_lineage
@@ -64,6 +64,140 @@ def _load_monitor_artifact(
     return monitor, relative, monitor_hash
 
 
+def _load_proposal_artifact(
+    repository_root: Path,
+    proposal_path: Path,
+) -> tuple[Mapping[str, object], str, str]:
+    """读取并绑定一个既有内容寻址提案。"""
+    root = repository_root.resolve()
+    path = proposal_path.resolve()
+    try:
+        relative = path.relative_to(root).as_posix()
+    except ValueError as error:
+        raise ValueError("历史提案必须位于项目目录内") from error
+    if path.stat().st_size > 1024 * 1024:
+        raise ValueError("历史提案超过 1 MiB 上限")
+    proposal_hash = sha256_file(path)
+    expected_name = f"proposal-sha256-{proposal_hash}.json"
+    if path.name != expected_name:
+        raise ValueError("历史提案文件名与实际制品散列不一致")
+    proposal = _object(
+        json.loads(path.read_text(encoding="utf-8")), "historical proposal",
+    )
+    return proposal, relative, proposal_hash
+
+
+def _verify_prior_proposal_source(
+    repository_root: Path,
+    config_path: Path,
+    config: Mapping[str, object],
+    parent_config_hash: str,
+    proposal: Mapping[str, object],
+) -> None:
+    """从受保护来源重建一个可能阻断新搜索的历史提案。"""
+    method = proposal.get("proposal_method_version")
+    if method not in {
+        "family-evolution-proposal-v2",
+        "family-evolution-proposal-v3",
+    }:
+        raise ValueError("历史提案方法版本不受支持")
+    root = repository_root.resolve()
+    monitor_path = _source_path(
+        root,
+        proposal.get("source_monitor_path"),
+        "historical proposal.source_monitor_path",
+    )
+    monitor, monitor_relative, monitor_hash = _load_monitor_artifact(
+        root, monitor_path,
+    )
+    if monitor_relative != proposal.get("source_monitor_path"):
+        raise ValueError("历史提案 monitor 路径不一致")
+    if monitor_hash != proposal.get("source_monitor_sha256"):
+        raise ValueError("历史提案 monitor 散列不一致")
+    if monitor.get("family") != proposal.get("family"):
+        raise ValueError("历史提案 monitor 流派不一致")
+    if monitor.get("run_id") != proposal.get("source_run_id"):
+        raise ValueError("历史提案 monitor 运行身份不一致")
+    if monitor.get("monitor_method_version") != proposal.get(
+        "source_monitor_method_version"
+    ):
+        raise ValueError("历史提案 monitor 方法版本不一致")
+    source = _object(monitor.get("source"), "historical monitor.source")
+    field_pairs = (
+        ("summary_sha256", "source_summary_sha256"),
+        ("trial_ledger_sha256", "source_trial_ledger_sha256"),
+        ("manifest_sha256", "source_manifest_sha256"),
+        ("panel_sha256", "source_panel_sha256"),
+        ("code_identity", "source_code_identity"),
+    )
+    for source_field, proposal_field in field_pairs:
+        proposal_value = proposal.get(proposal_field)
+        if (
+            proposal_value is None
+            or canonical_json(source.get(source_field))
+            != canonical_json(proposal_value)
+        ):
+            raise ValueError(f"历史提案 {source_field} 来源不一致")
+    monitor_method = monitor.get("monitor_method_version")
+    if monitor_method == "family-direction-monitor-v6":
+        verify_monitor_sources(root, config, monitor, parent_config_hash)
+    else:
+        _verify_legacy_single_vintage_monitor(
+            root, config, monitor, parent_config_hash,
+        )
+    rebuilt, _derived = _propose_family_evolution(
+        root,
+        config_path,
+        monitor_path,
+        (),
+        enforce_novelty=False,
+        verify_monitor=False,
+    )
+    semantic_fields = (
+        "schema_version",
+        "family",
+        "status",
+        "parameter",
+        "direction",
+        "proposed_value",
+        "candidate_count",
+        "candidate_budget",
+        "parent_config_hash",
+        "source_run_id",
+        "source_monitor_method_version",
+        "source_monitor_path",
+        "source_monitor_sha256",
+        "source_summary_sha256",
+        "source_trial_ledger_sha256",
+        "source_manifest_sha256",
+        "source_panel_sha256",
+        "source_code_identity",
+        "holdout_consumed",
+    )
+    mismatches = [
+        field for field in semantic_fields
+        if canonical_json(proposal.get(field))
+        != canonical_json(rebuilt.get(field))
+    ]
+    if method == "family-evolution-proposal-v3":
+        for field in (
+            "source_data_vintage_id",
+            "source_cross_run_direction",
+            "evidence_scope",
+        ):
+            if canonical_json(proposal.get(field)) != canonical_json(
+                rebuilt.get(field)
+            ):
+                mismatches.append(field)
+    elif proposal.get("evidence_scope") != "single_vintage_candidate_axis":
+        mismatches.append("evidence_scope")
+    if mismatches:
+        raise ValueError(
+            "历史提案不能由父配置与 monitor 重建: "
+            + ", ".join(mismatches)
+        )
+
+
 def _load_config_artifact(
     repository_root: Path,
     config_path: Path,
@@ -110,22 +244,26 @@ def verify_evolution_config(
     )
     if sha256_file(monitor_path) != parent.get("source_monitor_sha256"):
         raise ValueError("派生配置 source monitor 散列不匹配")
-    _proposal, rebuilt = propose_family_evolution(
+    _proposal, rebuilt = _propose_family_evolution(
         root,
         parent_path,
         monitor_path,
+        (),
+        enforce_novelty=False,
+        verify_monitor=True,
     )
     if rebuilt is None or canonical_json(rebuilt) != canonical_json(config):
         raise ValueError("派生配置不是父配置与监视证据允许的单轴变换")
 
 
-def verify_monitor_sources(
+def _recompute_monitor_sources(
     repository_root: Path,
     config: Mapping[str, object],
     monitor: Mapping[str, object],
     parent_config_hash: str,
-) -> None:
-    """验证监视来源并重算提案实际消费的单 vintage 证据。"""
+    prior_paths: Sequence[Path],
+) -> Mapping[str, object]:
+    """验证当前运行来源，并以给定历史重算监视结论。"""
     root = repository_root.resolve()
     source = _object(monitor.get("source"), "monitor.source")
     if source.get("config_hash") != parent_config_hash:
@@ -158,12 +296,47 @@ def verify_monitor_sources(
     if ledger.get("sha256") != source.get("trial_ledger_sha256"):
         raise ValueError("monitor trial ledger 身份与 summary 不一致")
     family = _text(monitor.get("family"), "monitor.family")
-    recomputed = monitor_family_run(
+    return monitor_family_run(
         root,
         summary_path,
         family,
         config,
         parent_config_hash,
+        prior_paths,
+    )
+
+
+def verify_monitor_sources(
+    repository_root: Path,
+    config: Mapping[str, object],
+    monitor: Mapping[str, object],
+    parent_config_hash: str,
+) -> None:
+    """验证 v6 监视器的完整历史来源并重算实际消费结论。"""
+    root = repository_root.resolve()
+    source = _object(monitor.get("source"), "monitor.source")
+    raw_history_sources = source.get("history_summaries")
+    if not isinstance(raw_history_sources, list):
+        raise ValueError("monitor 来源缺少历史 summary 注册表")
+    prior_paths: list[Path] = []
+    for index, raw_history in enumerate(raw_history_sources):
+        history_source = _object(
+            raw_history, f"monitor.source.history_summaries.{index}",
+        )
+        history_path = _source_path(
+            root,
+            history_source.get("summary_path"),
+            f"monitor.source.history_summaries.{index}.summary_path",
+        )
+        if sha256_file(history_path) != history_source.get("summary_sha256"):
+            raise ValueError("monitor 历史 summary 散列不匹配")
+        prior_paths.append(history_path)
+    recomputed = _recompute_monitor_sources(
+        repository_root,
+        config,
+        monitor,
+        parent_config_hash,
+        tuple(prior_paths),
     )
     consumed_fields = (
         "monitor_method_version",
@@ -180,6 +353,10 @@ def verify_monitor_sources(
         "candidate_count",
         "best_fixed_candidate_sharpe",
         "evolution_action",
+        "cross_run_direction",
+        "history",
+        "excluded_history",
+        "history_policy",
         "parameter_directions",
         "source",
     )
@@ -190,6 +367,66 @@ def verify_monitor_sources(
     if mismatches:
         raise ValueError(
             "monitor 与来源事实重算不一致: " + ", ".join(mismatches)
+        )
+
+
+def _verify_legacy_single_vintage_monitor(
+    repository_root: Path,
+    config: Mapping[str, object],
+    monitor: Mapping[str, object],
+    parent_config_hash: str,
+) -> None:
+    """复核未登记历史路径的 v5，仅允许其证明同 vintage 轴提案。"""
+    if monitor.get("monitor_method_version") != "family-direction-monitor-v5":
+        raise ValueError("历史 monitor 方法版本不受支持")
+    if (
+        monitor.get("cross_run_direction") != "insufficient_history"
+        or monitor.get("history") != []
+        or monitor.get("excluded_history") != []
+    ):
+        raise ValueError("v5 monitor 不能证明跨 vintage 历史")
+    recomputed = _recompute_monitor_sources(
+        repository_root,
+        config,
+        monitor,
+        parent_config_hash,
+        (),
+    )
+    consumed_fields = (
+        "run_id",
+        "research_identity",
+        "data_vintage_id",
+        "decision_time",
+        "family",
+        "eligible",
+        "rejection_reasons",
+        "adjusted_sharpe",
+        "fdr_q",
+        "latest_unallocated_target",
+        "candidate_count",
+        "best_fixed_candidate_sharpe",
+        "evolution_action",
+        "cross_run_direction",
+        "history",
+        "excluded_history",
+        "history_policy",
+        "parameter_directions",
+    )
+    mismatches = [
+        field for field in consumed_fields
+        if monitor.get(field) != recomputed.get(field)
+    ]
+    source = dict(_object(monitor.get("source"), "legacy monitor.source"))
+    recomputed_source = dict(_object(
+        recomputed.get("source"), "recomputed legacy monitor.source",
+    ))
+    recomputed_source.pop("history_summaries", None)
+    if source != recomputed_source:
+        mismatches.append("source")
+    if mismatches:
+        raise ValueError(
+            "v5 monitor 与单 vintage 来源重算不一致: "
+            + ", ".join(mismatches)
         )
 
 
@@ -214,10 +451,14 @@ def _axis_map(strategy: Mapping[str, object]) -> Mapping[str, str]:
     return result
 
 
-def propose_family_evolution(
+def _propose_family_evolution(
     repository_root: Path,
     config_path: Path,
     monitor_path: Path,
+    prior_proposal_paths: Sequence[Path],
+    *,
+    enforce_novelty: bool,
+    verify_monitor: bool,
 ) -> tuple[Mapping[str, object], Mapping[str, object] | None]:
     """扩展一个预登记数值轴，不直接覆盖基准配置。"""
     (
@@ -233,7 +474,10 @@ def propose_family_evolution(
     monitor, monitor_relative, monitor_hash = _load_monitor_artifact(
         repository_root, monitor_path,
     )
-    verify_monitor_sources(repository_root, config, monitor, parent_config_hash)
+    if verify_monitor:
+        verify_monitor_sources(
+            repository_root, config, monitor, parent_config_hash,
+        )
     family = str(monitor.get("family"))
     source = _object(monitor.get("source"), "monitor.source")
     source_summary_hash = source.get("summary_sha256")
@@ -246,8 +490,77 @@ def propose_family_evolution(
         raise ValueError("monitor 缺少合法 source summary hash")
     if not isinstance(source_ledger_hash, str) or len(source_ledger_hash) != 64:
         raise ValueError("monitor 缺少合法 source trial ledger hash")
+    excluded_proposal_history: list[Mapping[str, object]] = []
+    prior_records: list[tuple[Mapping[str, object], str, str]] = []
+    root = repository_root.resolve()
+    if enforce_novelty:
+        for prior_path in sorted(
+            {path.resolve() for path in prior_proposal_paths},
+            key=lambda path: path.as_posix(),
+        ):
+            try:
+                prior_path.relative_to(root)
+            except ValueError as error:
+                raise ValueError("历史提案必须位于项目目录内") from error
+            try:
+                prior_records.append(_load_proposal_artifact(
+                    root, prior_path,
+                ))
+            except (OSError, RecursionError, ValueError) as error:
+                exclusion: dict[str, object] = {
+                    "path": prior_path.relative_to(root).as_posix(),
+                    "reason": "unreadable_or_invalid_proposal_artifact",
+                    "detail": str(error),
+                }
+                try:
+                    exclusion["sha256"] = sha256_file(prior_path)
+                except OSError:
+                    pass
+                excluded_proposal_history.append(exclusion)
+    prior_records.sort(key=lambda item: (item[1], item[2]))
+    governance_records = [
+        record for record in prior_records
+        if record[0].get("status") == "proposed"
+    ]
+    verified_governance_records: list[
+        tuple[Mapping[str, object], str, str]
+    ] = []
+    for prior, prior_relative, prior_hash in governance_records:
+        if prior.get("family") != family:
+            excluded_proposal_history.append({
+                "path": prior_relative,
+                "sha256": prior_hash,
+                "reason": "different_strategy_family",
+            })
+            continue
+        if prior.get("parent_config_hash") != parent_config_hash:
+            excluded_proposal_history.append({
+                "path": prior_relative,
+                "sha256": prior_hash,
+                "reason": "different_parent_config",
+            })
+            continue
+        try:
+            _verify_prior_proposal_source(
+                repository_root,
+                config_path,
+                config,
+                parent_config_hash,
+                prior,
+            )
+        except (OSError, ValueError) as error:
+            excluded_proposal_history.append({
+                "path": prior_relative,
+                "sha256": prior_hash,
+                "reason": "unverified_proposal_source",
+                "detail": str(error),
+            })
+            continue
+        verified_governance_records.append((
+            prior, prior_relative, prior_hash,
+        ))
     evidence = {
-        "proposal_method_version": "family-evolution-proposal-v2",
+        "proposal_method_version": "family-evolution-proposal-v3",
         "parent_config_hash": parent_config_hash,
         "source_run_id": monitor.get("run_id"),
         "source_monitor_method_version": monitor.get("monitor_method_version"),
@@ -258,7 +571,14 @@ def propose_family_evolution(
         "source_manifest_sha256": source.get("manifest_sha256"),
         "source_panel_sha256": source.get("panel_sha256"),
         "source_code_identity": source.get("code_identity"),
-        "evidence_scope": "single_vintage_candidate_axis",
+        "source_data_vintage_id": monitor.get("data_vintage_id"),
+        "source_cross_run_direction": monitor.get("cross_run_direction"),
+        "proposal_history": [
+            {"path": relative, "sha256": digest}
+            for _proposal, relative, digest in governance_records
+        ],
+        "excluded_proposal_history": excluded_proposal_history,
+        "evidence_scope": "cross_vintage_proposal_history_gate",
         "holdout_consumed": False,
     }
 
@@ -338,6 +658,49 @@ def propose_family_evolution(
         for item in original_items
     )
     stored_value: int | float = int(round(proposed_value)) if integral else proposed_value
+    duplicate_candidates: list[
+        tuple[bool, Mapping[str, object], str, str]
+    ] = []
+    for prior, prior_relative, prior_hash in verified_governance_records:
+        same_axis_value = (
+            prior.get("family") == family
+            and prior.get("parent_config_hash") == parent_config_hash
+            and prior.get("parameter") == parameter
+            and prior.get("proposed_value") == stored_value
+        )
+        if not same_axis_value:
+            continue
+        prior_panel = prior.get("source_panel_sha256")
+        current_panel = evidence.get("source_panel_sha256")
+        same_vintage = (
+            isinstance(prior_panel, str)
+            and bool(prior_panel)
+            and prior_panel == current_panel
+        )
+        duplicate_candidates.append((
+            same_vintage, prior, prior_relative, prior_hash,
+        ))
+    duplicate_candidates.sort(
+        key=lambda item: (not item[0], item[2], item[3]),
+    )
+    for same_vintage, prior, prior_relative, prior_hash in duplicate_candidates:
+        prior_panel = prior.get("source_panel_sha256")
+        insufficient_new_history = (
+            monitor.get("cross_run_direction") == "insufficient_history"
+        )
+        if same_vintage or insufficient_new_history:
+            return no_proposal(
+                "duplicate_axis_value_proposal",
+                parameter=parameter,
+                proposed_value=stored_value,
+                duplicate_basis=(
+                    "same_data_vintage"
+                    if same_vintage else "insufficient_new_history"
+                ),
+                prior_proposal_path=prior_relative,
+                prior_proposal_sha256=prior_hash,
+                prior_source_panel_sha256=prior_panel,
+            )
     proposed_strategy[config_key] = sorted(set([
         *proposed_strategy[config_key], stored_value,
     ]))
@@ -385,3 +748,36 @@ def propose_family_evolution(
         **evidence,
     }
     return proposal, proposed
+
+
+def propose_family_evolution(
+    repository_root: Path,
+    config_path: Path,
+    monitor_path: Path,
+    prior_proposal_paths: Sequence[Path],
+) -> tuple[Mapping[str, object], Mapping[str, object] | None]:
+    """扩展一个新颖的预登记数值轴，强制消费历史提案门禁。"""
+    root = repository_root.resolve()
+    monitor, _relative, _digest = _load_monitor_artifact(root, monitor_path)
+    family = _text(monitor.get("family"), "monitor.family")
+    if Path(family).name != family:
+        raise ValueError("monitor.family 不能用于提案目录")
+    canonical_history = (
+        root / "reports" / "strategy-research" / "evolution-proposals"
+        / family
+    )
+    governed_paths = tuple(sorted(
+        {
+            *(path.resolve() for path in prior_proposal_paths),
+            *canonical_history.glob("proposal-sha256-*.json"),
+        },
+        key=lambda path: path.as_posix(),
+    ))
+    return _propose_family_evolution(
+        root,
+        config_path,
+        monitor_path,
+        governed_paths,
+        enforce_novelty=True,
+        verify_monitor=True,
+    )
