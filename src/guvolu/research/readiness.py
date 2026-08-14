@@ -10,6 +10,7 @@ from guvolu.research.config_lineage import (
     load_governed_strategy_config,
     verified_config_lineage_paths,
 )
+from guvolu.research.data_location import resolve_data_root_locator
 from guvolu.research.features import compute_features
 from guvolu.research.governance import (
     HoldoutVintage,
@@ -125,6 +126,9 @@ def strategy_readiness(
     config_source_paths = verified_config_lineage_paths(root, config_file)
     verified = verify_research_run(root, manifest_path)
     manifest = _read_object(verified.manifest_path, "research manifest")
+    source_data_root = resolve_data_root_locator(
+        root, manifest.get("source_data_root"),
+    )
     artifacts = _object(manifest.get("artifacts"), "manifest.artifacts")
     summary_record = _object(
         artifacts.get("summary_json"), "manifest.artifacts.summary_json",
@@ -132,7 +136,7 @@ def strategy_readiness(
     summary_path = _resolve(root, summary_record.get("path"), "summary path")
     summary = _read_object(summary_path, "research summary")
     market_id = _text(summary.get("market_id"), "summary.market_id")
-    current_inputs = freeze_trade_inputs(root / "data", market_id)
+    current_inputs = freeze_trade_inputs(source_data_root, market_id)
     identity = code_identity(root, config_source_paths)
     source_identity = _object(summary.get("code_identity"), "summary.code_identity")
     source_tree_digest = _text(
@@ -291,6 +295,7 @@ def strategy_readiness(
         "summary_path": summary_path.relative_to(root).as_posix(),
         "market_id": market_id,
         "source": {
+            "data_root": manifest.get("source_data_root"),
             "decision_grade": summary.get("decision_grade"),
             "eligible_families": list(eligible_families),
             "config_matches": config_matches,
