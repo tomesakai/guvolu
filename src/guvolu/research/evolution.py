@@ -26,6 +26,7 @@ _COMPARISON_METHOD_FIELDS = (
     "p_value_method_version",
     "pbo_method_version",
     "block_bootstrap_method_version",
+    "regime_attribution_method_version",
     "deflated_sharpe_method_version",
     "effective_trial_method_version",
     "parameter_stability_method_version",
@@ -162,7 +163,9 @@ def _comparison_cohort_payload(
             summary.get("config_lineage_root_hash") or summary.get("config_hash")
         ),
         "method_versions": {
-            field: summary.get(field) for field in _COMPARISON_METHOD_FIELDS
+            field: summary.get(field)
+            for field in _COMPARISON_METHOD_FIELDS
+            if field in summary
         },
     }
 

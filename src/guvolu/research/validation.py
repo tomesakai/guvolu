@@ -13,8 +13,10 @@ from dataclasses import dataclass, field
 from guvolu.research.contracts import (
     FamilyEvaluation,
     PerformanceMetrics,
+    RegimeAttribution,
     TrialRecord,
 )
+from guvolu.research.features import classify_market_state
 from guvolu.research.provenance import stable_identifier
 from guvolu.strategy.baselines import generate_targets
 from guvolu.strategy.contracts import CandidateSpec, FeatureRow, ResearchBar
@@ -27,6 +29,15 @@ BLOCK_BOOTSTRAP_METHOD_VERSION = "studentized-circular-block-sharpe-v2"
 DEFLATED_SHARPE_METHOD_VERSION = "deflated-sharpe-family-effective-gate-v3"
 EFFECTIVE_TRIAL_METHOD_VERSION = "fold-score-correlation-participation-v1"
 PARAMETER_STABILITY_METHOD_VERSION = "one-axis-nearest-neighbor-v1"
+REGIME_ATTRIBUTION_METHOD_VERSION = "predecision-stitched-oos-regime-v1"
+_REGIME_ATTRIBUTION_ORDER = (
+    "jump_risk",
+    "positive_trend",
+    "negative_trend",
+    "range",
+    "mixed",
+    "unavailable",
+)
 _INTERVAL_SECONDS = {
     "5min": 300.0,
     "15min": 900.0,
@@ -58,6 +69,7 @@ class ValidationResult:
         default_factory=dict,
     )
     block_bootstrap_method_version: str = BLOCK_BOOTSTRAP_METHOD_VERSION
+    regime_attribution_method_version: str | None = None
 
 
 @dataclass(frozen=True)
@@ -80,6 +92,7 @@ class _PendingFamily:
     bootstrap_lower: float
     bootstrap_p: float
     bootstrap_count: int
+    regime_attribution: tuple[RegimeAttribution, ...]
 
 
 def _mapping(value: object, name: str) -> Mapping[str, object]:
@@ -589,6 +602,81 @@ def _studentized_circular_block_bootstrap_sharpe(
     )
 
 
+def _stitched_oos_regime_attribution(
+    features: Sequence[FeatureRow],
+    targets: Sequence[float],
+    returns: Sequence[float],
+    oos_mask: Sequence[bool],
+    state_lookback: int,
+    periods_per_year: float,
+) -> tuple[RegimeAttribution, ...]:
+    """按收益区间开始前的状态归因 stitched OOS，不参与选择。"""
+    count = len(features)
+    if not (
+        len(targets) == count
+        and len(returns) == count
+        and len(oos_mask) == count
+    ):
+        raise ValueError("regime attribution 输入长度不一致")
+    if state_lookback <= 1 or periods_per_year <= 0.0:
+        raise ValueError("regime attribution 配置无效")
+    buckets: dict[str, list[tuple[float, float]]] = {
+        regime: [] for regime in _REGIME_ATTRIBUTION_ORDER
+    }
+    for index in range(1, count):
+        if not oos_mask[index]:
+            continue
+        feature = features[index - 1]
+        if (
+            not feature.contiguous
+            or feature.trend_scores.get(state_lookback) is None
+        ):
+            regime = "unavailable"
+        else:
+            regime = classify_market_state(
+                feature,
+                state_lookback,
+                feature.volume_score,
+                periods_per_year,
+            ).regime
+        buckets[regime].append((returns[index], targets[index - 1]))
+    total_bars = sum(len(values) for values in buckets.values())
+    result: list[RegimeAttribution] = []
+    for regime in _REGIME_ATTRIBUTION_ORDER:
+        values = buckets[regime]
+        regime_bars = len(values)
+        regime_returns = [value for value, _target in values]
+        regime_targets = [target for _value, target in values]
+        mean_return = statistics.fmean(regime_returns) if values else 0.0
+        period_volatility = statistics.pstdev(regime_returns) if values else 0.0
+        annualized_sharpe = (
+            mean_return / period_volatility * math.sqrt(periods_per_year)
+            if period_volatility > 0.0 else 0.0
+        )
+        result.append(RegimeAttribution(
+            regime=regime,
+            bars=regime_bars,
+            bar_share=regime_bars / total_bars if total_bars else 0.0,
+            net_log_return=sum(regime_returns),
+            mean_return=mean_return,
+            period_volatility=period_volatility,
+            annualized_sharpe=annualized_sharpe,
+            hit_rate=(
+                sum(value > 0.0 for value in regime_returns) / regime_bars
+                if regime_bars else 0.0
+            ),
+            active_target_share=(
+                sum(abs(target) > 1e-12 for target in regime_targets) / regime_bars
+                if regime_bars else 0.0
+            ),
+            mean_absolute_target=(
+                statistics.fmean(abs(target) for target in regime_targets)
+                if regime_bars else 0.0
+            ),
+        ))
+    return tuple(result)
+
+
 def make_folds(bar_count: int, config: Mapping[str, object]) -> tuple[WalkForwardFold, ...]:
     """生成带 embargo 的扩展 walk-forward。"""
     minimum_train = _integer(config.get("minimum_train_bars"), "minimum_train_bars")
@@ -872,6 +960,9 @@ def walk_forward_validate(
     decision_index: int | None = None,
     *,
     block_bootstrap_method_version: str = BLOCK_BOOTSTRAP_METHOD_VERSION,
+    regime_attribution_method_version: str | None = (
+        REGIME_ATTRIBUTION_METHOD_VERSION
+    ),
 ) -> ValidationResult:
     """按家族训练选择并只消费被选测试路径。"""
     if block_bootstrap_method_version not in {
@@ -879,6 +970,11 @@ def walk_forward_validate(
         BLOCK_BOOTSTRAP_METHOD_VERSION,
     }:
         raise ValueError("block bootstrap 方法版本不受支持")
+    if regime_attribution_method_version not in {
+        None,
+        REGIME_ATTRIBUTION_METHOD_VERSION,
+    }:
+        raise ValueError("regime attribution 方法版本不受支持")
     cost = _mapping(config.get("cost_model"), "cost_model")
     cost_bps = sum(_number(cost.get(name), name) for name in (
         "fee_bps_assumption",
@@ -894,6 +990,9 @@ def walk_forward_validate(
     if not isinstance(interval, str) or interval not in _INTERVAL_SECONDS:
         raise ValueError("bar_interval 不支持成本回放")
     feature_config = _mapping(config.get("features"), "features")
+    state_lookback = _integer(
+        feature_config.get("state_lookback"), "state_lookback",
+    )
     structural_gap_bars = _integer(
         feature_config.get("maximum_structural_gap_bars_assumption"),
         "maximum_structural_gap_bars_assumption",
@@ -1142,6 +1241,18 @@ def walk_forward_validate(
             )
         )
         family_validation_targets[family] = tuple(oos_targets)
+        regime_attribution = (
+            _stitched_oos_regime_attribution(
+                features,
+                oos_targets,
+                oos_returns,
+                oos_mask,
+                state_lookback,
+                periods_per_year,
+            )
+            if regime_attribution_method_version is not None
+            else ()
+        )
         pending.append(_PendingFamily(
             family=family,
             mode=selected_full.mode,
@@ -1159,6 +1270,7 @@ def walk_forward_validate(
             bootstrap_lower=bootstrap_lower,
             bootstrap_p=bootstrap_p,
             bootstrap_count=bootstrap_count,
+            regime_attribution=regime_attribution,
         ))
     candidate_oos_metrics: dict[str, PerformanceMetrics] = {}
     for candidate in candidates:
@@ -1376,6 +1488,7 @@ def walk_forward_validate(
             cscv_out_sample_fold_count=cscv_used_fold_count // 2,
             cscv_excluded_fold_count=len(folds) - cscv_used_fold_count,
             periods_per_year=periods_per_year,
+            regime_attribution=item.regime_attribution,
         ))
     return ValidationResult(
         families=tuple(sorted(evaluations, key=lambda item: item.family)),
@@ -1384,6 +1497,7 @@ def walk_forward_validate(
         folds=folds,
         family_validation_targets=family_validation_targets,
         block_bootstrap_method_version=block_bootstrap_method_version,
+        regime_attribution_method_version=regime_attribution_method_version,
     )
 
 

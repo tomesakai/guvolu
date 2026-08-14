@@ -4,7 +4,11 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 
-from guvolu.research.contracts import AllocationResult, PanelSnapshot
+from guvolu.research.contracts import (
+    AllocationResult,
+    PanelSnapshot,
+    RegimeAttribution,
+)
 from guvolu.research.features import MarketState
 from guvolu.research.provenance import canonical_json
 from guvolu.research.validation import (
@@ -59,7 +63,7 @@ def trial_ledger_body(
     research_identity: str,
 ) -> str:
     """生成包含所有候选事实的规范 JSONL 字节文本。"""
-    rows = [canonical_json({
+    header: dict[str, object] = {
         "record_type": "trial_ledger_header",
         "schema_version": PIPELINE_SCHEMA_VERSION,
         "research_identity": research_identity,
@@ -69,7 +73,12 @@ def trial_ledger_body(
         "block_bootstrap_method_version": (
             validation.block_bootstrap_method_version
         ),
-    })]
+    }
+    if validation.regime_attribution_method_version is not None:
+        header["regime_attribution_method_version"] = (
+            validation.regime_attribution_method_version
+        )
+    rows = [canonical_json(header)]
     for trial in sorted(validation.trials, key=lambda item: item.evaluation_id):
         selection_role = "none"
         if trial.selected:
@@ -235,52 +244,83 @@ def market_state_payload(value: MarketState) -> Mapping[str, object]:
 
 def family_payload(validation: ValidationResult) -> list[Mapping[str, object]]:
     """生成稳定家族级评估摘要。"""
-    return [{
-        "family": item.family,
-        "mode": item.mode,
-        "deployment_candidate_id": item.deployment_candidate.candidate_id,
-        "deployment_parameters": dict(item.deployment_candidate.parameters),
-        "walk_forward_selection_path": list(item.fold_selected_candidate_ids),
-        "latest_unallocated_target": item.latest_target,
-        "validation_metrics": metrics_payload(item.metrics),
-        "deployment_oos_metrics": metrics_payload(item.deployment_oos_metrics),
-        "metrics": metrics_payload(item.metrics),
-        "adjusted_sharpe": item.adjusted_sharpe,
-        "fdr_q": item.fdr_q,
-        "eligible": item.eligible,
-        "rejection_reasons": list(item.rejection_reasons),
-        "positive_fold_ratio": item.positive_fold_ratio,
-        "most_selected_candidate_share": item.most_selected_candidate_share,
-        "median_selected_fold_sharpe": item.median_selected_fold_sharpe,
-        "probability_backtest_overfitting": item.probability_backtest_overfitting,
-        "median_cscv_oos_rank": item.median_cscv_oos_rank,
-        "cscv_split_count": item.cscv_split_count,
-        "cscv_in_sample_fold_count": item.cscv_in_sample_fold_count,
-        "cscv_out_sample_fold_count": item.cscv_out_sample_fold_count,
-        "cscv_excluded_fold_count": item.cscv_excluded_fold_count,
-        "block_bootstrap_sharpe_lower_bound": (
-            item.block_bootstrap_sharpe_lower_bound
-        ),
-        "block_bootstrap_p_value": item.block_bootstrap_p_value,
-        "block_bootstrap_sample_count": item.block_bootstrap_sample_count,
-        "deflated_sharpe_probability_raw": item.deflated_sharpe_probability_raw,
-        "deflated_sharpe_probability_effective": (
-            item.deflated_sharpe_probability_effective
-        ),
-        "deflated_sharpe_benchmark_raw": item.deflated_sharpe_benchmark_raw,
-        "deflated_sharpe_benchmark_effective": (
-            item.deflated_sharpe_benchmark_effective
-        ),
-        "raw_trial_count": item.raw_trial_count,
-        "effective_trial_count": item.effective_trial_count,
-        "parameter_neighbor_count": item.parameter_neighbor_count,
-        "positive_parameter_neighbor_ratio": (
-            item.positive_parameter_neighbor_ratio
-        ),
-        "median_parameter_neighbor_sharpe_retention": (
-            item.median_parameter_neighbor_sharpe_retention
-        ),
-    } for item in validation.families]
+    payloads: list[Mapping[str, object]] = []
+    for item in validation.families:
+        payload: dict[str, object] = {
+            "family": item.family,
+            "mode": item.mode,
+            "deployment_candidate_id": item.deployment_candidate.candidate_id,
+            "deployment_parameters": dict(item.deployment_candidate.parameters),
+            "walk_forward_selection_path": list(item.fold_selected_candidate_ids),
+            "latest_unallocated_target": item.latest_target,
+            "validation_metrics": metrics_payload(item.metrics),
+            "deployment_oos_metrics": metrics_payload(item.deployment_oos_metrics),
+            "metrics": metrics_payload(item.metrics),
+            "adjusted_sharpe": item.adjusted_sharpe,
+            "fdr_q": item.fdr_q,
+            "eligible": item.eligible,
+            "rejection_reasons": list(item.rejection_reasons),
+            "positive_fold_ratio": item.positive_fold_ratio,
+            "most_selected_candidate_share": item.most_selected_candidate_share,
+            "median_selected_fold_sharpe": item.median_selected_fold_sharpe,
+            "probability_backtest_overfitting": (
+                item.probability_backtest_overfitting
+            ),
+            "median_cscv_oos_rank": item.median_cscv_oos_rank,
+            "cscv_split_count": item.cscv_split_count,
+            "cscv_in_sample_fold_count": item.cscv_in_sample_fold_count,
+            "cscv_out_sample_fold_count": item.cscv_out_sample_fold_count,
+            "cscv_excluded_fold_count": item.cscv_excluded_fold_count,
+            "block_bootstrap_sharpe_lower_bound": (
+                item.block_bootstrap_sharpe_lower_bound
+            ),
+            "block_bootstrap_p_value": item.block_bootstrap_p_value,
+            "block_bootstrap_sample_count": item.block_bootstrap_sample_count,
+            "deflated_sharpe_probability_raw": (
+                item.deflated_sharpe_probability_raw
+            ),
+            "deflated_sharpe_probability_effective": (
+                item.deflated_sharpe_probability_effective
+            ),
+            "deflated_sharpe_benchmark_raw": item.deflated_sharpe_benchmark_raw,
+            "deflated_sharpe_benchmark_effective": (
+                item.deflated_sharpe_benchmark_effective
+            ),
+            "raw_trial_count": item.raw_trial_count,
+            "effective_trial_count": item.effective_trial_count,
+            "parameter_neighbor_count": item.parameter_neighbor_count,
+            "positive_parameter_neighbor_ratio": (
+                item.positive_parameter_neighbor_ratio
+            ),
+            "median_parameter_neighbor_sharpe_retention": (
+                item.median_parameter_neighbor_sharpe_retention
+            ),
+        }
+        if validation.regime_attribution_method_version is not None:
+            payload["regime_attribution"] = [
+                regime_attribution_payload(value)
+                for value in item.regime_attribution
+            ]
+        payloads.append(payload)
+    return payloads
+
+
+def regime_attribution_payload(
+    value: RegimeAttribution,
+) -> Mapping[str, object]:
+    """序列化非选择性的 stitched OOS 状态归因。"""
+    return {
+        "regime": value.regime,
+        "bars": value.bars,
+        "bar_share": value.bar_share,
+        "net_log_return": value.net_log_return,
+        "mean_return": value.mean_return,
+        "period_volatility": value.period_volatility,
+        "annualized_sharpe": value.annualized_sharpe,
+        "hit_rate": value.hit_rate,
+        "active_target_share": value.active_target_share,
+        "mean_absolute_target": value.mean_absolute_target,
+    }
 
 
 def position_contract_payload(

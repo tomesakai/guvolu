@@ -19,6 +19,7 @@ from guvolu.data.materialize import ensure_markets
 from guvolu.research.allocator import _covariance, allocate
 from guvolu.research.artifact_contracts import (
     cost_replay_body,
+    family_payload,
     market_state_payload,
     position_contract_payload,
     trial_ledger_body,
@@ -32,6 +33,7 @@ from guvolu.research.contracts import (
     PanelSnapshot,
     PerformanceMetrics,
     QualityVector,
+    RegimeAttribution,
     TrialRecord,
 )
 from guvolu.research.data_location import (
@@ -63,6 +65,7 @@ from guvolu.research.quality import gate_feature_snapshot, panel_quality
 from guvolu.research.validation import (
     BLOCK_BOOTSTRAP_METHOD_VERSION,
     LEGACY_BLOCK_BOOTSTRAP_METHOD_VERSION,
+    REGIME_ATTRIBUTION_METHOD_VERSION,
     ValidationResult,
     WalkForwardFold,
     _circular_block_bootstrap_sharpe,
@@ -73,6 +76,7 @@ from guvolu.research.validation import (
     _probabilistic_sharpe_p_value,
     _probability_backtest_overfitting,
     _studentized_circular_block_bootstrap_sharpe,
+    _stitched_oos_regime_attribution,
     strategy_returns,
 )
 from guvolu.research.verification import _verify_operational_gate, verify_research_run
@@ -124,6 +128,30 @@ def _metrics() -> PerformanceMetrics:
         cost=0.01,
         p_value=0.02,
         capacity_score=1.0,
+    )
+
+
+def _regime_feature(
+    hour: int,
+    trend: float | None,
+    *,
+    jump: float | None = 0.0,
+    contiguous: bool = True,
+) -> FeatureRow:
+    """生成只含预决策状态所需字段的测试特征。"""
+    return FeatureRow(
+        decision_time=_time(hour),
+        as_of=_time(hour),
+        return_one=0.0,
+        trend_scores={3: trend},
+        volatility={3: 0.01 if trend is not None else None},
+        price_scores={3: 0.0},
+        prior_highs={3: 1.0},
+        prior_lows={3: 1.0},
+        flow_imbalance=0.0,
+        volume_score=0.0,
+        jump_score=jump,
+        contiguous=contiguous,
     )
 
 
@@ -626,6 +654,46 @@ def test_studentized_block_bootstrap_is_deterministic_and_one_sided() -> None:
         )
 
 
+def test_regime_attribution_uses_predecision_state_and_partitions_oos() -> None:
+    """状态桶须使用区间前特征，且贡献严格加总回 stitched OOS。"""
+    features = (
+        _regime_feature(0, 1.0),
+        _regime_feature(1, 0.0),
+        _regime_feature(2, -1.0),
+        _regime_feature(3, 1.0, jump=5.0),
+        _regime_feature(4, 0.6),
+        _regime_feature(5, 1.0, contiguous=False),
+        _regime_feature(6, -1.0),
+    )
+    targets = (1.0, 0.5, -0.5, 0.25, -0.25, 0.75, 0.0)
+    returns = (0.0, 0.01, -0.02, 0.03, -0.04, 0.05, -0.06)
+    attribution = _stitched_oos_regime_attribution(
+        features,
+        targets,
+        returns,
+        (False, True, True, True, True, True, True),
+        3,
+        365.0 * 24.0,
+    )
+    assert [item.regime for item in attribution] == [
+        "jump_risk",
+        "positive_trend",
+        "negative_trend",
+        "range",
+        "mixed",
+        "unavailable",
+    ]
+    assert [item.bars for item in attribution] == [1, 1, 1, 1, 1, 1]
+    by_regime = {item.regime: item for item in attribution}
+    assert by_regime["positive_trend"].net_log_return == pytest.approx(0.01)
+    assert by_regime["positive_trend"].mean_absolute_target == 1.0
+    assert by_regime["unavailable"].net_log_return == pytest.approx(-0.06)
+    assert sum(item.net_log_return for item in attribution) == pytest.approx(
+        sum(returns[1:])
+    )
+    assert sum(item.bar_share for item in attribution) == pytest.approx(1.0)
+
+
 def test_trial_ledger_binds_actual_bootstrap_method_version() -> None:
     """历史 verifier 重建 v1 时不得被当前 v2 常量改写 header。"""
     legacy = ValidationResult(
@@ -638,6 +706,7 @@ def test_trial_ledger_binds_actual_bootstrap_method_version() -> None:
     current = replace(
         legacy,
         block_bootstrap_method_version=BLOCK_BOOTSTRAP_METHOD_VERSION,
+        regime_attribution_method_version=REGIME_ATTRIBUTION_METHOD_VERSION,
     )
     legacy_header = json.loads(trial_ledger_body(legacy, "research").splitlines()[0])
     current_header = json.loads(trial_ledger_body(current, "research").splitlines()[0])
@@ -647,6 +716,60 @@ def test_trial_ledger_binds_actual_bootstrap_method_version() -> None:
     assert current_header["block_bootstrap_method_version"] == (
         BLOCK_BOOTSTRAP_METHOD_VERSION
     )
+    assert "regime_attribution_method_version" not in legacy_header
+    assert current_header["regime_attribution_method_version"] == (
+        REGIME_ATTRIBUTION_METHOD_VERSION
+    )
+
+
+def test_family_payload_omits_regime_diagnostic_for_legacy_manifest() -> None:
+    """旧 manifest 重建不得凭当前代码新增状态归因字段。"""
+    candidate = CandidateSpec("candidate", "trend", "paper", {}, 1)
+    attribution = RegimeAttribution(
+        regime="positive_trend",
+        bars=10,
+        bar_share=1.0,
+        net_log_return=0.1,
+        mean_return=0.01,
+        period_volatility=0.02,
+        annualized_sharpe=1.0,
+        hit_rate=0.6,
+        active_target_share=0.8,
+        mean_absolute_target=0.5,
+    )
+    family = FamilyEvaluation(
+        family="trend",
+        mode="paper",
+        deployment_candidate=candidate,
+        latest_target=0.5,
+        deployment_oos_metrics=_metrics(),
+        deployment_oos_returns=(0.01,),
+        metrics=_metrics(),
+        adjusted_sharpe=0.5,
+        fdr_q=0.1,
+        eligible=True,
+        rejection_reasons=(),
+        oos_returns=(0.01,),
+        regime_attribution=(attribution,),
+    )
+    legacy = ValidationResult((family,), (), {}, ())
+    current = replace(
+        legacy,
+        regime_attribution_method_version=REGIME_ATTRIBUTION_METHOD_VERSION,
+    )
+    assert "regime_attribution" not in family_payload(legacy)[0]
+    assert family_payload(current)[0]["regime_attribution"] == [{
+        "regime": "positive_trend",
+        "bars": 10,
+        "bar_share": 1.0,
+        "net_log_return": 0.1,
+        "mean_return": 0.01,
+        "period_volatility": 0.02,
+        "annualized_sharpe": 1.0,
+        "hit_rate": 0.6,
+        "active_target_share": 0.8,
+        "mean_absolute_target": 0.5,
+    }]
 
 
 def test_deflated_sharpe_penalizes_more_trials_and_reports_effective_count() -> None:

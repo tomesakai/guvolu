@@ -127,6 +127,22 @@ class TrialRecord:
 
 
 @dataclass(frozen=True)
+class RegimeAttribution:
+    """一个预决策状态桶对 stitched OOS 的条件贡献。"""
+
+    regime: str
+    bars: int
+    bar_share: float
+    net_log_return: float
+    mean_return: float
+    period_volatility: float
+    annualized_sharpe: float
+    hit_rate: float
+    active_target_share: float
+    mean_absolute_target: float
+
+
+@dataclass(frozen=True)
 class FamilyEvaluation:
     """一个策略家族的 walk-forward 结果。"""
 
@@ -165,6 +181,7 @@ class FamilyEvaluation:
     cscv_out_sample_fold_count: int = 0
     cscv_excluded_fold_count: int = 0
     periods_per_year: float = 365.0 * 24.0
+    regime_attribution: tuple[RegimeAttribution, ...] = ()
 
 
 @dataclass(frozen=True)

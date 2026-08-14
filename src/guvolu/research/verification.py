@@ -52,6 +52,7 @@ _RUN_IDENTITY_FIELDS = (
     "p_value_method_version",
     "pbo_method_version",
     "block_bootstrap_method_version",
+    "regime_attribution_method_version",
     "deflated_sharpe_method_version",
     "effective_trial_method_version",
     "parameter_stability_method_version",
@@ -246,6 +247,7 @@ def _attest_v12_decision_evidence(
     summary: Mapping[str, object],
     artifact_paths: Mapping[str, Path],
     block_bootstrap_method_version: str,
+    regime_attribution_method_version: str | None,
 ) -> None:
     """从受保护 panel/config 重建候选选择、资格、资金权重和回放。"""
     batches = build_family_batches(config, family_scope)
@@ -287,6 +289,7 @@ def _attest_v12_decision_evidence(
         config,
         decision_index=decision_index,
         block_bootstrap_method_version=block_bootstrap_method_version,
+        regime_attribution_method_version=regime_attribution_method_version,
     )
     interval = _text(config.get("bar_interval"), "bar_interval")
     interval_seconds = INTERVAL_SECONDS.get(interval)
@@ -501,6 +504,17 @@ def _verify_run_identity(
             )
         if rebuilt.panel_sha256 != sha256_file(panel_path):
             raise ValueError("v12 panel 不能由注册输入和版本化查询重建")
+        raw_regime_attribution_method = manifest.get(
+            "regime_attribution_method_version"
+        )
+        regime_attribution_method = (
+            None
+            if raw_regime_attribution_method is None
+            else _text(
+                raw_regime_attribution_method,
+                "regime_attribution_method_version",
+            )
+        )
         _attest_v12_decision_evidence(
             rebuilt,
             config,
@@ -512,6 +526,7 @@ def _verify_run_identity(
                 manifest.get("block_bootstrap_method_version"),
                 "block_bootstrap_method_version",
             ),
+            regime_attribution_method,
         )
         if decision_grade:
             assert isinstance(git_hash, str)
@@ -572,6 +587,10 @@ def _verify_run_identity(
         "governance_method_version": manifest.get("governance_method_version"),
         "data_scope": manifest.get("data_scope"),
     }
+    if "regime_attribution_method_version" in manifest:
+        identity_payload["regime_attribution_method_version"] = manifest.get(
+            "regime_attribution_method_version"
+        )
     if method == "strategy-research-pipeline-v12":
         identity_payload["input_receipt_sha256"] = manifest.get(
             "input_receipt_sha256"
