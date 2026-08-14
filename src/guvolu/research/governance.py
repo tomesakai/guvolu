@@ -23,6 +23,7 @@ from guvolu.strategy.expression import (
 )
 
 GOVERNANCE_SCHEMA_VERSION = 4
+SCHEMA_WRITE_CEILING_KEY = "schema_write_ceiling"
 GOVERNANCE_METHOD_VERSION = "research-data-governance-v2"
 _VINTAGE_STATUSES = ("sealed", "consumed")
 
@@ -965,12 +966,97 @@ def _upgrade_governance_state(
         )
 
 
-def _connect(path: Path) -> sqlite3.Connection:
-    """打开治理注册表并初始化固定 schema。"""
+def _schema_write_ceiling(
+    connection: sqlite3.Connection,
+) -> int | None:
+    """读取可选的部署写入上限；旧 reader 会忽略这个附加元数据。"""
+    table = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='governance_meta'"
+    ).fetchone()
+    if table is None:
+        return None
+    row = connection.execute(
+        "SELECT value FROM governance_meta WHERE key=?",
+        (SCHEMA_WRITE_CEILING_KEY,),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        ceiling = int(str(row["value"]))
+    except ValueError as error:
+        raise ValueError("治理库 schema 写入上限不是整数") from error
+    if ceiling < 1 or ceiling > GOVERNANCE_SCHEMA_VERSION:
+        raise ValueError("治理库 schema 写入上限超出支持范围")
+    return ceiling
+
+
+def _validate_pinned_read_schema(
+    connection: sqlite3.Connection,
+    existing_version: str | None,
+    ceiling: int,
+) -> None:
+    """证明低版本标记下的物理表足以供当前 reader 无副作用读取。"""
+    if existing_version != str(ceiling):
+        raise ValueError("治理库 schema 标记与写入上限不一致")
+    probes = (
+        "SELECT key,value FROM governance_meta LIMIT 0",
+        "SELECT exposure_id,research_identity,market_id,start_time,end_time,"
+        "recorded_at FROM research_exposure LIMIT 0",
+        "SELECT vintage_id,market_id,start_time,end_time,sealed_at,status,"
+        "consumed_at,candidate_set_hash,evaluation_id,verdict,"
+        "verdict_recorded_at FROM holdout_vintage LIMIT 0",
+        "SELECT plan_id,vintage_id,source_manifest_sha256,candidate_set_hash,"
+        "config_hash,code_tree_digest,plan_artifact_path,plan_artifact_sha256,"
+        "frozen_at FROM frozen_forward_plan LIMIT 0",
+        "SELECT evaluation_id,vintage_id,candidate_set_hash,status,stage,"
+        "started_at,updated_at,completed_at,result_manifest_path,"
+        "result_manifest_sha256 FROM holdout_evaluation_attempt LIMIT 0",
+        "SELECT prediction_id,plan_id,vintage_id,decision_time,"
+        "input_head_generation,panel_sha256,prediction_artifact_path,"
+        "prediction_artifact_sha256,recorded_at "
+        "FROM frozen_forward_prediction LIMIT 0",
+    )
+    try:
+        for statement in probes:
+            connection.execute(statement)
+        violation = _terminal_invariant_violation(connection)
+    except sqlite3.DatabaseError as error:
+        raise ValueError(
+            "治理库写入已冻结，但物理 schema 不兼容当前只读代码"
+        ) from error
+    if violation is not None:
+        raise ValueError(
+            "治理库存在不一致的 holdout 终态: "
+            + str(violation["vintage_id"])
+        )
+
+
+def _connect(path: Path, *, write: bool = False) -> sqlite3.Connection:
+    """打开治理库；部署写入上限存在时允许兼容读取并拒绝新 writer。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path, timeout=30.0, isolation_level=None)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys=ON")
+    try:
+        ceiling = _schema_write_ceiling(connection)
+        if ceiling is not None and GOVERNANCE_SCHEMA_VERSION > ceiling:
+            existing = connection.execute(
+                "SELECT value FROM governance_meta WHERE key='schema_version'"
+            ).fetchone()
+            if write:
+                raise ValueError(
+                    "治理库 schema 写入已冻结在版本 " + str(ceiling)
+                )
+            _validate_pinned_read_schema(
+                connection,
+                None if existing is None else str(existing["value"]),
+                ceiling,
+            )
+            return connection
+    except BaseException:
+        connection.close()
+        raise
     connection.execute("PRAGMA journal_mode=WAL")
     connection.execute("PRAGMA synchronous=FULL")
     connection.executescript(
@@ -1103,7 +1189,7 @@ def register_research_exposure(
         "start_time": start.isoformat(),
         "end_time": end.isoformat(),
     })
-    connection = _connect(registry_path)
+    connection = _connect(registry_path, write=True)
     try:
         _begin(connection)
         protected = connection.execute(
@@ -1183,7 +1269,7 @@ def seal_holdout_vintage(
         "start_time": start.isoformat(),
         "end_time": end.isoformat(),
     })
-    connection = _connect(registry_path)
+    connection = _connect(registry_path, write=True)
     try:
         _begin(connection)
         exposed = connection.execute(
@@ -1247,7 +1333,7 @@ def start_holdout_evaluation_attempt(
     if not candidate_set_hash or not evaluation_id:
         raise ValueError("评估封存段必须绑定 candidate_set_hash 与 evaluation_id")
     started = clock.utc_now()
-    connection = _connect(registry_path)
+    connection = _connect(registry_path, write=True)
     try:
         _begin(connection)
         vintage = connection.execute(
@@ -1302,7 +1388,7 @@ def update_holdout_evaluation_attempt(
     if not normalized:
         raise ValueError("holdout 评估阶段不得为空")
     updated = clock.utc_now()
-    connection = _connect(registry_path)
+    connection = _connect(registry_path, write=True)
     try:
         _begin(connection)
         row = connection.execute(
@@ -1357,7 +1443,7 @@ def finalize_holdout_evaluation(
         result_manifest_sha256,
     )
     completed = clock.utc_now()
-    connection = _connect(registry_path)
+    connection = _connect(registry_path, write=True)
     try:
         _begin(connection)
         vintage = connection.execute(
@@ -1593,7 +1679,7 @@ def register_frozen_forward_plan(
         plan_evidence.normalized_path,
         plan_artifact_sha256,
     )
-    connection = _connect(registry_path)
+    connection = _connect(registry_path, write=True)
     try:
         _begin(connection)
         vintage = connection.execute(
@@ -1665,7 +1751,7 @@ def register_frozen_forward_prediction(
     lag = (recorded - decision).total_seconds()
     if lag < 0 or lag > maximum_recording_lag_seconds:
         raise ValueError("冻结前向预测未在预登记时效窗口内生成")
-    connection = _connect(registry_path)
+    connection = _connect(registry_path, write=True)
     try:
         _begin(connection)
         plan = connection.execute(

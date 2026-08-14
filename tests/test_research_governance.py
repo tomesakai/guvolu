@@ -27,6 +27,7 @@ from guvolu.research.governance import (
     GOVERNANCE_METHOD_VERSION,
     finalize_holdout_evaluation,
     get_holdout_evaluation_attempt,
+    get_holdout_vintage,
     get_frozen_forward_plan_for_vintage,
     list_frozen_forward_predictions,
     list_holdout_vintages,
@@ -557,6 +558,68 @@ def test_legacy_consumed_vintage_is_migrated_to_incomplete_attempt(
             "SELECT value FROM governance_meta WHERE key='schema_version'"
         ).fetchone()
     assert version == ("4",)
+
+
+def test_schema_write_ceiling_preserves_legacy_reader_deployment(
+    tmp_path: Path,
+) -> None:
+    """新 reader 可读物理兼容库，但不得突破旧冻结 writer 的版本上限。"""
+    registry = tmp_path / "governance.sqlite3"
+    vintage = seal_holdout_vintage(
+        registry,
+        "market-one",
+        _time("2027-01-01T00:00:00"),
+        _time("2027-02-01T00:00:00"),
+    )
+    with sqlite3.connect(registry) as connection:
+        connection.execute(
+            "UPDATE governance_meta SET value='2' WHERE key='schema_version'"
+        )
+        connection.execute(
+            "INSERT INTO governance_meta(key,value) VALUES(?,?)",
+            ("schema_write_ceiling", "2"),
+        )
+
+    assert list_holdout_vintages(registry) == (vintage,)
+    assert get_holdout_vintage(registry, vintage.vintage_id) == vintage
+    with sqlite3.connect(registry) as connection:
+        version = connection.execute(
+            "SELECT value FROM governance_meta WHERE key='schema_version'"
+        ).fetchone()
+    assert version == ("2",)
+
+    with pytest.raises(ValueError, match="写入已冻结在版本 2"):
+        register_research_exposure(
+            registry,
+            "must-not-write",
+            "market-one",
+            _time("2026-01-01T00:00:00"),
+            _time("2026-02-01T00:00:00"),
+        )
+    with sqlite3.connect(registry) as connection:
+        assert connection.execute(
+            "SELECT value FROM governance_meta WHERE key='schema_version'"
+        ).fetchone() == ("2",)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM research_exposure"
+        ).fetchone() == (0,)
+
+
+def test_schema_write_ceiling_rejects_incompatible_physical_schema(
+    tmp_path: Path,
+) -> None:
+    """版本上限不是绕过物理 schema 验证的开关。"""
+    registry = tmp_path / "governance.sqlite3"
+    with sqlite3.connect(registry) as connection:
+        connection.execute(
+            "CREATE TABLE governance_meta(key TEXT PRIMARY KEY,value TEXT)"
+        )
+        connection.executemany(
+            "INSERT INTO governance_meta(key,value) VALUES(?,?)",
+            (("schema_version", "2"), ("schema_write_ceiling", "2")),
+        )
+    with pytest.raises(ValueError, match="物理 schema 不兼容"):
+        list_holdout_vintages(registry)
 
 
 def test_legacy_verdict_without_manifest_attempt_is_rejected(tmp_path: Path) -> None:

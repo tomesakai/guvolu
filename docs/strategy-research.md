@@ -168,6 +168,12 @@ paper 分配遵守以下长期边界：趋势、量价确认趋势和突破合�
 .\.venv\Scripts\python.exe scripts\manage_holdout_vintage.py list
 ```
 
+当冻结任务仍由旧治理 reader 执行、开发分支已经包含更高 schema 时，注册表可额外设置
+`governance_meta.schema_write_ceiling`。高版本代码在物理表完全兼容时只允许无副作用读取，既不
+自动提高 `schema_version`，也不允许任何治理写入；旧冻结 reader 会忽略这个附加键并继续登记
+及时预测。移除写入上限和升级 schema 必须等冻结区间结束，并作为显式部署动作完成，不能由
+监视器、验证器或演进脚本触发。
+
 当前 2019 年以来的数据已进入 adaptive 开发历史，不能倒签为 holdout。评估路径与冻结前向
 路径已经可用，但现有策略仍没有 G-08 通过结论；必须先产生与当前代码树一致的新组合运行，
 再由负责人选择未来区间，依次 seal、plan、逐柱 predict 和期末 consume。这一时间约束不能由
