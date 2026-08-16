@@ -8,7 +8,7 @@ from pathlib import Path
 from guvolu.data.intent_ledger import IntentLedger
 from guvolu.domain.config import Limits
 from guvolu.domain.enums import ExecutionType, ServiceStatus, Side
-from guvolu.domain.errors import ApiTimeout, GmoApiError
+from guvolu.domain.errors import ApiTimeout, DryRunBlocked, GmoApiError
 from guvolu.domain.intent import IntentState, OrderIntent
 from guvolu.domain.symbols import SpotSymbol
 from guvolu.execution.dispatch import dispatch_order_intent
@@ -230,6 +230,23 @@ def test_market_without_reference_rejected(tmp_path: Path) -> None:
     assert "参考价" in str(getattr(result, "reason"))
     assert sender.sent == []
     assert gate.usage().order_count == 0
+
+
+def test_dry_run_block_is_local_terminal(tmp_path: Path) -> None:
+    """模拟拦截记为本地终态，不计熔断异常（T-04）。"""
+    sender = FakeSender(error=DryRunBlocked("模拟运行模式拒绝写请求"))
+    ledger, gate, breaker, result = dispatch(
+        tmp_path, make_intent("it01"), sender
+    )
+    assert getattr(result, "state") is IntentState.DRY_RUN_BLOCKED
+    assert "模拟运行" in str(getattr(result, "reason"))
+    assert ledger.state("it01") is IntentState.DRY_RUN_BLOCKED
+    assert ledger.in_flight() == ()
+    assert breaker.consecutive_failures == 0
+    # 保守计数不回退
+    assert gate.usage().total_jpy == Decimal("100")
+    reloaded = IntentLedger(tmp_path / "intent_ledger.jsonl")
+    assert reloaded.state("it01") is IntentState.DRY_RUN_BLOCKED
 
 
 def test_market_with_reference_passes(tmp_path: Path) -> None:

@@ -223,6 +223,14 @@ class IntentLedger:
             intent_id, IntentState.SEND_TIMEOUT, reason=reason, at=at
         )
 
+    def block_dry_run(
+        self, intent_id: str, *, reason: str, at: datetime | None = None
+    ) -> None:
+        """模拟运行守卫在发送边界拦截，本地终态（T-04）。"""
+        self.transition(
+            intent_id, IntentState.DRY_RUN_BLOCKED, reason=reason, at=at
+        )
+
     def resolve_timeout_failed(
         self,
         intent_id: str,

@@ -26,7 +26,12 @@ class IntentTransitionError(GuvoluError):
 
 
 class IntentState(StrEnum):
-    """意图状态，语义沿用 T-05、T-06。"""
+    """意图状态，语义沿用 T-05、T-06。
+
+    DRY_RUN_BLOCKED 是模拟运行守卫在发送边界拦截后的本地
+    终态（T-04），未触达任何交易所写端点，与交易所拒绝的
+    REJECTED 严格区分（T-03）。
+    """
 
     RECORDED = "RECORDED"
     GATE_REJECTED = "GATE_REJECTED"
@@ -35,6 +40,7 @@ class IntentState(StrEnum):
     REJECTED = "REJECTED"
     SEND_TIMEOUT = "SEND_TIMEOUT"
     FAILED = "FAILED"
+    DRY_RUN_BLOCKED = "DRY_RUN_BLOCKED"
 
 
 # 终态集合，离开即违规
@@ -44,6 +50,7 @@ TERMINAL_STATES: frozenset[IntentState] = frozenset(
         IntentState.ACCEPTED,
         IntentState.REJECTED,
         IntentState.FAILED,
+        IntentState.DRY_RUN_BLOCKED,
     }
 )
 # 在途集合，占用品种发送额度（T-05）
@@ -65,6 +72,7 @@ _ALLOWED: Mapping[IntentState, frozenset[IntentState]] = MappingProxyType(
                 IntentState.ACCEPTED,
                 IntentState.REJECTED,
                 IntentState.SEND_TIMEOUT,
+                IntentState.DRY_RUN_BLOCKED,
             }
         ),
         IntentState.SEND_TIMEOUT: frozenset(
@@ -74,6 +82,7 @@ _ALLOWED: Mapping[IntentState, frozenset[IntentState]] = MappingProxyType(
         IntentState.ACCEPTED: frozenset(),
         IntentState.REJECTED: frozenset(),
         IntentState.FAILED: frozenset(),
+        IntentState.DRY_RUN_BLOCKED: frozenset(),
     }
 )
 
