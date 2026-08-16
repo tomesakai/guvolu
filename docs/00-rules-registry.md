@@ -64,6 +64,7 @@
 | docs/runtime-ops.md | 长期维护 | 运行时保活与进程操作设计（TBD-31 提案载体） |
 | docs/order-flow-data-contract.md | 长期维护 | 订单流事实、回补边界、长期任务与前端反馈契约 |
 | docs/strategy-research.md | 长期维护 | PIT 策略研究、样本外验证、组合分配与 paper 目标位置契约 |
+| docs/execution-chain-design.md | 长期维护 | 执行链分阶段契约与意图账本设计（TBD-10、TBD-11 提案载体） |
 | docs/llm-pipeline-design.md | 长期维护 | LLM 决策管线接入设计（TBD-34 提案载体） |
 | .claude/skills/guvolu-rules/SKILL.md | 长期维护 | 自动加载的规则摘要 |
 
