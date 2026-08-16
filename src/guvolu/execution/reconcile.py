@@ -20,7 +20,7 @@ from guvolu.domain.intent import IntentState, OrderIntent
 from guvolu.domain.models import Execution, Order
 
 # 本机与交易所时戳容差
-_CLOCK_TOLERANCE = timedelta(seconds=60)
+CLOCK_TOLERANCE = timedelta(seconds=60)
 # 对账触碰的只读端点
 READ_ENDPOINTS = ("GET /v1/activeOrders", "GET /v1/latestExecutions")
 
@@ -100,7 +100,7 @@ def resolve_send_timeout(
     if state is not IntentState.SEND_TIMEOUT:
         raise LedgerError(f"意图 {intent_id} 不在超时态: {state.value}")
     intent = ledger.intent(intent_id)
-    since = intent.created_at - _CLOCK_TOLERANCE
+    since = intent.created_at - CLOCK_TOLERANCE
     now = moment if moment is not None else datetime.now(UTC)
     symbol = str(intent.symbol)
     orders = reader.active_orders(symbol)
