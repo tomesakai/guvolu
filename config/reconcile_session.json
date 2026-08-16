@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "snapshot_interval_seconds": 30,
+  "timeout_query_initial_seconds": 5,
+  "timeout_query_max_seconds": 300,
+  "no_trade_band": "0.01"
+}
