@@ -1,12 +1,14 @@
-"""熔断骨架（R-02）。阈值从版本化配置读取（G-06）。
+"""熔断器（R-02）。阈值从版本化配置读取（G-06）。
 
-本阶段只实现计数与触发状态机，触发动作为拒绝新意图；
-全量撤单与进程退出动作在后续阶段接入紧急停止开关（T-07）。
+计数与触发状态机之外，可登记触发动作：执行侧把
+ops.kill_switch 的全量撤单接为动作（T-07），使触发从拒绝新
+意图升级为拒绝新意图加全撤。本模块只持回调，不依赖运维模块。
 阈值数值为 TBD-10 提案，待人工确认。
 """
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
@@ -84,6 +86,7 @@ class CircuitBreaker:
         self._state = BreakerState.NORMAL
         self._consecutive_failures = 0
         self._trip_reason: str | None = None
+        self._trip_action: Callable[[str], None] | None = None
 
     @property
     def state(self) -> BreakerState:
@@ -105,11 +108,24 @@ class CircuitBreaker:
         if self._state is BreakerState.TRIPPED:
             raise CircuitTripped(f"熔断已触发: {self._trip_reason}")
 
+    def set_trip_action(
+        self, action: Callable[[str], None] | None
+    ) -> None:
+        """登记触发动作，仅首次触发时调用一次（T-07 接线）。
+
+        动作在状态转入 TRIPPED 之后执行，动作异常不回滚状态；
+        调用方须自行收敛异常，见 execution.emergency_stop。
+        """
+        self._trip_action = action
+
     def trip(self, reason: str) -> None:
-        """直接触发熔断，保留首个触发原因。"""
-        if self._state is BreakerState.NORMAL:
-            self._trip_reason = reason
+        """触发熔断并保留首个触发原因；重复触发不重复动作。"""
+        if self._state is BreakerState.TRIPPED:
+            return
+        self._trip_reason = reason
         self._state = BreakerState.TRIPPED
+        if self._trip_action is not None:
+            self._trip_action(reason)
 
     def reset(self) -> None:
         """人工复位并清零计数，不自动恢复。"""
