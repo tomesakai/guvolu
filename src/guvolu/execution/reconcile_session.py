@@ -350,7 +350,9 @@ def execute_delta(
     return intent, result
 
 
-def _outcome_payload(outcome: TimeoutQueryOutcome) -> dict[str, object]:
+def timeout_outcome_payload(
+    outcome: TimeoutQueryOutcome,
+) -> dict[str, object]:
     """超时查询结果的报告形态。"""
     return {
         "intent_id": outcome.intent_id,
@@ -367,7 +369,7 @@ def _outcome_payload(outcome: TimeoutQueryOutcome) -> dict[str, object]:
     }
 
 
-def _snapshot_payload(outcome: SnapshotOutcome) -> dict[str, object]:
+def snapshot_payload(outcome: SnapshotOutcome) -> dict[str, object]:
     """快照对账结果的报告形态，金额落字符串（D-07）。"""
     reconcile = outcome.reconcile
     return {
@@ -397,6 +399,47 @@ def _snapshot_payload(outcome: SnapshotOutcome) -> dict[str, object]:
     }
 
 
+def delta_payload(
+    delta: DeltaDecision,
+    *,
+    target: float | None,
+    no_trade_band: Decimal,
+) -> dict[str, object]:
+    """差分决策的报告形态，金额落字符串（D-07）。"""
+    proposal_payload: dict[str, str] | None = None
+    if delta.proposal is not None:
+        proposal_payload = {
+            "symbol": str(delta.proposal.symbol),
+            "side": delta.proposal.side.value,
+            "size": format(delta.proposal.size, "f"),
+            "price": format(delta.proposal.price, "f"),
+            "notional_jpy": format(delta.proposal.notional_jpy, "f"),
+        }
+    return {
+        "target": target,
+        "desired_size": format(delta.desired_size, "f"),
+        "position_size": format(delta.position_size, "f"),
+        "delta_size": format(delta.delta_size, "f"),
+        "no_trade_band": format(no_trade_band, "f"),
+        "skip_reason": delta.skip_reason,
+        "proposal": proposal_payload,
+    }
+
+
+def intent_payload(
+    outcome: tuple[OrderIntent, DispatchResult],
+) -> dict[str, object]:
+    """一次编排结果的报告形态。"""
+    intent, result = outcome
+    return {
+        "intent_id": intent.intent_id,
+        "correlation_id": intent.correlation_id,
+        "state": result.state.value,
+        "order_id": result.order_id,
+        "reason": result.reason,
+    }
+
+
 def render_session_report(
     *,
     mode: RunMode,
@@ -421,19 +464,12 @@ def render_session_report(
     reads = list(read_endpoints)
     write_planned: list[str] = []
     write_touched: list[str] = []
-    intent_payload: dict[str, object] | None = None
+    intent_body: dict[str, object] | None = None
     if delta is not None and delta.proposal is not None:
         write_planned.append(ORDER_ENDPOINT)
     if outcome is not None:
-        intent, result = outcome
-        intent_payload = {
-            "intent_id": intent.intent_id,
-            "correlation_id": intent.correlation_id,
-            "state": result.state.value,
-            "order_id": result.order_id,
-            "reason": result.reason,
-        }
-        if result.state not in (
+        intent_body = intent_payload(outcome)
+        if outcome[1].state not in (
             IntentState.GATE_REJECTED,
             IntentState.DRY_RUN_BLOCKED,
         ):
@@ -443,26 +479,11 @@ def render_session_report(
         if EMERGENCY_READ_ENDPOINT not in reads:
             reads.append(EMERGENCY_READ_ENDPOINT)
         write_touched.append(EMERGENCY_WRITE_ENDPOINT)
-    delta_payload: dict[str, object] | None = None
+    delta_body: dict[str, object] | None = None
     if delta is not None:
-        proposal_payload: dict[str, str] | None = None
-        if delta.proposal is not None:
-            proposal_payload = {
-                "symbol": str(delta.proposal.symbol),
-                "side": delta.proposal.side.value,
-                "size": format(delta.proposal.size, "f"),
-                "price": format(delta.proposal.price, "f"),
-                "notional_jpy": format(delta.proposal.notional_jpy, "f"),
-            }
-        delta_payload = {
-            "target": target,
-            "desired_size": format(delta.desired_size, "f"),
-            "position_size": format(delta.position_size, "f"),
-            "delta_size": format(delta.delta_size, "f"),
-            "no_trade_band": format(no_trade_band, "f"),
-            "skip_reason": delta.skip_reason,
-            "proposal": proposal_payload,
-        }
+        delta_body = delta_payload(
+            delta, target=target, no_trade_band=no_trade_band
+        )
     return {
         "generated_at": datetime.now(UTC).isoformat(),
         "mode": mode.value,
@@ -480,14 +501,14 @@ def render_session_report(
                 1 for item in ws_outcomes if item.kind == "ignored"
             ),
         },
-        "snapshot": _snapshot_payload(snapshot),
-        "timeouts": [_outcome_payload(item) for item in timeouts],
+        "snapshot": snapshot_payload(snapshot),
+        "timeouts": [timeout_outcome_payload(item) for item in timeouts],
         "position": {
             "size": format(position_size, "f"),
             "basis": "READ_ONLY 成交事实",
         },
-        "delta": delta_payload,
-        "intent": intent_payload,
+        "delta": delta_body,
+        "intent": intent_body,
         "breaker": {
             "state": breaker.state.value,
             "consecutive_failures": breaker.consecutive_failures,
@@ -533,7 +554,7 @@ def load_ws_events(path: Path) -> tuple[PrivateEvent, ...]:
     )
 
 
-def _decimal_argument(raw: str, name: str) -> Decimal:
+def decimal_argument(raw: str, name: str) -> Decimal:
     """命令行数值参数直接进 Decimal，绝不经 float（T-08）。"""
     try:
         value = Decimal(raw)
@@ -638,7 +659,7 @@ def _resolve_market_inputs(
             rule = fetch_market_rule(get_public(), symbol)
             session._touch("GET /v1/symbols")
         if price_arg is not None:
-            reference_price = _decimal_argument(
+            reference_price = decimal_argument(
                 price_arg, "--reference-price"
             )
             if reference_price <= 0:
@@ -710,7 +731,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     timeouts = session.resolve_timeouts(now)
     band_arg: str | None = args.no_trade_band
     if band_arg is not None:
-        no_trade_band = _decimal_argument(band_arg, "--no-trade-band")
+        no_trade_band = decimal_argument(band_arg, "--no-trade-band")
     else:
         no_trade_band = settings.no_trade_band
     delta: DeltaDecision | None = None
@@ -726,7 +747,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             target_value,
             rule=rule,
             reference_price=reference_price,
-            budget_jpy=_decimal_argument(
+            budget_jpy=decimal_argument(
                 str(args.budget_jpy), "--budget-jpy"
             ),
             no_trade_band=no_trade_band,
