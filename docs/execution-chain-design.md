@@ -12,7 +12,7 @@
 paper 目标位置（研究域产物，见策略研究管线）
       |
       v
-float 到 Decimal 转换闸门（G-05，唯一转换点，本阶段只定位置不实现）
+float 到 Decimal 转换闸门（G-05，唯一转换点）
       |
       v
 意图生成（intent_id 先落盘入意图账本，T-05）
@@ -21,7 +21,7 @@ float 到 Decimal 转换闸门（G-05，唯一转换点，本阶段只定位置�
 风控闸门（T-09 白名单 / R-02 熔断 / R-03 服务状态 / T-05 在途 / T-11 限额）
       |
       v
-发送边界（OrderSender 抽象；阶段二由 TradeClient 适配，T-02）
+发送边界（OrderSender 抽象，TradeClient 适配，T-02；模拟运行在此拦截，T-04）
       |
       v
 对账状态机（明确成功 / 明确失败 / 超时查询，T-03、T-06；R-08 双通道在阶段三闭合）
@@ -29,27 +29,33 @@ float 到 Decimal 转换闸门（G-05，唯一转换点，本阶段只定位置�
 
 各环节的实现位置：
 
-| 环节 | 模块 | 本阶段状态 |
+| 环节 | 模块 | 状态 |
 |---|---|---|
-| 意图模型与状态机 | `src/guvolu/domain/intent.py` | 已实现 |
-| 意图账本 | `src/guvolu/data/intent_ledger.py` | 已实现 |
-| 三限额闸门 | `src/guvolu/risk/limits.py` | 已实现 |
-| 服务状态门禁 | `src/guvolu/risk/service_gate.py` | 已实现 |
-| 熔断骨架 | `src/guvolu/risk/circuit_breaker.py` | 已实现（计数与触发） |
-| 发送编排 | `src/guvolu/execution/dispatch.py` | 已实现（注入抽象，无真实发送） |
-| G-05 转换闸门 | 随阶段二意图生成器落地 | 仅接口约定 |
+| 意图模型与状态机 | `src/guvolu/domain/intent.py` | 阶段一实现，阶段二增补模拟拦截终态 |
+| 意图账本 | `src/guvolu/data/intent_ledger.py` | 阶段一实现 |
+| 三限额闸门 | `src/guvolu/risk/limits.py` | 阶段一实现 |
+| 服务状态门禁 | `src/guvolu/risk/service_gate.py` | 阶段一实现 |
+| 熔断骨架 | `src/guvolu/risk/circuit_breaker.py` | 阶段一实现（计数与触发） |
+| 发送编排 | `src/guvolu/execution/dispatch.py` | 阶段一实现，阶段二增补拦截分类 |
+| G-05 转换闸门 | `src/guvolu/execution/conversion.py` | 阶段二实现 |
+| TradeClient 发送适配 | `src/guvolu/execution/trade_sender.py` | 阶段二实现 |
+| 超时对账查询 | `src/guvolu/execution/reconcile.py` | 阶段二实现（人工触发） |
+| dry-run 执行器 | `src/guvolu/execution/dry_run_executor.py` 与 `scripts/run_dry_run_executor.py` | 阶段二实现 |
 
-G-05 转换点约定：研究域目标位置的数值以 float 承载，进入执行域时必须经唯一
-转换函数完成 float 到 Decimal 的转换，并按品种 `tickSize` 与 `sizeStep` 取整。
-该函数随阶段二意图生成器实现并配套单测；在其存在之前，执行域一切入口只接受
-Decimal，本阶段的意图模型与闸门均如此（T-08）。
+G-05 转换点：研究域目标位置的数值以 float 承载，进入执行域时必须经
+`execution.conversion.convert_target_to_order` 完成 float 到 Decimal 的转换，
+并按品种 `tickSize` 与 `sizeStep` 取整，超界拒绝；该函数是全项目唯一允许
+两域相接的位置，配套单测覆盖取整与拒绝边界。除此之外执行域一切入口只接受
+Decimal（T-08）。目标取值域为 [-1, 1]，正买负卖；数量向下取整到 `sizeStep`
+绝不超过目标名义，限价按买向下、卖向上取整到 `tickSize`，不劣于参考价；
+折算数量低于最小委托量时不生成委托。
 
 ## 2. 阶段划分
 
 | 阶段 | 范围 | 依赖 |
 |---|---|---|
-| 一（本次） | 意图状态机、意图账本、三限额闸门、服务状态门禁、熔断计数骨架；发送为注入抽象 | 无 |
-| 二 | 目标位置消费与意图生成（G-05 转换点）、TradeClient 适配 OrderSender、dry-run 执行器（T-04） | 阶段一 |
+| 一（已完成） | 意图状态机、意图账本、三限额闸门、服务状态门禁、熔断计数骨架；发送为注入抽象 | 无 |
+| 二（本次完成） | 目标位置消费与意图生成（G-05 转换点）、TradeClient 适配 OrderSender、dry-run 执行器（T-04）、超时意图的人工触发对账查询（T-06 后半） | 阶段一 |
 | 三 | READ_ONLY 对账消费：WS 实时回报与定时 REST 快照双通道（R-08、C-10、TBD-07）、超时意图的自动查询决策（T-06）、熔断触发动作接入紧急停止开关（T-07） | 阶段二 |
 | 四 | 回测、模拟运行纸上交易、最小手数实盘逐级验证（T-12）；切换实盘需人工确认（T-04、A-01） | 阶段三 |
 
@@ -85,6 +91,7 @@ Decimal，本阶段的意图模型与闸门均如此（T-08）。
 | `REJECTED` | 交易所明确拒绝 | 终态 |
 | `SEND_TIMEOUT` | 发送超时或网络错，结果未知 | 在途 |
 | `FAILED` | 经 READ_ONLY 查询确认未受理 | 终态 |
+| `DRY_RUN_BLOCKED` | 模拟运行守卫在发送边界拦截，未触达写端点 | 终态 |
 
 | 迁移 | 守卫 |
 |---|---|
@@ -93,12 +100,16 @@ Decimal，本阶段的意图模型与闸门均如此（T-08）。
 | `SENDING -> ACCEPTED` | 必须携带 `orderId` |
 | `SENDING -> REJECTED` | 记录错误码 |
 | `SENDING -> SEND_TIMEOUT` | 记录超时事由 |
+| `SENDING -> DRY_RUN_BLOCKED` | 记录拦截理由（T-04） |
 | `SEND_TIMEOUT -> ACCEPTED` | 必须携带 READ_ONLY 查询证据与 `orderId`（T-06） |
 | `SEND_TIMEOUT -> FAILED` | 必须携带 READ_ONLY 查询证据（T-06） |
 
 上表之外的一切迁移非法，账本直接拒绝且不落盘。`ACCEPTED` 是账本视角的
 终态：其后的委托生命周期（成交、撤销、失效）属对账域，由阶段三经 READ_ONLY
-消费（T-03、U-01），不回写意图账本。
+消费（T-03、U-01），不回写意图账本。`DRY_RUN_BLOCKED` 是本地终点：拦截发生
+在任何网络调用之前，与交易所明确拒绝的 `REJECTED` 严格区分（T-03），不计入
+熔断的写路径异常计数，是模拟运行彩排的预期终点（T-04）；限额累计在过闸时
+已记入且不回退，使彩排与实盘的限额口径一致。
 
 ## 5. 风控闸门
 
@@ -144,10 +155,33 @@ Decimal，本阶段的意图模型与闸门均如此（T-08）。
 - 撤单请求不经服务状态门禁与模拟运行守卫（T-07 口径）；替换下单按新意图走第 5 节全量闸门。
 - `changeOrder` 端点保留在 `TradeClient` 供人工处置，不进入执行链自动路径。
 
-## 8. 本阶段边界与未决
+## 8. 发送适配、执行器与超时对账（阶段二）
 
-- 真实发送未接线：`OrderSender` 为注入抽象，阶段一没有任何触达交易所写端点的调用路径（C-14）。
-- G-05 转换本体未实现：见第 1 节约定，随阶段二意图生成器落地。
-- 超时意图的查询决策本阶段为人工调用账本迁移接口，自动查询随阶段三对账通道实现（T-06）。
+发送适配 `execution.trade_sender.TradeClientSender` 实现 `OrderSender`，内部
+只持 `api.trade_client.TradeClient`（T-02）。适配器把发送结果收敛为编排可
+判定的三分类（T-06）：受理返回 `orderId`；业务错误原样上抛记为 `REJECTED`；
+超时与网络错、HTTP 层异常、响应形态异常与委托号不可解析一律按结果未知折算
+为网络错记为 `SEND_TIMEOUT`，绝不重试（C-08）。模拟运行守卫保持在
+`TradeClient` 内（T-04），撤单透传不受其限制（T-07）。
+
+dry-run 执行器 `execution.dry_run_executor`（命令行封装
+`scripts/run_dry_run_executor.py`）消费 target-position 制品的
+`operational_target_contract.aggregate_target`，经 G-05 转换闸门折算为单笔
+限价意图，过第 5 节全量闸门后进入发送适配；模拟运行模式下被拦截记为
+`DRY_RUN_BLOCKED` 即预期终点，账本留痕全程（T-05、R-07）。报告列明品种、
+方向、数量、金额与触碰端点：实盘将触碰的写端点仅 `POST /v1/order`，缺省
+拉取取引ルール、参考价与服务状态时另触碰三个公开只读端点（A-03）。当前
+口径为一次性从零折算，不与既有持仓差分；目标跟踪随阶段三对账通道实现。
+
+超时对账 `execution.reconcile.resolve_send_timeout` 经注入的只读抽象查询
+挂单一览与最新成交一览（`ReadClient` 为生产实现，T-02），以同品种单在途
+约束保证唯一匹配（T-05）：恰一笔未映射候选即 `ACCEPTED` 并登记映射，零笔
+即 `FAILED`，多笔为歧义，拒绝自动判定并保持超时态，留待人工处置。查询
+证据随迁移写入账本（T-06）。本阶段由执行器 `--resolve-timeouts` 人工触发。
+
+## 9. 本阶段边界与未决
+
+- 真实发送已接线但缺省不可达：模拟运行模式在发送边界拦截（T-04），切换实盘需人工确认（A-01）；本阶段全部测试注入替身传输，无任何触达交易所写端点的调用（C-14）。
+- 超时意图的查询决策为人工触发，自动定时查询与 WS 回报双通道随阶段三对账实现（T-06、R-08）。
 - 熔断触发后的全量撤单动作未接线（阶段三，T-07）。
 - 未决关联项：定时对账周期（TBD-07）、多策略委托归属（TBD-08）、执行进程状态持久化与本账本的恢复联动（TBD-09，阶段三对齐）。
