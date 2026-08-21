@@ -226,13 +226,15 @@ def strategy_readiness(
     input_summary = _object(summary.get("input"), "summary.input")
     head_matches = input_summary.get("head_generation") == current_inputs.head_generation
     current_trade_semantics = (
-        summary.get("pipeline_method_version") == "strategy-research-pipeline-v13"
+        summary.get("pipeline_method_version") == "strategy-research-pipeline-v14"
         and summary.get("panel_method_version") == "trade-bars-pit-v2"
         and summary.get("feature_method_version") == "research-features-v2"
         and summary.get("trade_flow_input_method_version")
         == "economic-trade-basis-v1"
         and summary.get("trade_input_receipt_method_version")
         == "active-trade-head-receipt-v2"
+        and summary.get("operational_gate_method_version")
+        == "economic-trade-operational-gate-v1"
     )
     operational_blockers: list[str] = []
     if latest_valid_index != len(features) - 1:

@@ -18,7 +18,7 @@ from guvolu.research.artifact_contracts import (
     trial_ledger_body,
 )
 from guvolu.research.config_lineage import attest_config_lineage_snapshot
-from guvolu.research.contracts import PanelSnapshot
+from guvolu.research.contracts import FamilyEvaluation, PanelSnapshot, QualityVector
 from guvolu.research.data_location import resolve_data_root_locator
 from guvolu.research.features import classify_market_state, compute_features
 from guvolu.research.features import FEATURE_METHOD_VERSION
@@ -43,7 +43,13 @@ from guvolu.research.provenance import (
     stable_identifier,
     verify_artifacts_match_commit,
 )
-from guvolu.research.quality import panel_quality, quality_payload
+from guvolu.research.quality import (
+    OPERATIONAL_GATE_METHOD_VERSION,
+    gate_economic_trade_volume,
+    gate_feature_snapshot,
+    panel_quality,
+    quality_payload,
+)
 from guvolu.research.validation import walk_forward_validate
 from guvolu.strategy.generation import (
     build_family_batches,
@@ -68,6 +74,7 @@ _RUN_IDENTITY_FIELDS = (
     "feature_method_version",
     "trade_flow_input_method_version",
     "trade_input_receipt_method_version",
+    "operational_gate_method_version",
     "governance_method_version",
     "run_id",
     "research_identity",
@@ -204,6 +211,24 @@ def _verify_operational_gate(summary: Mapping[str, object]) -> None:
         if not isinstance(value, (int, float)) or isinstance(value, bool):
             raise ValueError(f"运行仓位不是数值: {family}")
         numeric_weights.append(float(value))
+    if summary.get("pipeline_method_version") == "strategy-research-pipeline-v13":
+        panel = _object(summary.get("panel"), "panel")
+        evaluations = summary.get("family_evaluations")
+        if not isinstance(evaluations, list):
+            raise ValueError("v13 family_evaluations 必须为数组")
+        flow_sensitive = any(
+            isinstance(item, Mapping)
+            and item.get("eligible") is True
+            and item.get("mode") == "paper"
+            and item.get("family") in {"flow_trend", "breakout"}
+            for item in evaluations
+        )
+        if (
+            flow_sensitive
+            and panel.get("latest_economic_volume_qualified") is not True
+            and (eligible or any(abs(value) > 1e-12 for value in numeric_weights))
+        ):
+            raise ValueError("v13 flow 运行门禁语义过期")
     if not eligible and any(abs(value) > 1e-12 for value in numeric_weights):
         raise ValueError("运行质量失败但存在非零仓位")
     decision_grade = summary.get("decision_grade")
@@ -251,6 +276,20 @@ def _verify_operational_gate(summary: Mapping[str, object]) -> None:
         raise ValueError("代码身份非决策级但组合目标非零")
 
 
+def _gate_operational_quality_for_pipeline(
+    pipeline_method_version: str,
+    quality: QualityVector,
+    families: Sequence[FamilyEvaluation],
+    feature: FeatureRow,
+) -> QualityVector:
+    """按发布版本重建经济成交运行门，避免改写历史质量对象。"""
+    if pipeline_method_version == "strategy-research-pipeline-v13":
+        return quality
+    if pipeline_method_version == "strategy-research-pipeline-v14":
+        return gate_economic_trade_volume(quality, families, feature)
+    raise ValueError("不受支持的 operational gate 管线版本")
+
+
 def _attest_panel_volume_qualification(
     panel: PanelSnapshot,
     features: Sequence[FeatureRow],
@@ -284,6 +323,7 @@ def _attest_v12_decision_evidence(
     artifact_paths: Mapping[str, Path],
     block_bootstrap_method_version: str,
     regime_attribution_method_version: str | None,
+    pipeline_method_version: str,
 ) -> None:
     """从受保护 panel/config 重建候选选择、资格、资金权重和回放。"""
     batches = build_family_batches(config, family_scope)
@@ -373,6 +413,49 @@ def _attest_v12_decision_evidence(
     for name, value in expected.items():
         if canonical_json(summary.get(name)) != canonical_json(value):
             raise ValueError(f"v12 {name} 不能由受保护决策证据重建")
+    execution_evaluated_at = parse_time(
+        summary.get("execution_evaluated_at"), "execution_evaluated_at",
+    )
+    maximum_age = _integer(
+        config.get("strategy_decision_max_age_seconds"),
+        "strategy_decision_max_age_seconds",
+    )
+    operational_quality = gate_feature_snapshot(
+        panel_quality(panel, execution_evaluated_at, maximum_age, minimum_bars),
+        decision_time,
+        execution_evaluated_at,
+        maximum_age,
+    )
+    # v13 重建旧质量对象。
+    # 不安全权重由独立门拒绝。
+    # v14 才纳入新成交门。
+    operational_quality = _gate_operational_quality_for_pipeline(
+        pipeline_method_version,
+        operational_quality,
+        validation.families,
+        features[decision_index],
+    )
+    code = _object(summary.get("code_identity"), "code_identity")
+    if code.get("decision_grade") is not True:
+        operational_quality = QualityVector(
+            integrity=operational_quality.integrity,
+            freshness=operational_quality.freshness,
+            clock=operational_quality.clock,
+            coverage=operational_quality.coverage,
+            pit=operational_quality.pit,
+            lineage=False,
+            reasons=tuple(sorted({
+                *operational_quality.reasons,
+                f"code_identity_{code.get('reason') or 'not_decision_grade'}",
+            })),
+        )
+    if canonical_json(summary.get("operational_quality")) != canonical_json(
+        quality_payload(operational_quality)
+    ):
+        version = "v13" if pipeline_method_version.endswith("v13") else "v14"
+        raise ValueError(
+            f"{version} operational_quality 不能由受保护证据重建"
+        )
     strategy_decision = _object(
         summary.get("strategy_decision"), "strategy_decision",
     )
@@ -436,6 +519,7 @@ def _verify_run_identity(
         "strategy-research-pipeline-v11",
         "strategy-research-pipeline-v12",
         "strategy-research-pipeline-v13",
+        "strategy-research-pipeline-v14",
     }:
         return
     if candidate_registry is None:
@@ -445,7 +529,10 @@ def _verify_run_identity(
             "v12 仅允许制品完整性与旧收据只读复核；"
             "当前验证器不会把旧成交语义声明为决策级证据"
         )
-    if method == "strategy-research-pipeline-v13":
+    if method in {
+        "strategy-research-pipeline-v13",
+        "strategy-research-pipeline-v14",
+    }:
         config_path = artifact_paths.get("config")
         config_lineage_path = artifact_paths.get("config_lineage")
         panel_path = artifact_paths.get("panel")
@@ -490,7 +577,10 @@ def _verify_run_identity(
             manifest.get("generator_method_version"),
             "generator_method_version",
         )
-        if method == "strategy-research-pipeline-v13":
+        if method in {
+            "strategy-research-pipeline-v13",
+            "strategy-research-pipeline-v14",
+        }:
             expected_registry = candidate_registry_payload(
                 build_family_batches(config, family_scope),
                 config_hash,
@@ -542,7 +632,10 @@ def _verify_run_identity(
             or registered.normalization_versions != normalizations
         ):
             raise ValueError("v12 panel 输入身份不能由控制面注册表重建")
-        if method == "strategy-research-pipeline-v13":
+        if method in {
+            "strategy-research-pipeline-v13",
+            "strategy-research-pipeline-v14",
+        }:
             expected_methods = {
                 "panel_method_version": PANEL_METHOD_VERSION,
                 "panel_schema_version": PANEL_SCHEMA_VERSION,
@@ -557,6 +650,10 @@ def _verify_run_identity(
             for field, expected in expected_methods.items():
                 if manifest.get(field) != expected:
                     raise ValueError(f"v13 {field} 不受支持")
+            if method == "strategy-research-pipeline-v14" and manifest.get(
+                "operational_gate_method_version"
+            ) != OPERATIONAL_GATE_METHOD_VERSION:
+                raise ValueError("v14 operational gate 方法不受支持")
             qualification = _object(
                 manifest.get("trade_input_qualification"),
                 "trade_input_qualification",
@@ -568,9 +665,12 @@ def _verify_run_identity(
                 "volume_qualified": registered.volume_qualified,
             }:
                 raise ValueError("v13 经济成交资格不能由输入收据重建")
-        # v13 is the first cohort eligible for current semantic replay and
-        # promotion. v12 is rejected above rather than partially attested.
-        if method == "strategy-research-pipeline-v13":
+        # 只有 v13/v14 可按当前语义重放。
+        # v12 已在上方拒绝，禁止部分复验。
+        if method in {
+            "strategy-research-pipeline-v13",
+            "strategy-research-pipeline-v14",
+        }:
             with TemporaryDirectory(
                 prefix="guvolu-research-attest-"
             ) as temporary:
@@ -611,6 +711,7 @@ def _verify_run_identity(
                     "block_bootstrap_method_version",
                 ),
                 regime_attribution_method,
+                _text(method, "pipeline_method_version"),
             )
         if decision_grade:
             assert isinstance(git_hash, str)
@@ -675,11 +776,18 @@ def _verify_run_identity(
         identity_payload["regime_attribution_method_version"] = manifest.get(
             "regime_attribution_method_version"
         )
-    if method in {"strategy-research-pipeline-v12", "strategy-research-pipeline-v13"}:
+    if method in {
+        "strategy-research-pipeline-v12",
+        "strategy-research-pipeline-v13",
+        "strategy-research-pipeline-v14",
+    }:
         identity_payload["input_receipt_sha256"] = manifest.get(
             "input_receipt_sha256"
         )
-        if method == "strategy-research-pipeline-v13":
+        if method in {
+            "strategy-research-pipeline-v13",
+            "strategy-research-pipeline-v14",
+        }:
             identity_payload.update({
                 "panel_method_version": manifest.get("panel_method_version"),
                 "panel_schema_version": manifest.get("panel_schema_version"),
@@ -696,6 +804,10 @@ def _verify_run_identity(
             identity_payload["trade_input_qualification"] = manifest.get(
                 "trade_input_qualification"
             )
+            if method == "strategy-research-pipeline-v14":
+                identity_payload["operational_gate_method_version"] = manifest.get(
+                    "operational_gate_method_version"
+                )
         if "source_data_snapshot" in manifest:
             identity_payload["source_data_snapshot"] = manifest.get(
                 "source_data_snapshot"
@@ -720,6 +832,7 @@ def _verify_data_governance(root: Path, summary: Mapping[str, object]) -> None:
         "strategy-research-pipeline-v11",
         "strategy-research-pipeline-v12",
         "strategy-research-pipeline-v13",
+        "strategy-research-pipeline-v14",
     ):
         return
     governance = _object(summary.get("data_governance"), "data_governance")

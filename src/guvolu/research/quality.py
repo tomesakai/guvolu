@@ -1,9 +1,13 @@
 """研究回放与当前运行的质量门禁。"""
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
 
-from guvolu.research.contracts import PanelSnapshot, QualityVector
+from guvolu.research.contracts import FamilyEvaluation, PanelSnapshot, QualityVector
+from guvolu.strategy.contracts import FeatureRow
+
+OPERATIONAL_GATE_METHOD_VERSION = "economic-trade-operational-gate-v1"
 
 
 def panel_quality(
@@ -115,4 +119,37 @@ def gate_feature_snapshot(
         pit=quality.pit,
         lineage=quality.lineage,
         reasons=tuple(sorted(set(reasons))),
+    )
+
+
+def gate_economic_trade_volume(
+    quality: QualityVector,
+    families: Sequence[FamilyEvaluation],
+    feature: FeatureRow,
+) -> QualityVector:
+    """实际部署集合依赖 flow 时要求当前经济成交窗口可用。"""
+    flow_sensitive = any(
+        item.eligible
+        and item.mode == "paper"
+        and item.family in {"flow_trend", "breakout"}
+        for item in families
+    )
+    latest_volume_qualified = (
+        feature.volume_qualified
+        and feature.volume_score is not None
+        and feature.flow_imbalance is not None
+    )
+    if not flow_sensitive or latest_volume_qualified:
+        return quality
+    return QualityVector(
+        integrity=quality.integrity,
+        freshness=quality.freshness,
+        clock=quality.clock,
+        coverage=False,
+        pit=quality.pit,
+        lineage=quality.lineage,
+        reasons=tuple(sorted({
+            *quality.reasons,
+            "latest_economic_trade_volume_unqualified",
+        })),
     )

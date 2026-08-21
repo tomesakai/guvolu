@@ -334,19 +334,23 @@ def _validated_forward_plan_artifact(
         "feature_method_version",
         "trade_flow_input_method_version",
         "trade_input_receipt_method_version",
+        "operational_gate_method_version",
     }
     present_semantics = semantic_fields.intersection(payload)
     if present_semantics != semantic_fields:
         raise ValueError("冻结前向计划成交语义身份不完整")
     if present_semantics:
         expected_semantics: Mapping[str, object] = {
-            "pipeline_method_version": "strategy-research-pipeline-v13",
+            "pipeline_method_version": "strategy-research-pipeline-v14",
             "panel_method_version": "trade-bars-pit-v2",
             "panel_schema_version": 2,
             "feature_method_version": "research-features-v2",
             "trade_flow_input_method_version": "economic-trade-basis-v1",
             "trade_input_receipt_method_version": (
                 "active-trade-head-receipt-v2"
+            ),
+            "operational_gate_method_version": (
+                "economic-trade-operational-gate-v1"
             ),
         }
         for field, value in expected_semantics.items():
@@ -3140,6 +3144,7 @@ def register_frozen_forward_plan(
         "feature_method_version",
         "trade_flow_input_method_version",
         "trade_input_receipt_method_version",
+        "operational_gate_method_version",
     )
     present = tuple(name for name in semantic_names if name in raw_payload)
     if len(present) != len(semantic_names):

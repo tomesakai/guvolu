@@ -24,7 +24,7 @@ from guvolu.research.config_lineage import (
     load_governed_strategy_config_with_paths,
     snapshot_verified_config_lineage,
 )
-from guvolu.research.contracts import PanelSnapshot, QualityVector
+from guvolu.research.contracts import CodeIdentity, PanelSnapshot, QualityVector
 from guvolu.research.data_location import data_root_locator
 from guvolu.research.features import (
     FEATURE_METHOD_VERSION,
@@ -57,6 +57,8 @@ from guvolu.research.provenance import (
     stable_identifier,
 )
 from guvolu.research.quality import (
+    OPERATIONAL_GATE_METHOD_VERSION,
+    gate_economic_trade_volume,
     gate_feature_snapshot,
     panel_quality,
     quality_payload,
@@ -87,7 +89,7 @@ from guvolu.strategy.generation import (
     candidate_registry_payload,
 )
 
-PIPELINE_METHOD_VERSION = "strategy-research-pipeline-v13"
+PIPELINE_METHOD_VERSION = "strategy-research-pipeline-v14"
 
 
 @dataclass(frozen=True)
@@ -112,6 +114,17 @@ def _mapping(value: object, name: str) -> Mapping[str, object]:
     if not isinstance(value, Mapping):
         raise ValueError(f"{name} 必须为对象")
     return {str(key): item for key, item in value.items()}
+
+
+def _attest_stable_code_identity(
+    root: Path,
+    config_source_paths: Sequence[Path],
+    initial: CodeIdentity,
+) -> None:
+    """长运行发布前重新确认代码树没有在执行期间变化。"""
+    current = code_identity(root, config_source_paths)
+    if current != initial:
+        raise ValueError("研究运行期间代码身份发生变化")
 
 
 def _integer(value: object, name: str) -> int:
@@ -395,6 +408,7 @@ def run_research(
         "trade_input_receipt_method_version": (
             TRADE_INPUT_RECEIPT_METHOD_VERSION
         ),
+        "operational_gate_method_version": OPERATIONAL_GATE_METHOD_VERSION,
         "config_hash": config_hash,
         "config_lineage_root_hash": lineage_root_config_hash,
         "config_lineage_depth": config_lineage_depth,
@@ -490,6 +504,7 @@ def run_research(
         config,
         decision_index=decision_index,
     )
+    _attest_stable_code_identity(root, config_source_paths, identity)
     maximum_age = _integer(
         config.get("strategy_decision_max_age_seconds"),
         "strategy_decision_max_age_seconds",
@@ -514,6 +529,11 @@ def run_research(
         strategy_decision_time,
         execution_evaluated_at,
         maximum_age,
+    )
+    operational_quality = gate_economic_trade_volume(
+        operational_quality,
+        validation.families,
+        features[decision_index],
     )
     if not identity.decision_grade:
         operational_quality = QualityVector(
@@ -768,6 +788,7 @@ def run_research(
         "trade_input_receipt_method_version": (
             TRADE_INPUT_RECEIPT_METHOD_VERSION
         ),
+        "operational_gate_method_version": OPERATIONAL_GATE_METHOD_VERSION,
         "governance_method_version": GOVERNANCE_METHOD_VERSION,
         "run_id": run_id,
         "research_identity": research_identity,
@@ -835,6 +856,7 @@ def run_research(
         "disabled_families": _disabled_families(),
         "artifacts": artifacts,
     }
+    _attest_stable_code_identity(root, config_source_paths, identity)
     summary_path = run_directory / "summary.json"
     atomic_write_text(summary_path, canonical_json(summary) + "\n")
     summary_text_path = run_directory / "summary.txt"
@@ -857,6 +879,7 @@ def run_research(
         "trade_input_receipt_method_version": (
             TRADE_INPUT_RECEIPT_METHOD_VERSION
         ),
+        "operational_gate_method_version": OPERATIONAL_GATE_METHOD_VERSION,
         "governance_method_version": GOVERNANCE_METHOD_VERSION,
         "run_id": run_id,
         "research_identity": research_identity,

@@ -27,6 +27,7 @@ from guvolu.research.artifact_contracts import (
 from guvolu.research import provenance
 from guvolu.research.contracts import (
     AllocationResult,
+    CodeIdentity,
     FamilyEvaluation,
     FrozenPanelInputs,
     FrozenPanelPartition,
@@ -59,9 +60,16 @@ from guvolu.research.panel import (
     load_panel_bars,
     registered_trade_inputs,
 )
-from guvolu.research.pipeline import _research_output_paths
+from guvolu.research.pipeline import (
+    _attest_stable_code_identity,
+    _research_output_paths,
+)
 from guvolu.research.provenance import canonical_json, stable_identifier
-from guvolu.research.quality import gate_feature_snapshot, panel_quality
+from guvolu.research.quality import (
+    gate_economic_trade_volume,
+    gate_feature_snapshot,
+    panel_quality,
+)
 from guvolu.research.validation import (
     BLOCK_BOOTSTRAP_METHOD_VERSION,
     LEGACY_BLOCK_BOOTSTRAP_METHOD_VERSION,
@@ -80,6 +88,7 @@ from guvolu.research.validation import (
     strategy_returns,
 )
 from guvolu.research.verification import (
+    _gate_operational_quality_for_pipeline,
     _verify_operational_gate,
     _verify_run_identity,
     verify_research_run,
@@ -1151,6 +1160,113 @@ def test_allocator_weight_is_independent_of_current_family_signal() -> None:
     assert contract["aggregate_target"] == 0.0
 
 
+def test_flow_operational_quality_requires_current_economic_volume() -> None:
+    """flow 家族不得依靠零目标掩盖当前经济成交窗口不可用。"""
+    quality = QualityVector(True, True, True, True, True, True, ())
+    flow = FamilyEvaluation(
+        family="flow_trend",
+        mode="paper",
+        deployment_candidate=CandidateSpec(
+            "candidate-flow", "flow_trend", "paper", {}, 1,
+        ),
+        latest_target=0.0,
+        deployment_oos_metrics=_metrics(),
+        deployment_oos_returns=(0.01, 0.02),
+        metrics=_metrics(),
+        adjusted_sharpe=0.5,
+        fdr_q=0.1,
+        eligible=True,
+        rejection_reasons=(),
+        oos_returns=(0.01, 0.02),
+    )
+    feature = replace(
+        _regime_feature(1, 1.0),
+        flow_imbalance=None,
+        volume_score=None,
+        volume_qualified=False,
+    )
+
+    gated = gate_economic_trade_volume(
+        quality,
+        (flow,),
+        feature,
+    )
+
+    assert not gated.eligible
+    assert not gated.coverage
+    assert "latest_economic_trade_volume_unqualified" in gated.reasons
+
+    # v13 保留旧质量语义。
+    assert _gate_operational_quality_for_pipeline(
+        "strategy-research-pipeline-v13", quality, (flow,), feature,
+    ) == quality
+    assert _gate_operational_quality_for_pipeline(
+        "strategy-research-pipeline-v14", quality, (flow,), feature,
+    ) == gated
+
+
+def test_price_only_operational_quality_ignores_unqualified_volume() -> None:
+    """纯价格突破不得被未使用的经济成交量误伤。"""
+    quality = QualityVector(True, True, True, True, True, True, ())
+    trend = FamilyEvaluation(
+        family="price_breakout",
+        mode="paper",
+        deployment_candidate=CandidateSpec(
+            "candidate-price-breakout", "price_breakout", "paper", {}, 1,
+        ),
+        latest_target=1.0,
+        deployment_oos_metrics=_metrics(),
+        deployment_oos_returns=(0.01, 0.02),
+        metrics=_metrics(),
+        adjusted_sharpe=0.5,
+        fdr_q=0.1,
+        eligible=True,
+        rejection_reasons=(),
+        oos_returns=(0.01, 0.02),
+    )
+    feature = replace(
+        _regime_feature(1, 1.0),
+        flow_imbalance=None,
+        volume_score=None,
+        volume_qualified=False,
+    )
+
+    assert gate_economic_trade_volume(
+        quality,
+        (trend,),
+        feature,
+    ) == quality
+
+
+def test_research_publish_rechecks_code_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """长运行期间代码树变化必须阻止最终发布。"""
+    initial = CodeIdentity(
+        git_hash="a" * 40,
+        tree_digest="b" * 64,
+        dirty_digest="c" * 64,
+        dirty=False,
+        decision_grade=True,
+        reason=None,
+    )
+    changed = replace(
+        initial,
+        tree_digest="d" * 64,
+        dirty=True,
+        decision_grade=False,
+        reason="repository_dirty",
+    )
+    monkeypatch.setattr(
+        "guvolu.research.pipeline.code_identity",
+        lambda *_args: changed,
+    )
+
+    with pytest.raises(ValueError, match="代码身份发生变化"):
+        _attest_stable_code_identity(tmp_path, (), initial)
+
+
 def test_allocator_covariance_uses_stitched_oos_returns(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1470,6 +1586,36 @@ def test_operational_gate_requires_flat_position_for_non_decision_grade() -> Non
         }],
     }
     _verify_operational_gate(payload)
+
+
+def test_verifier_rejects_unsafe_legacy_v13_flow_allocation() -> None:
+    """旧 v13 不得在最新经济成交量不合格时保留 flow 权重。"""
+    payload: dict[str, object] = {
+        "pipeline_method_version": "strategy-research-pipeline-v13",
+        "decision_grade": True,
+        "panel": {"latest_economic_volume_qualified": False},
+        "family_evaluations": [{
+            "family": "flow_trend",
+            "mode": "paper",
+            "eligible": True,
+        }],
+        "operational_quality": {"eligible": True},
+        "operational_position": {
+            "weights": {"flow_trend": 0.2},
+            "reserve": 0.8,
+        },
+        "operational_target_contract": {
+            "aggregate_target": 0.2,
+            "families": [{
+                "family": "flow_trend",
+                "family_target": 1.0,
+                "allocation_weight": 0.2,
+                "portfolio_target_contribution": 0.2,
+            }],
+        },
+    }
+    with pytest.raises(ValueError, match="v13 flow 运行门禁语义过期"):
+        _verify_operational_gate(payload)
 
 
 def test_manifest_verifier_checks_hashes_and_flat_gate(

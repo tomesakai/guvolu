@@ -69,11 +69,12 @@ def test_readiness_reports_data_waits_without_mutating_governance(
     summary = reports / "summary.json"
     summary.write_text(json.dumps({
         "run_id": "run-one",
-        "pipeline_method_version": "strategy-research-pipeline-v13",
+        "pipeline_method_version": "strategy-research-pipeline-v14",
         "panel_method_version": "trade-bars-pit-v2",
         "feature_method_version": "research-features-v2",
         "trade_flow_input_method_version": "economic-trade-basis-v1",
         "trade_input_receipt_method_version": "active-trade-head-receipt-v2",
+        "operational_gate_method_version": "economic-trade-operational-gate-v1",
         "market_id": "market-one",
         "decision_grade": True,
         "config_hash": sha256_file(config),
@@ -177,8 +178,6 @@ def test_readiness_reports_data_waits_without_mutating_governance(
     assert promotion["next_action"] == "seal_future_vintage_before_its_start"
     assert result["read_only"] is True
 
-    # 探索 scope 中出现 flow 不应阻塞仅 trend 的部署；一旦 flow 实际
-    # eligible，同一受保护 panel 必须同时触发最新窗口与研究期硬门。
     summary_payload = json.loads(summary.read_text(encoding="utf-8"))
     summary_payload["family_evaluations"].append({
         "family": "flow_trend", "eligible": True, "mode": "paper",
@@ -224,11 +223,12 @@ def test_readiness_blocks_operational_config_mismatch(
     summary = reports / "summary.json"
     summary.write_text(json.dumps({
         "run_id": "run-one",
-        "pipeline_method_version": "strategy-research-pipeline-v13",
+        "pipeline_method_version": "strategy-research-pipeline-v14",
         "panel_method_version": "trade-bars-pit-v2",
         "feature_method_version": "research-features-v2",
         "trade_flow_input_method_version": "economic-trade-basis-v1",
         "trade_input_receipt_method_version": "active-trade-head-receipt-v2",
+        "operational_gate_method_version": "economic-trade-operational-gate-v1",
         "market_id": "market-one",
         "decision_grade": True,
         "config_hash": "different-config",

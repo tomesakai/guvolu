@@ -53,7 +53,12 @@ from guvolu.research.provenance import (
     sha256_file,
     stable_identifier,
 )
-from guvolu.research.quality import gate_feature_snapshot, panel_quality, quality_payload
+from guvolu.research.quality import (
+    OPERATIONAL_GATE_METHOD_VERSION,
+    gate_feature_snapshot,
+    panel_quality,
+    quality_payload,
+)
 from guvolu.strategy.baselines import generate_targets
 from guvolu.strategy.contracts import CandidateSpec
 
@@ -242,7 +247,7 @@ def freeze_forward_plan(
         return FrozenPlanResult(existing.plan_id, path, existing.plan_artifact_sha256)
     summary = _load(summary_file)
     required_methods: Mapping[str, object] = {
-        "pipeline_method_version": "strategy-research-pipeline-v13",
+        "pipeline_method_version": "strategy-research-pipeline-v14",
         "panel_method_version": PANEL_METHOD_VERSION,
         "panel_schema_version": PANEL_SCHEMA_VERSION,
         "feature_method_version": FEATURE_METHOD_VERSION,
@@ -250,6 +255,7 @@ def freeze_forward_plan(
         "trade_input_receipt_method_version": (
             TRADE_INPUT_RECEIPT_METHOD_VERSION
         ),
+        "operational_gate_method_version": OPERATIONAL_GATE_METHOD_VERSION,
     }
     for field, expected in required_methods.items():
         if summary.get(field) != expected or source_manifest.get(field) != expected:
@@ -394,7 +400,7 @@ def _source_research_volume_qualified(
 def _attest_current_trade_methods(payload: Mapping[str, object]) -> None:
     """拒绝缺少新成交语义身份的 legacy 冻结计划。"""
     expected: Mapping[str, object] = {
-        "pipeline_method_version": "strategy-research-pipeline-v13",
+        "pipeline_method_version": "strategy-research-pipeline-v14",
         "panel_method_version": PANEL_METHOD_VERSION,
         "panel_schema_version": PANEL_SCHEMA_VERSION,
         "feature_method_version": FEATURE_METHOD_VERSION,
@@ -402,6 +408,7 @@ def _attest_current_trade_methods(payload: Mapping[str, object]) -> None:
         "trade_input_receipt_method_version": (
             TRADE_INPUT_RECEIPT_METHOD_VERSION
         ),
+        "operational_gate_method_version": OPERATIONAL_GATE_METHOD_VERSION,
     }
     for field, value in expected.items():
         if payload.get(field) != value:

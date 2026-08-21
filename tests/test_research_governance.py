@@ -240,12 +240,13 @@ def _write_forward_plan_artifact(
 ) -> tuple[str, str, str]:
     """写入与注册合同一致的冻结前向计划制品。"""
     semantics: dict[str, object] = {} if legacy else {
-        "pipeline_method_version": "strategy-research-pipeline-v13",
+        "pipeline_method_version": "strategy-research-pipeline-v14",
         "panel_method_version": "trade-bars-pit-v2",
         "panel_schema_version": 2,
         "feature_method_version": "research-features-v2",
         "trade_flow_input_method_version": "economic-trade-basis-v1",
         "trade_input_receipt_method_version": "active-trade-head-receipt-v2",
+        "operational_gate_method_version": "economic-trade-operational-gate-v1",
     }
     plan_id = stable_identifier("frozen-forward-plan", {
         "governance_method_version": GOVERNANCE_METHOD_VERSION,
@@ -3000,7 +3001,10 @@ def test_holdout_is_consumed_before_market_data_is_opened(
     }
     summary = tmp_path / "reports" / "summary.json"
     summary.write_text(json.dumps({
-        "pipeline_method_version": "strategy-research-pipeline-v13",
+        "pipeline_method_version": "strategy-research-pipeline-v14",
+        "operational_gate_method_version": (
+            "economic-trade-operational-gate-v1"
+        ),
         "run_id": "run-one",
         "research_identity": "research-one",
         "config_hash": config_hash,
