@@ -576,6 +576,26 @@ v13 运行；当前 verifier 能读取并校验其收据和制品身份，但在
 的候选身份、三档 lookback 预算、monitor 与 evolution cohort；原 `breakout` 保留为 flow-sensitive
 历史假设。二者不得共享指标或把一个流派的通过结果平移给另一个。
 
+clean commit `3e5402cdbcf72d0849839efaa4d497aae76b5ee9` 上的真实 v14 独立运行确认了两个
+当前可用、但尚未冻结部署的纯价格家族。`price_breakout` 运行
+`research-run-4e0aec7d9febe712db67f84ef1d85d2e7b3bfde110f78d1d335b7e090ce85641`
+的 manifest SHA-256 是 `3bcb7a3ba84822d3a068c8f7a9a1e3d4c4191811a1e1cfd42357922786ae588c`；
+完整 verifier 重建通过。其 stitched OOS Sharpe 为 `1.102`、部署候选 Sharpe 为 `1.260`、
+FDR q 为 `0.00536`、PBO 为 `0.00586`、bootstrap p 为 `0.00488`，当前 target 为
+`0.9796`。固定目标成本扫描位于
+`reports/strategy-research/v14-baselines/cost-sensitivity/price_breakout/`，stitched 与部署
+单边 break-even 分别为 `66.36bp` 和 `90.66bp`；`40bp` 时 stitched Sharpe 仍为 `0.513`。
+
+同一 cohort 的 `trend` 运行
+`research-run-cb8b5a942d19ee31b2004f5c55c9876efd1fb1416cb7448c09b66a2e7f26face`
+及 manifest SHA-256 `df2639e5f28bad4e7c9121ab0da755cec77d2b4c6ea15738713fb6207e1f6702`
+也通过完整 verifier。其 stitched OOS Sharpe 为 `0.772`、部署候选 Sharpe 为 `0.970`、
+FDR q 为 `0.0358`、PBO 为 `0.320`、bootstrap p 为 `0.0380`。固定路径 stitched break-even
+为 `44.54bp`，`40bp` 时 Sharpe 仅 `0.101`，因此可用但成本安全边际弱于纯价格突破。
+两个 family monitor 都报告 `evolution_action=eligible_axis_refinement`，但
+`cross_run_direction=insufficient_history` 且去重历史为零。lookback `264` 派生配置只是
+单次候选网格关联支持的预登记 challenger；不得替换当前候选，须等待时间分离的新 vintage。
+
 固定候选成本扫描器只重放已经保护的 walk-forward OOS 目标，不重新选择候选，因此不会以不同
 成本反复挑冠军。趋势基线在 `10bp` 时精确重建 OOS Sharpe `0.7718`；固定选择下 `20bp`、
 `30bp`、`40bp` 分别为 `0.5478`、`0.3241`、`0.1010`，约 `44.54bp` 才到损益平衡。
