@@ -48,12 +48,15 @@ def atomic_write_bytes(path: Path, body: bytes) -> None:
             # 替换时保留既有 mode。
             temp.chmod(existing_mode if existing_mode is not None else 0o644)
             with os.fdopen(descriptor, "wb") as handle:
+                descriptor = -1
                 handle.write(body)
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temp, path)
             _fsync_parent(path)
         finally:
+            if descriptor >= 0:
+                os.close(descriptor)
             try:
                 temp.unlink()
             except FileNotFoundError:

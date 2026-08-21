@@ -267,6 +267,22 @@ def test_atomic_write_supports_parallel_writers(tmp_path: Path) -> None:
         assert pointer.stat().st_mode & 0o777 == 0o644
 
 
+def test_atomic_write_closes_descriptor_when_chmod_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """权限设置失败时不得泄漏句柄或掩盖原异常。"""
+    pointer = tmp_path / "failed-pointer.json"
+
+    def fail_chmod(_path: Path, _mode: int) -> None:
+        raise OSError("chmod failure")
+
+    monkeypatch.setattr(Path, "chmod", fail_chmod)
+    with pytest.raises(OSError, match="chmod failure"):
+        atomic_write_text(pointer, "{}\n")
+    assert tuple(tmp_path.glob(".failed-pointer.json.tmp-*")) == ()
+
+
 def test_atomic_write_is_cross_process_serialized(tmp_path: Path) -> None:
     """不同进程同时替换一个指针时不得留下坏字节或临时文件。"""
     pointer = tmp_path / "shared-pointer.json"
