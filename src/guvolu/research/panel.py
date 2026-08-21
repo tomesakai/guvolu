@@ -14,6 +14,10 @@ from typing import Any, Mapping
 
 import duckdb
 
+from guvolu.data.trade_economics import (
+    TRADE_FLOW_INPUT_METHOD_VERSION,
+    economic_trade_qualification_sql,
+)
 from guvolu.data.store import connect_readonly
 from guvolu.data.durable_io import atomic_write_text
 from guvolu.research.contracts import (
@@ -25,9 +29,10 @@ from guvolu.research.provenance import sha256_file
 from guvolu.strategy.contracts import ResearchBar
 from guvolu.ui.query_catalog import QueryCatalog
 
-PANEL_SCHEMA_VERSION = 1
-PANEL_METHOD_VERSION = "trade-bars-pit-v1"
-TRADE_INPUT_RECEIPT_METHOD_VERSION = "active-trade-head-receipt-v1"
+PANEL_SCHEMA_VERSION = 2
+PANEL_METHOD_VERSION = "trade-bars-pit-v2"
+TRADE_INPUT_RECEIPT_METHOD_VERSION = "active-trade-head-receipt-v2"
+LEGACY_TRADE_INPUT_RECEIPT_METHOD_VERSION = "active-trade-head-receipt-v1"
 PANEL_DUCKDB_MEMORY_LIMIT = "4GB"
 PANEL_DUCKDB_THREADS = 2
 _INTERVAL_SQL = {
@@ -93,6 +98,8 @@ def _freeze_trade_snapshot(
                 row_count=row.row_count,
                 min_event_time=row.min_event_time,
                 max_event_time=row.max_event_time,
+                domain=row.domain,
+                normalization_version=row.normalization_version,
             )
             for row in outputs
         ),
@@ -102,8 +109,37 @@ def _freeze_trade_snapshot(
 
 def freeze_trade_inputs(data_root: Path, market_id: str) -> FrozenPanelInputs:
     """在只读事务中冻结成交活动 head。"""
-    inputs, _outputs = _freeze_trade_snapshot(data_root, market_id)
-    return inputs
+    inputs, outputs = _freeze_trade_snapshot(data_root, market_id)
+    source = 0
+    economic = 0
+    unqualified = 0
+    venue_id = str(inputs.market.get("venue_id") or "")
+    summaries = _trade_qualification_summaries(
+        tuple(output.path.resolve() for output in outputs),
+        str(inputs.market.get("market_id") or ""),
+        venue_id,
+        {
+            output.path.resolve(): (
+                str(output.domain), str(output.normalization_version),
+            )
+            for output in outputs
+        },
+    )
+    for output in outputs:
+        summary = summaries[output.path.resolve()]
+        if summary[0] != int(output.row_count):
+            raise ValueError("活动成交控制面行数与物理文件不一致")
+        source += summary[0]
+        economic += summary[1]
+        unqualified += summary[2]
+    return replace(
+        inputs,
+        trade_flow_input_method_version=TRADE_FLOW_INPUT_METHOD_VERSION,
+        source_trade_rows=source,
+        economic_trade_rows=economic,
+        unqualified_trade_rows=unqualified,
+        volume_qualified=unqualified == 0,
+    )
 
 
 def _trade_receipt_payload(
@@ -114,6 +150,20 @@ def _trade_receipt_payload(
     """把一次完整活动 head 快照编码为可内容寻址的输入收据。"""
     root = data_root.resolve()
     entries: list[Mapping[str, object]] = []
+    source_trade_rows = 0
+    economic_trade_rows = 0
+    unqualified_trade_rows = 0
+    qualifications = _trade_qualification_summaries(
+        tuple(output.path.resolve() for output in outputs),
+        str(inputs.market.get("market_id") or ""),
+        str(inputs.market.get("venue_id") or ""),
+        {
+            output.path.resolve(): (
+                str(output.domain), str(output.normalization_version),
+            )
+            for output in outputs
+        },
+    )
     for output in outputs:
         path = output.path.resolve()
         try:
@@ -123,6 +173,12 @@ def _trade_receipt_payload(
         digest = sha256_file(path)
         if output.artifact_id != f"sha256-{digest}":
             raise ValueError("活动成交 artifact_id 与物理文件 SHA-256 不一致")
+        qualification = qualifications[path]
+        if qualification[0] != int(output.row_count):
+            raise ValueError("活动成交控制面行数与物理文件不一致")
+        source_trade_rows += qualification[0]
+        economic_trade_rows += qualification[1]
+        unqualified_trade_rows += qualification[2]
         entries.append({
             "domain": output.domain,
             "partition_key": output.partition_key,
@@ -142,6 +198,13 @@ def _trade_receipt_payload(
                 None if output.max_event_time is None
                 else output.max_event_time.isoformat()
             ),
+            "trade_flow_input_method_version": (
+                TRADE_FLOW_INPUT_METHOD_VERSION
+            ),
+            "source_trade_rows": qualification[0],
+            "economic_trade_rows": qualification[1],
+            "unqualified_trade_rows": qualification[2],
+            "volume_qualified": qualification[3],
         })
     return {
         "schema_version": 1,
@@ -152,6 +215,11 @@ def _trade_receipt_payload(
         "artifact_ids": list(inputs.artifact_ids),
         "normalization_versions": list(inputs.normalization_versions),
         "maximum_event_time": inputs.maximum_event_time.isoformat(),
+        "trade_flow_input_method_version": TRADE_FLOW_INPUT_METHOD_VERSION,
+        "source_trade_rows": source_trade_rows,
+        "economic_trade_rows": economic_trade_rows,
+        "unqualified_trade_rows": unqualified_trade_rows,
+        "volume_qualified": unqualified_trade_rows == 0,
         "entries": sorted(
             entries,
             key=lambda item: (
@@ -160,6 +228,64 @@ def _trade_receipt_payload(
             ),
         ),
     }
+
+
+def _trade_qualification_summaries(
+    paths: tuple[Path, ...],
+    market_id: str,
+    venue_id: str,
+    control_contracts: Mapping[Path, tuple[str, str]] | None = None,
+) -> Mapping[Path, tuple[int, int, int, bool]]:
+    """一次扫描一组 Parquet，并按物理文件返回资格摘要。"""
+    resolved = tuple(path.resolve() for path in paths)
+    columns = _parquet_columns(resolved)
+    if "market_id" not in columns:
+        predicate = "FALSE"
+    elif venue_id == "gmo" and control_contracts is not None:
+        market_literal = _quote(market_id)
+        predicates = tuple(
+            "(filename='" + _quote(str(path)) + "' AND "
+            + f"market_id='{market_literal}' AND "
+            + (
+                "FALSE"
+                if control_contracts.get(path) is None
+                else economic_trade_qualification_sql(
+                    venue_id, columns, control_contracts[path],
+                )
+            ) + ")"
+            for path in resolved
+        )
+        predicate = "(" + " OR ".join(predicates) + ")"
+    else:
+        predicate = (
+            f"(market_id='{_quote(market_id)}' AND "
+            + economic_trade_qualification_sql(venue_id, columns) + ")"
+        )
+    db: Any = duckdb.connect()
+    try:
+        rows = db.execute(
+            "SELECT filename,COUNT(*),COUNT(*) FILTER (WHERE " + predicate + "),"
+            "COUNT(*) FILTER (WHERE NOT (" + predicate + ")) "
+            f"FROM read_parquet({_path_list(resolved)},union_by_name=true,"
+            "filename=true) GROUP BY filename"
+        ).fetchall()
+    finally:
+        db.close()
+    result: dict[Path, tuple[int, int, int, bool]] = {}
+    for row in rows:
+        path = Path(str(row[0])).resolve()
+        source = int(row[1])
+        economic = int(row[2])
+        unqualified = int(row[3])
+        if source != economic + unqualified:
+            raise ValueError("成交资格摘要不守恒")
+        result[path] = (source, economic, unqualified, unqualified == 0)
+    extra = set(result).difference(resolved)
+    if extra:
+        raise ValueError("成交资格摘要包含未冻结物理文件")
+    for path in resolved:
+        result.setdefault(path, (0, 0, 0, True))
+    return result
 
 
 def capture_trade_input_receipt(
@@ -181,7 +307,16 @@ def capture_trade_input_receipt(
             raise ValueError("既有活动成交输入收据内容损坏")
     else:
         atomic_write_text(path, content)
-    return replace(inputs, receipt_path=path, receipt_sha256=digest)
+    return replace(
+        inputs,
+        receipt_path=path,
+        receipt_sha256=digest,
+        trade_flow_input_method_version=TRADE_FLOW_INPUT_METHOD_VERSION,
+        source_trade_rows=int(str(payload["source_trade_rows"])),
+        economic_trade_rows=int(str(payload["economic_trade_rows"])),
+        unqualified_trade_rows=int(str(payload["unqualified_trade_rows"])),
+        volume_qualified=bool(payload["volume_qualified"]),
+    )
 
 
 def attest_trade_input_receipt(
@@ -198,11 +333,19 @@ def attest_trade_input_receipt(
     if not isinstance(raw, dict):
         raise ValueError("活动成交输入收据必须为对象")
     receipt = {str(key): value for key, value in raw.items()}
-    if (
-        receipt.get("schema_version") != 1
-        or receipt.get("method_version") != TRADE_INPUT_RECEIPT_METHOD_VERSION
-    ):
+    receipt_method = receipt.get("method_version")
+    legacy_receipt = (
+        receipt.get("schema_version") == 1
+        and receipt_method == LEGACY_TRADE_INPUT_RECEIPT_METHOD_VERSION
+    )
+    current_receipt = (
+        receipt.get("schema_version") == 1
+        and receipt_method == TRADE_INPUT_RECEIPT_METHOD_VERSION
+    )
+    if not legacy_receipt and not current_receipt:
         raise ValueError("活动成交输入收据版本不受支持")
+    if legacy_receipt and require_current_head:
+        raise ValueError("旧版活动成交输入收据不能证明当前 head")
     market_id = str(receipt.get("market_id") or "")
     raw_attempts = receipt.get("attempt_ids")
     raw_artifacts = receipt.get("artifact_ids")
@@ -268,6 +411,12 @@ def attest_trade_input_receipt(
     recorded_attempts: set[str] = set()
     recorded_artifacts: set[str] = set()
     recorded_normalizations: set[str] = set()
+    source_trade_rows = 0
+    economic_trade_rows = 0
+    unqualified_trade_rows = 0
+    qualification_expectations: list[
+        tuple[int, Path, dict[str, object]]
+    ] = []
     for index, raw_entry in enumerate(entries):
         if not isinstance(raw_entry, dict):
             raise ValueError("活动成交输入收据 partition 映射无效")
@@ -311,6 +460,8 @@ def attest_trade_input_receipt(
             or output["max_event_time"] != entry.get("max_event_time")
         ):
             raise ValueError(f"活动成交输入收据散列不匹配: {index}")
+        if current_receipt:
+            qualification_expectations.append((index, path, entry))
         recorded_paths.append(path)
         recorded_partitions.append(FrozenPanelPartition(
             path=path,
@@ -323,10 +474,41 @@ def attest_trade_input_receipt(
                 None if output["max_event_time"] is None
                 else parse_time(output["max_event_time"], "max_event_time")
             ),
+            domain=str(entry.get("domain") or ""),
+            normalization_version=str(
+                entry.get("normalization_version") or ""
+            ),
         ))
         recorded_attempts.add(identity_key[0])
         recorded_artifacts.add(identity_key[1])
         recorded_normalizations.add(str(entry.get("normalization_version") or ""))
+    if current_receipt:
+        qualifications = _trade_qualification_summaries(
+            tuple(recorded_paths), market_id, str(market["venue_id"]),
+            {
+                path: (
+                    str(entry.get("domain") or ""),
+                    str(entry.get("normalization_version") or ""),
+                )
+                for _index, path, entry in qualification_expectations
+            },
+        )
+        for index, path, entry in qualification_expectations:
+            qualification = qualifications[path]
+            if (
+                entry.get("trade_flow_input_method_version")
+                != TRADE_FLOW_INPUT_METHOD_VERSION
+                or entry.get("source_trade_rows") != qualification[0]
+                or entry.get("economic_trade_rows") != qualification[1]
+                or entry.get("unqualified_trade_rows") != qualification[2]
+                or entry.get("volume_qualified") is not qualification[3]
+            ):
+                raise ValueError(
+                    f"活动成交输入收据经济成交资格不匹配: {index}"
+                )
+            source_trade_rows += qualification[0]
+            economic_trade_rows += qualification[1]
+            unqualified_trade_rows += qualification[2]
     if (
         recorded_attempts != set(attempt_ids)
         or recorded_artifacts != set(artifact_ids)
@@ -337,6 +519,15 @@ def attest_trade_input_receipt(
     maximum_event_time = parse_time(
         receipt.get("maximum_event_time"), "maximum_event_time",
     )
+    if current_receipt and (
+        receipt.get("trade_flow_input_method_version")
+        != TRADE_FLOW_INPUT_METHOD_VERSION
+        or receipt.get("source_trade_rows") != source_trade_rows
+        or receipt.get("economic_trade_rows") != economic_trade_rows
+        or receipt.get("unqualified_trade_rows") != unqualified_trade_rows
+        or receipt.get("volume_qualified") is not (unqualified_trade_rows == 0)
+    ):
+        raise ValueError("活动成交输入收据资格汇总不匹配")
     registered = FrozenPanelInputs(
         market={
             "market_id": str(market["market_id"]),
@@ -359,6 +550,13 @@ def attest_trade_input_receipt(
         normalization_versions=normalizations,
         maximum_event_time=maximum_event_time,
         partitions=tuple(recorded_partitions),
+        trade_flow_input_method_version=(
+            TRADE_FLOW_INPUT_METHOD_VERSION if current_receipt else None
+        ),
+        source_trade_rows=source_trade_rows,
+        economic_trade_rows=economic_trade_rows,
+        unqualified_trade_rows=unqualified_trade_rows,
+        volume_qualified=(current_receipt and unqualified_trade_rows == 0),
     )
     if require_current_head:
         current, current_outputs = _freeze_trade_snapshot(data_root, market_id)
@@ -480,6 +678,8 @@ def registered_trade_inputs(
                 None if row["max_event_time"] is None
                 else parse_time(row["max_event_time"], "max_event_time")
             ),
+            domain=str(row["domain"]),
+            normalization_version=normalization,
         ))
     generation_body = json.dumps(
         sorted(heads), separators=(",", ":"), ensure_ascii=False,
@@ -592,23 +792,44 @@ def _panel_path_groups(
 def _bar_fragment_query(
     paths: tuple[Path, ...],
     interval_sql: str,
+    venue_id: str,
+    columns: set[str],
+    control_contracts: Mapping[Path, tuple[str, str]],
 ) -> str:
     """生成一个事件覆盖重叠组的局部去重小时片段。"""
     files = _path_list(paths)
+    if venue_id == "gmo":
+        predicates = tuple(
+            "(filename='" + _quote(str(path.resolve())) + "' AND "
+            + (
+                "FALSE"
+                if control_contracts.get(path.resolve()) is None
+                else economic_trade_qualification_sql(
+                    venue_id,
+                    columns,
+                    control_contracts[path.resolve()],
+                )
+            ) + ")"
+            for path in paths
+        )
+        economic = "(" + " OR ".join(predicates) + ")"
+    else:
+        economic = economic_trade_qualification_sql(venue_id, columns)
     return f"""
         WITH source AS (
           SELECT observation_id,event_time,available_time,side,
                  source_side_basis,price,size,
+                 ({economic}) AS economic_trade_qualified,
                  ROW_NUMBER() OVER (
                    PARTITION BY observation_id
                    ORDER BY ingest_time,source_artifact_id,source_row_index
                  ) AS duplicate_ordinal
-          FROM read_parquet({files}, union_by_name=true)
+          FROM read_parquet({files}, union_by_name=true,filename=true)
           WHERE market_id=? AND event_time>=? AND event_time<?
             AND available_time<=?
         ), typed AS (
           SELECT observation_id,event_time,available_time,side,
-                 source_side_basis,
+                 source_side_basis,economic_trade_qualified,
                  TRY_CAST(price AS DECIMAL(38,12)) AS price_decimal,
                  TRY_CAST(size AS DECIMAL(38,12)) AS size_decimal,
                  time_bucket(INTERVAL '{interval_sql}',event_time) AS bucket_start
@@ -634,18 +855,38 @@ def _bar_fragment_query(
                  AS close_observation_id,
                LAST(price_decimal ORDER BY event_time,observation_id)
                  AS close_price,
-               SUM(size_decimal) AS base_volume,
-               SUM(price_decimal*size_decimal) AS quote_volume,
+               SUM(CASE WHEN economic_trade_qualified THEN size_decimal ELSE 0 END)
+                 AS base_volume,
+               SUM(CASE WHEN economic_trade_qualified
+                        THEN price_decimal*size_decimal ELSE 0 END)
+                 AS quote_volume,
                SUM(CASE
-                     WHEN source_side_basis LIKE 'taker%' AND side='buy'
+                     WHEN economic_trade_qualified AND side='buy'
                        THEN size_decimal
-                     WHEN source_side_basis LIKE 'taker%' AND side='sell'
+                     WHEN economic_trade_qualified AND side='sell'
                        THEN -size_decimal
                      ELSE 0
                    END) AS signed_base_volume,
-               COUNT(*) AS trade_count
+               COUNT(*) FILTER (WHERE economic_trade_qualified) AS trade_count,
+               COUNT(*) AS source_trade_count,
+               COUNT(*) FILTER (WHERE NOT economic_trade_qualified)
+                 AS unqualified_trade_count,
+               BOOL_AND(economic_trade_qualified) AS volume_qualified
         FROM eligible GROUP BY bucket_start
     """
+
+
+def _parquet_columns(paths: tuple[Path, ...]) -> set[str]:
+    """读取一个重叠组实际存在的物理列，缺列按不合格处理。"""
+    db: Any = duckdb.connect()
+    try:
+        rows = db.execute(
+            f"DESCRIBE SELECT * FROM read_parquet({_path_list(paths)}, "
+            "union_by_name=true)"
+        ).fetchall()
+    finally:
+        db.close()
+    return {str(row[0]) for row in rows}
 
 
 def _panel_output_query(
@@ -672,14 +913,19 @@ def _panel_output_query(
                  SUM(base_volume) AS base_volume,
                  SUM(quote_volume) AS quote_volume,
                  SUM(signed_base_volume) AS signed_base_volume,
-                 CAST(SUM(trade_count) AS BIGINT) AS trade_count
+                 CAST(SUM(trade_count) AS BIGINT) AS trade_count,
+                 CAST(SUM(source_trade_count) AS BIGINT) AS source_trade_count,
+                 CAST(SUM(unqualified_trade_count) AS BIGINT)
+                   AS unqualified_trade_count,
+                 BOOL_AND(volume_qualified) AS volume_qualified
           FROM bar_fragments GROUP BY bucket_start
         )
         SELECT ? AS market_id,? AS bar_interval,bucket_start AS open_time,
                decision_time,latest_available_time,
                open_price AS open,high_price AS high,low_price AS low,
                close_price AS close,base_volume,quote_volume,signed_base_volume,
-               trade_count,
+               trade_count,source_trade_count,unqualified_trade_count,
+               volume_qualified,
                CAST(ROUND(open_price/CAST(? AS DECIMAL(38,12))) AS BIGINT)
                  AS open_ticks,
                CAST(ROUND(high_price/CAST(? AS DECIMAL(38,12))) AS BIGINT)
@@ -733,8 +979,24 @@ def compact_trade_panel(
     market_id, tick_size, size_step, mapping_revision = _panel_contract(
         inputs, interval, notional_scale,
     )
+    if str(inputs.market.get("venue_id") or "") == "gmo":
+        input_paths = {path.resolve() for path in inputs.paths}
+        partition_paths = {
+            partition.path.resolve() for partition in inputs.partitions
+        }
+        if input_paths != partition_paths or len(inputs.partitions) != len(
+            input_paths
+        ):
+            raise ValueError("GMO panel 输入缺少逐文件控制合同")
     interval_sql = _INTERVAL_SQL[interval]
     groups = _panel_path_groups(inputs, from_time, to_time)
+    control_contracts = {
+        partition.path.resolve(): (
+            str(partition.domain or ""),
+            str(partition.normalization_version or ""),
+        )
+        for partition in inputs.partitions
+    }
     query, parameters = _panel_output_query(
         market_id,
         interval,
@@ -771,7 +1033,10 @@ def compact_trade_panel(
                       base_volume DECIMAL(38,12),
                       quote_volume DECIMAL(38,24),
                       signed_base_volume DECIMAL(38,12),
-                      trade_count BIGINT
+                      trade_count BIGINT,
+                      source_trade_count BIGINT,
+                      unqualified_trade_count BIGINT,
+                      volume_qualified BOOLEAN
                     )
                 """)
                 fragment_parameters: tuple[object, ...] = (
@@ -782,9 +1047,14 @@ def compact_trade_panel(
                     _utc(to_time),
                 )
                 for paths in groups:
+                    columns = _parquet_columns(paths)
                     db.execute(
                         "INSERT INTO bar_fragments "
-                        + _bar_fragment_query(paths, interval_sql),
+                        + _bar_fragment_query(
+                            paths, interval_sql,
+                            str(inputs.market.get("venue_id") or ""), columns,
+                            control_contracts,
+                        ),
                         fragment_parameters,
                     )
                 copy = (
@@ -821,7 +1091,8 @@ def load_panel_bars(path: Path) -> tuple[ResearchBar, ...]:
             "CAST(open AS DOUBLE),CAST(high AS DOUBLE),CAST(low AS DOUBLE),"
             "CAST(close AS DOUBLE),CAST(base_volume AS DOUBLE),"
             "CAST(quote_volume AS DOUBLE),CAST(signed_base_volume AS DOUBLE),"
-            "trade_count FROM read_parquet(?) ORDER BY open_time",
+            "trade_count,source_trade_count,unqualified_trade_count,"
+            "volume_qualified FROM read_parquet(?) ORDER BY open_time",
             (str(path.resolve()),),
         ).fetchall()
     finally:
@@ -838,6 +1109,9 @@ def load_panel_bars(path: Path) -> tuple[ResearchBar, ...]:
         quote_volume=float(row[8]),
         signed_base_volume=float(row[9]),
         trade_count=int(row[10]),
+        source_trade_count=int(row[11]),
+        unqualified_trade_count=int(row[12]),
+        volume_qualified=bool(row[13]),
     ) for row in rows)
     if not bars:
         raise ValueError("紧凑研究面板为空")
@@ -895,4 +1169,11 @@ def panel_inputs_payload(inputs: FrozenPanelInputs) -> Mapping[str, object]:
         "input_file_count": len(inputs.paths),
         "maximum_event_time": inputs.maximum_event_time.isoformat(),
         "receipt_sha256": inputs.receipt_sha256,
+        "trade_flow_input_method_version": (
+            inputs.trade_flow_input_method_version
+        ),
+        "source_trade_rows": inputs.source_trade_rows,
+        "economic_trade_rows": inputs.economic_trade_rows,
+        "unqualified_trade_rows": inputs.unqualified_trade_rows,
+        "volume_qualified": inputs.volume_qualified,
     }

@@ -21,6 +21,9 @@ class ResearchBar:
     quote_volume: float
     signed_base_volume: float
     trade_count: int
+    source_trade_count: int = 0
+    unqualified_trade_count: int = 0
+    volume_qualified: bool = True
 
 
 @dataclass(frozen=True)
@@ -39,6 +42,7 @@ class FeatureRow:
     volume_score: float | None
     jump_score: float | None
     contiguous: bool
+    volume_qualified: bool = True
 
 
 @dataclass(frozen=True)

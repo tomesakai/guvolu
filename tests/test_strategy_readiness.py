@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -68,6 +69,11 @@ def test_readiness_reports_data_waits_without_mutating_governance(
     summary = reports / "summary.json"
     summary.write_text(json.dumps({
         "run_id": "run-one",
+        "pipeline_method_version": "strategy-research-pipeline-v13",
+        "panel_method_version": "trade-bars-pit-v2",
+        "feature_method_version": "research-features-v2",
+        "trade_flow_input_method_version": "economic-trade-basis-v1",
+        "trade_input_receipt_method_version": "active-trade-head-receipt-v2",
         "market_id": "market-one",
         "decision_grade": True,
         "config_hash": sha256_file(config),
@@ -75,6 +81,7 @@ def test_readiness_reports_data_waits_without_mutating_governance(
         "config_lineage_depth": 1,
         "code_identity": {"git_hash": "source", "tree_digest": "tree-one"},
         "input": {"head_generation": "published-head"},
+        "family_scope": ["trend", "flow_trend"],
         "family_evaluations": [{
             "family": "trend",
             "eligible": True,
@@ -133,7 +140,13 @@ def test_readiness_reports_data_waits_without_mutating_governance(
         "guvolu.research.readiness.code_identity",
         current_identity,
     )
-    bars = tuple(_bar(hour) for hour in (0, 1, 2, 10, 11))
+    bars = tuple(_bar(hour) for hour in (0, 1, 2, 10)) + (
+        replace(
+            _bar(11), base_volume=0.0, quote_volume=0.0,
+            signed_base_volume=0.0, trade_count=0,
+            unqualified_trade_count=1, volume_qualified=False,
+        ),
+    )
     monkeypatch.setattr(  # type: ignore[attr-defined]
         "guvolu.research.readiness.load_panel_bars", lambda _path: bars,
     )
@@ -164,6 +177,30 @@ def test_readiness_reports_data_waits_without_mutating_governance(
     assert promotion["next_action"] == "seal_future_vintage_before_its_start"
     assert result["read_only"] is True
 
+    # 探索 scope 中出现 flow 不应阻塞仅 trend 的部署；一旦 flow 实际
+    # eligible，同一受保护 panel 必须同时触发最新窗口与研究期硬门。
+    summary_payload = json.loads(summary.read_text(encoding="utf-8"))
+    summary_payload["family_evaluations"].append({
+        "family": "flow_trend", "eligible": True, "mode": "paper",
+    })
+    summary.write_text(json.dumps(summary_payload), encoding="utf-8")
+    flow_result = strategy_readiness(
+        tmp_path,
+        config,
+        manifest,
+        reference_time=_bar(11).decision_time,
+    )
+    flow_operational = flow_result["operational"]
+    assert isinstance(flow_operational, dict)
+    assert "latest_economic_trade_volume_unqualified" in (
+        flow_operational["blockers"]
+    )
+    flow_promotion = flow_result["promotion"]
+    assert isinstance(flow_promotion, dict)
+    assert "source_economic_trade_volume_unqualified" in (
+        flow_promotion["blockers"]
+    )
+
 
 def test_readiness_blocks_operational_config_mismatch(
     tmp_path: Path,
@@ -187,6 +224,11 @@ def test_readiness_blocks_operational_config_mismatch(
     summary = reports / "summary.json"
     summary.write_text(json.dumps({
         "run_id": "run-one",
+        "pipeline_method_version": "strategy-research-pipeline-v13",
+        "panel_method_version": "trade-bars-pit-v2",
+        "feature_method_version": "research-features-v2",
+        "trade_flow_input_method_version": "economic-trade-basis-v1",
+        "trade_input_receipt_method_version": "active-trade-head-receipt-v2",
         "market_id": "market-one",
         "decision_grade": True,
         "config_hash": "different-config",

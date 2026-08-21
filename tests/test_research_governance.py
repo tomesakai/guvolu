@@ -235,8 +235,18 @@ def _write_forward_plan_artifact(
     candidate_set_hash: str,
     config_hash: str,
     code_tree_digest: str,
+    *,
+    legacy: bool = False,
 ) -> tuple[str, str, str]:
     """写入与注册合同一致的冻结前向计划制品。"""
+    semantics: dict[str, object] = {} if legacy else {
+        "pipeline_method_version": "strategy-research-pipeline-v13",
+        "panel_method_version": "trade-bars-pit-v2",
+        "panel_schema_version": 2,
+        "feature_method_version": "research-features-v2",
+        "trade_flow_input_method_version": "economic-trade-basis-v1",
+        "trade_input_receipt_method_version": "active-trade-head-receipt-v2",
+    }
     plan_id = stable_identifier("frozen-forward-plan", {
         "governance_method_version": GOVERNANCE_METHOD_VERSION,
         "vintage_id": vintage_id,
@@ -244,6 +254,7 @@ def _write_forward_plan_artifact(
         "candidate_set_hash": candidate_set_hash,
         "config_hash": config_hash,
         "code_tree_digest": code_tree_digest,
+        **semantics,
     })
     path = root / "reports" / plan_id / "plan.json"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -251,6 +262,7 @@ def _write_forward_plan_artifact(
         "schema_version": FROZEN_FORWARD_SCHEMA_VERSION,
         "method_version": FROZEN_FORWARD_METHOD_VERSION,
         "governance_method_version": GOVERNANCE_METHOD_VERSION,
+        **semantics,
         "scope": "FROZEN_FORWARD",
         "plan_id": plan_id,
         "vintage": {"vintage_id": vintage_id},
@@ -1610,6 +1622,24 @@ def test_holdout_verdict_and_completed_attempt_are_atomic(tmp_path: Path) -> Non
         )
 
 
+def test_legacy_forward_plan_cannot_be_newly_registered(tmp_path: Path) -> None:
+    registry = tmp_path / "governance.sqlite3"
+    vintage = seal_holdout_vintage(
+        registry, "market-one", _time("2027-01-01T00:00:00"),
+        _time("2027-02-01T00:00:00"),
+    )
+    _, plan_path, plan_sha256 = _write_forward_plan_artifact(
+        tmp_path, vintage.vintage_id, "manifest", "candidates", "config",
+        "tree", legacy=True,
+    )
+    with pytest.raises(ValueError, match="成交语义身份不完整"):
+        register_frozen_forward_plan(
+            registry, vintage.vintage_id, "manifest", "candidates",
+            "config", "tree", plan_path, plan_sha256,
+            repository_root=tmp_path,
+        )
+
+
 def test_registered_forward_plan_prevents_relaxed_policy_finalize(
     tmp_path: Path,
 ) -> None:
@@ -2009,11 +2039,11 @@ def test_governance_timestamps_are_not_caller_controlled(tmp_path: Path) -> None
         )
 
 
-def test_prediction_registration_rejects_unattested_self_reported_target(
+def test_prediction_registration_rejects_incomplete_attestation_evidence(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """公开注册 API 不得接受缺少绑定面板与配置的自报目标。"""
+    """公开注册 API 不得接受缺少配置谱系的自报目标。"""
     monkeypatch.setattr(
         "guvolu.research.frozen_forward.attest_frozen_prediction_artifact",
         _actual_forward_attestation,
@@ -2970,7 +3000,7 @@ def test_holdout_is_consumed_before_market_data_is_opened(
     }
     summary = tmp_path / "reports" / "summary.json"
     summary.write_text(json.dumps({
-        "pipeline_method_version": "strategy-research-pipeline-v12",
+        "pipeline_method_version": "strategy-research-pipeline-v13",
         "run_id": "run-one",
         "research_identity": "research-one",
         "config_hash": config_hash,

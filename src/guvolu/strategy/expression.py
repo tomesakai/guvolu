@@ -147,7 +147,7 @@ _TEMPLATES: Mapping[str, StrategyExpression] = {
             "annual_volatility_target": Unit.DIMENSIONLESS,
             "maximum_target": Unit.DIMENSIONLESS,
         }),
-        required=(_TREND,),
+        required=(_FLOW, _VOLUME, _TREND),
         entry=_and(
             _binary("ge", _TREND, _parameter("entry_score")),
             _binary("ge", _FLOW, _parameter("flow_confirmation")),
@@ -166,7 +166,7 @@ _TEMPLATES: Mapping[str, StrategyExpression] = {
             "annual_volatility_target": Unit.DIMENSIONLESS,
             "maximum_target": Unit.DIMENSIONLESS,
         }),
-        required=(_PRIOR_HIGH, _PRICE_SCORE),
+        required=(_PRICE_SCORE, _PRIOR_HIGH, _FLOW),
         entry=_and(
             _binary("gt", _CLOSE, _PRIOR_HIGH),
             _binary("ge", _FLOW, _parameter("flow_confirmation")),

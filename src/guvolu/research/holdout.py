@@ -144,8 +144,8 @@ def load_frozen_candidates(
     source_manifest: Mapping[str, object],
 ) -> tuple[tuple[CandidateSpec, ...], Path]:
     """从已发布组合运行冻结 paper eligible 部署候选。"""
-    if source_summary.get("pipeline_method_version") != "strategy-research-pipeline-v12":
-        raise ValueError("holdout v4 只接受可现场重建全部证据的 v12 来源运行")
+    if source_summary.get("pipeline_method_version") != "strategy-research-pipeline-v13":
+        raise ValueError("holdout v4 只接受可现场重建全部证据的 v13 来源运行")
     for field in ("run_id", "research_identity", "config_hash"):
         if source_summary.get(field) != source_manifest.get(field):
             raise ValueError(f"source summary 与 manifest 的 {field} 不一致")

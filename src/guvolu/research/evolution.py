@@ -30,6 +30,11 @@ _COMPARISON_METHOD_FIELDS = (
     "deflated_sharpe_method_version",
     "effective_trial_method_version",
     "parameter_stability_method_version",
+    "panel_method_version",
+    "panel_schema_version",
+    "feature_method_version",
+    "trade_flow_input_method_version",
+    "trade_input_receipt_method_version",
 )
 
 

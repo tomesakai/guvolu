@@ -23,7 +23,7 @@ from guvolu.research.verification_attestation import (
 )
 from guvolu.strategy.contracts import ResearchBar
 
-READINESS_METHOD_VERSION = "strategy-readiness-v3"
+READINESS_METHOD_VERSION = "strategy-readiness-v4"
 _INTERVAL_SECONDS = {
     "5min": 300,
     "15min": 900,
@@ -175,11 +175,31 @@ def strategy_readiness(
         volume_lookback,
         maximum_gap,
     )
+    raw_evaluations = summary.get("family_evaluations")
+    if not isinstance(raw_evaluations, list):
+        raise ValueError("summary.family_evaluations 必须为数组")
+    eligible_families = tuple(
+        str(item.get("family"))
+        for item in raw_evaluations
+        if isinstance(item, Mapping)
+        and item.get("eligible") is True
+        and item.get("mode") == "paper"
+    )
+    flow_sensitive = any(
+        family in {"flow_trend", "breakout"}
+        for family in eligible_families
+    )
     valid_indices = [
         index for index, feature in enumerate(features)
         if feature.contiguous
-        and feature.volume_score is not None
         and feature.trend_scores.get(state_lookback) is not None
+        and (
+            not flow_sensitive
+            or (
+                feature.volume_score is not None
+                and feature.flow_imbalance is not None
+            )
+        )
     ]
     if not valid_indices:
         raise ValueError("研究面板没有任何可用策略决策时点")
@@ -205,6 +225,15 @@ def strategy_readiness(
     feature_age_seconds = (evaluated_at - latest_valid_time).total_seconds()
     input_summary = _object(summary.get("input"), "summary.input")
     head_matches = input_summary.get("head_generation") == current_inputs.head_generation
+    current_trade_semantics = (
+        summary.get("pipeline_method_version") == "strategy-research-pipeline-v13"
+        and summary.get("panel_method_version") == "trade-bars-pit-v2"
+        and summary.get("feature_method_version") == "research-features-v2"
+        and summary.get("trade_flow_input_method_version")
+        == "economic-trade-basis-v1"
+        and summary.get("trade_input_receipt_method_version")
+        == "active-trade-head-receipt-v2"
+    )
     operational_blockers: list[str] = []
     if latest_valid_index != len(features) - 1:
         operational_blockers.append("latest_panel_feature_not_mature")
@@ -220,6 +249,19 @@ def strategy_readiness(
         operational_blockers.append("source_code_tree_mismatch")
     if not config_matches:
         operational_blockers.append("source_config_mismatch")
+    if not current_trade_semantics:
+        operational_blockers.append("source_trade_semantics_outdated")
+    latest_volume_qualified = (
+        features[-1].volume_qualified
+        and features[-1].volume_score is not None
+        and features[-1].flow_imbalance is not None
+    )
+    research_volume_qualified = all(bar.volume_qualified for bar in bars)
+    if (
+        flow_sensitive
+        and not latest_volume_qualified
+    ):
+        operational_blockers.append("latest_economic_trade_volume_unqualified")
 
     governance = _object(config.get("data_governance"), "data_governance")
     registry_path = _resolve(root, governance.get("registry"), "governance registry")
@@ -238,16 +280,6 @@ def strategy_readiness(
             registry_path, item.vintage_id,
         ) is None
     )
-    raw_evaluations = summary.get("family_evaluations")
-    if not isinstance(raw_evaluations, list):
-        raise ValueError("summary.family_evaluations 必须为数组")
-    eligible_families = tuple(
-        str(item.get("family"))
-        for item in raw_evaluations
-        if isinstance(item, Mapping)
-        and item.get("eligible") is True
-        and item.get("mode") == "paper"
-    )
     promotion_blockers: list[str] = []
     if summary.get("decision_grade") is not True:
         promotion_blockers.append("source_run_not_decision_grade")
@@ -257,6 +289,13 @@ def strategy_readiness(
         promotion_blockers.append("source_code_tree_mismatch")
     if not config_matches:
         promotion_blockers.append("source_config_mismatch")
+    if not current_trade_semantics:
+        promotion_blockers.append("source_trade_semantics_outdated")
+    if (
+        flow_sensitive
+        and not research_volume_qualified
+    ):
+        promotion_blockers.append("source_economic_trade_volume_unqualified")
     if not eligible_families:
         promotion_blockers.append("no_frozen_paper_eligible_family")
     if not sealed:

@@ -120,6 +120,14 @@ def test_frozen_forward_uses_fixed_weight_and_is_idempotent(
         "candidate_set_hash": "candidate-set-hash",
         "config_hash": config_hash,
         "code_tree_digest": identity.tree_digest,
+        "pipeline_method_version": "strategy-research-pipeline-v13",
+        "panel_method_version": "trade-bars-pit-v2",
+        "panel_schema_version": 2,
+        "feature_method_version": "research-features-v2",
+        "trade_flow_input_method_version": "economic-trade-basis-v1",
+        "trade_input_receipt_method_version": (
+            "active-trade-head-receipt-v2"
+        ),
     })
     template = strategy_expression("trend")
     parameters: dict[str, int | float] = {
@@ -133,6 +141,14 @@ def test_frozen_forward_uses_fixed_weight_and_is_idempotent(
         "schema_version": 1,
         "method_version": "frozen-forward-v2",
         "governance_method_version": GOVERNANCE_METHOD_VERSION,
+        "pipeline_method_version": "strategy-research-pipeline-v13",
+        "panel_method_version": "trade-bars-pit-v2",
+        "panel_schema_version": 2,
+        "feature_method_version": "research-features-v2",
+        "trade_flow_input_method_version": "economic-trade-basis-v1",
+        "trade_input_receipt_method_version": (
+            "active-trade-head-receipt-v2"
+        ),
         "scope": "FROZEN_FORWARD",
         "plan_id": plan_id,
         "vintage": {

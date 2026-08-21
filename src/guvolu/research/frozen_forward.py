@@ -9,6 +9,7 @@ from tempfile import TemporaryDirectory
 from typing import Mapping
 
 from guvolu.data.durable_io import atomic_write_text
+from guvolu.data.trade_economics import TRADE_FLOW_INPUT_METHOD_VERSION
 from guvolu.research import clock
 from guvolu.research.config_lineage import attest_config_lineage_snapshot
 from guvolu.research.contracts import (
@@ -18,7 +19,7 @@ from guvolu.research.contracts import (
     QualityVector,
 )
 from guvolu.research.data_location import resolve_data_root_locator
-from guvolu.research.features import compute_features
+from guvolu.research.features import FEATURE_METHOD_VERSION, compute_features
 from guvolu.research.governance import (
     GOVERNANCE_METHOD_VERSION,
     FrozenForwardPlan,
@@ -37,6 +38,9 @@ from guvolu.research.holdout import (
     verified_source_manifest,
 )
 from guvolu.research.panel import (
+    PANEL_METHOD_VERSION,
+    PANEL_SCHEMA_VERSION,
+    TRADE_INPUT_RECEIPT_METHOD_VERSION,
     attest_trade_input_receipt,
     build_panel_snapshot,
     capture_trade_input_receipt,
@@ -237,11 +241,33 @@ def freeze_forward_plan(
             raise ValueError("已登记冻结前向计划制品散列不匹配")
         return FrozenPlanResult(existing.plan_id, path, existing.plan_artifact_sha256)
     summary = _load(summary_file)
+    required_methods: Mapping[str, object] = {
+        "pipeline_method_version": "strategy-research-pipeline-v13",
+        "panel_method_version": PANEL_METHOD_VERSION,
+        "panel_schema_version": PANEL_SCHEMA_VERSION,
+        "feature_method_version": FEATURE_METHOD_VERSION,
+        "trade_flow_input_method_version": TRADE_FLOW_INPUT_METHOD_VERSION,
+        "trade_input_receipt_method_version": (
+            TRADE_INPUT_RECEIPT_METHOD_VERSION
+        ),
+    }
+    for field, expected in required_methods.items():
+        if summary.get(field) != expected or source_manifest.get(field) != expected:
+            raise ValueError(f"冻结前向来源缺少当前成交语义: {field}")
     source_data_root_record = summary.get("source_data_root")
     resolve_data_root_locator(repository, source_data_root_record)
     candidates, candidate_registry_path = load_frozen_candidates(
         repository, summary, source_manifest,
     )
+    if (
+        _plan_requires_economic_volume(candidates)
+        and not _source_research_volume_qualified(
+            repository, source_manifest,
+        )
+    ):
+        raise ValueError(
+            "冻结计划依赖 flow/volume，但研究证据窗口含不合格经济成交"
+        )
     identity = code_identity(repository, config_source_paths)
     if not identity.decision_grade:
         raise ValueError("冻结前向计划只允许 clean commit 的决策级代码")
@@ -268,6 +294,7 @@ def freeze_forward_plan(
         "candidate_set_hash": candidate_set_hash,
         "config_hash": config_hash,
         "code_tree_digest": identity.tree_digest,
+        **required_methods,
     })
     plan_path = (
         repository / "reports" / "strategy-research" / "frozen-forward"
@@ -302,6 +329,7 @@ def freeze_forward_plan(
         "code_identity": asdict(identity),
         "code_tree_digest": identity.tree_digest,
         "source_data_root": source_data_root_record,
+        **required_methods,
         "candidate_set_hash": candidate_set_hash,
         "candidates": [asdict(candidate) for candidate in candidates],
         "allocation": {"weights": weights, "reserve": reserve},
@@ -342,6 +370,44 @@ def _candidate_from_payload(raw: object) -> CandidateSpec:
     )
 
 
+def _plan_requires_economic_volume(candidates: tuple[CandidateSpec, ...]) -> bool:
+    """方向流或量能确认策略必须使用完全合格的经济成交输入。"""
+    return any(item.family in {"flow_trend", "breakout"} for item in candidates)
+
+
+def _source_research_volume_qualified(
+    repository: Path,
+    source_manifest: Mapping[str, object],
+) -> bool:
+    """从受保护 panel 重算整个研究证据窗口的成交量资格。"""
+    artifacts = _object(source_manifest.get("artifacts"), "source.artifacts")
+    panel_record = _object(artifacts.get("panel"), "source.artifacts.panel")
+    panel_path = _project_path(
+        repository,
+        Path(_text(panel_record.get("path"), "source panel path")),
+        "source panel",
+    )
+    bars = load_panel_bars(panel_path)
+    return bool(bars) and all(bar.volume_qualified for bar in bars)
+
+
+def _attest_current_trade_methods(payload: Mapping[str, object]) -> None:
+    """拒绝缺少新成交语义身份的 legacy 冻结计划。"""
+    expected: Mapping[str, object] = {
+        "pipeline_method_version": "strategy-research-pipeline-v13",
+        "panel_method_version": PANEL_METHOD_VERSION,
+        "panel_schema_version": PANEL_SCHEMA_VERSION,
+        "feature_method_version": FEATURE_METHOD_VERSION,
+        "trade_flow_input_method_version": TRADE_FLOW_INPUT_METHOD_VERSION,
+        "trade_input_receipt_method_version": (
+            TRADE_INPUT_RECEIPT_METHOD_VERSION
+        ),
+    }
+    for field, value in expected.items():
+        if payload.get(field) != value:
+            raise ValueError(f"冻结计划成交语义已过期: {field}")
+
+
 def _maturity_gate(quality: QualityVector, mature: bool) -> QualityVector:
     if mature:
         return quality
@@ -376,6 +442,7 @@ def attest_frozen_prediction_artifact(
     """从绑定面板、配置和候选公式现场重算冻结预测全部决策字段。"""
     root = repository_root.resolve()
     plan = _load(plan_path)
+    _attest_current_trade_methods(plan)
     source_data_root = resolve_data_root_locator(
         root, plan.get("source_data_root"),
     )
@@ -459,6 +526,17 @@ def attest_frozen_prediction_artifact(
         or registered_inputs.normalization_versions != normalization_versions
     ):
         raise ValueError("冻结预测面板血缘不能由控制面注册表重建")
+    qualification = _object(
+        prediction.get("trade_input_qualification"),
+        "prediction.trade_input_qualification",
+    )
+    if qualification != {
+        "source_trade_rows": registered_inputs.source_trade_rows,
+        "economic_trade_rows": registered_inputs.economic_trade_rows,
+        "unqualified_trade_rows": registered_inputs.unqualified_trade_rows,
+        "volume_qualified": registered_inputs.volume_qualified,
+    }:
+        raise ValueError("冻结预测经济成交资格不能由输入收据重建")
     raw_vintage = _object(plan.get("vintage"), "plan.vintage")
     vintage_end = parse_time(raw_vintage.get("end_time"), "plan.vintage.end_time")
     with TemporaryDirectory(prefix="guvolu-forward-attest-") as temporary:
@@ -506,13 +584,25 @@ def attest_frozen_prediction_artifact(
         ),
     )
     latest_feature = features[-1]
+    raw_candidates = plan.get("candidates")
+    if not isinstance(raw_candidates, list):
+        raise ValueError("冻结计划缺少 candidates")
+    candidates = tuple(
+        _candidate_from_payload(raw) for raw in raw_candidates
+    )
     state_lookback = _integer(
         feature_config.get("state_lookback"), "state_lookback",
     )
     mature = (
         latest_feature.contiguous
-        and latest_feature.volume_score is not None
         and latest_feature.trend_scores.get(state_lookback) is not None
+        and (
+            not _plan_requires_economic_volume(candidates)
+            or (
+                latest_feature.volume_score is not None
+                and latest_feature.flow_imbalance is not None
+            )
+        )
     )
     maximum_age = _integer(
         config.get("strategy_decision_max_age_seconds"),
@@ -537,10 +627,6 @@ def attest_frozen_prediction_artifact(
         quality_payload(quality)
     ):
         raise ValueError("冻结预测 quality 不能由绑定面板现场重建")
-    raw_candidates = plan.get("candidates")
-    if not isinstance(raw_candidates, list):
-        raise ValueError("冻结计划缺少 candidates")
-    candidates = tuple(_candidate_from_payload(raw) for raw in raw_candidates)
     allocation = _object(plan.get("allocation"), "plan.allocation")
     raw_weights = _object(allocation.get("weights"), "plan.allocation.weights")
     weights = {
@@ -601,6 +687,7 @@ def run_frozen_forward_prediction(
     if sha256_file(plan_path) != plan.plan_artifact_sha256:
         raise ValueError("冻结前向计划制品散列不匹配")
     payload = _load(plan_path)
+    _attest_current_trade_methods(payload)
     source_data_root = resolve_data_root_locator(
         repository, payload.get("source_data_root"),
     )
@@ -647,6 +734,12 @@ def run_frozen_forward_prediction(
     )
     if inputs.receipt_path is None or inputs.receipt_sha256 is None:
         raise AssertionError("冻结预测没有生成活动 head 收据")
+    candidates_raw = payload.get("candidates")
+    if not isinstance(candidates_raw, list):
+        raise ValueError("冻结前向计划缺少 candidates")
+    frozen_candidates = tuple(
+        _candidate_from_payload(raw) for raw in candidates_raw
+    )
     if inputs.maximum_event_time < vintage.start_time:
         raise ValueError("vintage 尚未开始，没有可生成的前向决策")
     interval = _text(config.get("bar_interval"), "bar_interval")
@@ -706,8 +799,14 @@ def run_frozen_forward_prediction(
     state_lookback = _integer(feature_config.get("state_lookback"), "state_lookback")
     mature = (
         latest_feature.contiguous
-        and latest_feature.volume_score is not None
         and latest_feature.trend_scores.get(state_lookback) is not None
+        and (
+            not _plan_requires_economic_volume(frozen_candidates)
+            or (
+                latest_feature.volume_score is not None
+                and latest_feature.flow_imbalance is not None
+            )
+        )
     )
     validation = _object(config.get("validation"), "validation")
     quality = _maturity_gate(
@@ -724,10 +823,7 @@ def run_frozen_forward_prediction(
         ),
         mature,
     )
-    candidates_raw = payload.get("candidates")
-    if not isinstance(candidates_raw, list):
-        raise ValueError("冻结前向计划缺少 candidates")
-    candidates = tuple(_candidate_from_payload(raw) for raw in candidates_raw)
+    candidates = frozen_candidates
     allocation = _object(payload.get("allocation"), "allocation")
     weights_raw = _object(allocation.get("weights"), "allocation.weights")
     weights = {family: _number(value, f"weights.{family}") for family, value in weights_raw.items()}
@@ -764,6 +860,12 @@ def run_frozen_forward_prediction(
         "decision_time": decision_time.isoformat(),
         "input_head_generation": inputs.head_generation,
         "input_receipt_sha256": inputs.receipt_sha256,
+        "trade_input_qualification": {
+            "source_trade_rows": inputs.source_trade_rows,
+            "economic_trade_rows": inputs.economic_trade_rows,
+            "unqualified_trade_rows": inputs.unqualified_trade_rows,
+            "volume_qualified": inputs.volume_qualified,
+        },
         "input_receipt": {
             "path": _relative(repository, inputs.receipt_path),
             "sha256": inputs.receipt_sha256,

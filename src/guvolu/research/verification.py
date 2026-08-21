@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -21,15 +21,20 @@ from guvolu.research.config_lineage import attest_config_lineage_snapshot
 from guvolu.research.contracts import PanelSnapshot
 from guvolu.research.data_location import resolve_data_root_locator
 from guvolu.research.features import classify_market_state, compute_features
+from guvolu.research.features import FEATURE_METHOD_VERSION
 from guvolu.research.governance import (
     get_active_head_receipt,
     get_research_exposure,
 )
 from guvolu.research.panel import (
+    PANEL_METHOD_VERSION,
+    PANEL_SCHEMA_VERSION,
+    TRADE_INPUT_RECEIPT_METHOD_VERSION,
     attest_trade_input_receipt,
     build_panel_snapshot,
     parse_time,
 )
+from guvolu.data.trade_economics import TRADE_FLOW_INPUT_METHOD_VERSION
 from guvolu.research.provenance import (
     canonical_json,
     code_tree_digest_at_commit,
@@ -44,6 +49,7 @@ from guvolu.strategy.generation import (
     build_family_batches,
     candidate_registry_payload,
 )
+from guvolu.strategy.contracts import FeatureRow
 
 
 _RUN_IDENTITY_FIELDS = (
@@ -57,6 +63,11 @@ _RUN_IDENTITY_FIELDS = (
     "effective_trial_method_version",
     "parameter_stability_method_version",
     "position_contract_method_version",
+    "panel_method_version",
+    "panel_schema_version",
+    "feature_method_version",
+    "trade_flow_input_method_version",
+    "trade_input_receipt_method_version",
     "governance_method_version",
     "run_id",
     "research_identity",
@@ -240,6 +251,30 @@ def _verify_operational_gate(summary: Mapping[str, object]) -> None:
         raise ValueError("代码身份非决策级但组合目标非零")
 
 
+def _attest_panel_volume_qualification(
+    panel: PanelSnapshot,
+    features: Sequence[FeatureRow],
+    decision_index: int,
+    summary: Mapping[str, object],
+) -> None:
+    """从受保护 panel/features 重算研究期与当前窗口成交资格。"""
+    panel_summary = _object(summary.get("panel"), "summary.panel")
+    expected_research = all(bar.volume_qualified for bar in panel.bars)
+    decision_feature = features[decision_index]
+    expected_latest = (
+        decision_feature.volume_qualified
+        and decision_feature.volume_score is not None
+        and decision_feature.flow_imbalance is not None
+    )
+    if (
+        panel_summary.get("research_economic_volume_qualified")
+        is not expected_research
+        or panel_summary.get("latest_economic_volume_qualified")
+        is not expected_latest
+    ):
+        raise ValueError("v13 panel 经济成交资格摘要不能由受保护证据重建")
+
+
 def _attest_v12_decision_evidence(
     panel: PanelSnapshot,
     config: Mapping[str, object],
@@ -275,13 +310,15 @@ def _attest_v12_decision_evidence(
     valid_indices = [
         index for index, feature in enumerate(features)
         if feature.contiguous
-        and feature.volume_score is not None
         and feature.trend_scores.get(state_lookback) is not None
     ]
     if not valid_indices:
         raise ValueError("v12 受保护 panel 没有可用决策时点")
     decision_index = valid_indices[-1]
     decision_time = features[decision_index].decision_time
+    _attest_panel_volume_qualification(
+        panel, features, decision_index, summary,
+    )
     validation = walk_forward_validate(
         research_identity,
         panel.bars,
@@ -398,11 +435,17 @@ def _verify_run_identity(
     if method not in {
         "strategy-research-pipeline-v11",
         "strategy-research-pipeline-v12",
+        "strategy-research-pipeline-v13",
     }:
         return
     if candidate_registry is None:
         raise ValueError("v11/v12 manifest 缺少 candidate_registry 制品")
     if method == "strategy-research-pipeline-v12":
+        raise ValueError(
+            "v12 仅允许制品完整性与旧收据只读复核；"
+            "当前验证器不会把旧成交语义声明为决策级证据"
+        )
+    if method == "strategy-research-pipeline-v13":
         config_path = artifact_paths.get("config")
         config_lineage_path = artifact_paths.get("config_lineage")
         panel_path = artifact_paths.get("panel")
@@ -447,13 +490,18 @@ def _verify_run_identity(
             manifest.get("generator_method_version"),
             "generator_method_version",
         )
-        expected_registry = candidate_registry_payload(
-            build_family_batches(config, family_scope),
-            config_hash,
-            generator_method_version,
-        )
-        if canonical_json(candidate_registry) != canonical_json(expected_registry):
-            raise ValueError("v12 candidate registry 不能由配置与公式注册表重建")
+        if method == "strategy-research-pipeline-v13":
+            expected_registry = candidate_registry_payload(
+                build_family_batches(config, family_scope),
+                config_hash,
+                generator_method_version,
+            )
+            if canonical_json(candidate_registry) != canonical_json(
+                expected_registry
+            ):
+                raise ValueError(
+                    "v13 candidate registry 不能由配置与公式注册表重建"
+                )
         attempt_ids = _text_tuple(
             manifest.get("input_attempt_ids"), "input_attempt_ids",
         )
@@ -494,41 +542,76 @@ def _verify_run_identity(
             or registered.normalization_versions != normalizations
         ):
             raise ValueError("v12 panel 输入身份不能由控制面注册表重建")
-        with TemporaryDirectory(prefix="guvolu-research-attest-") as temporary:
-            rebuilt = build_panel_snapshot(
-                registered,
-                Path(temporary),
-                _text(config.get("bar_interval"), "bar_interval"),
-                parse_time(config.get("from_time"), "from_time"),
-                registered.maximum_event_time,
-                _integer(config.get("notional_scale"), "notional_scale"),
+        if method == "strategy-research-pipeline-v13":
+            expected_methods = {
+                "panel_method_version": PANEL_METHOD_VERSION,
+                "panel_schema_version": PANEL_SCHEMA_VERSION,
+                "feature_method_version": FEATURE_METHOD_VERSION,
+                "trade_flow_input_method_version": (
+                    TRADE_FLOW_INPUT_METHOD_VERSION
+                ),
+                "trade_input_receipt_method_version": (
+                    TRADE_INPUT_RECEIPT_METHOD_VERSION
+                ),
+            }
+            for field, expected in expected_methods.items():
+                if manifest.get(field) != expected:
+                    raise ValueError(f"v13 {field} 不受支持")
+            qualification = _object(
+                manifest.get("trade_input_qualification"),
+                "trade_input_qualification",
             )
-        if rebuilt.panel_sha256 != sha256_file(panel_path):
-            raise ValueError("v12 panel 不能由注册输入和版本化查询重建")
-        raw_regime_attribution_method = manifest.get(
-            "regime_attribution_method_version"
-        )
-        regime_attribution_method = (
-            None
-            if raw_regime_attribution_method is None
-            else _text(
-                raw_regime_attribution_method,
-                "regime_attribution_method_version",
+            if qualification != {
+                "source_trade_rows": registered.source_trade_rows,
+                "economic_trade_rows": registered.economic_trade_rows,
+                "unqualified_trade_rows": registered.unqualified_trade_rows,
+                "volume_qualified": registered.volume_qualified,
+            }:
+                raise ValueError("v13 经济成交资格不能由输入收据重建")
+        # v13 is the first cohort eligible for current semantic replay and
+        # promotion. v12 is rejected above rather than partially attested.
+        if method == "strategy-research-pipeline-v13":
+            with TemporaryDirectory(
+                prefix="guvolu-research-attest-"
+            ) as temporary:
+                rebuilt = build_panel_snapshot(
+                    registered,
+                    Path(temporary),
+                    _text(config.get("bar_interval"), "bar_interval"),
+                    parse_time(config.get("from_time"), "from_time"),
+                    registered.maximum_event_time,
+                    _integer(config.get("notional_scale"), "notional_scale"),
+                )
+            if rebuilt.panel_sha256 != sha256_file(panel_path):
+                raise ValueError(
+                    "v13 panel 不能由注册输入和版本化查询重建"
+                )
+            raw_regime_attribution_method = manifest.get(
+                "regime_attribution_method_version"
             )
-        )
-        _attest_v12_decision_evidence(
-            rebuilt,
-            config,
-            family_scope,
-            _text(manifest.get("research_identity"), "research_identity"),
-            summary,
-            artifact_paths,
-            _text(
-                manifest.get("block_bootstrap_method_version"),
-                "block_bootstrap_method_version",
-            ),
-            regime_attribution_method,
-        )
+            regime_attribution_method = (
+                None
+                if raw_regime_attribution_method is None
+                else _text(
+                    raw_regime_attribution_method,
+                    "regime_attribution_method_version",
+                )
+            )
+            _attest_v12_decision_evidence(
+                rebuilt,
+                config,
+                family_scope,
+                _text(
+                    manifest.get("research_identity"), "research_identity"
+                ),
+                summary,
+                artifact_paths,
+                _text(
+                    manifest.get("block_bootstrap_method_version"),
+                    "block_bootstrap_method_version",
+                ),
+                regime_attribution_method,
+            )
         if decision_grade:
             assert isinstance(git_hash, str)
             commit_digest = code_tree_digest_at_commit(
@@ -592,10 +675,27 @@ def _verify_run_identity(
         identity_payload["regime_attribution_method_version"] = manifest.get(
             "regime_attribution_method_version"
         )
-    if method == "strategy-research-pipeline-v12":
+    if method in {"strategy-research-pipeline-v12", "strategy-research-pipeline-v13"}:
         identity_payload["input_receipt_sha256"] = manifest.get(
             "input_receipt_sha256"
         )
+        if method == "strategy-research-pipeline-v13":
+            identity_payload.update({
+                "panel_method_version": manifest.get("panel_method_version"),
+                "panel_schema_version": manifest.get("panel_schema_version"),
+                "feature_method_version": manifest.get(
+                    "feature_method_version"
+                ),
+                "trade_flow_input_method_version": manifest.get(
+                    "trade_flow_input_method_version"
+                ),
+                "trade_input_receipt_method_version": manifest.get(
+                    "trade_input_receipt_method_version"
+                ),
+            })
+            identity_payload["trade_input_qualification"] = manifest.get(
+                "trade_input_qualification"
+            )
         if "source_data_snapshot" in manifest:
             identity_payload["source_data_snapshot"] = manifest.get(
                 "source_data_snapshot"
@@ -619,6 +719,7 @@ def _verify_data_governance(root: Path, summary: Mapping[str, object]) -> None:
         "strategy-research-pipeline-v10",
         "strategy-research-pipeline-v11",
         "strategy-research-pipeline-v12",
+        "strategy-research-pipeline-v13",
     ):
         return
     governance = _object(summary.get("data_governance"), "data_governance")

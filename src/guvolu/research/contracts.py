@@ -40,6 +40,8 @@ class FrozenPanelPartition:
     row_count: int
     min_event_time: datetime | None
     max_event_time: datetime | None
+    domain: str | None = None
+    normalization_version: str | None = None
 
 
 @dataclass(frozen=True)
@@ -56,6 +58,11 @@ class FrozenPanelInputs:
     partitions: tuple[FrozenPanelPartition, ...] = ()
     receipt_path: Path | None = None
     receipt_sha256: str | None = None
+    trade_flow_input_method_version: str | None = None
+    source_trade_rows: int = 0
+    economic_trade_rows: int = 0
+    unqualified_trade_rows: int = 0
+    volume_qualified: bool = False
 
 
 @dataclass(frozen=True)

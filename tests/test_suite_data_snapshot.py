@@ -7,6 +7,7 @@ import os
 import sqlite3
 from pathlib import Path
 
+import duckdb
 import pytest
 
 from guvolu.data.store import DB_FILE_NAME
@@ -23,7 +24,22 @@ def _source_data_root(root: Path) -> tuple[Path, Path]:
     data_root.mkdir()
     artifact = data_root / "materialized" / "trade" / "part.parquet"
     artifact.parent.mkdir(parents=True)
-    artifact.write_bytes(b"immutable-parquet-fixture")
+    trade_db = duckdb.connect()
+    try:
+        trade_db.execute("""
+            CREATE TABLE trade(
+              venue_id VARCHAR,source_side_basis VARCHAR,
+              normalization_version VARCHAR
+            )
+        """)
+        trade_db.execute(
+            "INSERT INTO trade VALUES ('venue','taker','trade-v1')"
+        )
+        trade_db.execute(
+            "COPY trade TO ? (FORMAT PARQUET)", (str(artifact),),
+        )
+    finally:
+        trade_db.close()
     digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
     l2_artifact = data_root / "materialized" / "book" / "part.parquet"
     l2_artifact.parent.mkdir(parents=True)

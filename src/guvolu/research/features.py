@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 from guvolu.strategy.contracts import FeatureRow, ResearchBar
 
-FEATURE_METHOD_VERSION = "research-features-v1"
+FEATURE_METHOD_VERSION = "research-features-v2"
 
 
 @dataclass(frozen=True)
@@ -150,10 +150,15 @@ def compute_features(
             prior_lows[window] = min(item.low for item in prior)
         flow = (
             bar.signed_base_volume / bar.base_volume
-            if bar.base_volume > 0 else None
+            if bar.volume_qualified and bar.base_volume > 0 else None
         )
         volume_score: float | None = None
-        if _window_contiguous(failures, index, volume_lookback):
+        volume_window = bars[index - volume_lookback + 1:index + 1]
+        if (
+            _window_contiguous(failures, index, volume_lookback)
+            and len(volume_window) == volume_lookback
+            and all(item.volume_qualified for item in volume_window)
+        ):
             volume_mean, volume_std = _rolling_mean_std(
                 log_volumes,
                 volume_prefix,
@@ -186,6 +191,7 @@ def compute_features(
             volume_score=volume_score,
             jump_score=jump,
             contiguous=contiguous,
+            volume_qualified=bar.volume_qualified,
         ))
     return tuple(result)
 
@@ -253,5 +259,6 @@ def feature_payload(feature: FeatureRow) -> Mapping[str, object]:
         "volume_score": feature.volume_score,
         "jump_score": feature.jump_score,
         "contiguous": feature.contiguous,
+        "volume_qualified": feature.volume_qualified,
         "method_version": FEATURE_METHOD_VERSION,
     }

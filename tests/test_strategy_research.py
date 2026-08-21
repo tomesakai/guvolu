@@ -79,7 +79,11 @@ from guvolu.research.validation import (
     _stitched_oos_regime_attribution,
     strategy_returns,
 )
-from guvolu.research.verification import _verify_operational_gate, verify_research_run
+from guvolu.research.verification import (
+    _verify_operational_gate,
+    _verify_run_identity,
+    verify_research_run,
+)
 from guvolu.research.tuning import (
     propose_family_evolution,
     verify_evolution_config,
@@ -180,24 +184,25 @@ def test_compact_panel_enforces_pit_and_integer_projection(tmp_path: Path) -> No
               available_time TIMESTAMPTZ,ingest_time TIMESTAMPTZ,
               side VARCHAR,source_side_basis VARCHAR,price VARCHAR,size VARCHAR,
               source_artifact_id VARCHAR,source_row_index BIGINT,
-              market_id VARCHAR
+              market_id VARCHAR,venue_id VARCHAR
             )
         """)
         rows = [
-            ("a", _time(0, 10), _time(0, 10), _time(0, 11), "buy", "taker", "100", "1", "x", 0, "m"),
-            ("a", _time(0, 10), _time(0, 10), _time(0, 12), "buy", "taker", "100", "1", "y", 1, "m"),
-            ("b", _time(0, 20), _time(1, 5), _time(1, 6), "buy", "taker", "120", "1", "x", 2, "m"),
-            ("c", _time(1, 10), _time(1, 10), _time(1, 11), "sell", "taker", "110", "2", "x", 3, "m"),
-            ("d", _time(1, 20), _time(1, 20), _time(1, 21), "buy", "participant_side_unfiltered", "110", "3", "x", 4, "m"),
+            ("a", _time(0, 10), _time(0, 10), _time(0, 11), "buy", "taker", "100", "1", "x", 0, "m", "bitbank"),
+            ("a", _time(0, 10), _time(0, 10), _time(0, 12), "buy", "taker", "100", "1", "y", 1, "m", "bitbank"),
+            ("b", _time(0, 20), _time(1, 5), _time(1, 6), "buy", "taker", "120", "1", "x", 2, "m", "bitbank"),
+            ("c", _time(1, 10), _time(1, 10), _time(1, 11), "sell", "taker", "110", "2", "x", 3, "m", "bitbank"),
+            ("d", _time(1, 20), _time(1, 20), _time(1, 21), "buy", "participant_side_unfiltered", "110", "3", "x", 4, "m", "bitbank"),
         ]
-        db.executemany("INSERT INTO source VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows)
+        db.executemany("INSERT INTO source VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", rows)
         escaped = str(source.resolve()).replace("'", "''")
         db.execute(f"COPY source TO '{escaped}' (FORMAT PARQUET)")
     finally:
         db.close()
     inputs = FrozenPanelInputs(
         market={
-            "market_id": "m",
+                "market_id": "m",
+                "venue_id": "bitbank",
             "mapping_revision": 0,
             "tick_size": "1",
             "size_step": "0.1",
@@ -221,8 +226,12 @@ def test_compact_panel_enforces_pit_and_integer_projection(tmp_path: Path) -> No
     assert len(bars) == 2
     assert bars[0].close == 100.0
     assert bars[0].trade_count == 1
-    assert bars[1].base_volume == 5.0
+    assert bars[1].base_volume == 2.0
     assert bars[1].signed_base_volume == -2.0
+    assert bars[1].trade_count == 1
+    assert bars[1].source_trade_count == 2
+    assert bars[1].unqualified_trade_count == 1
+    assert bars[1].volume_qualified is False
     check = duckdb.connect()
     try:
         row = check.execute(
@@ -243,7 +252,8 @@ def test_compact_panel_deduplicates_only_overlapping_partition_groups(
         "observation_id VARCHAR,event_time TIMESTAMPTZ,"
         "available_time TIMESTAMPTZ,ingest_time TIMESTAMPTZ,"
         "side VARCHAR,source_side_basis VARCHAR,price VARCHAR,size VARCHAR,"
-        "source_artifact_id VARCHAR,source_row_index BIGINT,market_id VARCHAR"
+        "source_artifact_id VARCHAR,source_row_index BIGINT,market_id VARCHAR,"
+        "venue_id VARCHAR"
     )
 
     def write_source(name: str, rows: list[tuple[object, ...]]) -> Path:
@@ -252,7 +262,7 @@ def test_compact_panel_deduplicates_only_overlapping_partition_groups(
         try:
             database.execute(f"CREATE TABLE source({columns})")
             database.executemany(
-                "INSERT INTO source VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows,
+                "INSERT INTO source VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", rows,
             )
             escaped = str(path.resolve()).replace("'", "''")
             database.execute(f"COPY source TO '{escaped}' (FORMAT PARQUET)")
@@ -262,21 +272,21 @@ def test_compact_panel_deduplicates_only_overlapping_partition_groups(
 
     first = write_source("first", [
         ("a", _time(0, 10), _time(0, 10), _time(0, 11),
-         "buy", "taker", "100", "1", "x", 0, "m"),
+         "buy", "taker", "100", "1", "x", 0, "m", "bitbank"),
     ])
     second = write_source("second", [
         ("b", _time(0, 20), _time(0, 20), _time(0, 21),
-         "buy", "taker", "110", "1", "y", 0, "m"),
+         "buy", "taker", "110", "1", "y", 0, "m", "bitbank"),
     ])
     overlap = write_source("overlap", [
         ("b", _time(0, 20), _time(0, 20), _time(0, 22),
-         "buy", "taker", "110", "1", "z", 0, "m"),
+         "buy", "taker", "110", "1", "z", 0, "m", "bitbank"),
         ("c", _time(0, 30), _time(0, 30), _time(0, 31),
-         "sell", "taker", "120", "2", "z", 1, "m"),
+         "sell", "taker", "120", "2", "z", 1, "m", "bitbank"),
     ])
     inputs = FrozenPanelInputs(
         market={
-            "market_id": "m", "mapping_revision": 0,
+                "market_id": "m", "venue_id": "bitbank", "mapping_revision": 0,
             "tick_size": "1", "size_step": "0.1",
         },
         paths=(first, second, overlap),
@@ -410,6 +420,7 @@ def test_registered_trade_inputs_rebuilds_control_plane_identity(
     assert len(rebuilt.partitions) == 1
     assert rebuilt.partitions[0] == FrozenPanelPartition(
         source.resolve(), 1, _time(0), _time(1),
+        "trade", "trade-test-v1",
     )
     assert rebuilt.head_generation.startswith("sha256-")
 
@@ -428,6 +439,29 @@ def test_registered_trade_inputs_rebuilds_control_plane_identity(
     receipt_payload = json.loads(
         captured.receipt_path.read_text(encoding="utf-8")
     )
+    legacy_payload = json.loads(json.dumps(receipt_payload))
+    legacy_payload["method_version"] = "active-trade-head-receipt-v1"
+    for field in (
+        "trade_flow_input_method_version", "source_trade_rows",
+        "economic_trade_rows", "unqualified_trade_rows", "volume_qualified",
+    ):
+        legacy_payload.pop(field, None)
+        for entry in legacy_payload["entries"]:
+            entry.pop(field, None)
+    legacy_receipt = tmp_path / "legacy-trade-input-receipt.json"
+    legacy_receipt.write_text(
+        canonical_json(legacy_payload) + "\n", encoding="utf-8",
+    )
+    legacy_attested = attest_trade_input_receipt(
+        data_root, legacy_receipt, require_current_head=False,
+    )
+    assert legacy_attested.paths == captured.paths
+    assert legacy_attested.trade_flow_input_method_version is None
+    assert legacy_attested.volume_qualified is False
+    with pytest.raises(ValueError, match="不能证明当前 head"):
+        attest_trade_input_receipt(
+            data_root, legacy_receipt, require_current_head=True,
+        )
     receipt_payload["entries"][0]["domain"] = "trade_realtime"
     receipt_payload["entries"][0]["partition_key"] = "forged-partition"
     receipt_payload["entries"][0]["normalization_version"] = "forged-v1"
@@ -1581,6 +1615,43 @@ def test_manifest_verifier_checks_hashes_and_flat_gate(
     summary.write_text("{}", encoding="utf-8")
     with pytest.raises(ValueError, match="散列不匹配"):
         verify_research_run(tmp_path, manifest)
+
+
+def test_legacy_v12_full_verification_and_current_head_use_fail_closed(
+    tmp_path: Path,
+) -> None:
+    """旧制品可做字节读取，但不得冒充当前语义的完整验证或 head。"""
+    identity = {
+        "git_hash": "legacy-commit",
+        "tree_digest": "t" * 64,
+        "dirty_digest": hashlib.sha256(b"").hexdigest(),
+        "dirty": False,
+        "decision_grade": True,
+        "reason": None,
+    }
+    manifest = {
+        "pipeline_method_version": "strategy-research-pipeline-v12",
+        "code_identity": identity,
+        "decision_grade": True,
+    }
+    with pytest.raises(ValueError, match="仅允许制品完整性"):
+        _verify_run_identity(
+            tmp_path,
+            manifest,
+            dict(manifest),
+            {"candidates": []},
+            {},
+            tmp_path,
+        )
+    receipt = tmp_path / "legacy-receipt.json"
+    receipt.write_text(json.dumps({
+        "schema_version": 1,
+        "method_version": "active-trade-head-receipt-v1",
+    }), encoding="utf-8")
+    with pytest.raises(ValueError, match="不能证明当前 head"):
+        attest_trade_input_receipt(
+            tmp_path, receipt, require_current_head=True,
+        )
 
 
 def test_family_monitor_reports_parameter_search_direction(

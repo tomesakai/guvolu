@@ -327,6 +327,31 @@ def _validated_forward_plan_artifact(
     for field, value in expected.items():
         if payload.get(field) != value:
             raise ValueError(f"冻结前向计划 {field} 与注册身份不一致")
+    semantic_fields = {
+        "pipeline_method_version",
+        "panel_method_version",
+        "panel_schema_version",
+        "feature_method_version",
+        "trade_flow_input_method_version",
+        "trade_input_receipt_method_version",
+    }
+    present_semantics = semantic_fields.intersection(payload)
+    if present_semantics != semantic_fields:
+        raise ValueError("冻结前向计划成交语义身份不完整")
+    if present_semantics:
+        expected_semantics: Mapping[str, object] = {
+            "pipeline_method_version": "strategy-research-pipeline-v13",
+            "panel_method_version": "trade-bars-pit-v2",
+            "panel_schema_version": 2,
+            "feature_method_version": "research-features-v2",
+            "trade_flow_input_method_version": "economic-trade-basis-v1",
+            "trade_input_receipt_method_version": (
+                "active-trade-head-receipt-v2"
+            ),
+        }
+        for field, value in expected_semantics.items():
+            if payload.get(field) != value:
+                raise ValueError(f"冻结前向计划 {field} 不受支持")
     vintage = payload.get("vintage")
     if not isinstance(vintage, dict) or vintage.get("vintage_id") != vintage_id:
         raise ValueError("冻结前向计划 vintage_id 与注册身份不一致")
@@ -3102,14 +3127,36 @@ def register_frozen_forward_plan(
     )
     if any(not value.strip() for value in values):
         raise ValueError("冻结前向计划身份字段不得为空")
-    plan_id = stable_identifier("frozen-forward-plan", {
+    raw_path, _normalized = _evidence_file(
+        repository_root, plan_artifact_path, "frozen forward plan",
+    )
+    if sha256_file(raw_path) != plan_artifact_sha256:
+        raise ValueError("冻结前向计划现场 SHA-256 不匹配")
+    raw_payload = _json_file(raw_path, "frozen forward plan")
+    semantic_names = (
+        "pipeline_method_version",
+        "panel_method_version",
+        "panel_schema_version",
+        "feature_method_version",
+        "trade_flow_input_method_version",
+        "trade_input_receipt_method_version",
+    )
+    present = tuple(name for name in semantic_names if name in raw_payload)
+    if len(present) != len(semantic_names):
+        raise ValueError("冻结前向计划成交语义身份不完整")
+    identity_payload: dict[str, object] = {
         "governance_method_version": GOVERNANCE_METHOD_VERSION,
         "vintage_id": vintage_id,
         "source_manifest_sha256": source_manifest_sha256,
         "candidate_set_hash": candidate_set_hash,
         "config_hash": config_hash,
         "code_tree_digest": code_tree_digest,
-    })
+    }
+    if present:
+        identity_payload.update({
+            name: raw_payload.get(name) for name in semantic_names
+        })
+    plan_id = stable_identifier("frozen-forward-plan", identity_payload)
     connection = _connect(registry_path, write=True)
     try:
         _begin(connection)

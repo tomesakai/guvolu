@@ -27,6 +27,7 @@ from guvolu.research.config_lineage import (
 from guvolu.research.contracts import PanelSnapshot, QualityVector
 from guvolu.research.data_location import data_root_locator
 from guvolu.research.features import (
+    FEATURE_METHOD_VERSION,
     MarketState,
     classify_market_state,
     compute_features,
@@ -38,11 +39,15 @@ from guvolu.research.governance import (
     register_research_exposure,
 )
 from guvolu.research.panel import (
+    PANEL_METHOD_VERSION,
+    PANEL_SCHEMA_VERSION,
+    TRADE_INPUT_RECEIPT_METHOD_VERSION,
     build_panel_snapshot,
     capture_trade_input_receipt,
     panel_inputs_payload,
     parse_time,
 )
+from guvolu.data.trade_economics import TRADE_FLOW_INPUT_METHOD_VERSION
 from guvolu.research.provenance import (
     artifact_record,
     canonical_json,
@@ -82,7 +87,7 @@ from guvolu.strategy.generation import (
     candidate_registry_payload,
 )
 
-PIPELINE_METHOD_VERSION = "strategy-research-pipeline-v12"
+PIPELINE_METHOD_VERSION = "strategy-research-pipeline-v13"
 
 
 @dataclass(frozen=True)
@@ -383,6 +388,13 @@ def run_research(
         "effective_trial_method_version": EFFECTIVE_TRIAL_METHOD_VERSION,
         "parameter_stability_method_version": PARAMETER_STABILITY_METHOD_VERSION,
         "position_contract_method_version": POSITION_CONTRACT_METHOD_VERSION,
+        "panel_method_version": PANEL_METHOD_VERSION,
+        "panel_schema_version": PANEL_SCHEMA_VERSION,
+        "feature_method_version": FEATURE_METHOD_VERSION,
+        "trade_flow_input_method_version": TRADE_FLOW_INPUT_METHOD_VERSION,
+        "trade_input_receipt_method_version": (
+            TRADE_INPUT_RECEIPT_METHOD_VERSION
+        ),
         "config_hash": config_hash,
         "config_lineage_root_hash": lineage_root_config_hash,
         "config_lineage_depth": config_lineage_depth,
@@ -390,6 +402,12 @@ def run_research(
         "attempt_ids": inputs.attempt_ids,
         "artifact_ids": inputs.artifact_ids,
         "input_receipt_sha256": inputs.receipt_sha256,
+        "trade_input_qualification": {
+            "source_trade_rows": inputs.source_trade_rows,
+            "economic_trade_rows": inputs.economic_trade_rows,
+            "unqualified_trade_rows": inputs.unqualified_trade_rows,
+            "volume_qualified": inputs.volume_qualified,
+        },
         "source_data_snapshot": source_data_snapshot,
         "code_tree_digest": identity.tree_digest,
         "dirty_digest": identity.dirty_digest,
@@ -453,7 +471,6 @@ def run_research(
     valid_indices = [
         index for index, feature in enumerate(features)
         if feature.contiguous
-        and feature.volume_score is not None
         and feature.trend_scores.get(state_lookback) is not None
     ]
     if not valid_indices:
@@ -744,6 +761,13 @@ def run_research(
         "effective_trial_method_version": EFFECTIVE_TRIAL_METHOD_VERSION,
         "parameter_stability_method_version": PARAMETER_STABILITY_METHOD_VERSION,
         "position_contract_method_version": POSITION_CONTRACT_METHOD_VERSION,
+        "panel_method_version": PANEL_METHOD_VERSION,
+        "panel_schema_version": PANEL_SCHEMA_VERSION,
+        "feature_method_version": FEATURE_METHOD_VERSION,
+        "trade_flow_input_method_version": TRADE_FLOW_INPUT_METHOD_VERSION,
+        "trade_input_receipt_method_version": (
+            TRADE_INPUT_RECEIPT_METHOD_VERSION
+        ),
         "governance_method_version": GOVERNANCE_METHOD_VERSION,
         "run_id": run_id,
         "research_identity": research_identity,
@@ -776,6 +800,14 @@ def run_research(
             "to_time": panel.bars[-1].decision_time.isoformat(),
             "latest_available_time": panel.latest_available_time.isoformat(),
             "sha256": panel.panel_sha256,
+            "research_economic_volume_qualified": all(
+                bar.volume_qualified for bar in panel.bars
+            ),
+            "latest_economic_volume_qualified": (
+                features[decision_index].volume_qualified
+                and features[decision_index].volume_score is not None
+                and features[decision_index].flow_imbalance is not None
+            ),
         },
         "strategy_decision": {
             "feature_index": decision_index,
@@ -818,6 +850,13 @@ def run_research(
         "effective_trial_method_version": EFFECTIVE_TRIAL_METHOD_VERSION,
         "parameter_stability_method_version": PARAMETER_STABILITY_METHOD_VERSION,
         "position_contract_method_version": POSITION_CONTRACT_METHOD_VERSION,
+        "panel_method_version": PANEL_METHOD_VERSION,
+        "panel_schema_version": PANEL_SCHEMA_VERSION,
+        "feature_method_version": FEATURE_METHOD_VERSION,
+        "trade_flow_input_method_version": TRADE_FLOW_INPUT_METHOD_VERSION,
+        "trade_input_receipt_method_version": (
+            TRADE_INPUT_RECEIPT_METHOD_VERSION
+        ),
         "governance_method_version": GOVERNANCE_METHOD_VERSION,
         "run_id": run_id,
         "research_identity": research_identity,
@@ -838,6 +877,12 @@ def run_research(
         "input_attempt_ids": list(panel.attempt_ids),
         "input_artifact_ids": list(panel.artifact_ids),
         "normalization_versions": list(panel.normalization_versions),
+        "trade_input_qualification": {
+            "source_trade_rows": inputs.source_trade_rows,
+            "economic_trade_rows": inputs.economic_trade_rows,
+            "unqualified_trade_rows": inputs.unqualified_trade_rows,
+            "volume_qualified": inputs.volume_qualified,
+        },
         "artifacts": {
             **artifacts,
             "summary_json": {

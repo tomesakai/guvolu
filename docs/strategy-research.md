@@ -499,7 +499,7 @@ vintage。单 vintage 的候选轴诊断再次指向突破和趋势的 264 小�
 entry 方向触及配置边界；均值回归要求修订假设或成本模型；网格要求先完善被动成交模型。
 264 小时 challenger 已在同一面板的上一轮隔离试验中输给 168 小时冠军；v3 提案器自动扫描
 内容寻址历史后，以 `duplicate_axis_value_proposal` 同时拒绝两个重复提案，因此本轮不重复运行
-相同 challenger，也不把提案当成新时间证据或 promotion。只有未来时间分离的 v12 vintage
+相同 challenger，也不把提案当成新时间证据或 promotion。只有未来时间分离的 v13 同 cohort vintage
 才能推动 improving、stable 或 decaying，并决定是否重新开启该轴。
 
 隔离开发分支的 `family-direction-monitor-v6` 进一步要求在监视时实际复核 trial ledger 散列，
@@ -527,7 +527,7 @@ v7 在 v6 的内容去重和时间间隔合同上增加 canonical 历史自动�
 vintage 先按配置、代码树、summary 与 manifest 内容散列选择
 唯一代表，再按时间排序和间隔过滤；因此颠倒 CLI 历史路径顺序不会改变监视方向或消费的证据。
 
-`pipeline-v12` 已完成 `holdout-v4` 所需的研究来源合同。面板建立前会捕获完整活动 head 收据，
+`pipeline-v12` 已完成 `holdout-v4` 所需的旧研究来源合同。面板建立前会捕获完整活动 head 收据，
 登记每个 partition 对应的 materialization output、artifact SHA、行数与事件区间；冻结预测和
 holdout 也分别把同一类收据与消费者身份原子绑定。配置及完整父谱系按原始字节复制为内容寻址
 快照，并与记录的 clean Git commit blob 逐字节比对。复核器会从受保护 panel、配置与公式重建
@@ -543,6 +543,25 @@ holdout 也分别把同一类收据与消费者身份原子绑定。配置及完
 `v12 research_position` 重建比较处拒绝该制品。该运行发生在未提交开发树，故
 `decision_grade=false` 且 operational 权重按硬门禁归零；它证明证据闭环，不是 promotion 结论。
 G-08 仍必须由开始前冻结、完整及时预测并一次性消费的未来 vintage 给出，不能由 v12 回测替代。
+以上“完整重建”是当时 v12 验证器的历史结果。当前 v13 验证器不再用已改变的 panel/feature
+实现冒充旧语义重放：v12 只允许调用制品完整性 API 和 legacy receipt 的历史只读复核，完整
+`verify_research_run` 明确 fail-close；readiness、monitor、promotion 与新冻结写入均不得消费它。
+
+`pipeline-v13`、`trade-bars-pit-v2`、`research-features-v2` 与
+`economic-trade-basis-v1` 进一步收紧 GMO 成交语义。实时经济成交只有在物理行同时证明
+normalization v4、raw schema v3、`EP-0007` r1 和 taker basis 时才合格；经核证的历史
+archive v1 使用独立允许合同。r0/participant 行只参与价格 OHLC 和时钟覆盖，不进入经济成交量、
+flow、rolling volume 或 capacity。内容寻址输入收据按物理文件重算 source/economic/unqualified
+行数；混合柱虽可统计其中合格成交，但整柱 volume 资格失败，flow_trend 与 breakout 必须归零。
+新冻结计划和预测身份显式绑定上述版本，旧 v12 计划不能继续追加预测，旧 metrics 与 monitor
+history 也不跨该 cohort 平移。
+
+活动 head 可用独立只读门禁检查；命令在存在任一不合格经济成交行时返回退出码 2：
+
+```powershell
+python scripts/check_trade_economic_qualification.py mkt__gmo__btc__r0 `
+  --data-root C:\Users\wu_zh\dev\guvolu\data
+```
 
 提交后的首次 clean v12 运行暴露了 Windows Git 换行合同缺口：工作区的 PowerShell 与
 `uv.lock` 经 clean/smudge 检出为 CRLF，而 verifier 从 commit 读取 LF，导致代码树散列不能重建。

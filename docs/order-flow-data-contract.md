@@ -527,7 +527,10 @@ GMO 实时逐笔把服务端 `error`/`errors` 帧先按 raw v3 原样落盘，�
 
 GMO `EP-0007` r1 订阅固定携带 `option=TAKER_ONLY`，其成交方向才登记为 `taker`。
 旧 r0 与未记录修订的原件保持可重投影，但方向降级为
-`participant_side_unfiltered`；价格与总量仍保留，signed flow 不计入这些行。
+`participant_side_unfiltered`；价格与时钟覆盖仍保留，但其 base/quote volume、
+economic trade count、signed flow 与 capacity notional 均不得进入决策级研究。
+不得用除以二或时间/价/量镜像启发式猜测真实成交量；只有来源合同提供可证明的
+配对身份时才能另行去重。
 这是 normalization v4 相对 v3 的语义修正，旧制品不原地改写。
 
 MON 与 OFL 已完成市场身份迁移：市场选择来自 Query Catalog，K线、
