@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import importlib
+import tempfile
 from contextlib import contextmanager
 from collections.abc import Iterator
 from pathlib import Path
@@ -31,19 +32,32 @@ def _fsync_parent(path: Path) -> None:
 def atomic_write_bytes(path: Path, body: bytes) -> None:
     """写同目录临时文件，fsync 后原子替换目标。"""
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_name(path.name + ".tmp")
-    try:
-        with temp.open("wb") as handle:
-            handle.write(body)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp, path)
-        _fsync_parent(path)
-    finally:
+    with exclusive_path_lock(path):
+        existing_mode = (
+            path.stat().st_mode & 0o777
+            if path.exists()
+            else None
+        )
+        descriptor, raw_temp = tempfile.mkstemp(
+            dir=path.parent,
+            prefix=f".{path.name}.tmp-",
+        )
+        temp = Path(raw_temp)
         try:
-            temp.unlink()
-        except FileNotFoundError:
-            pass
+            # 新文件使用普通制品权限。
+            # 替换时保留既有 mode。
+            temp.chmod(existing_mode if existing_mode is not None else 0o644)
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(body)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp, path)
+            _fsync_parent(path)
+        finally:
+            try:
+                temp.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def atomic_write_text(path: Path, text: str) -> None:
