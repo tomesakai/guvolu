@@ -596,6 +596,16 @@ FDR q 为 `0.0358`、PBO 为 `0.320`、bootstrap p 为 `0.0380`。固定路径 s
 `cross_run_direction=insufficient_history` 且去重历史为零。lookback `264` 派生配置只是
 单次候选网格关联支持的预登记 challenger；不得替换当前候选，须等待时间分离的新 vintage。
 
+同一 clean commit 上的共同 v14 组合运行
+`research-run-82672ddf72d3feebf41fe9d5b572a4a50a2a05b1590e5181044109e473618ab1`
+及 manifest SHA-256 `5b99ad503f1636fd80e3b60b7dd9ed9792ace0fc9823a1cc68ae111edaea41b0`
+也通过完整 verifier。组合器没有相加两个单流派独立权重，而是从共同 stitched OOS 回报重算：
+`price_breakout=0.5188`、`trend=0.0812`、reserve `0.4`，research aggregate target 为
+`0.58785`。运行开始于 `06:05 JST`，最新完整特征仍为 `05:00`；实时门因
+`strategy_data_stale` 与 `feature_snapshot_stale` 把 operational 权重和 aggregate target
+全部归零。该结果证明慢速研究选择与快速逐柱发布必须分层：研究权重可作为冻结计划输入，
+不能把耗时的完整研究运行直接当作实时预测器，也不得通过重跑追逐一个已错过的决策时点。
+
 固定候选成本扫描器只重放已经保护的 walk-forward OOS 目标，不重新选择候选，因此不会以不同
 成本反复挑冠军。趋势基线在 `10bp` 时精确重建 OOS Sharpe `0.7718`；固定选择下 `20bp`、
 `30bp`、`40bp` 分别为 `0.5478`、`0.3241`、`0.1010`，约 `44.54bp` 才到损益平衡。
