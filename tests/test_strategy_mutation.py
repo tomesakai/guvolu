@@ -25,12 +25,13 @@ FAMILIES = (
     "flow_trend",
     "grid_shadow",
     "mean_reversion",
+    "price_breakout",
     "trend",
 )
 
 
 def _runtime_row() -> tuple[ResearchBar, FeatureRow]:
-    """构造覆盖五流派字段的固定 CPU reference 输入。"""
+    """构造覆盖六流派字段的固定 CPU reference 输入。"""
     opened = datetime(2026, 1, 1, tzinfo=UTC)
     decided = datetime(2026, 1, 1, 1, tzinfo=UTC)
     return ResearchBar(

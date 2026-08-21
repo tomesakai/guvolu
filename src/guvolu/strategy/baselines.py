@@ -18,6 +18,7 @@ SUPPORTED_FAMILIES = (
     "flow_trend",
     "grid_shadow",
     "mean_reversion",
+    "price_breakout",
     "trend",
 )
 
@@ -152,6 +153,24 @@ def build_candidates(
                     breakout.get("maximum_target"), "breakout.maximum_target",
                 ),
                 }))
+    if "price_breakout" in requested:
+        price_breakout = _mapping(
+            strategies.get("price_breakout"), "strategies.price_breakout",
+        )
+        for lookback in _numbers(
+            price_breakout.get("lookbacks"), "price_breakout.lookbacks",
+        ):
+            result.append(_candidate("price_breakout", "paper", {
+                "lookback": int(lookback),
+                "annual_volatility_target": _number(
+                    price_breakout.get("annual_volatility_target"),
+                    "price_breakout.annual_volatility_target",
+                ),
+                "maximum_target": _number(
+                    price_breakout.get("maximum_target"),
+                    "price_breakout.maximum_target",
+                ),
+            }))
     if "mean_reversion" in requested:
         reversion = _mapping(
             strategies.get("mean_reversion"), "strategies.mean_reversion",

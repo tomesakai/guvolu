@@ -73,16 +73,16 @@ def test_interval_suite_pre_registers_one_global_trial_domain() -> None:
     assert [member["bar_interval"] for member in members] == [
         "1hour", "4hour",
     ]
-    assert [member["candidate_count"] for member in members] == [34, 34]
+    assert [member["candidate_count"] for member in members] == [37, 37]
     domain = first["global_multiple_testing_domain"]
     assert isinstance(domain, list)
     assert all(isinstance(trial, Mapping) for trial in domain)
-    assert len(domain) == 78
-    assert len({trial["trial_id"] for trial in domain}) == 78
-    assert sum(trial["role"] == "candidate_oos_path" for trial in domain) == 68
+    assert len(domain) == 86
+    assert len({trial["trial_id"] for trial in domain}) == 86
+    assert sum(trial["role"] == "candidate_oos_path" for trial in domain) == 74
     assert sum(
         trial["role"] == "walk_forward_family_path" for trial in domain
-    ) == 10
+    ) == 12
 
 
 def test_interval_suite_rejects_duplicate_interval() -> None:

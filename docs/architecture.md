@@ -285,7 +285,7 @@ DuckDB 列裁剪、CPU 完成 schema/PIT/散列验证、盘口重放与 Decimal/
 | 编号 | 未决问题 | 备注 |
 |---|---|---|
 | **TBD-18** | GPU 技术栈（CuPy / PyTorch / RAPIDS / 原生 CUDA） | 【目标机基准 2026-08-14】RTX 5070 12 GB / compute 12.0 已用 PyTorch 2.11 cu128 跑通 SearchFast f32 与 CPU f64 数值对照；首阶段采用隔离 PyTorch worker，后续以全管线 profile 决定是否下沉原生 CUDA。CuPy/RAPIDS 暂无引入证据。见 [策略研究管线](strategy-research.md) |
-| **TBD-19** | 因子库的组织方式与注册机制 | 【提案 2026-08-14，typed CPU reference 已实现】五个流派使用带 shape/unit/frequency/availability/missing policy/numeric domain 的规范 AST；expression identity 绑定公式，candidate identity 绑定表达式与规范参数。公共子表达式 DAG、typed mutation/crossover 与长期 promotion registry 仍未决。见 [策略研究管线](strategy-research.md) |
+| **TBD-19** | 因子库的组织方式与注册机制 | 【提案 2026-08-14，typed CPU reference 已实现】六个流派使用带 shape/unit/frequency/availability/missing policy/numeric domain 的规范 AST；expression identity 绑定公式，candidate identity 绑定表达式与规范参数。公共子表达式 DAG 与 typed mutation/crossover 已实现，长期 promotion registry 仍未决。见 [策略研究管线](strategy-research.md) |
 | **TBD-20** | 回测引擎形态（事件驱动 / 向量化 / 两者） | 【提案 2026-08-14】中频系列已用向量化 CPU walk-forward；被动网格已用 L2 事件重放实现 snapshot 成交上下界、库存、gap 与逆向选择 shadow。私有 fill、queue、撤单失败仍未闭合，因而权重固定为零。见 [策略研究管线](strategy-research.md) |
 | **TBD-21** | 因子存储格式与版本管理 | 【已锁定 2026-08-11 基础面，2026-08-14 扩展】规范化事实先以内容寻址 Parquet 物化；研究层已新增内容寻址紧凑面板、特征、label/cost/replay、全候选 trial ledger、目标位置与 manifest，并以 SQLite 原子注册表实施 adaptive exposure、一次性 holdout vintage、开始前冻结计划和逐决策不可变前向预测。完整因子生命周期/promotion registry 仍随 GPU 阶段定义。见 [materialization-design.md](materialization-design.md) 与 [策略研究管线](strategy-research.md) |
 | **TBD-22** | 硬件环境（GPU 型号、显存、是否本机） | 【已测 2026-08-14】本机 Windows、RTX 5070 12,227 MiB、compute 12.0、驱动 580.88；Windows TDR 约束要求 GPU 计算分块并保持独立进程。 |

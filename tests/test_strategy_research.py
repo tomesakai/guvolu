@@ -955,7 +955,7 @@ def test_candidate_registry_and_identifiers_are_deterministic() -> None:
     first = build_candidates(config)
     second = build_candidates(config)
     assert first == second
-    assert len(first) == 34
+    assert len(first) == 37
     value = {"b": 2, "a": 1}
     assert canonical_json(value) == '{"a":1,"b":2}'
     assert stable_identifier("x", value) == stable_identifier("x", value)
@@ -1326,7 +1326,7 @@ def test_allocator_covariance_uses_stitched_oos_returns(
 
 
 def test_directional_families_share_one_cap() -> None:
-    """量价趋势不得绕过趋势与突破共享的方向风险上限。"""
+    """所有趋势与突破变体必须共享同一个方向风险上限。"""
     quality = QualityVector(True, True, True, True, True, True, ())
     evaluations = tuple(FamilyEvaluation(
         family=family,
@@ -1341,7 +1341,7 @@ def test_directional_families_share_one_cap() -> None:
         eligible=True,
         rejection_reasons=(),
         oos_returns=(0.01, 0.02, 0.01),
-    ) for family in ("trend", "flow_trend", "breakout"))
+    ) for family in ("trend", "flow_trend", "breakout", "price_breakout"))
     state = MarketState(1.0, 0.2, 0.0, 0.5, None, None, None, 0.0, "positive_trend", 0.0)
     config = json.loads(Path("config/strategy_research.json").read_text())["allocation"]
     result = allocate(evaluations, state, quality, config)

@@ -53,6 +53,11 @@
       "annual_volatility_target": 0.4,
       "maximum_target": 1.0
     },
+    "price_breakout": {
+      "lookbacks": [6, 18, 42],
+      "annual_volatility_target": 0.4,
+      "maximum_target": 1.0
+    },
     "mean_reversion": {
       "lookbacks": [6, 18, 42],
       "entry_scores": [1.0, 1.5],
@@ -116,6 +121,9 @@
         "lookback": {"minimum": 3, "maximum": 84},
         "flow_confirmation": {"minimum": -1.0, "maximum": 1.0}
       },
+      "price_breakout": {
+        "lookback": {"minimum": 3, "maximum": 84}
+      },
       "mean_reversion": {
         "lookback": {"minimum": 3, "maximum": 84},
         "entry_score": {"minimum": 0.5, "maximum": 3.0}
@@ -127,7 +135,12 @@
     }
   },
   "allocation": {
-    "directional_families": ["trend", "flow_trend", "breakout"],
+    "directional_families": [
+      "trend",
+      "flow_trend",
+      "breakout",
+      "price_breakout"
+    ],
     "maximum_gross_weight": 0.85,
     "trend_breakout_cap": 0.6,
     "mean_reversion_cap": 0.25,

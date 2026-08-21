@@ -175,6 +175,20 @@ _TEMPLATES: Mapping[str, StrategyExpression] = {
         target=None,
         sizing="volatility_target",
     ),
+    "price_breakout": StrategyExpression(
+        family="price_breakout",
+        mode="paper",
+        parameter_types=_parameter_schema({
+            "lookback": Unit.WINDOW,
+            "annual_volatility_target": Unit.DIMENSIONLESS,
+            "maximum_target": Unit.DIMENSIONLESS,
+        }),
+        required=(_PRIOR_HIGH, _PRICE_SCORE),
+        entry=_binary("gt", _CLOSE, _PRIOR_HIGH),
+        exit=_binary("le", _PRICE_SCORE, _constant(0.0)),
+        target=None,
+        sizing="volatility_target",
+    ),
     "mean_reversion": StrategyExpression(
         family="mean_reversion",
         mode="paper",
