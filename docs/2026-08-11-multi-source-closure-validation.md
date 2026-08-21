@@ -73,7 +73,7 @@ python -m guvolu.data.persistence_audit --data-root data --mode full
 
 ## 7. 全量持久化审计
 
-全量审计已输出为 [persistence-audit-full-2026-08-11.json](../data/export/persistence-audit-full-2026-08-11.json)：逐项检查 53,725 个文件、5,876,206,996 字节、52,842 个归档文件与 52,845 条覆盖登记。新建 P0/P1 分区的内容散列、行数、金额文本、时间顺序和血缘均通过；但整个历史数据集的 `loss_detected=true`、`fully_proven=false`，因此不得把本次分区验证扩大表述为“历史库零缺陷”。
+全量审计已输出为 `data/export/persistence-audit-full-2026-08-11.json`：逐项检查 53,725 个文件、5,876,206,996 字节、52,842 个归档文件与 52,845 条覆盖登记。新建 P0/P1 分区的内容散列、行数、金额文本、时间顺序和血缘均通过；但整个历史数据集的 `loss_detected=true`、`fully_proven=false`，因此不得把本次分区验证扩大表述为“历史库零缺陷”。
 
 审计的确定性错误是既有 `data/raw/2026-08-08/ws_public.jsonl` 第 42,288 行畸形 JSON。另有 18 个 manifest 后追加记录警告、4 个未完成运行、215,459 行和 16 个 manifest 缺少 durable-ack 版本证据，以及归档覆盖表与 heatmap 元数据缺少逐文件/逐源散列的可证明性盲区。原始介质保持不改写；这些问题应以隔离清单、补充 manifest 与后续内容散列台账修复。
 

@@ -137,7 +137,7 @@ raw 独立重建与瓦片文件在旗标、mid、档集、侧别与三值分解�
 
 ## 5. 视觉核验（图形线）
 
-八图落 [data/export/alert-verify/](../data/export/alert-verify/)，
+八图落在 `data/export/alert-verify/`，
 画法沿快照热力基线（纵轴价格、横轴逐帧、卖红买绿、亮度为挂量对数、
 中间价灰线、逐笔成交为亮点，侧别按 tick 规则推断），
 白框为判定区域（价带乘时窗），标注含窗、带、关键指标。
