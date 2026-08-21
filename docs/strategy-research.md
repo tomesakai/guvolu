@@ -548,13 +548,41 @@ G-08 仍必须由开始前冻结、完整及时预测并一次性消费的未来
 `verify_research_run` 明确 fail-close；readiness、monitor、promotion 与新冻结写入均不得消费它。
 
 `pipeline-v13`、`trade-bars-pit-v2`、`research-features-v2` 与
-`economic-trade-basis-v1` 进一步收紧 GMO 成交语义。实时经济成交只有在物理行同时证明
+`economic-trade-basis-v1` 收紧了 GMO 成交语义。实时经济成交只有在物理行同时证明
 normalization v4、raw schema v3、`EP-0007` r1 和 taker basis 时才合格；经核证的历史
 archive v1 使用独立允许合同。r0/participant 行只参与价格 OHLC 和时钟覆盖，不进入经济成交量、
 flow、rolling volume 或 capacity。内容寻址输入收据按物理文件重算 source/economic/unqualified
 行数；混合柱虽可统计其中合格成交，但整柱 volume 资格失败，flow_trend 与 breakout 必须归零。
 新冻结计划和预测身份显式绑定上述版本，旧 v12 计划不能继续追加预测，旧 metrics 与 monitor
 history 也不跨该 cohort 平移。
+
+`pipeline-v14` 再把 `economic-trade-operational-gate-v1` 纳入研究身份。生产者和 verifier 都从
+实际 eligible 部署集合与受保护的最新 feature 重算运行门：只要 flow_trend 或旧 breakout
+实际准入、但最新经济成交窗口不合格，组合运行权重必须全零、reserve 必须为一。旧 v13 若自报
+相同情形下仍有 flow 权重，当前 verifier 明确拒绝；这不会否定其 archive 历史统计，只撤销其
+operational 解释。
+
+2026-08-22 的 v13 独立复核进一步把“统计上通过”与“当前可部署”分开。历史 archive-only
+窗口的量价趋势仍得到 OOS Sharpe `0.741`、FDR q `0.0331`、PBO `0.330`；带 flow 确认的
+突破得到 OOS Sharpe `1.114`、FDR q `0.00578`、PBO `0.0664`。这些数值来自登记的内容寻址
+v13 运行；当前 verifier 能读取并校验其收据和制品身份，但在从现有受保护输入重建 panel 时
+出现 SHA 不一致，因而不能宣称已完成端到端重建。两份运行的研究全窗和最新特征经济成交量
+资格也都是 false，因此不得冻结或获得 operational 权重。这个结果只说明旧残差在当时运行中
+呈现结构，不再把它解释为主动买卖失衡，也不把未完成的复核当成稳健性证据。
+其中 flow_trend 运行的非零 operational 权重属于 v14 门禁前的旧语义，不能作为部署证据。
+
+为区分突破收益来自价格形态还是 GMO r0 残差，候选注册表新增独立 `price_breakout` 结构消融：
+它只要求 close 突破 lagged prior high，并按实现波动率缩放，不读取 flow 或 volume。它拥有自己
+的候选身份、三档 lookback 预算、monitor 与 evolution cohort；原 `breakout` 保留为 flow-sensitive
+历史假设。二者不得共享指标或把一个流派的通过结果平移给另一个。
+
+固定候选成本扫描器只重放已经保护的 walk-forward OOS 目标，不重新选择候选，因此不会以不同
+成本反复挑冠军。趋势基线在 `10bp` 时精确重建 OOS Sharpe `0.7718`；固定选择下 `20bp`、
+`30bp`、`40bp` 分别为 `0.5478`、`0.3241`、`0.1010`，约 `44.54bp` 才到损益平衡。
+full-history deployment 候选的损益平衡约 `58.98bp`。这说明当前 10bp 假设有可量化余量，
+但不是 100 天未来 vintage 的保证，也不能替代按真实成交生命周期校准 slippage/impact。
+来源为 trend run `research-run-bf59f3ef...64a34eb`、manifest
+`50dd3eb099ff...ce566` 与内容寻址成本制品 `a14fa9065ae3...05d04`。
 
 活动 head 可用独立只读门禁检查；命令在存在任一不合格经济成交行时返回退出码 2：
 
@@ -845,6 +873,7 @@ CUDA v2 仍须在隔离环境重新测量，不能沿用 v1 性能数字冒充�
 | 趋势 | 1h paper eligible；4h rejected | 时序趋势分数、波动目标、主动成交成本 | 独立扩展 lookback/entry 轴 |
 | 量价趋势 | 1h paper eligible；4h rejected | 趋势加 signed flow/volume 确认，同一方向风险桶 | 独立演进 flow confirmation |
 | 突破 | 1h/4h paper eligible | 区间突破加 flow 确认，最新信号允许空仓 | 监视冠军集中度与边界轴 |
+| 纯价格突破 | structural ablation | 只用 lagged prior high 与波动缩放，不读取成交方向/量 | 先比较旧 breakout，证明价格还是 flow 来源 |
 | 均值回归 | rejected | range 假设、逆势入场、主动成本后评估 | 当前先修订假设，不扩大亏损网格 |
 | 网格 | L2 shadow rejected | snapshot 成交上下界、库存与逆向选择只用于否证 | 待私有 fill/撤单生命周期校准后再演进 |
 | 微观结构/做市/queue | disabled | 缺 L3、MBO、私有成交生命周期 | 不生成伪候选，先补事实合同 |
@@ -864,7 +893,7 @@ flowchart TB
     raw --> l2
 
     subgraph generation["独立流派生成与演进"]
-        direction["方向时序池<br/>trend / flow_trend / breakout"]
+        direction["方向时序池<br/>trend / flow_trend / breakout / price_breakout"]
         reversion["反转池<br/>mean_reversion"]
         grid["库存与被动成交池<br/>grid shadow"]
         micro["微观结构池<br/>MM / queue / cross-venue"]
@@ -914,7 +943,7 @@ flowchart TB
     ledger --> evolution["SelectionView<br/>仅反馈本流派下一代"]
     evolution --> monitors
 
-    suiteFdr["多节拍套件证据<br/>统一 78 项 BH-FDR / 最粗栅格相关性"]
+    suiteFdr["多节拍套件证据<br/>统一全局 BH-FDR / 最粗栅格相关性"]
     ledger --> suiteFdr
 
     privateFill["未来私有委托/成交生命周期<br/>queue calibration"]
