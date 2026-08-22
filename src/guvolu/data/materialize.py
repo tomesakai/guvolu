@@ -2619,6 +2619,63 @@ def _stage_archive_trade_rows(
     )
 
 
+@dataclass(frozen=True)
+class ArchiveMonthKey:
+    """重算一个归档月 Parquet 所需的市场与版本键。"""
+
+    venue_id: str
+    venue_symbol: str
+    market_id: str
+    instrument_id: str
+    mapping_revision: int
+    event_month: str
+    normalization_version: str
+
+
+def rebuild_archive_trade_month_parquet(
+    root: Path,
+    inputs: Sequence[ArchiveInput],
+    key: ArchiveMonthKey,
+    temp_dir: Path,
+) -> Path:
+    """只在临时目录重算归档月 Parquet 字节，不触碰控制面。"""
+    _month_bounds(key.event_month)
+    if not inputs:
+        raise ValueError("重算归档月没有输入原件")
+    ordered = sorted(
+        inputs, key=lambda item: (item.partition.day, item.artifact.storage_path),
+    )
+    artifacts = [item.artifact for item in ordered]
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    staging_path = temp_dir / "stage.csv"
+    temp_path = temp_dir / "rebuild.parquet"
+    for stale in (staging_path, temp_path):
+        stale.unlink(missing_ok=True)
+    stage = _stage_archive_trade_rows(
+        root, staging_path, key.venue_id, key.venue_symbol, key.market_id,
+        key.instrument_id, key.mapping_revision, key.event_month,
+        key.normalization_version, list(ordered),
+    )
+    source_total = sum(stage.source_counts.values())
+    rejected_total = sum(stage.rejected_counts.values())
+    if source_total != stage.row_count + rejected_total:
+        raise ValueError("来源行数不等于事实行数加拒绝行数")
+    db = open_analytics()
+    try:
+        _create_duckdb_table(db)
+        if stage.row_count:
+            _load_staged_rows(db, staging_path)
+        _validate_staged_contract(
+            db, key.market_id, key.normalization_version, artifacts,
+            stage.normalized_counts, stage.row_count,
+        )
+        staging_path.unlink()
+        _copy_parquet(db, temp_path)
+    finally:
+        db.close()
+    return temp_path
+
+
 def materialize_archive_trade_month(
     root: Path,
     conn: sqlite3.Connection,
