@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "market_id": "mkt__gmo__btc__r0",
+  "symbol": "BTC",
+  "bar_interval": "1hour",
+  "risk_budget_jpy": "500",
+  "no_trade_band": "0.01",
+  "taker_fee_fallback_bps": "5",
+  "taker_fee_cache_seconds": 86400,
+  "overlay": {
+    "limit": "0.3",
+    "maximum_spread_bps": "10",
+    "minimum_top5_depth_base": "0.5",
+    "maximum_anchor_age_seconds": 300
+  },
+  "ledger_directory": "execution/paper"
+}
