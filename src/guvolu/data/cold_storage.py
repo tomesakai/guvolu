@@ -839,6 +839,7 @@ def restore_hot_from_raw_plan(
     plan_path: Path,
     *,
     apply: bool = False,
+    shard: tuple[int, int] | None = None,
 ) -> dict[str, object]:
     """不读冷盘，由热层 raw 归档重算并恢复缺失的热 Parquet。"""
     root = data_root.resolve()
@@ -851,6 +852,15 @@ def restore_hot_from_raw_plan(
         if item.artifact_kind == "materialized_parquet"
         and item.logical_path.endswith(".parquet")
     )
+    if shard is not None:
+        shard_index, shard_count = shard
+        if shard_count <= 0 or not 0 <= shard_index < shard_count:
+            raise StoragePathError(f"分片参数非法: {shard_index}/{shard_count}")
+        # 按序号取模分片，项间无共享状态
+        candidates = tuple(
+            item for position, item in enumerate(candidates)
+            if position % shard_count == shard_index
+        )
     if not candidates:
         raise StoragePathError("迁移计划没有可恢复的热 Parquet")
     conn = store.connect_readonly(root)
@@ -938,6 +948,7 @@ def restore_hot_from_raw_plan(
         "mismatched": mismatched,
         "mismatched_items": len(mismatched),
         "present_items": present_items,
+        "shard": None if shard is None else [shard[0], shard[1]],
         "restorable_bytes": restorable_bytes,
         "restored_bytes": restored_bytes,
         "restored_items": restored_items,
@@ -945,7 +956,10 @@ def restore_hot_from_raw_plan(
         "status": status,
     }
     if apply:
-        _atomic_json(_receipt_path(plan_path, "hot-restored-from-raw"), {
+        receipt_phase = "hot-restored-from-raw" if shard is None else (
+            f"hot-restored-from-raw-{shard[0]}of{shard[1]}"
+        )
+        _atomic_json(_receipt_path(plan_path, receipt_phase), {
             **result,
             "restored_at": datetime.now(UTC).isoformat(),
         })
@@ -981,6 +995,7 @@ def main() -> None:
     restore_parser.add_argument("--plan", type=Path, required=True)
     restore_parser.add_argument("--apply", action="store_true")
     restore_parser.add_argument("--from-raw", action="store_true")
+    restore_parser.add_argument("--shard", default=None)
     verify_parser = subparsers.add_parser("verify")
     verify_parser.add_argument("--plan", type=Path, required=True)
     verify_parser.add_argument(
@@ -1022,8 +1037,12 @@ def main() -> None:
                 confirm_migration_id=args.confirm_migration_id,
             ))
         elif args.command == "restore-hot" and args.from_raw:
+            shard: tuple[int, int] | None = None
+            if args.shard is not None:
+                index_text, count_text = str(args.shard).split("/", 1)
+                shard = (int(index_text), int(count_text))
             _json_result(restore_hot_from_raw_plan(
-                root, args.plan.resolve(), apply=bool(args.apply),
+                root, args.plan.resolve(), apply=bool(args.apply), shard=shard,
             ))
         elif args.command == "restore-hot":
             _json_result(restore_hot_plan(

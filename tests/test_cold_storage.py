@@ -156,6 +156,19 @@ def test_restore_hot_recovers_released_parquet_then_rollback_works(
     assert rollback_plan(root, path)["status"] == "planned"
 
 
+def test_restore_from_raw_shard_filters_candidates(tmp_path: Path) -> None:
+    root, _, prefix = _fixture(tmp_path)
+    _, path = create_plan(root, prefix)
+    # 单候选两分片校验
+    with pytest.raises(StoragePathError, match="没有可恢复"):
+        restore_hot_from_raw_plan(root, path, shard=(1, 2))
+    with pytest.raises(StoragePathError, match="分片参数非法"):
+        restore_hot_from_raw_plan(root, path, shard=(2, 2))
+    result = restore_hot_from_raw_plan(root, path, shard=(0, 2))
+    assert result["shard"] == [0, 2]
+    assert result["candidate_items"] == 1
+
+
 def test_rollback_allows_missing_superseded_non_head_items(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
