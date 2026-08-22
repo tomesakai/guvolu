@@ -143,3 +143,40 @@ def test_market_notional_requires_reference() -> None:
     with pytest.raises(IntentError, match="参考价"):
         intent.notional_jpy()
     assert intent.notional_jpy(Decimal("2000000")) == Decimal("200")
+
+
+def make_lineage_intent(
+    *, prediction_id: str | None, decision_time: datetime | None,
+) -> OrderIntent:
+    """构造携带血缘字段的意图（X-08）。"""
+    return OrderIntent(
+        intent_id="it0003",
+        correlation_id="co0001",
+        symbol=SpotSymbol("BTC"),
+        side=Side.BUY,
+        execution_type=ExecutionType.LIMIT,
+        size=Decimal("0.0001"),
+        price=Decimal("1000000"),
+        time_in_force=None,
+        created_at=CREATED_AT,
+        prediction_id=prediction_id,
+        decision_time=decision_time,
+    )
+
+
+def test_naive_decision_time_rejected() -> None:
+    """决策时刻必须带时区（D-08）。"""
+    with pytest.raises(IntentError, match="决策时刻"):
+        make_lineage_intent(
+            prediction_id="pred-1", decision_time=datetime(2026, 8, 16, 0, 0),
+        )
+    aware = make_lineage_intent(prediction_id="pred-1", decision_time=CREATED_AT)
+    assert aware.decision_time == CREATED_AT
+
+
+def test_empty_prediction_id_rejected() -> None:
+    """prediction_id 可为空值但不得为空文本。"""
+    with pytest.raises(IntentError, match="prediction_id"):
+        make_lineage_intent(prediction_id="", decision_time=CREATED_AT)
+    absent = make_lineage_intent(prediction_id=None, decision_time=None)
+    assert absent.prediction_id is None and absent.decision_time is None

@@ -140,9 +140,11 @@ def test_adapter_inherits_v2_validity_and_correlation(tmp_path: Path) -> None:
     assert lineage["decision_input_sha256"] == "a" * 64
 
 
-@pytest.mark.parametrize("bad", [-0.1, 1.5])
+@pytest.mark.parametrize(
+    "bad", [-0.1, 1.5, float("nan"), float("inf"), "0.5", True],
+)
 def test_adapter_rejects_negative_or_out_of_range_target(
-    tmp_path: Path, bad: float
+    tmp_path: Path, bad: object
 ) -> None:
     source = tmp_path / "prediction.json"
     _prediction(source, target=bad)
