@@ -13,7 +13,16 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Literal, cast
 
+import duckdb
+
 from guvolu.data import store
+from guvolu.data.materialize import (
+    ArchiveInput,
+    ArchiveMonthKey,
+    SourceArtifact,
+    rebuild_archive_trade_month_parquet,
+)
+from guvolu.data.projection import ArchivePartition
 from guvolu.data.sqlite_writer_lock import sqlite_writer_lock
 from guvolu.data.storage_paths import (
     CONFIG_FILE_NAME,
@@ -697,6 +706,203 @@ def restore_hot_plan(
     return result
 
 
+@dataclass(frozen=True)
+class _RawRebuildSource:
+    """一个 Parquet 项反查得到的重算来源。"""
+
+    attempt_id: str
+    key: ArchiveMonthKey
+    inputs: tuple[ArchiveInput, ...]
+
+
+def _rebuild_source(
+    conn: sqlite3.Connection, root: Path, item: MigrationItem,
+) -> _RawRebuildSource:
+    """由控制面反查完成态尝试与热层 raw 输入并逐个核验。"""
+    attempt = conn.execute(
+        "SELECT p.attempt_id,p.market_id,p.partition_key,p.normalization_version "
+        "FROM materialization_output o "
+        "JOIN partition_attempt p ON p.attempt_id=o.attempt_id "
+        "WHERE o.artifact_id=? AND p.domain='trade' "
+        "AND p.status IN ('complete','complete_with_rejections') "
+        "ORDER BY p.finished_at DESC LIMIT 1",
+        (item.artifact_id,),
+    ).fetchone()
+    if attempt is None:
+        raise StoragePathError("没有完成态物化尝试输出该制品")
+    attempt_id = str(attempt[0])
+    market = conn.execute(
+        "SELECT venue_id,venue_symbol,instrument_id,mapping_revision "
+        "FROM market WHERE market_id=?",
+        (str(attempt[1]),),
+    ).fetchone()
+    if market is None:
+        raise StoragePathError(f"尝试市场未登记: {attempt[1]}")
+    venue_id, venue_symbol = str(market[0]), str(market[1])
+    rows = conn.execute(
+        "SELECT b.artifact_id,b.storage_path,b.source_rows,a.artifact_kind,"
+        "a.sha256,a.byte_count,a.sealed_at FROM partition_input_binding b "
+        "JOIN artifact a ON a.artifact_id=b.artifact_id "
+        "WHERE b.attempt_id=? ORDER BY b.storage_path",
+        (attempt_id,),
+    ).fetchall()
+    if not rows:
+        # 旧尝试无位置绑定时退回内容台账
+        rows = conn.execute(
+            "SELECT i.artifact_id,a.storage_path,i.source_rows,a.artifact_kind,"
+            "a.sha256,a.byte_count,a.sealed_at FROM partition_input i "
+            "JOIN artifact a ON a.artifact_id=i.artifact_id "
+            "WHERE i.attempt_id=? ORDER BY a.storage_path",
+            (attempt_id,),
+        ).fetchall()
+    if not rows:
+        raise StoragePathError(f"尝试没有输入原件: {attempt_id}")
+    inputs: list[ArchiveInput] = []
+    for row in rows:
+        storage_path = str(row[1])
+        if str(row[3]) != "source_archive":
+            raise StoragePathError(f"输入不是 raw 归档: {storage_path}")
+        path = _source_path(root, storage_path)
+        if not path.is_file():
+            raise StoragePathError(f"raw 归档热副本缺失: {storage_path}")
+        if path.stat().st_size != int(row[5]) or _sha256(path) != str(row[4]):
+            raise StoragePathError(f"raw 归档与登记不符: {storage_path}")
+        partition = ArchivePartition(venue_id, venue_symbol, path.name[:8], path)
+        artifact = SourceArtifact(
+            str(row[0]), storage_path, path, int(row[2]), 0, 0,
+        )
+        # 摄取时刻取登记封口时刻
+        inputs.append(ArchiveInput(partition, artifact, str(row[6])))
+    key = ArchiveMonthKey(
+        venue_id=venue_id,
+        venue_symbol=venue_symbol,
+        market_id=str(attempt[1]),
+        instrument_id=str(market[2]),
+        mapping_revision=int(market[3]),
+        event_month=str(attempt[2]),
+        normalization_version=str(attempt[3]),
+    )
+    return _RawRebuildSource(attempt_id, key, tuple(inputs))
+
+
+def restore_hot_from_raw_plan(
+    data_root: Path,
+    plan_path: Path,
+    *,
+    apply: bool = False,
+) -> dict[str, object]:
+    """不读冷盘，由热层 raw 归档重算并恢复缺失的热 Parquet。"""
+    root = data_root.resolve()
+    plan = load_plan(plan_path)
+    _validate_catalog(plan, root)
+    resolver = storage_resolver(root)
+    _route(resolver, plan.logical_prefix, statuses={"active", "planned"})
+    candidates = tuple(
+        item for item in plan.items
+        if item.artifact_kind == "materialized_parquet"
+        and item.logical_path.endswith(".parquet")
+    )
+    if not candidates:
+        raise StoragePathError("迁移计划没有可恢复的热 Parquet")
+    conn = store.connect_readonly(root)
+    if conn is None:
+        raise FileNotFoundError(root / store.DB_FILE_NAME)
+    restored_items = restored_bytes = present_items = 0
+    restorable_bytes = 0
+    mismatched: list[dict[str, object]] = []
+    failures: list[dict[str, object]] = []
+    report_step = max(1, len(candidates) // 20)
+    try:
+        conn.execute("PRAGMA query_only=ON")
+        for index, item in enumerate(candidates, start=1):
+            hot = _source_path(root, item.logical_path)
+            if hot.exists():
+                if not hot.is_file() or hot.stat().st_size != item.byte_count or (
+                    _sha256(hot) != item.sha256
+                ):
+                    raise StoragePathError(f"热副本存在但身份不符: {item.logical_path}")
+                present_items += 1
+                continue
+            try:
+                source = _rebuild_source(conn, root, item)
+            except StoragePathError as exc:
+                failures.append({
+                    "logical_path": item.logical_path, "reason": str(exc),
+                })
+                continue
+            restorable_bytes += item.byte_count
+            if not apply:
+                continue
+            temp_dir = hot.with_name(f".{hot.name}.{plan.migration_id}.rebuild")
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            try:
+                rebuilt = rebuild_archive_trade_month_parquet(
+                    root, source.inputs, source.key, temp_dir,
+                )
+                actual_bytes = rebuilt.stat().st_size
+                actual_sha = _sha256(rebuilt)
+                if actual_bytes != item.byte_count or actual_sha != item.sha256:
+                    # 门禁不等绝不写入热路径
+                    mismatched.append({
+                        "actual_byte_count": actual_bytes,
+                        "actual_sha256": actual_sha,
+                        "attempt_id": source.attempt_id,
+                        "expected_byte_count": item.byte_count,
+                        "expected_sha256": item.sha256,
+                        "logical_path": item.logical_path,
+                    })
+                    continue
+                os.replace(rebuilt, hot)
+            except (OSError, ValueError, sqlite3.Error, duckdb.Error) as exc:
+                failures.append({
+                    "logical_path": item.logical_path,
+                    "reason": f"{type(exc).__name__}: {exc}",
+                })
+                continue
+            finally:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+            restored_items += 1
+            restored_bytes += item.byte_count
+            if index == len(candidates) or index % report_step == 0:
+                print(json.dumps({
+                    "failed_items": len(failures),
+                    "migration_id": plan.migration_id,
+                    "mismatched_items": len(mismatched),
+                    "percent": round(index * 100 / len(candidates), 2),
+                    "restored_items": restored_items,
+                    "total_items": len(candidates),
+                }, sort_keys=True), file=sys.stderr, flush=True)
+    finally:
+        conn.close()
+    if not apply:
+        status = "planned"
+    elif mismatched or failures:
+        status = "partial"
+    else:
+        status = "restored"
+    result: dict[str, object] = {
+        "apply": apply,
+        "candidate_items": len(candidates),
+        "failed_items": len(failures),
+        "failures": failures,
+        "migration_id": plan.migration_id,
+        "mismatched": mismatched,
+        "mismatched_items": len(mismatched),
+        "present_items": present_items,
+        "restorable_bytes": restorable_bytes,
+        "restored_bytes": restored_bytes,
+        "restored_items": restored_items,
+        "source": "raw",
+        "status": status,
+    }
+    if apply:
+        _atomic_json(_receipt_path(plan_path, "hot-restored-from-raw"), {
+            **result,
+            "restored_at": datetime.now(UTC).isoformat(),
+        })
+    return result
+
+
 def _json_result(value: object) -> None:
     """输出稳定 JSON。"""
     print(json.dumps(value, ensure_ascii=False, sort_keys=True))
@@ -720,6 +926,7 @@ def main() -> None:
     restore_parser = subparsers.add_parser("restore-hot")
     restore_parser.add_argument("--plan", type=Path, required=True)
     restore_parser.add_argument("--apply", action="store_true")
+    restore_parser.add_argument("--from-raw", action="store_true")
     verify_parser = subparsers.add_parser("verify")
     verify_parser.add_argument("--plan", type=Path, required=True)
     verify_parser.add_argument(
@@ -755,6 +962,10 @@ def main() -> None:
                 args.plan.resolve(),
                 apply=bool(args.apply),
                 confirm_migration_id=args.confirm_migration_id,
+            ))
+        elif args.command == "restore-hot" and args.from_raw:
+            _json_result(restore_hot_from_raw_plan(
+                root, args.plan.resolve(), apply=bool(args.apply),
             ))
         elif args.command == "restore-hot":
             _json_result(restore_hot_plan(
