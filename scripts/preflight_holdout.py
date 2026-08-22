@@ -39,6 +39,9 @@ _TAIL_GRACE_SECONDS = 7_200
 # 数据陈旧告警秒数
 _DATA_STALE_SECONDS = 7_200
 
+# 零暴露缺口占比告警阈值，待入配置
+_COVERAGE_GAP_RATIO_WARNING = 0.2
+
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
@@ -207,6 +210,14 @@ def run_preflight(
         # 零暴露政策下缺口降为告警
         if plan.missing_policy == "zero_exposure":
             warnings.append(coverage_gap)
+            gap_ratio = len(missing) / len(expected)
+            # 缺口占已过去决策窗比例过高另行告警
+            if gap_ratio > _COVERAGE_GAP_RATIO_WARNING:
+                warnings.append({
+                    "issue": "prediction_coverage_gap_ratio_high",
+                    "gap_ratio": round(gap_ratio, 4),
+                    "threshold": _COVERAGE_GAP_RATIO_WARNING,
+                })
         else:
             blockers.append(coverage_gap)
 
