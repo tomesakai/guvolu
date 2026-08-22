@@ -13,7 +13,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import duckdb
@@ -35,6 +35,7 @@ from guvolu.data.materialize import (
     _market_row,
     _register_content_artifact,
     _relative_storage_path,
+    _resolve_recorded_path,
     artifact_id,
     ensure_markets,
     sha256_file,
@@ -333,23 +334,57 @@ _PARSERS = {
 }
 
 
-def _sealed_inputs(root: Path) -> list[SegmentInput]:
+def _sealed_inputs(
+    root: Path, *, latest_run_only: bool = False,
+) -> list[SegmentInput]:
     inputs: list[SegmentInput] = []
-    base = root / "raw" / "realtime" / "book_l2"
+    base = _resolve_recorded_path(root, "raw/realtime/book_l2")
     if not base.is_dir():
         return []
-    for manifest_path in sorted(base.rglob("segment-*.manifest.json")):
+    if latest_run_only:
+        latest_directories: dict[str, tuple[int, int, str, Path]] = {}
+        for run_directory in base.rglob("run_id=*"):
+            if not run_directory.is_dir():
+                continue
+            venue_id = next(
+                (
+                    part.split("=", 1)[1] for part in run_directory.parts
+                    if part.startswith("venue_id=")
+                ),
+                "",
+            )
+            run_id = run_directory.name.split("=", 1)[1]
+            open_run = int(
+                (run_directory / "checkpoint.json").is_file()
+                and next(run_directory.glob("segment-*.open"), None)
+                is not None
+            )
+            candidate = (
+                open_run, run_directory.stat().st_mtime_ns,
+                run_id, run_directory,
+            )
+            if candidate[:3] > latest_directories.get(
+                venue_id, (-1, -1, "", run_directory),
+            )[:3]:
+                latest_directories[venue_id] = candidate
+        manifest_paths = sorted(
+            path
+            for _, _, _, directory in latest_directories.values()
+            for path in directory.glob("segment-*.manifest.json")
+        )
+    else:
+        manifest_paths = sorted(base.rglob("segment-*.manifest.json"))
+    manifests: list[tuple[Path, Mapping[str, object]]] = []
+    for manifest_path in manifest_paths:
         body = json.loads(manifest_path.read_text(encoding="utf-8"))
         if not isinstance(body, Mapping):
             continue
         if body.get("status") != "sealed" or body.get("completion_claim") is not True:
             continue
+        manifests.append((manifest_path, body))
+    for manifest_path, body in manifests:
         recorded = str(body["storage_path"])
-        path = (root / recorded).resolve()
-        try:
-            path.relative_to(root.resolve())
-        except ValueError as exc:
-            raise ValueError(f"segment 路径越界: {recorded}") from exc
+        path = _resolve_recorded_path(root, recorded)
         expected_path = manifest_path.with_name(
             manifest_path.name.removesuffix(".manifest.json") + ".jsonl"
         ).resolve()
@@ -425,6 +460,27 @@ def _sealed_inputs(root: Path) -> list[SegmentInput]:
             ),
         ))
     return inputs
+
+
+def _latest_run_inputs(inputs: Sequence[SegmentInput]) -> list[SegmentInput]:
+    """每所只保留最近写入的封口运行。"""
+    latest: dict[str, tuple[int, str]] = {}
+    for item in inputs:
+        venue = next(
+            part.split("=", 1)[1] for part in item.manifest_path.parts
+            if part.startswith("venue_id=")
+        )
+        candidate = (item.manifest_path.stat().st_mtime_ns, item.run_id)
+        if candidate > latest.get(venue, (-1, "")):
+            latest[venue] = candidate
+    selected_runs = {venue: value[1] for venue, value in latest.items()}
+    return [
+        item for item in inputs
+        if item.run_id == selected_runs[next(
+            part.split("=", 1)[1] for part in item.manifest_path.parts
+            if part.startswith("venue_id=")
+        )]
+    ]
 
 
 def _capability_revision(
@@ -903,13 +959,16 @@ def materialize_segment(
         conn, attempt_id, venue_id, capability_revision
     )
     conn.commit()
-    output_dir = (
-        root / "materialized" / "book_l2"
-        / f"schema_version={L2_SCHEMA_VERSION}"
-        / f"normalization_version={L2_NORMALIZATION_VERSION}"
-        / f"venue_id={venue_id}" / f"market_id={market_id}"
-        / f"run_id={item.run_id}"
-        / f"segment={item.segment_sequence:06d}"
+    output_dir = _resolve_recorded_path(
+        root,
+        PurePosixPath(
+            "materialized", "book_l2",
+            f"schema_version={L2_SCHEMA_VERSION}",
+            f"normalization_version={L2_NORMALIZATION_VERSION}",
+            f"venue_id={venue_id}", f"market_id={market_id}",
+            f"run_id={item.run_id}",
+            f"segment={item.segment_sequence:06d}",
+        ).as_posix(),
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     frame_csv = output_dir / f".{attempt_id}.frames.csv"
@@ -1108,9 +1167,10 @@ def materialize_all(
     conn: sqlite3.Connection,
     *,
     report_reused: bool = True,
+    latest_run_only: bool = False,
 ) -> list[L2Result]:
     """断点复用地物化全部已封口 L2 segment。"""
-    inputs = _sealed_inputs(root)
+    inputs = _sealed_inputs(root, latest_run_only=latest_run_only)
     results: list[L2Result] = []
     for index, item in enumerate(inputs, start=1):
         result = materialize_segment(root, conn, item)
@@ -1161,7 +1221,8 @@ def audit_l2(root: Path, conn: sqlite3.Connection) -> dict[str, object]:
             if not row[7] or not row[8]:
                 errors.append(f"L2 双输出缺失: {attempt}")
                 continue
-            frame_path, level_path = root / str(row[7]), root / str(row[8])
+            frame_path = _resolve_recorded_path(root, str(row[7]))
+            level_path = _resolve_recorded_path(root, str(row[8]))
             result = db.execute(
                 "SELECT COUNT(*),COUNT(*)-COUNT(DISTINCT frame_id),"
                 "SUM(available_time<event_time),SUM(source_depth_levels),"
@@ -1265,7 +1326,7 @@ def _refresh_market_status_nonblocking(
         return None, exc
 
 
-def _watch(root: Path, interval: float) -> int:
+def _watch(root: Path, interval: float, *, latest_run_only: bool) -> int:
     """持续追赶封口盘口；启动锁竞争只延后本轮。"""
     def report_connect_error(exc: Exception, elapsed: float) -> None:
         print(json.dumps({
@@ -1287,10 +1348,23 @@ def _watch(root: Path, interval: float) -> int:
             cycle_started = time.monotonic()
             try:
                 with sqlite_writer_lock(root):
-                    cycle = materialize_all(root, conn, report_reused=False)
-                    market_status_summary, market_status_error = (
-                        _refresh_market_status_nonblocking(root, conn)
+                    cycle = materialize_all(
+                        root, conn, report_reused=False,
+                        latest_run_only=latest_run_only,
                     )
+                    market_status_summary: dict[str, object] | None
+                    market_status_error: Exception | None
+                    if latest_run_only:
+                        market_status_summary = {
+                            "candidate_segments": 0,
+                            "materialized_now": 0,
+                            "deferred": True,
+                        }
+                        market_status_error = None
+                    else:
+                        market_status_summary, market_status_error = (
+                            _refresh_market_status_nonblocking(root, conn)
+                        )
                     # 质量遥测共用写锁。
                     # 已完成事实不阻断追赶。
                     quality_summary, quality_error = (
@@ -1350,23 +1424,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="三所 L2 segment 物化")
     parser.add_argument("--data-root", type=Path, default=None)
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("all", help="物化全部封口 segment")
+    all_parser = sub.add_parser("all", help="物化全部封口 segment")
+    all_parser.add_argument("--latest-run-only", action="store_true")
     sub.add_parser("audit", help="审计活动 L2 输出")
     watch = sub.add_parser("watch", help="周期追赶新封口 segment")
     watch.add_argument("--interval-seconds", type=float, default=300.0)
+    watch.add_argument("--latest-run-only", action="store_true")
     args = parser.parse_args(argv)
     root = (args.data_root or configured_data_root()).resolve()
     if args.command == "watch":
         interval = float(args.interval_seconds)
         if interval < 10:
             raise ValueError("interval-seconds 不得小于 10")
-        return _watch(root, interval)
+        return _watch(
+            root, interval, latest_run_only=bool(args.latest_run_only),
+        )
 
     conn = store.connect(root)
     try:
         if args.command == "all":
             with sqlite_writer_lock(root):
-                completed = materialize_all(root, conn)
+                completed = materialize_all(
+                    root, conn,
+                    latest_run_only=bool(args.latest_run_only),
+                )
             results: object = [asdict(result) for result in completed]
             code = 0
         elif args.command == "audit":

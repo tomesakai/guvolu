@@ -1,5 +1,6 @@
 param(
-    [int]$IntervalSeconds = 300
+    [int]$IntervalSeconds = 300,
+    [switch]$LatestRunOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -18,8 +19,11 @@ Set-Location -LiteralPath $RepoRoot
 Start-Transcript -Path $LogPath -Append | Out-Null
 try {
     Write-Host "guvolu l2-materializer started; interval=${IntervalSeconds}s."
-    & $PythonPath -m guvolu.data.l2_materialize watch `
-        --interval-seconds $IntervalSeconds
+    $Arguments = @('watch', '--interval-seconds', [string]$IntervalSeconds)
+    if ($LatestRunOnly) {
+        $Arguments += '--latest-run-only'
+    }
+    & $PythonPath -m guvolu.data.l2_materialize @Arguments
 } finally {
     Write-Host 'guvolu l2-materializer exited.'
     Stop-Transcript | Out-Null

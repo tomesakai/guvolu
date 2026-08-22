@@ -30,6 +30,10 @@ from guvolu.data.normalization import (
 from guvolu.data.paths import data_root as configured_data_root
 from guvolu.data.sqlite_writer_lock import sqlite_writer_lock
 from guvolu.data import store
+from guvolu.data.storage_paths import (
+    relative_storage_path,
+    resolve_storage_path,
+)
 from guvolu.data.projection import (
     ArchivePartition,
     archive_partitions,
@@ -306,26 +310,17 @@ def _validate_safe_value(value: str, field: str) -> None:
 
 
 def _resolve_recorded_path(root: Path, recorded: str) -> Path:
-    """把旧台账的两种路径前缀统一到数据根。"""
-    candidate = Path(recorded)
-    if candidate.is_absolute():
-        resolved = candidate.resolve()
-    else:
-        parts = PurePosixPath(recorded.replace("\\", "/")).parts
-        if parts and parts[0].lower() == root.name.lower():
-            resolved = root.parent.joinpath(*parts).resolve()
-        else:
-            resolved = root.joinpath(*parts).resolve()
-    try:
-        resolved.relative_to(root.resolve())
-    except ValueError as exc:
-        raise ValueError(f"制品路径超出数据根: {recorded}") from exc
-    return resolved
+    """把逻辑台账路径解析到已验证存储根。"""
+    normalized = recorded.replace("\\", "/")
+    parts = PurePosixPath(normalized).parts
+    if parts and parts[0].lower() == root.name.lower():
+        normalized = PurePosixPath(*parts[1:]).as_posix()
+    return resolve_storage_path(root, normalized)
 
 
 def _relative_storage_path(root: Path, path: Path) -> str:
-    """生成数据根相对的正斜杠路径。"""
-    return path.resolve().relative_to(root.resolve()).as_posix()
+    """生成跨热冷根稳定的逻辑路径。"""
+    return relative_storage_path(root, path)
 
 
 def _recorded_path_from_reference(reference: str) -> str:
@@ -646,13 +641,14 @@ def _output_directory(
     _validate_safe_value(selected_market_id, "market_id")
     _validate_safe_value(normalization_version, "normalization_version")
     year, month = event_month.split("-", 1)
-    return (
-        root / "materialized" / DATASET_TRADE
-        / f"schema_version={TRADE_SCHEMA_VERSION}"
-        / f"normalization_version={normalization_version}"
-        / f"venue_id={venue_id}" / f"market_id={selected_market_id}"
-        / f"event_year={year}" / f"event_month={month}"
+    logical = PurePosixPath(
+        "materialized", DATASET_TRADE,
+        f"schema_version={TRADE_SCHEMA_VERSION}",
+        f"normalization_version={normalization_version}",
+        f"venue_id={venue_id}", f"market_id={selected_market_id}",
+        f"event_year={year}", f"event_month={month}",
     )
+    return _resolve_recorded_path(root, logical.as_posix())
 
 
 def _copy_parquet(db: Any, temp_path: Path) -> None:
@@ -845,7 +841,7 @@ def register_materialization_manifest(
 
 def _manifest_schema_version(root: Path, path: Path) -> int:
     """从物化目录的结构版本分区读取清单版本。"""
-    parts = path.resolve().relative_to(root.resolve()).parts
+    parts = PurePosixPath(_relative_storage_path(root, path)).parts
     versions = [
         part.removeprefix("schema_version=") for part in parts
         if part.startswith("schema_version=")

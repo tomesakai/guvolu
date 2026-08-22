@@ -17,7 +17,7 @@
 | U | 用语 | SKILLS.md | 7 | 无 |
 | A | 代理协作 | SKILLS.md | 6 | 无 |
 | W | 文书 | SKILLS.md | 8 | 无 |
-| TBD | 未决项 | docs/architecture.md | 34 | 无 |
+| TBD | 未决项 | docs/architecture.md | 35 | 无 |
 
 ## 2. 文档清单
 

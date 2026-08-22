@@ -1,6 +1,7 @@
 param(
     [ValidateSet('Normal', 'Hidden')]
-    [string]$WindowStyle = 'Normal'
+    [string]$WindowStyle = 'Normal',
+    [switch]$L2LatestRunOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -67,6 +68,8 @@ foreach ($Materializer in $Materializers) {
     }
     $CommandTail = if ($Materializer.Name -eq 'orderflow-tile-watcher') {
         "-m $($Materializer.Module) watch --bucket 5s $IntervalArgument 300"
+    } elseif ($Materializer.Name -eq 'l2-materializer' -and $L2LatestRunOnly) {
+        "-m $($Materializer.Module) watch $IntervalArgument 300 --latest-run-only"
     } else {
         "-m $($Materializer.Module) watch $IntervalArgument 300"
     }
@@ -83,6 +86,9 @@ foreach ($Materializer in $Materializers) {
         '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $RunnerPath,
         '-IntervalSeconds', '300'
     )
+    if ($Materializer.Name -eq 'l2-materializer' -and $L2LatestRunOnly) {
+        $Arguments += '-LatestRunOnly'
+    }
     if ($WindowStyle -eq 'Normal') {
         $Arguments = @('-NoProfile', '-NoExit') + $Arguments[1..($Arguments.Count - 1)]
     }
@@ -90,4 +96,26 @@ foreach ($Materializer in $Materializers) {
         -ArgumentList $Arguments -WorkingDirectory $RepoRoot `
         -WindowStyle $WindowStyle -PassThru
     Write-Host "[$($Materializer.Name)] window started PID=$($Started.Id)"
+}
+
+$QueryTail = '-m guvolu.ui.query_service'
+$ExistingQuery = @(
+    Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
+        Where-Object { $_.CommandLine -like "*$QueryTail*" }
+)
+if ($ExistingQuery.Count -gt 0) {
+    Write-Host "[query-service] already running PID=$(($ExistingQuery.ProcessId -join ','))"
+} else {
+    $QueryRunner = Join-Path $PSScriptRoot 'run_query_service.ps1'
+    $QueryArguments = @(
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $QueryRunner
+    )
+    if ($WindowStyle -eq 'Normal') {
+        $QueryArguments = @('-NoProfile', '-NoExit') +
+            $QueryArguments[1..($QueryArguments.Count - 1)]
+    }
+    $QueryStarted = Start-Process -FilePath 'powershell.exe' `
+        -ArgumentList $QueryArguments -WorkingDirectory $RepoRoot `
+        -WindowStyle $WindowStyle -PassThru
+    Write-Host "[query-service] window started PID=$($QueryStarted.Id)"
 }

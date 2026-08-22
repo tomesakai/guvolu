@@ -207,6 +207,74 @@ DuckDB 构建任务是单进程写文件任务。查询服务只读已登记完�
 
 ## 8. 扩展与迁移
 
+### 8.1 热冷存储根
+
+数据根 `C:\Users\wu_zh\dev\guvolu\data` 继续承担 SQLite、锁、开放段、
+checkpoint、近期实时事实与查询热集。E 盘同时承担冷层和受控温层，但不成为
+第二个控制面，也不复制 `partition_head`。冷层保存长期不可变事实；温层只在
+C 盘容量门禁触发时接收已封口、有 SHA-256、可独立重放的近期段或小时压实制品。
+SQLite/WAL、锁、当前 `.open`、信号、intent、订单、成交回报和风险账本永不进入
+温层或冷层。
+
+`artifact_id` 仍只由文件字节决定，`artifact_location.storage_path` 仍是数据根相对的
+逻辑路径。物理位置由版本化存储根与最长逻辑前缀路由解析，不把 `E:`、绝对路径或
+卷序列号写入事实身份。控制面下一追加版本应登记：
+
+| 对象 | 必需身份 | 约束 |
+|---|---|---|
+| `storage_root` | `storage_root_id`、tier、卷 GUID、分区 GUID、卷标、文件系统、base path、marker SHA-256 | 根身份追加式；身份冲突拒绝覆盖 |
+| `storage_route` | 逻辑前缀、`storage_root_id`、根内物理前缀、状态、启用时刻 | 最长前缀唯一命中；重叠或循环拒绝 |
+| `storage_migration` | migration ID、来源/目标根、逻辑前缀、计划散列、状态和各阶段时刻 | 状态只前进；失败可回滚到原热位置 |
+
+Windows 当前冷根为 `storage-root__cold__2be00220-add2-4bf3-ab68-479c9e66cf66__v1`；
+卷 GUID 为 `\\?\Volume{2be00220-add2-4bf3-ab68-479c9e66cf66}\`，当前盘符 `E:`
+只用于挂载发现。根目录 `guvolu-cold/v1` 的 `.guvolu-storage-root.json` 必须与
+登记的卷标 `GUVOLU_COLD`、文件系统 `NTFS` 和 marker SHA-256 同时一致。
+USB 桥接器未提供可信硬盘序列号，因此序列号不参与身份判定。
+
+现有 L2 raw 热批量根为
+`storage-root__hot_bulk__1000af7b-e404-4482-938f-5cc9f555ac80__v1`；卷 GUID
+为 `\\?\Volume{1000af7b-e404-4482-938f-5cc9f555ac80}\`，当前盘符 `D:`。C
+盘的 `raw/realtime/book_l2` 联接只作兼容入口，解析器以 D 盘项目 marker、分区
+GUID、卷 GUID、卷标和 NTFS 身份为准，不把 reparse target 本身当事实身份。
+
+路径解析必须 fail-closed：热路径只能位于数据根；冷路径只能位于已登记根并命中
+启用路由。盘符被其他介质占用、冷盘离线、哨兵缺失、卷 GUID 不符、路径逃逸或
+reparse target 不符时均拒绝读取和写入，不能静默回退到同名目录。
+
+### 8.2 迁移状态机
+
+迁移不直接执行移动或覆盖，固定顺序为：
+
+```text
+planned
+-> copied
+-> byte_verified
+-> catalog_registered
+-> route_activated
+-> observed
+-> hot_copy_released
+```
+
+`copied` 使用目标根内专属临时名，完成 flush/fsync 后才原子改为内容寻址终名。
+`byte_verified` 对计划冻结的每个 artifact 复算来源和目标 SHA-256、字节数及 Parquet
+行数/schema。`catalog_registered` 只增目标 location 和迁移台账，不切换活动 head。
+`route_activated` 在短写锁窗口内切换逻辑前缀；热副本继续保留作为回滚来源。
+至少一个完整物化、查询和 full audit 周期通过后才能进入 `observed`。释放热副本是
+独立显式阶段，只允许删除已经证明有冷盘等字节副本的可重建 Parquet；raw、archive、
+SQLite、manifest、拒绝证据和 quarantine 不在本阶段删除范围。
+
+首批只迁静态大制品：OKX 历史 L2 schema v2 和历史
+`trade-normalization-v1`。日元三所实时 L2、实时逐笔、book-state、OFL、质量摘要、
+REST anchor 与当前研究预测保持热层。未来小时压实制品可直接生成到冷层，但开放
+段与最终清单提交前的 stage 始终位于热层或同一目标卷的专属 staging，不能跨卷
+假装原子 rename。
+
+温层路由按年龄与可重建性逐级启用：先迁非活动历史成品，再迁已完成小时压实和
+较老活动分区，最后才缩短 C 盘实时事实保留窗口。温层断开时，实时采集继续写 C
+盘；依赖缺失冷输入的新信号 fail-closed，已有仓位只允许风险收敛。盘恢复后必须
+先核卷身份与 marker，再核活动输入散列，不能按同一盘符自动恢复交易决策。
+
 新来源接入不需要改 Parquet 目录或事实主键，只需完成以下边界：
 
 1. 登记 `venue`、`instrument_map` 与固定 `market_id`。

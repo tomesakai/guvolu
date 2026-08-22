@@ -257,6 +257,7 @@ flowchart LR
 | **TBD-32** | 法币汇率来源（美元系对照的汇率腿） | 仍未实现；任何 USD/USDT 与 JPY 比较必须使用独立、PIT 可审计的 FX 制品，缺 FX 时保持不同 instrument，不直接换算 |
 | **TBD-33** | 报警规则实例与 alert_event 派生表 | 提案 2026-08-08 见 [footprint-design.md](footprint-design.md) 第 6.8 节；随 OFL 页实施；提案实施中（2026-08-09）后端半场：`alert_event` 表（schema v3）、规则实例配置 `config/alert_rules.json`、报警清单与确认端点、区域判读落库即流上匹配；2026-08-10 规则实例增带几何维度（band_bp 标准带或显式价带，匹配器按规则带评估，缺省沿用请求带并记录来源），缺省规则带几何按复核快照 4.4 节再现几何取值；自动检测器属 TBD-30 未做 |
 | **TBD-34** | LLM 决策管线的输入输出构造与台账 | 提案 2026-08-09 见 [llm-pipeline-design.md](llm-pipeline-design.md)；研究进程内、无下单通路、输入内容寻址、输出 schema 校验 |
+| **TBD-35** | 热冷存储根、路径解析与迁移事务 | 【已实现首批 2026-08-22】逻辑 `storage_path` 继续保持数据根相对路径；物理存储根以稳定 `storage_root_id`、卷 GUID、分区 GUID、卷标、哨兵 SHA-256 和逻辑前缀路由共同识别。冷盘离线、身份不符或哨兵变异时读取失败，不按盘符猜测。E 盘兼作受控温层，但只接已封口、有散列、可重放制品；SQLite、锁、开放段与执行状态固定在 C 盘。迁移固定为规划、复制、双端散列、登记、切换、观察和热副本释放七阶段；原始事实不改写。结构见 [materialization-design.md](materialization-design.md) 第 8 节，操作见 [runtime-ops.md](runtime-ops.md) 第 8 节 |
 
 ## 3. 执行架构
 

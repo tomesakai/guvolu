@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import cast
 
 import duckdb
 import pytest
 
+import guvolu.data.l2_materialize as l2_module
 from guvolu.data import store
 from guvolu.data.book_l2_contract import BOOK_L2_V3_NORMALIZATION_VERSION
 from guvolu.data.l2_materialize import (
@@ -18,9 +20,11 @@ from guvolu.data.l2_materialize import (
     _DESCRIPTORS,
     _raw_metadata,
     _sealed_inputs,
+    _latest_run_inputs,
     audit_l2,
     materialize_segment,
 )
+from guvolu.data.storage_paths import MARKER_FILE_NAME
 
 
 BASE = datetime(2026, 8, 12, tzinfo=UTC)
@@ -145,6 +149,152 @@ def _materialize(root: Path) -> L2Result:
     finally:
         conn.close()
     return result
+
+
+def test_sealed_input_can_reside_on_verified_hot_bulk_root(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / "data"
+    bulk_root = tmp_path / "bulk"
+    data_root.mkdir()
+    _write_segment(
+        bulk_root, "gmo", "BTC", "run-hot-bulk",
+        [(_gmo_payload(), None, None)], schema_version=1,
+    )
+    marker = {
+        "role": "hot_bulk",
+        "schema_version": 1,
+        "storage_root_id": "storage-root__hot-bulk__v1",
+    }
+    marker_path = bulk_root / MARKER_FILE_NAME
+    marker_payload = (json.dumps(marker, sort_keys=True) + "\n").encode()
+    marker_path.write_bytes(marker_payload)
+    config = {
+        "roots": [{
+            "filesystem": None,
+            "marker_sha256": hashlib.sha256(marker_payload).hexdigest(),
+            "mount_path": str(bulk_root),
+            "partition_guid": None,
+            "role": "hot_bulk",
+            "storage_root_id": "storage-root__hot-bulk__v1",
+            "volume_guid": None,
+            "volume_label": None,
+        }],
+        "routes": [{
+            "logical_prefix": "raw/realtime/book_l2",
+            "physical_prefix": "raw/realtime/book_l2",
+            "status": "active",
+            "storage_root_id": "storage-root__hot-bulk__v1",
+        }],
+        "schema_version": 1,
+    }
+    (data_root / "storage-roots.json").write_text(
+        json.dumps(config), encoding="utf-8",
+    )
+
+    item = _sealed_inputs(data_root)[0]
+
+    assert item.artifact.absolute_path.is_relative_to(bulk_root)
+    assert item.artifact.storage_path.startswith("raw/realtime/book_l2/")
+
+
+def test_latest_run_filter_keeps_complete_newest_run(tmp_path: Path) -> None:
+    _write_segment(
+        tmp_path, "gmo", "BTC", "run-old",
+        [(_gmo_payload(), None, None)], schema_version=1,
+    )
+    _write_segment(
+        tmp_path, "gmo", "BTC", "run-new",
+        [(_gmo_payload(), None, None)], schema_version=1,
+    )
+
+    selected = _latest_run_inputs(_sealed_inputs(tmp_path))
+
+    assert [item.run_id for item in selected] == ["run-new"]
+
+
+def test_latest_run_filter_hashes_only_selected_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_segment(
+        tmp_path, "gmo", "BTC", "run-old",
+        [(_gmo_payload(), None, None)], schema_version=1,
+    )
+    _write_segment(
+        tmp_path, "gmo", "BTC", "run-new",
+        [(_gmo_payload(), None, None)], schema_version=1,
+    )
+    hashed: list[Path] = []
+    original = cast(
+        Callable[[Path], str], getattr(l2_module, "sha256_file"),
+    )
+
+    def tracked(path: Path) -> str:
+        hashed.append(path)
+        return original(path)
+
+    monkeypatch.setattr(l2_module, "sha256_file", tracked)
+
+    selected = _sealed_inputs(tmp_path, latest_run_only=True)
+
+    assert [item.run_id for item in selected] == ["run-new"]
+    assert len(hashed) == 1
+    assert "run_id=run-new" in hashed[0].as_posix()
+
+
+def test_latest_run_filter_reads_only_selected_manifests(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_segment(
+        tmp_path, "gmo", "BTC", "run-old",
+        [(_gmo_payload(), None, None)], schema_version=1,
+    )
+    _write_segment(
+        tmp_path, "gmo", "BTC", "run-new",
+        [(_gmo_payload(), None, None)], schema_version=1,
+    )
+    read_manifests: list[Path] = []
+    original = Path.read_text
+
+    def tracked(
+        path: Path, encoding: str | None = None, errors: str | None = None,
+    ) -> str:
+        if path.name.endswith(".manifest.json"):
+            read_manifests.append(path)
+        return original(path, encoding=encoding, errors=errors)
+
+    monkeypatch.setattr(Path, "read_text", tracked)
+
+    selected = _sealed_inputs(tmp_path, latest_run_only=True)
+
+    assert [item.run_id for item in selected] == ["run-new"]
+    assert len(read_manifests) == 1
+    assert "run_id=run-new" in read_manifests[0].as_posix()
+
+
+def test_latest_run_filter_prefers_open_run_over_newer_closed_run(
+    tmp_path: Path,
+) -> None:
+    _write_segment(
+        tmp_path, "gmo", "BTC", "run-open",
+        [(_gmo_payload(), None, None)], schema_version=1,
+    )
+    open_directory = (
+        tmp_path / "raw/realtime/book_l2/venue_id=gmo/venue_symbol=BTC"
+        / "run_id=run-open"
+    )
+    (open_directory / "checkpoint.json").write_text("{}", encoding="utf-8")
+    (open_directory / "segment-000002.jsonl.open").write_text(
+        "{}\n", encoding="utf-8",
+    )
+    _write_segment(
+        tmp_path, "gmo", "BTC", "run-closed-newer",
+        [(_gmo_payload(), None, None)], schema_version=1,
+    )
+
+    selected = _sealed_inputs(tmp_path, latest_run_only=True)
+
+    assert [item.run_id for item in selected] == ["run-open"]
 
 
 def test_legacy_raw_v1_becomes_explicit_nullable_v3_fact(tmp_path: Path) -> None:

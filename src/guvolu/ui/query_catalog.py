@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from guvolu.data.store import connect_readonly
+from guvolu.data.storage_paths import storage_resolver
 
 CATALOG_SCHEMA_VERSION = 1
 L2_QUALITY_SCHEMA_VERSION = 1
@@ -409,7 +410,7 @@ class QueryCatalog:
         finally:
             conn.close()
 
-        root = self.data_root.resolve()
+        resolver = storage_resolver(self.data_root)
         rows_by_market: dict[str, list[ActiveOutput]] = defaultdict(list)
         heads_by_market: dict[str, set[tuple[str, str, str, str]]] = defaultdict(set)
         for row in output_rows:
@@ -419,8 +420,8 @@ class QueryCatalog:
                 continue
             if to_time is not None and low is not None and low >= to_time:
                 continue
-            path = (root / str(row["storage_path"])).resolve()
-            if not path.is_relative_to(root) or path.suffix.lower() != ".parquet":
+            path = resolver.resolve(str(row["storage_path"]))
+            if path.suffix.lower() != ".parquet":
                 raise ValueError(
                     f"活动输出路径越界或类型非法: {row['storage_path']}"
                 )
@@ -582,7 +583,7 @@ class QueryCatalog:
         finally:
             conn.close()
 
-        root = self.data_root.resolve()
+        resolver = storage_resolver(self.data_root)
         outputs: list[ActiveOutput] = []
         heads: set[tuple[str, str, str, str]] = set()
         for row in rows:
@@ -592,8 +593,8 @@ class QueryCatalog:
                 continue
             if to_time is not None and low is not None and low >= to_time:
                 continue
-            path = (root / str(row["storage_path"])).resolve()
-            if not path.is_relative_to(root) or path.suffix.lower() != ".parquet":
+            path = resolver.resolve(str(row["storage_path"]))
+            if path.suffix.lower() != ".parquet":
                 raise ValueError(f"活动输出路径越界或类型非法: {row['storage_path']}")
             if not path.is_file():
                 raise FileNotFoundError(f"活动输出缺失: {row['storage_path']}")
