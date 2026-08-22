@@ -13,6 +13,7 @@ from guvolu.data.cold_storage import (
     copy_plan,
     create_plan,
     release_hot_plan,
+    restore_hot_plan,
     rollback_plan,
     verify_plan,
 )
@@ -120,6 +121,31 @@ def test_plan_rejects_unregistered_file(tmp_path: Path) -> None:
 
     with pytest.raises(StoragePathError, match="不闭合"):
         create_plan(root, prefix)
+
+
+def test_restore_hot_recovers_released_parquet_then_rollback_works(
+    tmp_path: Path,
+) -> None:
+    root, cold, prefix = _fixture(tmp_path)
+    plan, path = create_plan(root, prefix)
+    copy_plan(root, path)
+    activate_plan(root, path)
+    release_hot_plan(
+        root, path, apply=True, confirm_migration_id=plan.migration_id,
+    )
+    assert not (root / prefix / "a.parquet").exists()
+
+    dry_run = restore_hot_plan(root, path)
+    assert dry_run["restorable_bytes"] == 3
+    assert not (root / prefix / "a.parquet").exists()
+
+    applied = restore_hot_plan(root, path, apply=True)
+    assert applied["restored_items"] == 1
+    assert (root / prefix / "a.parquet").read_bytes() == b"aaa"
+    # 重复恢复幂等
+    assert restore_hot_plan(root, path, apply=True)["present_items"] == 1
+    assert verify_plan(root, path, side="both")["status"] == "verified"
+    assert rollback_plan(root, path)["status"] == "planned"
 
 
 def test_activate_rejects_overlapping_active_route_without_persisting(

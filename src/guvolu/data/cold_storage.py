@@ -623,6 +623,80 @@ def release_hot_plan(
     return result
 
 
+def restore_hot_plan(
+    data_root: Path,
+    plan_path: Path,
+    *,
+    apply: bool = False,
+) -> dict[str, object]:
+    """由已验证冷副本恢复缺失的热 Parquet，供回滚或热读取。"""
+    root = data_root.resolve()
+    plan = load_plan(plan_path)
+    _validate_catalog(plan, root)
+    resolver = storage_resolver(root)
+    route = _route(resolver, plan.logical_prefix, statuses={"active", "planned"})
+    physical_prefix = _root_path(resolver, route)
+    candidates = tuple(
+        item for item in plan.items
+        if item.artifact_kind == "materialized_parquet"
+        and item.logical_path.endswith(".parquet")
+    )
+    if not candidates:
+        raise StoragePathError("迁移计划没有可恢复的热 Parquet")
+    restored_items = restored_bytes = present_items = 0
+    restorable_bytes = 0
+    for item in candidates:
+        cold = _target_path(
+            physical_prefix, plan.logical_prefix, item.logical_path,
+        )
+        if not cold.is_file():
+            raise StoragePathError(f"冷副本缺失: {item.logical_path}")
+        if cold.stat().st_size != item.byte_count or _sha256(cold) != item.sha256:
+            raise StoragePathError(f"冷副本验证失败: {item.logical_path}")
+        hot = _source_path(root, item.logical_path)
+        if hot.exists():
+            if not hot.is_file() or hot.stat().st_size != item.byte_count or (
+                _sha256(hot) != item.sha256
+            ):
+                raise StoragePathError(f"热副本存在但身份不符: {item.logical_path}")
+            present_items += 1
+            continue
+        restorable_bytes += item.byte_count
+        if not apply:
+            continue
+        hot.parent.mkdir(parents=True, exist_ok=True)
+        temporary = hot.with_name(f".{hot.name}.{plan.migration_id}.restore")
+        temporary.unlink(missing_ok=True)
+        with cold.open("rb") as incoming, temporary.open("xb", buffering=0) as outgoing:
+            shutil.copyfileobj(incoming, outgoing, COPY_BLOCK_BYTES)
+            outgoing.flush()
+            os.fsync(outgoing.fileno())
+        if temporary.stat().st_size != item.byte_count or (
+            _sha256(temporary) != item.sha256
+        ):
+            temporary.unlink(missing_ok=True)
+            raise StoragePathError(f"热恢复临时文件验证失败: {item.logical_path}")
+        os.replace(temporary, hot)
+        restored_items += 1
+        restored_bytes += item.byte_count
+    result: dict[str, object] = {
+        "apply": apply,
+        "candidate_items": len(candidates),
+        "migration_id": plan.migration_id,
+        "present_items": present_items,
+        "restorable_bytes": restorable_bytes,
+        "restored_bytes": restored_bytes,
+        "restored_items": restored_items,
+        "status": "restored" if apply else "planned",
+    }
+    if apply:
+        _atomic_json(_receipt_path(plan_path, "hot-restored"), {
+            **result,
+            "restored_at": datetime.now(UTC).isoformat(),
+        })
+    return result
+
+
 def _json_result(value: object) -> None:
     """输出稳定 JSON。"""
     print(json.dumps(value, ensure_ascii=False, sort_keys=True))
@@ -643,6 +717,9 @@ def main() -> None:
     release_parser.add_argument("--plan", type=Path, required=True)
     release_parser.add_argument("--apply", action="store_true")
     release_parser.add_argument("--confirm-migration-id")
+    restore_parser = subparsers.add_parser("restore-hot")
+    restore_parser.add_argument("--plan", type=Path, required=True)
+    restore_parser.add_argument("--apply", action="store_true")
     verify_parser = subparsers.add_parser("verify")
     verify_parser.add_argument("--plan", type=Path, required=True)
     verify_parser.add_argument(
@@ -678,6 +755,10 @@ def main() -> None:
                 args.plan.resolve(),
                 apply=bool(args.apply),
                 confirm_migration_id=args.confirm_migration_id,
+            ))
+        elif args.command == "restore-hot":
+            _json_result(restore_hot_plan(
+                root, args.plan.resolve(), apply=bool(args.apply),
             ))
     except (OSError, sqlite3.Error, StoragePathError, ValueError) as exc:
         parser.exit(2, f"cold_storage_error: {type(exc).__name__}: {exc}\n")
