@@ -50,6 +50,7 @@
 | docs/2026-08-13-production-rollout.md | 时效快照 | 市场数据生产运行与验证记录 |
 | docs/2026-08-11-account-assets-capability.md | 时效快照 | GMO Coin 与 bitFlyer 私有资产接口复核 |
 | docs/2026-08-10-persistence-audit.md | 时效快照 | 持久化完整性、恢复探针与历史损坏边界审计 |
+| docs/2026-08-22-paper-executor-phase1.md | 时效快照 | paper 执行器阶段一：第 2 版执行目标、paper 成交模型、差异账与覆盖层门控记录 |
 | docs/ui-design.md | 长期维护 | 控制面与可视化设计（TBD-12 至 17 提案载体） |
 | docs/storage-design.md | 长期维护 | Legacy 存储设计兼容索引；现行内容已迁移至物化、运行与订单流文档 |
 | docs/materialization-design.md | 长期维护 | P2 分析物化、键链、Parquet 与 DuckDB 边界 |
