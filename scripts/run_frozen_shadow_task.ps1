@@ -26,7 +26,13 @@ $Output = @()
 try {
     # 运行根不可达也必须留下调度记录。
     $Runtime = (Resolve-Path -LiteralPath $RuntimeRoot -ErrorAction Stop).Path
+    if (-not $Runtime) {
+        throw "运行根不可达: $RuntimeRoot"
+    }
     $Execution = (Resolve-Path -LiteralPath $ExecutionRepository -ErrorAction Stop).Path
+    if (-not $Execution) {
+        throw "执行仓不可达: $ExecutionRepository"
+    }
     # 完整保留原生进程输出，任务日志另存调度层结果。
     $ErrorActionPreference =
         [System.Management.Automation.ActionPreference]::Continue
