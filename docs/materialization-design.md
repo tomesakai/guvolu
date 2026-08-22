@@ -264,7 +264,10 @@ planned
 独立显式阶段，只允许删除已经证明有冷盘等字节副本的可重建 Parquet；raw、archive、
 SQLite、manifest、拒绝证据和 quarantine 不在本阶段删除范围。释放后可用
 `restore-hot` 按同一计划由已验证冷副本逐项恢复热 Parquet（临时名独占创建、fsync、
-散列复核后原子替换，幂等），路由状态不变；恢复后 `rollback` 重新可用。研究面板或
+散列复核后原子替换，幂等），路由状态不变；`restore-hot --from-raw` 不读冷盘，由热层
+raw 归档按 `materialization_output` 反查的完成态尝试与 `partition_input` 输入重算
+Parquet，并以登记 SHA-256 与字节数相等为门禁恢复，不等项只列为 `mismatched` 绝不
+写入，输入缺失或散列不符的项计入 `failures` 后跳过；恢复后 `rollback` 重新可用。研究面板或
 冻结前向仍在读取的逻辑前缀（如历史 `trade-normalization-v1`）不得长期只存冷层：冷盘
 离线即中断研究，须保留或恢复热副本后再释放。
 
