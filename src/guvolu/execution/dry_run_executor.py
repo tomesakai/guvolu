@@ -29,7 +29,11 @@ from guvolu.domain.config import Config, load_config
 from guvolu.domain.enums import ExecutionType, RunMode, ServiceStatus
 from guvolu.domain.errors import DryRunBlocked, GuvoluError
 from guvolu.domain.ids import new_correlation_id, new_intent_id
-from guvolu.domain.intent import IntentState, OrderIntent
+from guvolu.domain.intent import (
+    LOCAL_TERMINAL_STATES,
+    IntentState,
+    OrderIntent,
+)
 from guvolu.domain.models import SymbolRule
 from guvolu.domain.symbols import SpotSymbol
 from guvolu.execution.conversion import (
@@ -287,9 +291,7 @@ def render_report(
             "order_id": result.order_id,
             "reason": result.reason,
         }
-        if result.state not in (
-            IntentState.GATE_REJECTED, IntentState.DRY_RUN_BLOCKED
-        ):
+        if result.state not in LOCAL_TERMINAL_STATES:
             write_touched.append(ORDER_ENDPOINT)
     return {
         "generated_at": datetime.now(UTC).isoformat(),

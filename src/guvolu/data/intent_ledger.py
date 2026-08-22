@@ -35,7 +35,8 @@ from guvolu.domain.intent import (
 )
 from guvolu.domain.symbols import SpotSymbol
 
-SCHEMA_VERSION = 1
+# 第 2 版只增血缘字段（D-06）
+SCHEMA_VERSION = 2
 # 账本在数据根下的相对位置
 LEDGER_RELATIVE_PATH = Path("execution") / "intent_ledger.jsonl"
 
@@ -112,6 +113,12 @@ def _intent_record(intent: OrderIntent, at: datetime) -> dict[str, object]:
             else intent.time_in_force.value
         ),
         "created_at": intent.created_at.isoformat(),
+        "prediction_id": intent.prediction_id,
+        "decision_time": (
+            None
+            if intent.decision_time is None
+            else intent.decision_time.isoformat()
+        ),
     }
 
 
@@ -229,6 +236,31 @@ class IntentLedger:
         """模拟运行守卫在发送边界拦截，本地终态（T-04）。"""
         self.transition(
             intent_id, IntentState.DRY_RUN_BLOCKED, reason=reason, at=at
+        )
+
+    def paper_fill(
+        self,
+        intent_id: str,
+        *,
+        reason: str,
+        evidence: Mapping[str, str],
+        at: datetime | None = None,
+    ) -> None:
+        """paper 成交模型在发送边界结算，本地终态（T-04）。"""
+        self.transition(
+            intent_id,
+            IntentState.PAPER_FILLED,
+            reason=reason,
+            evidence=evidence,
+            at=at,
+        )
+
+    def paper_reject(
+        self, intent_id: str, *, reason: str, at: datetime | None = None
+    ) -> None:
+        """paper 成交模型拒绝结算，本地终态（T-04）。"""
+        self.transition(
+            intent_id, IntentState.PAPER_REJECTED, reason=reason, at=at
         )
 
     def resolve_timeout_failed(
@@ -399,6 +431,8 @@ class IntentLedger:
             raise LedgerCorrupt(f"第 {number} 行重复意图 {intent_id}")
         price_text = _optional_text(record, "price")
         tif_text = _optional_text(record, "time_in_force")
+        # 第 1 版行无血缘字段，按空值兼容读取
+        decision_text = _optional_text(record, "decision_time")
         try:
             intent = OrderIntent(
                 intent_id=intent_id,
@@ -415,6 +449,11 @@ class IntentLedger:
                 ),
                 created_at=datetime.fromisoformat(
                     _required_text(record, "created_at")
+                ),
+                prediction_id=_optional_text(record, "prediction_id"),
+                decision_time=(
+                    None if decision_text is None
+                    else datetime.fromisoformat(decision_text)
                 ),
             )
         except (ValueError, InvalidOperation, SymbolError, IntentError) as exc:

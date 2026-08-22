@@ -100,6 +100,8 @@ G-05 转换点：研究域目标位置的数值以 float 承载，进入执行�
 | `SEND_TIMEOUT` | 发送超时或网络错，结果未知 | 在途 |
 | `FAILED` | 经 READ_ONLY 查询确认未受理 | 终态 |
 | `DRY_RUN_BLOCKED` | 模拟运行守卫在发送边界拦截，未触达写端点 | 终态 |
+| `PAPER_FILLED` | paper 成交模型在发送边界结算，未触达写端点 | 终态 |
+| `PAPER_REJECTED` | paper 成交模型在发送边界拒绝结算，未触达写端点 | 终态 |
 
 | 迁移 | 守卫 |
 |---|---|
@@ -109,6 +111,8 @@ G-05 转换点：研究域目标位置的数值以 float 承载，进入执行�
 | `SENDING -> REJECTED` | 记录错误码 |
 | `SENDING -> SEND_TIMEOUT` | 记录超时事由 |
 | `SENDING -> DRY_RUN_BLOCKED` | 记录拦截理由（T-04） |
+| `SENDING -> PAPER_FILLED` | 必须携带成交模型证据（T-04） |
+| `SENDING -> PAPER_REJECTED` | 记录拒绝理由（T-04） |
 | `SEND_TIMEOUT -> ACCEPTED` | 必须携带 READ_ONLY 查询证据与 `orderId`（T-06） |
 | `SEND_TIMEOUT -> FAILED` | 必须携带 READ_ONLY 查询证据（T-06） |
 

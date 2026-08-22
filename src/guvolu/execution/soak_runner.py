@@ -52,7 +52,11 @@ from guvolu.data.paths import data_root
 from guvolu.domain.config import load_config
 from guvolu.domain.enums import RunMode, ServiceStatus, WsChannel
 from guvolu.domain.errors import GuvoluError
-from guvolu.domain.intent import IntentState, OrderIntent
+from guvolu.domain.intent import (
+    LOCAL_TERMINAL_STATES,
+    IntentState,
+    OrderIntent,
+)
 from guvolu.domain.models import Asset, Execution, Order
 from guvolu.domain.symbols import SpotSymbol
 from guvolu.execution.conversion import DeltaDecision, MarketRule
@@ -543,9 +547,9 @@ class SoakRunner:
                 sender=self._sender,
                 moment=moment,
             )
-            if outcome is not None and outcome[1].state not in (
-                IntentState.GATE_REJECTED,
-                IntentState.DRY_RUN_BLOCKED,
+            if (
+                outcome is not None
+                and outcome[1].state not in LOCAL_TERMINAL_STATES
             ):
                 self._touch_write(ORDER_ENDPOINT)
         self._rounds += 1

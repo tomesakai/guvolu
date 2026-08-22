@@ -31,6 +31,8 @@ EXPECTED_TRANSITIONS: dict[IntentState, set[IntentState]] = {
         IntentState.REJECTED,
         IntentState.SEND_TIMEOUT,
         IntentState.DRY_RUN_BLOCKED,
+        IntentState.PAPER_FILLED,
+        IntentState.PAPER_REJECTED,
     },
     IntentState.SEND_TIMEOUT: {IntentState.ACCEPTED, IntentState.FAILED},
     IntentState.GATE_REJECTED: set(),
@@ -38,6 +40,8 @@ EXPECTED_TRANSITIONS: dict[IntentState, set[IntentState]] = {
     IntentState.REJECTED: set(),
     IntentState.FAILED: set(),
     IntentState.DRY_RUN_BLOCKED: set(),
+    IntentState.PAPER_FILLED: set(),
+    IntentState.PAPER_REJECTED: set(),
 }
 
 

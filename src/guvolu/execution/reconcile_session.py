@@ -28,7 +28,11 @@ from guvolu.domain.config import Config, load_config
 from guvolu.domain.enums import ExecutionType, RunMode, ServiceStatus
 from guvolu.domain.errors import ConfigError
 from guvolu.domain.ids import new_correlation_id, new_intent_id
-from guvolu.domain.intent import IntentState, OrderIntent
+from guvolu.domain.intent import (
+    LOCAL_TERMINAL_STATES,
+    IntentState,
+    OrderIntent,
+)
 from guvolu.domain.symbols import SpotSymbol
 from guvolu.execution.conversion import (
     DeltaDecision,
@@ -469,10 +473,7 @@ def render_session_report(
         write_planned.append(ORDER_ENDPOINT)
     if outcome is not None:
         intent_body = intent_payload(outcome)
-        if outcome[1].state not in (
-            IntentState.GATE_REJECTED,
-            IntentState.DRY_RUN_BLOCKED,
-        ):
+        if outcome[1].state not in LOCAL_TERMINAL_STATES:
             write_touched.append(ORDER_ENDPOINT)
     if emergency.records:
         # 全撤动作已真实触碰端点（T-07）

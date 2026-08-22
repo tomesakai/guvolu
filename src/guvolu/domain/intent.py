@@ -30,7 +30,9 @@ class IntentState(StrEnum):
 
     DRY_RUN_BLOCKED 是模拟运行守卫在发送边界拦截后的本地
     终态（T-04），未触达任何交易所写端点，与交易所拒绝的
-    REJECTED 严格区分（T-03）。
+    REJECTED 严格区分（T-03）。PAPER_FILLED 与 PAPER_REJECTED
+    是 paper 执行器在发送边界以成交模型替代真实发送后的本地
+    终态，同样未触达任何写端点；二者只增不改既有语义（D-06）。
     """
 
     RECORDED = "RECORDED"
@@ -41,6 +43,8 @@ class IntentState(StrEnum):
     SEND_TIMEOUT = "SEND_TIMEOUT"
     FAILED = "FAILED"
     DRY_RUN_BLOCKED = "DRY_RUN_BLOCKED"
+    PAPER_FILLED = "PAPER_FILLED"
+    PAPER_REJECTED = "PAPER_REJECTED"
 
 
 # 终态集合，离开即违规
@@ -51,6 +55,17 @@ TERMINAL_STATES: frozenset[IntentState] = frozenset(
         IntentState.REJECTED,
         IntentState.FAILED,
         IntentState.DRY_RUN_BLOCKED,
+        IntentState.PAPER_FILLED,
+        IntentState.PAPER_REJECTED,
+    }
+)
+# 本地终态集合，未触达任何写端点
+LOCAL_TERMINAL_STATES: frozenset[IntentState] = frozenset(
+    {
+        IntentState.GATE_REJECTED,
+        IntentState.DRY_RUN_BLOCKED,
+        IntentState.PAPER_FILLED,
+        IntentState.PAPER_REJECTED,
     }
 )
 # 在途集合，占用品种发送额度（T-05）
@@ -73,6 +88,8 @@ _ALLOWED: Mapping[IntentState, frozenset[IntentState]] = MappingProxyType(
                 IntentState.REJECTED,
                 IntentState.SEND_TIMEOUT,
                 IntentState.DRY_RUN_BLOCKED,
+                IntentState.PAPER_FILLED,
+                IntentState.PAPER_REJECTED,
             }
         ),
         IntentState.SEND_TIMEOUT: frozenset(
@@ -83,6 +100,8 @@ _ALLOWED: Mapping[IntentState, frozenset[IntentState]] = MappingProxyType(
         IntentState.REJECTED: frozenset(),
         IntentState.FAILED: frozenset(),
         IntentState.DRY_RUN_BLOCKED: frozenset(),
+        IntentState.PAPER_FILLED: frozenset(),
+        IntentState.PAPER_REJECTED: frozenset(),
     }
 )
 
@@ -105,6 +124,8 @@ class OrderIntent:
     """下单意图（U-07）。金额与数量一律 Decimal（T-08）。
 
     品种固定为现物类型，杠杆执行路径在类型层面不可达（T-09）。
+    prediction_id 与 decision_time 是回链到决策记录的血缘字段
+    （X-08），由执行目标继承；非目标驱动的意图可为空。
     """
 
     intent_id: str
@@ -116,12 +137,18 @@ class OrderIntent:
     price: Decimal | None
     time_in_force: TimeInForce | None
     created_at: datetime
+    prediction_id: str | None = None
+    decision_time: datetime | None = None
 
     def __post_init__(self) -> None:
         if self.size <= 0:
             raise IntentError("数量必须为正")
         if self.created_at.tzinfo is None:
             raise IntentError("创建时刻必须带时区")
+        if self.decision_time is not None and self.decision_time.tzinfo is None:
+            raise IntentError("决策时刻必须带时区")
+        if self.prediction_id is not None and not self.prediction_id:
+            raise IntentError("prediction_id 不得为空文本")
         if self.execution_type is ExecutionType.MARKET:
             if self.price is not None:
                 raise IntentError("市价意图不得带价格")

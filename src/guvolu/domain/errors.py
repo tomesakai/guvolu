@@ -1,5 +1,6 @@
 """异常层级。按具体异常处理，不统一吞没（C-03）。"""
 import re
+from collections.abc import Mapping
 
 # 错误码形态见处置册
 _ERROR_CODE_RE = re.compile(r"ERR-\d+")
@@ -25,6 +26,21 @@ class SymbolError(GuvoluError):
 
 class DryRunBlocked(GuvoluError):
     """模拟运行模式下拒绝实盘写请求（T-04）。"""
+
+
+class PaperSettled(GuvoluError):
+    """paper 发送边界以成交模型结算，未触达写端点（T-04）。
+
+    evidence 为成交模型产物的键值表，由账本落盘为迁移证据。
+    """
+
+    def __init__(self, detail: str, evidence: Mapping[str, str]) -> None:
+        super().__init__(detail)
+        self.evidence = dict(evidence)
+
+
+class PaperRejected(GuvoluError):
+    """paper 发送边界的成交模型拒绝结算，未触达写端点（T-04）。"""
 
 
 class ClockDriftError(GuvoluError):

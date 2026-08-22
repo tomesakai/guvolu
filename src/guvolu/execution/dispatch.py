@@ -4,7 +4,8 @@
 单测（C-13、C-14）；生产接线由 execution.trade_sender 适配
 TradeClient 完成（T-02）。闸门次序与拒绝动作见执行链设计
 第 5 节。模拟运行模式下发送边界抛出拦截异常，编排把它记为
-本地终态，作为 dry-run 彩排的预期终点（T-04）。
+本地终态，作为 dry-run 彩排的预期终点（T-04）。paper 模式的
+发送边界以成交模型结算或拒绝，同样记为本地终态，零写请求。
 """
 from __future__ import annotations
 
@@ -15,7 +16,13 @@ from typing import Protocol
 
 from guvolu.data.intent_ledger import IntentLedger
 from guvolu.domain.enums import ServiceStatus
-from guvolu.domain.errors import ApiNetworkError, DryRunBlocked, GmoApiError
+from guvolu.domain.errors import (
+    ApiNetworkError,
+    DryRunBlocked,
+    GmoApiError,
+    PaperRejected,
+    PaperSettled,
+)
 from guvolu.domain.intent import IntentError, IntentState, OrderIntent
 from guvolu.domain.symbols import SpotSymbol
 from guvolu.risk.circuit_breaker import CircuitBreaker
@@ -97,6 +104,19 @@ def dispatch_order_intent(
         ledger.block_dry_run(intent.intent_id, reason=str(exc), at=now)
         return DispatchResult(
             intent.intent_id, IntentState.DRY_RUN_BLOCKED, None, str(exc)
+        )
+    except PaperSettled as exc:
+        # 成交模型结算，零写请求（T-04）
+        ledger.paper_fill(
+            intent.intent_id, reason=str(exc), evidence=exc.evidence, at=now
+        )
+        return DispatchResult(
+            intent.intent_id, IntentState.PAPER_FILLED, None, str(exc)
+        )
+    except PaperRejected as exc:
+        ledger.paper_reject(intent.intent_id, reason=str(exc), at=now)
+        return DispatchResult(
+            intent.intent_id, IntentState.PAPER_REJECTED, None, str(exc)
         )
     except ApiNetworkError as exc:
         # 含超时，绝不盲目重发（T-06）
