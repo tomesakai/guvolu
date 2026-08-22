@@ -3097,6 +3097,9 @@ def finalize_holdout_evaluation(
                 or plan["config_hash"] != evidence.config_hash
             ):
                 raise ValueError("holdout 冻结前向 plan 身份不匹配")
+            # 先对注册行政策，再复核制品
+            if _row_missing_policy(plan) != evidence.missing_policy:
+                raise ValueError("holdout 缺预测处置政策与注册计划不一致")
             _validated_forward_plan_artifact(
                 repository_root,
                 str(plan["plan_id"]),
@@ -3110,8 +3113,6 @@ def finalize_holdout_evaluation(
                 evidence.candidate_ids,
                 expected_missing_policy=evidence.missing_policy,
             )
-            if _row_missing_policy(plan) != evidence.missing_policy:
-                raise ValueError("holdout 缺预测处置政策与注册计划不一致")
             row_set_hash, prediction_times = _frozen_forward_prediction_row_set(
                 connection, evidence.forward_plan_id,
             )
