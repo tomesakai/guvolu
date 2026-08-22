@@ -332,6 +332,7 @@ def apply_missing_policy(
     missing: list[datetime] = []
     for decision_time in decision_times:
         recorded = frozen_targets.get(decision_time)
+        # 候选齐全检查为纵深防御，理论不可达
         if recorded is not None and all(
             candidate_id in recorded for candidate_id in candidate_ids
         ):
