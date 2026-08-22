@@ -341,11 +341,32 @@ tree 完全匹配；
 计划制品 SHA-256 为
 `2f90a2f05f96c1920a77c06ce4e211d633d123f3a2baf241642b7301efcd8822`。
 Windows 计划任务 `guvolu-frozen-forward-61c0c4cab6c5` 已登记为从 2026-08-21 09:10 JST
-开始每小时运行，重复实例采用 `IgnoreNew`，每次退出码和输出追加到
-`logs/research/frozen-forward/task.jsonl`。当前 Windows 权限策略拒绝无密码 `S4U` 注册，任务只能
-在用户登录期间运行；关机或注销超过两小时会造成不可补算的预测缺口，必须由每日健康巡检报警。
-promotion 当前只等待封存段与预测历史完整到达；区间结束前不得运行新的重叠
-`DEV_ADAPTIVE` 研究。
+开始每小时运行，重复实例采用 `IgnoreNew`。任务不再从当前脏主树直接预测，而是依次
+运行 `scripts/refresh_frozen_runtime.py`、E 盘冻结运行根中的预测器、独立执行仓目标适配器
+和 dry-run 执行器。调度层结果追加到
+`logs/research/frozen-forward/shadow-scheduler.jsonl`；逐周期 shadow 结果追加到独立执行仓
+`data/execution/shadow/frozen-forward/task.jsonl`，意图状态另记内容寻址报告与 append-only
+ledger。相同 `prediction_id` 重跑必须复用既有报告，不得重复追加意图。
+
+当前 Windows 权限策略拒绝无密码 `S4U` 注册，任务只能在用户登录期间运行；关机或注销
+超过两小时会造成不可补算的预测缺口，必须由每日健康巡检报警。任何 E 盘身份/哨兵失败、
+冻结树非 clean、输入散列不符、预测年龄超过九十分钟、dry-run 模式不符或
+`write_touched` 非空都会使当期失败。promotion 当前只等待封存段与预测历史完整到达；
+区间结束前不得运行新的重叠 `DEV_ADAPTIVE` 研究。
+
+从 shadow 到最小实盘不是同一开关。最快门禁为连续二十四小时、推荐七十二小时均满足：
+
+1. 每小时任务退出码为零，决策时点连续推进，预测年龄不超过九十分钟；
+2. 每个预测只有一个内容寻址报告，重复运行不增加 intent ledger，全部
+   `write_touched=[]`；
+3. 三所 BTC/JPY L2 与三所 BTC 逐笔 checkpoint 新鲜，物化无新增 reject，质量窗与活动
+   head 同代，跨所 quorum 可用；
+4. SQLite quick/FK、活动制品路径/字节/散列、C/D/E 身份与容量门禁均通过；
+5. 执行仓无在途意图，公开行情、市场状态、预算、最小量、取消和对账均完成 dry-run 验证。
+
+满足上述条件只形成“可申请 canary”的证据，不授予 TRADE 写权限。首次 canary 仍须人工
+显式批准，固定 GMO BTC、单笔限价、最大约 500 JPY、最小数量 0.00001 BTC；完成成交或
+撤单及账户对账后立即停机复核，不能自动扩到其他来源、品种或资金规模。
 
 封存段评估开始时会在同一 SQLite 写事务内完成 `sealed → consumed` 与
 `holdout_evaluation_attempt=incomplete/vintage_consumed`。后续面板构建、候选评分会更新持久化

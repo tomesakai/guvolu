@@ -631,7 +631,7 @@ def materialize_segment(
             item.artifact.source_rows, rows, ignored, len(rejected),
             output_storage, False,
         )
-    except Exception as exc:
+    except (Exception, KeyboardInterrupt) as exc:
         conn.rollback()
         for path in (output_csv, output_temp):
             if path.exists():

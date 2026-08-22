@@ -16,7 +16,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from email.utils import parsedate_to_datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, cast
 
 import duckdb
@@ -37,6 +37,7 @@ from guvolu.data.materialize import (
     _market_row,
     _register_content_artifact,
     _relative_storage_path,
+    _resolve_recorded_path,
     artifact_id,
     ensure_markets,
     sha256_file,
@@ -817,12 +818,15 @@ def materialize_archive(
         return prepared.reused_result
     attempt_id = prepared.attempt_id
     market_id = prepared.market_id
-    output_dir = (
-        root / "materialized" / "book_l2"
-        / f"schema_version={BOOK_L2_SCHEMA_VERSION}"
-        / f"normalization_version={BOOK_L2_NORMALIZATION_VERSION}"
-        / "venue_id=okx" / f"market_id={market_id}"
-        / f"event_day={item.day}"
+    output_dir = _resolve_recorded_path(
+        root,
+        PurePosixPath(
+            "materialized", "book_l2",
+            f"schema_version={BOOK_L2_SCHEMA_VERSION}",
+            f"normalization_version={BOOK_L2_NORMALIZATION_VERSION}",
+            "venue_id=okx", f"market_id={market_id}",
+            f"event_day={item.day}",
+        ).as_posix(),
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     frame_csv = output_dir / f".{attempt_id}.frames.csv"

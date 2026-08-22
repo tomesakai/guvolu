@@ -13,7 +13,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import duckdb
@@ -60,6 +60,7 @@ from guvolu.data.realtime_control import (
     register_materialized_raw_v3_observations,
 )
 from guvolu.data.sqlite_writer_lock import sqlite_writer_lock
+from guvolu.data.storage_paths import resolve_storage_path
 from guvolu.venues import registry
 
 L2_SCHEMA_VERSION = BOOK_L2_V5_SCHEMA_VERSION
@@ -996,7 +997,7 @@ def _load_replay_context(
         artifact=SourceArtifact(
             artifact_id=loaded.artifact_id,
             storage_path=loaded.storage_path,
-            absolute_path=root / loaded.storage_path,
+            absolute_path=resolve_storage_path(root, loaded.storage_path),
             source_rows=0,
             normalized_rows=0,
             rejected_rows=0,
@@ -1559,14 +1560,16 @@ def materialize_segment(
     if prepared.reused is not None:
         return prepared.reused
     attempt_id = prepared.attempt_id
-    output_dir = (
-        root / "materialized" / "book_l2"
-        / f"schema_version={L2_SCHEMA_VERSION}"
-        / f"normalization_version={L2_NORMALIZATION_VERSION}"
-        / "venue_id=okx"
-        / f"market_id={prepared.market_id}"
-        / f"run_id={item.run_id}"
-        / f"segment={item.segment_sequence:06d}"
+    output_dir = resolve_storage_path(
+        root,
+        PurePosixPath(
+            "materialized", "book_l2",
+            f"schema_version={L2_SCHEMA_VERSION}",
+            f"normalization_version={L2_NORMALIZATION_VERSION}",
+            "venue_id=okx", f"market_id={prepared.market_id}",
+            f"run_id={item.run_id}",
+            f"segment={item.segment_sequence:06d}",
+        ).as_posix(),
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     frame_csv = output_dir / f".{attempt_id}.frames.csv"

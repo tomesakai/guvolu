@@ -13,7 +13,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import duckdb
@@ -27,6 +27,7 @@ from guvolu.data.materialize import (
     _market_row,
     _register_content_artifact,
     _relative_storage_path,
+    _resolve_recorded_path,
     artifact_id,
     ensure_markets,
     sha256_file,
@@ -767,13 +768,16 @@ def materialize_segment(
     )
     capability_revision = _bind_capability(conn, attempt_id, venue_id)
     conn.commit()
-    output_dir = (
-        root / "materialized" / DATASET_TRADE
-        / f"schema_version={TRADE_REALTIME_SCHEMA_VERSION}"
-        / f"normalization_version={TRADE_REALTIME_NORMALIZATION_VERSION}"
-        / f"venue_id={venue_id}" / f"market_id={market_id}"
-        / f"run_id={item.run_id}"
-        / f"segment={item.segment_sequence:06d}"
+    output_dir = _resolve_recorded_path(
+        root,
+        PurePosixPath(
+            "materialized", DATASET_TRADE,
+            f"schema_version={TRADE_REALTIME_SCHEMA_VERSION}",
+            f"normalization_version={TRADE_REALTIME_NORMALIZATION_VERSION}",
+            f"venue_id={venue_id}", f"market_id={market_id}",
+            f"run_id={item.run_id}",
+            f"segment={item.segment_sequence:06d}",
+        ).as_posix(),
     )
     output_dir.mkdir(parents=True, exist_ok=True)
     staging = output_dir / f".{attempt_id}.csv"

@@ -17,7 +17,7 @@
 | U | 用语 | SKILLS.md | 7 | 无 |
 | A | 代理协作 | SKILLS.md | 6 | 无 |
 | W | 文书 | SKILLS.md | 8 | 无 |
-| TBD | 未决项 | docs/architecture.md | 34 | 无 |
+| TBD | 未决项 | docs/architecture.md | 35 | 无 |
 
 ## 2. 文档清单
 
@@ -48,6 +48,8 @@
 | docs/2026-08-13-data-strategy-execution-roadmap.md | 时效快照 | 多场所数据、L2/L3、研究策略与执行路线只读审计 |
 | docs/2026-08-13-data-platform-strategy-audit-review.md | 时效快照 | 多场所数据平台、运行缺陷、L3、策略优先级与 soft-gating 复核审计 |
 | docs/2026-08-13-production-rollout.md | 时效快照 | 市场数据生产运行与验证记录 |
+| docs/2026-08-15-framework-review.md | 时效快照 | 全框架评审、总图落位、代码文档偏差与运行现场偏差 |
+| docs/2026-08-17-execution-link-verification.md | 时效快照 | 执行链路验证性实盘的授权、端点与结论记录 |
 | docs/2026-08-11-account-assets-capability.md | 时效快照 | GMO Coin 与 bitFlyer 私有资产接口复核 |
 | docs/2026-08-10-persistence-audit.md | 时效快照 | 持久化完整性、恢复探针与历史损坏边界审计 |
 | docs/ui-design.md | 长期维护 | 控制面与可视化设计（TBD-12 至 17 提案载体） |

@@ -3,7 +3,8 @@ param(
     [string]$WindowStyle = 'Normal',
     [ValidateSet('Full', 'ForwardMinimal')]
     [string]$Profile = 'Full',
-    [string]$Repository = ''
+    [string]$Repository = '',
+    [switch]$L2LatestRunOnly
 )
 
 $ErrorActionPreference = 'Stop'
@@ -160,8 +161,33 @@ foreach ($Materializer in $Materializers) {
         "-File `"$RunnerPath`" -Repository `"$RepoRoot`" " +
         '-IntervalSeconds 300'
     )
+    if ($Materializer.Name -eq 'l2-materializer' -and $L2LatestRunOnly) {
+        $Arguments += ' -LatestRunOnly'
+    }
     $Started = Start-Process -FilePath 'powershell.exe' `
         -ArgumentList $Arguments -WorkingDirectory $RepoRoot `
         -WindowStyle $WindowStyle -PassThru
     Write-Host "[$($Materializer.Name)] window started PID=$($Started.Id)"
+}
+
+$QueryTail = '-m guvolu.ui.query_service'
+$ExistingQuery = @(
+    Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
+        Where-Object { $_.CommandLine -like "*$QueryTail*" }
+)
+if ($ExistingQuery.Count -gt 0) {
+    Write-Host "[query-service] already running PID=$(($ExistingQuery.ProcessId -join ','))"
+} else {
+    $QueryRunner = Join-Path $PSScriptRoot 'run_query_service.ps1'
+    $QueryArguments = @(
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $QueryRunner
+    )
+    if ($WindowStyle -eq 'Normal') {
+        $QueryArguments = @('-NoProfile', '-NoExit') +
+            $QueryArguments[1..($QueryArguments.Count - 1)]
+    }
+    $QueryStarted = Start-Process -FilePath 'powershell.exe' `
+        -ArgumentList $QueryArguments -WorkingDirectory $RepoRoot `
+        -WindowStyle $WindowStyle -PassThru
+    Write-Host "[query-service] window started PID=$($QueryStarted.Id)"
 }

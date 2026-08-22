@@ -4,7 +4,7 @@
 > - **【已锁定】** —— 由 [SKILLS.md](../SKILLS.md) 铁律推导，不经讨论不得变更。
 > - **【TBD-nn】** —— 尚未确定，讨论后回填。**任何人不得擅自实现 TBD 项**（A-05）。
 >
-> 更新日期：2026-08-13
+> 更新日期：2026-08-15
 >
 > 当前项目根为 `C:\Users\wu_zh\dev\guvolu`；`GUVOLU_DATA_ROOT=data`
 > 解析为 `C:\Users\wu_zh\dev\guvolu\data`。路径是部署位置，不进入
@@ -12,27 +12,94 @@
 
 ## 1. 系统全景
 
-```text
-┌────────────────────────────────────────────────────────────┐
-│  Public API / Public WS   （行情，无需密钥，不消耗私有额度）    │
-└───────────────────────────┬────────────────────────────────┘
-                            │
-        ┌───────────────────┴───────────────────┐
-        │                                       │
-┌───────▼─────────┐                   ┌─────────▼────────┐
-│  READ_ONLY 密钥  │                   │   TRADE 密钥      │
-│  REST × 13      │                   │  order           │
-│  Private WS × 4 │                   │  changeOrder     │
-│  ── 唯一真相源 ── │                   │  cancelOrder(s)  │
-│      (T-03)     │                   │  cancelBulkOrder │
-└───────┬─────────┘                   └─────────┬────────┘
-        │                                       │
-        └── intent_id（本地先落盘）↔ orderId ───┘
-                  （关联键为交易所 orderId，T-05）
+```mermaid
+flowchart TB
+    subgraph OPS["运维与保活 ops"]
+        TASK["Windows 计划任务<br/>登录启动 + 五分钟守护"]
+        PM["process_manager<br/>白名单登记 + 命令行收编"]
+        KS["kill_switch 独立入口<br/>dry-run 下仍可撤单"]
+    end
 
-进程隔离：
-  [研究进程] 无 TRADE 密钥 (T-13)   [执行进程] 持有两把   [控制面 UI] 见 §4
+    subgraph SRC["外部来源"]
+        GMOS["GMO REST + WS"]
+        JPYS["bitbank / bitFlyer WS + REST"]
+        OKXS["OKX WS + 历史归档"]
+        REFS["Binance / Coincheck 等参考源"]
+    end
+
+    subgraph COL["采集进程 venues + data 只读，无密钥"]
+        CAP["l2_capture / trade_capture<br/>内嵌 REST anchor worker"]
+        OKXC["okx_l2_live_capture<br/>okx_l2_archive 与回补"]
+        CLT["collect K 线与归档投影"]
+    end
+
+    subgraph PLAT["数据平台 data"]
+        RAWL["raw v3 不可变分段<br/>endpoint 修订 + payload SHA-256"]
+        MATZ["物化器群<br/>L2 / 逐笔 / K 线 / 状态<br/>anchor / book-state / OFL"]
+        CTRLDB["SQLite v20 控制面<br/>attempt / artifact / 活动 head<br/>单写锁串行"]
+        FACTP["内容寻址 Parquet 事实<br/>market_id 与版本隔离"]
+        QW["质量窗口与审计"]
+    end
+
+    subgraph SRV["查询与控制面 ui + web"]
+        QCAT["QueryCatalog 活动 head 解析"]
+        DUCK["MaterializedQuery DuckDB"]
+        QSVC["query_service FastAPI<br/>127.0.0.1 + 本地令牌"]
+        FRONT["web 前端 MON / OFL / CAP / SET"]
+    end
+
+    subgraph RESE["研究进程 research + strategy 永不持 TRADE 密钥"]
+        PAN["PIT 面板与特征冻结"]
+        FIVE["五流派候选生成<br/>trend / flow_trend / breakout<br/>mean_reversion / grid_shadow"]
+        WF["walk-forward 验证与统计门禁"]
+        ALO["质量门禁 + 受约束分配"]
+        LED["run 制品 + trial ledger<br/>目标位置合同"]
+        GOVN["治理注册表<br/>holdout 封存 + 冻结前向<br/>一次性消费"]
+        GPUW["GPU SearchFast worker"]
+        LLMP["LLM 决策管线"]
+    end
+
+    subgraph EXE["执行边界 api + domain"]
+        PUBC["PublicClient 无密钥"]
+        ROC["ReadClient READ_ONLY<br/>唯一真相源"]
+        TRDC["TradeClient TRADE<br/>只写不读"]
+        INT["intent 账本"]
+        RUNR["目标位置执行器"]
+    end
+
+    TASK --> CAP
+    TASK --> MATZ
+    PM --> CAP
+    SRC --> COL
+    PUBC --> CLT
+    CAP --> RAWL
+    OKXC --> RAWL
+    CLT --> RAWL
+    RAWL --> MATZ --> FACTP
+    MATZ --> CTRLDB
+    FACTP --> QW --> CTRLDB
+    CTRLDB --> QCAT
+    FACTP --> DUCK
+    QCAT --> DUCK --> QSVC --> FRONT
+    ROC --> QSVC
+    QCAT --> PAN --> FIVE --> WF --> ALO --> LED --> GOVN
+    FIVE -.-> GPUW -.-> WF
+    LLMP -.-> ALO
+    LED -. 目标位置当前无消费者 .-> RUNR
+    RUNR -.-> INT
+    INT -.-> TRDC
+    TRDC -. 受理回执 orderId .-> INT
+    ROC -. 委托与成交事实对账 .-> INT
+    KS --> TRDC
 ```
+
+实线为已实现路径，虚线为已定义未接线路径：intent 账本（T-05，标识函数已实现、
+执行链未接线）、目标位置执行器（TBD-08 执行层归属未决）、GPU SearchFast（TBD-18
+数值对照基准已验，未常驻）、LLM 决策管线（TBD-34 仅提案）。READ_ONLY 与 TRADE
+的能力正交见 [SKILLS.md](../SKILLS.md) 第 0 章已决策表与下方锁定表；下单状态机
+见 §3；数据平台细图见 §2 与
+[materialization-design.md](materialization-design.md)；研究管线细图见
+[strategy-research.md](strategy-research.md) 第 10 节。
 
 ### 语言基线（提案 2026-08-06）
 
@@ -190,6 +257,7 @@ flowchart LR
 | **TBD-32** | 法币汇率来源（美元系对照的汇率腿） | 仍未实现；任何 USD/USDT 与 JPY 比较必须使用独立、PIT 可审计的 FX 制品，缺 FX 时保持不同 instrument，不直接换算 |
 | **TBD-33** | 报警规则实例与 alert_event 派生表 | 提案 2026-08-08 见 [footprint-design.md](footprint-design.md) 第 6.8 节；随 OFL 页实施；提案实施中（2026-08-09）后端半场：`alert_event` 表（schema v3）、规则实例配置 `config/alert_rules.json`、报警清单与确认端点、区域判读落库即流上匹配；2026-08-10 规则实例增带几何维度（band_bp 标准带或显式价带，匹配器按规则带评估，缺省沿用请求带并记录来源），缺省规则带几何按复核快照 4.4 节再现几何取值；自动检测器属 TBD-30 未做 |
 | **TBD-34** | LLM 决策管线的输入输出构造与台账 | 提案 2026-08-09 见 [llm-pipeline-design.md](llm-pipeline-design.md)；研究进程内、无下单通路、输入内容寻址、输出 schema 校验 |
+| **TBD-35** | 热冷存储根、路径解析与迁移事务 | 【已实现首批 2026-08-22】逻辑 `storage_path` 继续保持数据根相对路径；物理存储根以稳定 `storage_root_id`、卷 GUID、分区 GUID、卷标、哨兵 SHA-256 和逻辑前缀路由共同识别。冷盘离线、身份不符或哨兵变异时读取失败，不按盘符猜测。E 盘兼作受控温层，但只接已封口、有散列、可重放制品；SQLite、锁、开放段与执行状态固定在 C 盘。迁移固定为规划、复制、双端散列、登记、切换、观察和热副本释放七阶段；原始事实不改写。结构见 [materialization-design.md](materialization-design.md) 第 8 节，操作见 [runtime-ops.md](runtime-ops.md) 第 8 节 |
 
 ## 3. 执行架构
 
