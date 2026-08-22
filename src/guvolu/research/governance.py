@@ -53,10 +53,13 @@ from guvolu.strategy.expression import (
     strategy_expression,
 )
 
-GOVERNANCE_SCHEMA_VERSION = 7
+GOVERNANCE_SCHEMA_VERSION = 8
 SCHEMA_WRITE_CEILING_KEY = "schema_write_ceiling"
 GOVERNANCE_METHOD_VERSION = "research-data-governance-v2"
 _VINTAGE_STATUSES = ("sealed", "consumed")
+# 缺预测处置政策取值
+MISSING_POLICIES = ("burn", "zero_exposure")
+DEFAULT_MISSING_POLICY = "burn"
 
 
 @dataclass(frozen=True)
@@ -117,6 +120,7 @@ class FrozenForwardPlan:
     plan_artifact_path: str
     plan_artifact_sha256: str
     frozen_at: datetime
+    missing_policy: str = DEFAULT_MISSING_POLICY
 
 
 @dataclass(frozen=True)
@@ -198,6 +202,8 @@ class _TerminalEvidence:
     score_end: datetime
     score_bars: int
     score_decision_times: tuple[datetime, ...]
+    missing_policy: str
+    missing_decision_times: tuple[datetime, ...]
 
 
 @dataclass(frozen=True)
@@ -210,6 +216,47 @@ class _ForwardPlanEvidence:
     candidate_families: tuple[tuple[str, str], ...]
     weights: tuple[tuple[str, float], ...]
     reserve: float
+    missing_policy: str
+
+
+def _validated_missing_policy(value: object) -> str:
+    """读取计划制品的缺预测处置政策，缺省 burn。"""
+    if value is None:
+        return DEFAULT_MISSING_POLICY
+    if not isinstance(value, str) or value not in MISSING_POLICIES:
+        raise ValueError("冻结前向计划 missing_policy 取值无效")
+    return value
+
+
+def _row_missing_policy(row: sqlite3.Row) -> str:
+    """读取计划行的缺预测处置政策；旧库无此列视为 burn。"""
+    if "missing_policy" not in row.keys():
+        return DEFAULT_MISSING_POLICY
+    return _validated_missing_policy(str(row["missing_policy"]))
+
+
+def frozen_forward_plan_identity(
+    vintage_id: str,
+    source_manifest_sha256: str,
+    candidate_set_hash: str,
+    config_hash: str,
+    code_tree_digest: str,
+    semantics: Mapping[str, object],
+    missing_policy: str | None,
+) -> dict[str, object]:
+    """生成冻结前向计划身份载荷；政策显式登记时进入身份。"""
+    payload: dict[str, object] = {
+        "governance_method_version": GOVERNANCE_METHOD_VERSION,
+        "vintage_id": vintage_id,
+        "source_manifest_sha256": source_manifest_sha256,
+        "candidate_set_hash": candidate_set_hash,
+        "config_hash": config_hash,
+        "code_tree_digest": code_tree_digest,
+        **semantics,
+    }
+    if missing_policy is not None:
+        payload["missing_policy"] = _validated_missing_policy(missing_policy)
+    return payload
 
 
 def _utc(value: datetime) -> datetime:
@@ -304,6 +351,7 @@ def _validated_forward_plan_artifact(
     artifact_path: str,
     artifact_sha256: str,
     expected_candidate_ids: tuple[str, ...] | None = None,
+    expected_missing_policy: str | None = None,
 ) -> _ForwardPlanEvidence:
     """现场复核冻结前向计划制品与注册身份。"""
     if not _canonical_sha256(artifact_sha256):
@@ -314,6 +362,12 @@ def _validated_forward_plan_artifact(
     if sha256_file(path) != artifact_sha256:
         raise ValueError("冻结前向计划现场 SHA-256 不匹配")
     payload = _json_file(path, "frozen forward plan")
+    missing_policy = _validated_missing_policy(payload.get("missing_policy"))
+    if (
+        expected_missing_policy is not None
+        and missing_policy != expected_missing_policy
+    ):
+        raise ValueError("冻结前向计划 missing_policy 与注册身份不一致")
     expected = {
         "schema_version": FROZEN_FORWARD_SCHEMA_VERSION,
         "method_version": FROZEN_FORWARD_METHOD_VERSION,
@@ -445,6 +499,7 @@ def _validated_forward_plan_artifact(
         candidate_families=tuple(candidate_families),
         weights=tuple(sorted(weights.items())),
         reserve=reserve,
+        missing_policy=missing_policy,
     )
 
 
@@ -1566,12 +1621,38 @@ def _validated_terminal_evidence(
         or forward_prediction_count < 0
     ):
         raise ValueError("holdout 冻结预测数量无效")
+    missing_policy = _validated_missing_policy(result.get("missing_policy"))
+    if manifest.get("missing_policy", DEFAULT_MISSING_POLICY) != missing_policy:
+        raise ValueError("holdout manifest 的 missing_policy 与 result 不一致")
+    raw_missing_times = result.get("missing_decision_times", [])
+    if not isinstance(raw_missing_times, list) or any(
+        not isinstance(item, str) for item in raw_missing_times
+    ):
+        raise ValueError("holdout missing_decision_times 无效")
+    missing_decision_times = tuple(
+        _parse_timestamp(str(item)) for item in raw_missing_times
+    )
+    schedule_set = set(decision_times)
+    if (
+        missing_decision_times != tuple(sorted(set(missing_decision_times)))
+        or any(item not in schedule_set for item in missing_decision_times)
+    ):
+        raise ValueError("holdout missing_decision_times 必须有序且属于评分日程")
+    missing_count = result.get("missing_decision_count", len(missing_decision_times))
+    if missing_count != len(missing_decision_times) or manifest.get(
+        "missing_decision_count", missing_count,
+    ) != missing_count:
+        raise ValueError("holdout missing_decision_count 与时点表不一致")
+    if missing_policy == DEFAULT_MISSING_POLICY and missing_decision_times:
+        raise ValueError("holdout burn 政策不得声明缺失决策柱")
+    if not require_forward_predictions and missing_decision_times:
+        raise ValueError("holdout 非冻结前向模式不得声明缺失决策柱")
     if require_forward_predictions:
         if target_source != "recorded_frozen_forward":
             raise ValueError("holdout 必须使用预先记录的冻结前向目标")
         if not isinstance(forward_plan_id, str) or not forward_plan_id:
             raise ValueError("holdout 缺少冻结前向 plan_id")
-        if forward_prediction_count != score_bars:
+        if forward_prediction_count + len(missing_decision_times) != score_bars:
             raise ValueError("holdout 冻结预测数量必须完整等于评分柱数")
         if (
             not isinstance(forward_prediction_row_set_hash, str)
@@ -1691,6 +1772,8 @@ def _validated_terminal_evidence(
         score_end=score_end,
         score_bars=score_bars,
         score_decision_times=decision_times,
+        missing_policy=missing_policy,
+        missing_decision_times=missing_decision_times,
     )
 
 
@@ -1730,13 +1813,21 @@ def _terminal_invariant_violation(
     return row
 
 
+def _has_missing_policy_column(connection: sqlite3.Connection) -> bool:
+    """检查冻结计划表是否已有 missing_policy 列。"""
+    rows = connection.execute(
+        "PRAGMA table_info(frozen_forward_plan)"
+    ).fetchall()
+    return any(str(row[1]) == "missing_policy" for row in rows)
+
+
 def _upgrade_governance_state(
     connection: sqlite3.Connection,
     existing_version: str | None,
 ) -> None:
     """原子升级治理库，并把旧 consumed 记录变成可解释 incomplete 尝试。"""
     supported = {
-        None, "1", "2", "3", "4", "5", "6",
+        None, "1", "2", "3", "4", "5", "6", "7",
         str(GOVERNANCE_SCHEMA_VERSION),
     }
     if existing_version not in supported:
@@ -1751,11 +1842,19 @@ def _upgrade_governance_state(
         """
     ).fetchone()[0])
     needs_upgrade = existing_version != str(GOVERNANCE_SCHEMA_VERSION)
-    if needs_upgrade or orphan_count:
+    policy_column_missing = not _has_missing_policy_column(connection)
+    if needs_upgrade or orphan_count or policy_column_missing:
         owns_transaction = not connection.in_transaction
         if owns_transaction:
             connection.execute("BEGIN IMMEDIATE")
         try:
+            if policy_column_missing:
+                # v8 只增列，旧行缺省 burn
+                connection.execute(
+                    "ALTER TABLE frozen_forward_plan ADD COLUMN "
+                    "missing_policy TEXT NOT NULL DEFAULT 'burn' "
+                    "CHECK(missing_policy IN ('burn','zero_exposure'))"
+                )
             invalid_legacy = connection.execute(
                 """
                 SELECT v.vintage_id
@@ -2237,8 +2336,13 @@ def _validate_pinned_read_schema(
         "prediction_artifact_sha256,recorded_at "
         "FROM interval_suite_forward_prediction LIMIT 0",
     ) if ceiling >= 7 else ()
+    policy_probes = (
+        "SELECT missing_policy FROM frozen_forward_plan LIMIT 0",
+    ) if ceiling >= 8 else ()
     try:
-        for statement in (*probes, *suite_probes, *suite_prediction_probes):
+        for statement in (
+            *probes, *suite_probes, *suite_prediction_probes, *policy_probes,
+        ):
             connection.execute(statement)
         violation = _terminal_invariant_violation(connection)
     except sqlite3.DatabaseError as error:
@@ -2334,6 +2438,8 @@ def _connect(
           plan_artifact_path TEXT NOT NULL,
           plan_artifact_sha256 TEXT NOT NULL,
           frozen_at TEXT NOT NULL,
+          missing_policy TEXT NOT NULL DEFAULT 'burn'
+            CHECK(missing_policy IN ('burn','zero_exposure')),
           FOREIGN KEY(vintage_id) REFERENCES holdout_vintage(vintage_id)
         );
         CREATE TABLE IF NOT EXISTS holdout_evaluation_attempt (
@@ -2992,13 +3098,22 @@ def finalize_holdout_evaluation(
                 str(plan["plan_artifact_path"]),
                 str(plan["plan_artifact_sha256"]),
                 evidence.candidate_ids,
+                expected_missing_policy=evidence.missing_policy,
             )
+            if _row_missing_policy(plan) != evidence.missing_policy:
+                raise ValueError("holdout 缺预测处置政策与注册计划不一致")
             row_set_hash, prediction_times = _frozen_forward_prediction_row_set(
                 connection, evidence.forward_plan_id,
             )
             if len(prediction_times) != evidence.forward_prediction_count:
                 raise ValueError("holdout 冻结预测数量与注册表不一致")
-            if prediction_times != evidence.score_decision_times:
+            # 缺失柱不在预测行集内
+            missing_times = set(evidence.missing_decision_times)
+            expected_times = tuple(
+                item for item in evidence.score_decision_times
+                if item not in missing_times
+            )
+            if prediction_times != expected_times:
                 raise ValueError("holdout 冻结预测时点未逐柱匹配评分面板")
             if row_set_hash != evidence.forward_prediction_row_set_hash:
                 raise ValueError("holdout 冻结预测 row-set 与注册表不一致")
@@ -3149,18 +3264,21 @@ def register_frozen_forward_plan(
     present = tuple(name for name in semantic_names if name in raw_payload)
     if len(present) != len(semantic_names):
         raise ValueError("冻结前向计划成交语义身份不完整")
-    identity_payload: dict[str, object] = {
-        "governance_method_version": GOVERNANCE_METHOD_VERSION,
-        "vintage_id": vintage_id,
-        "source_manifest_sha256": source_manifest_sha256,
-        "candidate_set_hash": candidate_set_hash,
-        "config_hash": config_hash,
-        "code_tree_digest": code_tree_digest,
-    }
-    if present:
-        identity_payload.update({
-            name: raw_payload.get(name) for name in semantic_names
-        })
+    # 政策显式写入制品时才进入身份
+    declared_policy = (
+        _validated_missing_policy(raw_payload.get("missing_policy"))
+        if "missing_policy" in raw_payload else None
+    )
+    missing_policy = declared_policy or DEFAULT_MISSING_POLICY
+    identity_payload = frozen_forward_plan_identity(
+        vintage_id,
+        source_manifest_sha256,
+        candidate_set_hash,
+        config_hash,
+        code_tree_digest,
+        {name: raw_payload.get(name) for name in semantic_names} if present else {},
+        declared_policy,
+    )
     plan_id = stable_identifier("frozen-forward-plan", identity_payload)
     connection = _connect(registry_path, write=True)
     try:
@@ -3196,6 +3314,7 @@ def register_frozen_forward_plan(
             code_tree_digest,
             plan_artifact_path,
             plan_artifact_sha256,
+            expected_missing_policy=missing_policy,
         )
         values = (
             source_manifest_sha256,
@@ -3209,12 +3328,12 @@ def register_frozen_forward_plan(
             "SELECT * FROM frozen_forward_plan WHERE vintage_id=?", (vintage_id,),
         ).fetchone()
         if existing is not None:
-            expected = (plan_id, *values)
+            expected = (plan_id, *values, missing_policy)
             actual = (
                 existing["plan_id"], existing["source_manifest_sha256"],
                 existing["candidate_set_hash"], existing["config_hash"],
                 existing["code_tree_digest"], existing["plan_artifact_path"],
-                existing["plan_artifact_sha256"],
+                existing["plan_artifact_sha256"], _row_missing_policy(existing),
             )
             if actual != expected:
                 raise ValueError("vintage 已绑定不同的冻结前向计划")
@@ -3224,8 +3343,9 @@ def register_frozen_forward_plan(
             "INSERT INTO frozen_forward_plan("
             "plan_id,vintage_id,source_manifest_sha256,candidate_set_hash,"
             "config_hash,code_tree_digest,plan_artifact_path,"
-            "plan_artifact_sha256,frozen_at) VALUES(?,?,?,?,?,?,?,?,?)",
-            (plan_id, vintage_id, *values, _timestamp(frozen)),
+            "plan_artifact_sha256,frozen_at,missing_policy) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (plan_id, vintage_id, *values, _timestamp(frozen), missing_policy),
         )
         row = connection.execute(
             "SELECT * FROM frozen_forward_plan WHERE plan_id=?", (plan_id,),
@@ -3594,6 +3714,7 @@ def register_frozen_forward_prediction(
             str(plan["code_tree_digest"]),
             str(plan["plan_artifact_path"]),
             str(plan["plan_artifact_sha256"]),
+            expected_missing_policy=_row_missing_policy(plan),
         )
         prediction_id = stable_identifier("frozen-forward-prediction", {
             "governance_method_version": GOVERNANCE_METHOD_VERSION,
@@ -3897,6 +4018,7 @@ def _plan_from_row(row: sqlite3.Row) -> FrozenForwardPlan:
         plan_artifact_path=str(row["plan_artifact_path"]),
         plan_artifact_sha256=str(row["plan_artifact_sha256"]),
         frozen_at=_parse_timestamp(str(row["frozen_at"])),
+        missing_policy=_row_missing_policy(row),
     )
 
 
