@@ -17,10 +17,13 @@ from guvolu.research.contracts import (
 from guvolu.research.data_location import resolve_data_root_locator
 from guvolu.research.features import compute_features
 from guvolu.research.governance import (
+    DEFAULT_MISSING_POLICY,
     GOVERNANCE_METHOD_VERSION,
+    MISSING_POLICIES,
     HoldoutVintage,
     finalize_holdout_evaluation,
     get_active_head_receipt,
+    get_frozen_forward_plan,
     get_frozen_forward_plan_for_vintage,
     get_holdout_vintage,
     register_active_head_receipt,
@@ -316,6 +319,36 @@ def _score_decision_times(
     return tuple(decisions)
 
 
+def apply_missing_policy(
+    frozen_targets: Mapping[datetime, Mapping[str, float]],
+    decision_times: Sequence[datetime],
+    candidate_ids: Sequence[str],
+    missing_policy: str,
+) -> tuple[Mapping[datetime, Mapping[str, float]], tuple[datetime, ...]]:
+    """按计划级缺预测处置政策补齐评分时点的全部候选目标。"""
+    if missing_policy not in MISSING_POLICIES:
+        raise ValueError("缺预测处置政策取值无效")
+    filled: dict[datetime, Mapping[str, float]] = {}
+    missing: list[datetime] = []
+    for decision_time in decision_times:
+        recorded = frozen_targets.get(decision_time)
+        if recorded is not None and all(
+            candidate_id in recorded for candidate_id in candidate_ids
+        ):
+            filled[decision_time] = recorded
+            continue
+        # 缺失柱对全部候选记零目标
+        missing.append(decision_time)
+        filled[decision_time] = {
+            candidate_id: 0.0 for candidate_id in candidate_ids
+        }
+    if missing and missing_policy == DEFAULT_MISSING_POLICY:
+        raise ValueError(
+            f"holdout 冻结前向预测覆盖不完整: missing={len(missing)}"
+        )
+    return filled, tuple(missing)
+
+
 def _attested_artifact_path(
     root: Path,
     artifacts: Mapping[str, object],
@@ -508,6 +541,8 @@ def attest_holdout_terminal_artifacts(
         "capacity_notional_quote",
     )
     frozen_targets: Mapping[datetime, Mapping[str, float]] | None = None
+    missing_policy = DEFAULT_MISSING_POLICY
+    missing_decision_times: tuple[datetime, ...] = ()
     if policy.get("require_frozen_forward_predictions") is True:
         from guvolu.research.frozen_forward import load_verified_prediction_targets
 
@@ -516,26 +551,31 @@ def attest_holdout_terminal_artifacts(
             Path(_text(governance.get("registry"), "data_governance.registry")),
             "governance registry",
         )
-        frozen_targets = load_verified_prediction_targets(
-            root,
-            _text(result.get("frozen_forward_plan_id"), "frozen_forward_plan_id"),
-            registry_path=registry_path,
+        plan_id = _text(
+            result.get("frozen_forward_plan_id"), "frozen_forward_plan_id",
         )
+        missing_policy = get_frozen_forward_plan(
+            registry_path, plan_id,
+        ).missing_policy
+        frozen_targets, missing_decision_times = apply_missing_policy(
+            load_verified_prediction_targets(
+                root, plan_id, registry_path=registry_path,
+            ),
+            _score_decision_times(bars, start, end),
+            tuple(candidate.candidate_id for candidate in candidates),
+            missing_policy,
+        )
+    if result.get("missing_policy", DEFAULT_MISSING_POLICY) != missing_policy or (
+        result.get("missing_decision_times", [])
+        != [value.isoformat() for value in missing_decision_times]
+    ):
+        raise ValueError("holdout 缺失决策柱登记不能由计划政策与预测重建")
     raw_results: list[dict[str, object]] = []
     p_values: dict[str, float] = {}
     for candidate in candidates:
         if frozen_targets is None:
             targets = generate_targets(candidate, bars, features, periods_per_year)
         else:
-            missing = [
-                bars[index - 1].decision_time
-                for index in range(start, end)
-                if candidate.candidate_id not in frozen_targets.get(
-                    bars[index - 1].decision_time, {},
-                )
-            ]
-            if missing:
-                raise ValueError("holdout 冻结前向目标未覆盖绑定评分区间")
             mutable_targets = [0.0] * len(bars)
             for index in range(start, end):
                 target_time = bars[index - 1].decision_time
@@ -708,6 +748,8 @@ def run_holdout_validation(
     forward_plan_id: str | None = None
     forward_prediction_count = 0
     forward_prediction_row_set_hash: str | None = None
+    missing_policy = DEFAULT_MISSING_POLICY
+    missing_decision_times: tuple[datetime, ...] = ()
     if require_forward_predictions:
         from guvolu.research.frozen_forward import (
             attest_frozen_forward_batch,
@@ -717,6 +759,7 @@ def run_holdout_validation(
         if plan is None:
             raise ValueError("holdout 要求预冻结前向计划")
         forward_plan_id = plan.plan_id
+        missing_policy = plan.missing_policy
         if plan.source_manifest_sha256 != sha256_file(source_manifest_path):
             raise ValueError("前向计划与 holdout 来源 manifest 不一致")
         if plan.candidate_set_hash != candidate_set_hash:
@@ -825,24 +868,21 @@ def run_holdout_validation(
         cost_config.get("capacity_notional_quote"),
         "capacity_notional_quote",
     )
+    score_decision_times = _score_decision_times(panel.bars, start, end)
+    if frozen_targets is not None:
+        # burn 政策缺柱在此抛错并烧毁
+        frozen_targets, missing_decision_times = apply_missing_policy(
+            frozen_targets,
+            score_decision_times,
+            tuple(candidate.candidate_id for candidate in candidates),
+            missing_policy,
+        )
     raw_results: list[dict[str, object]] = []
     p_values: dict[str, float] = {}
     for candidate in candidates:
         if frozen_targets is None:
             targets = generate_targets(candidate, panel.bars, features, periods_per_year)
         else:
-            missing = [
-                panel.bars[index - 1].decision_time
-                for index in range(start, end)
-                if candidate.candidate_id not in frozen_targets.get(
-                    panel.bars[index - 1].decision_time, {},
-                )
-            ]
-            if missing:
-                raise ValueError(
-                    "holdout 冻结前向预测覆盖不完整: "
-                    f"{candidate.candidate_id} missing={len(missing)}"
-                )
             mutable_targets = [0.0] * len(panel.bars)
             for index in range(start, end):
                 target_time = panel.bars[index - 1].decision_time
@@ -899,8 +939,8 @@ def run_holdout_validation(
             "rejection_reasons": reasons,
         })
     verdict = "passed" if len(passed_families) == len(candidates) else "failed"
-    score_decision_times = _score_decision_times(panel.bars, start, end)
     score_schedule = [value.isoformat() for value in score_decision_times]
+    missing_schedule = [value.isoformat() for value in missing_decision_times]
     schedule_path = run_directory / "score-schedule.json"
     atomic_write_text(schedule_path, canonical_json({
         "schema_version": HOLDOUT_MANIFEST_SCHEMA_VERSION,
@@ -922,6 +962,9 @@ def run_holdout_validation(
         "frozen_forward_plan_id": forward_plan_id,
         "frozen_forward_prediction_count": forward_prediction_count,
         "frozen_forward_row_set_hash": forward_prediction_row_set_hash,
+        "missing_policy": missing_policy,
+        "missing_decision_times": missing_schedule,
+        "missing_decision_count": len(missing_schedule),
         "source_summary_sha256": sha256_file(summary_file),
         "config_hash": sha256_file(config_file),
         "code_identity": asdict(identity),
@@ -955,6 +998,8 @@ def run_holdout_validation(
         "input_receipt_sha256": receipt_registration.receipt_artifact_sha256,
         "source_data_root": source_data_root_record,
         "frozen_forward_row_set_hash": forward_prediction_row_set_hash,
+        "missing_policy": missing_policy,
+        "missing_decision_count": len(missing_schedule),
         "artifacts": {
             "source_manifest": {
                 **artifact_record(source_manifest_path, "research_manifest"),
@@ -1008,6 +1053,8 @@ def run_holdout_validation(
             "verdict": verdict,
             "candidate_ids": [candidate.candidate_id for candidate in candidates],
             "passed_families": sorted(passed_families),
+            "missing_policy": missing_policy,
+            "missing_decision_count": len(missing_schedule),
             "result_sha256": sha256_file(result_path),
             "manifest_sha256": manifest_sha256,
         })

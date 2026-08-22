@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Mapping
+from typing import Mapping, Sequence
 
 from guvolu.data.durable_io import atomic_write_text
 from guvolu.data.trade_economics import TRADE_FLOW_INPUT_METHOD_VERSION
@@ -21,8 +21,11 @@ from guvolu.research.contracts import (
 from guvolu.research.data_location import resolve_data_root_locator
 from guvolu.research.features import FEATURE_METHOD_VERSION, compute_features
 from guvolu.research.governance import (
+    DEFAULT_MISSING_POLICY,
     GOVERNANCE_METHOD_VERSION,
+    MISSING_POLICIES,
     FrozenForwardPlan,
+    frozen_forward_plan_identity,
     get_active_head_receipt,
     get_frozen_forward_plan,
     get_frozen_forward_prediction_row_set,
@@ -33,6 +36,7 @@ from guvolu.research.governance import (
     register_frozen_forward_prediction,
 )
 from guvolu.research.holdout import (
+    apply_missing_policy,
     frozen_candidate_set_hash,
     load_frozen_candidates,
     verified_source_manifest,
@@ -99,6 +103,7 @@ class FrozenForwardBatchAttestation:
     targets: Mapping[datetime, Mapping[str, float]]
     row_set_hash: str
     decision_times: tuple[datetime, ...]
+    candidate_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -108,6 +113,7 @@ class FrozenForwardVerification:
     plan_id: str
     plan_sha256: str
     prediction_count: int
+    missing_policy: str = DEFAULT_MISSING_POLICY
 
 
 def _object(value: object, name: str) -> Mapping[str, object]:
@@ -199,8 +205,12 @@ def freeze_forward_plan(
     config_path: Path,
     source_summary_path: Path,
     vintage_id: str,
+    *,
+    missing_policy: str = DEFAULT_MISSING_POLICY,
 ) -> FrozenPlanResult:
-    """在 vintage 开始前冻结来源、公式、参数和资金权重。"""
+    """在 vintage 开始前冻结来源、公式、参数、资金权重与缺预测政策。"""
+    if missing_policy not in MISSING_POLICIES:
+        raise ValueError("缺预测处置政策取值无效")
     repository = root.resolve()
     config_file = _project_path(repository, config_path, "config")
     summary_file = _project_path(repository, source_summary_path, "source summary")
@@ -244,6 +254,8 @@ def freeze_forward_plan(
         path = _project_path(repository, Path(existing.plan_artifact_path), "plan artifact")
         if sha256_file(path) != existing.plan_artifact_sha256:
             raise ValueError("已登记冻结前向计划制品散列不匹配")
+        if existing.missing_policy != missing_policy:
+            raise ValueError("vintage 已绑定不同缺预测处置政策的冻结计划")
         return FrozenPlanResult(existing.plan_id, path, existing.plan_artifact_sha256)
     summary = _load(summary_file)
     required_methods: Mapping[str, object] = {
@@ -293,15 +305,19 @@ def freeze_forward_plan(
     )
     source_manifest_hash = sha256_file(source_manifest_path)
     weights, reserve = _source_weights(summary, candidates)
-    plan_id = stable_identifier("frozen-forward-plan", {
-        "governance_method_version": GOVERNANCE_METHOD_VERSION,
-        "vintage_id": vintage_id,
-        "source_manifest_sha256": source_manifest_hash,
-        "candidate_set_hash": candidate_set_hash,
-        "config_hash": config_hash,
-        "code_tree_digest": identity.tree_digest,
-        **required_methods,
-    })
+    # 政策进入计划身份
+    plan_id = stable_identifier(
+        "frozen-forward-plan",
+        frozen_forward_plan_identity(
+            vintage_id,
+            source_manifest_hash,
+            candidate_set_hash,
+            config_hash,
+            identity.tree_digest,
+            required_methods,
+            missing_policy,
+        ),
+    )
     plan_path = (
         repository / "reports" / "strategy-research" / "frozen-forward"
         / vintage_id / plan_id / "plan.json"
@@ -339,6 +355,7 @@ def freeze_forward_plan(
         "candidate_set_hash": candidate_set_hash,
         "candidates": [asdict(candidate) for candidate in candidates],
         "allocation": {"weights": weights, "reserve": reserve},
+        "missing_policy": missing_policy,
     }
     atomic_write_text(plan_path, canonical_json(payload) + "\n")
     plan_hash = sha256_file(plan_path)
@@ -353,7 +370,7 @@ def freeze_forward_plan(
         plan_hash,
         repository_root=repository,
     )
-    if registered.plan_id != plan_id:
+    if registered.plan_id != plan_id or registered.missing_policy != missing_policy:
         raise RuntimeError("治理注册表返回了不同的冻结计划身份")
     return FrozenPlanResult(plan_id, plan_path, plan_hash)
 
@@ -1073,10 +1090,12 @@ def attest_frozen_forward_batch(
             plan_id=plan.plan_id,
             plan_sha256=plan.plan_artifact_sha256,
             prediction_count=len(predictions),
+            missing_policy=plan.missing_policy,
         ),
         targets=targets_by_time,
         row_set_hash=row_set_hash,
         decision_times=decision_times,
+        candidate_ids=tuple(sorted(planned_candidates)),
     )
 
 
@@ -1097,8 +1116,21 @@ def load_verified_prediction_targets(
     plan_id: str,
     *,
     registry_path: Path | None = None,
+    decision_times: Sequence[datetime] | None = None,
 ) -> Mapping[datetime, Mapping[str, float]]:
-    """复核后按决策时间返回 candidate_id 到当时目标的不可变映射。"""
-    return attest_frozen_forward_batch(
+    """复核后按决策时间返回 candidate_id 到当时目标的不可变映射。
+
+    传入 decision_times 时按计划缺预测政策补齐：zero_exposure 把缺失柱
+    记为零目标，burn 缺柱抛错。
+    """
+    batch = attest_frozen_forward_batch(
         root, plan_id, registry_path=registry_path,
-    ).targets
+    )
+    if decision_times is None:
+        return batch.targets
+    return apply_missing_policy(
+        batch.targets,
+        decision_times,
+        batch.candidate_ids,
+        batch.verification.missing_policy,
+    )[0]

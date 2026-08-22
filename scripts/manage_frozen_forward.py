@@ -8,14 +8,19 @@ from pathlib import Path
 from typing import Sequence
 
 from guvolu.research.frozen_forward import (
+    FrozenForwardVerification,
+    FrozenPlanResult,
+    FrozenPredictionResult,
     freeze_forward_plan,
     run_frozen_forward_prediction,
     verify_frozen_forward,
 )
 
+_Result = FrozenPlanResult | FrozenPredictionResult | FrozenForwardVerification
 
-def _payload(value: object) -> dict[str, object]:
-    raw = asdict(value)  # type: ignore[arg-type]
+
+def _payload(value: _Result) -> dict[str, object]:
+    raw = asdict(value)
     return {
         key: item.isoformat() if hasattr(item, "isoformat") else str(item)
         if isinstance(item, Path) else item
@@ -34,6 +39,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     plan.add_argument(
         "--config", type=Path, default=Path("config/strategy_research.json"),
     )
+    plan.add_argument(
+        "--missing-policy",
+        choices=("burn", "zero_exposure"),
+        default="burn",
+        help="缺预测处置政策：burn 烧毁 vintage，zero_exposure 缺柱记零暴露",
+    )
     predict = subparsers.add_parser("predict", help="为最新完整决策柱追加不可变预测")
     predict.add_argument("plan_id")
     predict.add_argument(
@@ -48,12 +59,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     arguments = parser.parse_args(argv)
     root = arguments.root.resolve()
+    result: _Result
     if arguments.action == "plan":
         result = freeze_forward_plan(
             root,
             arguments.config,
             arguments.source_summary,
             arguments.vintage_id,
+            missing_policy=arguments.missing_policy,
         )
     elif arguments.action == "predict":
         result = run_frozen_forward_prediction(
