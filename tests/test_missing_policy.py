@@ -4,6 +4,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sqlite3
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import ModuleType
@@ -11,6 +12,7 @@ from types import ModuleType
 import pytest
 
 from guvolu.research import clock
+from guvolu.research import governance as governance_module
 from guvolu.research.config_lineage import snapshot_verified_config_lineage
 from guvolu.research.contracts import (
     CodeIdentity,
@@ -43,7 +45,11 @@ from guvolu.research.governance import (
     start_holdout_evaluation_attempt,
     upgrade_governance_write_ceiling,
 )
-from guvolu.research.holdout import apply_missing_policy, run_holdout_validation
+from guvolu.research.holdout import (
+    apply_missing_policy,
+    attest_holdout_terminal_artifacts,
+    run_holdout_validation,
+)
 from guvolu.research.provenance import (
     canonical_json,
     sha256_file,
@@ -97,6 +103,11 @@ def _authoritative_test_clock(monkeypatch: pytest.MonkeyPatch) -> None:
         "guvolu.research.frozen_forward.attest_frozen_prediction_artifact",
         lambda *_args, **_kwargs: None,
     )
+
+
+@pytest.fixture
+def skip_terminal_attestation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """仅伪造证据的治理层测试按需跳过终态制品复核。"""
     monkeypatch.setattr(
         "guvolu.research.holdout.attest_holdout_terminal_artifacts",
         lambda *_args: None,
@@ -544,8 +555,12 @@ def _write_evidence(
     missing_policy: str,
     missing_decision_times: tuple[datetime, ...],
     declare_missing: bool = True,
+    manifest_policy: str | None = None,
 ) -> tuple[str, str, str]:
-    """写入互相绑定的 holdout result、schedule、manifest 与 verdict。"""
+    """写入互相绑定的 holdout result、schedule、manifest 与 verdict。
+
+    manifest_policy 非空时让 manifest 声明与 result 不同的政策。
+    """
     evaluation_id = stable_identifier("holdout-evaluation", evaluation_identity)
     run_directory = root / "reports" / "holdout" / evaluation_id
     run_directory.mkdir(parents=True, exist_ok=True)
@@ -636,6 +651,8 @@ def _write_evidence(
     if declare_missing:
         manifest["missing_policy"] = missing_policy
         manifest["missing_decision_count"] = len(missing_decision_times)
+    if manifest_policy is not None:
+        manifest["missing_policy"] = manifest_policy
     manifest_path = run_directory / "manifest.json"
     manifest_path.write_text(canonical_json(manifest) + "\n", encoding="utf-8")
     terminal = canonical_json({
@@ -651,12 +668,24 @@ def _write_evidence(
     )
 
 
-@pytest.mark.parametrize("missing_policy", ["zero_exposure", "burn"])
-def test_finalize_coverage_rule_follows_plan_policy(
-    tmp_path: Path, missing_policy: str,
-) -> None:
-    """终态登记：zero_exposure 接受声明缺失柱，burn 仍要求逐柱覆盖。"""
-    registry = tmp_path / "governance.sqlite3"
+@dataclass(frozen=True)
+class _FinalizeSetup:
+    """伪造证据终态登记测试的共享上下文。"""
+
+    registry: Path
+    vintage_id: str
+    candidate_set_identity: dict[str, object]
+    policy: dict[str, object]
+    config_path: Path
+    plan_id: str
+    times: tuple[datetime, datetime, datetime]
+    evaluation_identity: dict[str, object]
+    evaluation_id: str
+
+
+def _finalize_setup(root: Path, missing_policy: str) -> _FinalizeSetup:
+    """登记计划、t0 与 t2 两个预测，并开启评估尝试。"""
+    registry = root / "governance.sqlite3"
     vintage = seal_holdout_vintage(
         registry, "market-one",
         _time("2027-01-01T00:00:00"), _time("2027-02-01T00:00:00"),
@@ -669,84 +698,112 @@ def test_finalize_coverage_rule_follows_plan_policy(
         "candidate_ids": [_CANDIDATE_ID],
     }
     candidate_set_hash = stable_identifier("candidate-set", candidate_set_identity)
-    config_path, policy = _holdout_config(tmp_path, require_forward=True)
+    config_path, policy = _holdout_config(root, require_forward=True)
     config_hash = sha256_file(config_path)
     plan_id, path, sha256 = _write_plan(
-        tmp_path, vintage.vintage_id, "1" * 64, candidate_set_hash,
+        root, vintage.vintage_id, "1" * 64, candidate_set_hash,
         config_hash, "tree-one", missing_policy=missing_policy,
     )
     register_frozen_forward_plan(
         registry, vintage.vintage_id, "1" * 64, candidate_set_hash,
-        config_hash, "tree-one", path, sha256, repository_root=tmp_path,
+        config_hash, "tree-one", path, sha256, repository_root=root,
     )
     t0 = vintage.start_time
     t1 = t0 + timedelta(hours=1)
     t2 = t0 + timedelta(hours=2)
     for decision in (t0, t2):
         _register_prediction(
-            registry, tmp_path, plan_id, vintage.vintage_id, decision,
+            registry, root, plan_id, vintage.vintage_id, decision,
             config_hash, "tree-one",
         )
     _set_now(_time("2027-02-02T00:00:00"))
     evaluation_identity, evaluation_id = _evaluation_identity(
-        tmp_path, registry, vintage.vintage_id, candidate_set_hash, config_hash,
+        root, registry, vintage.vintage_id, candidate_set_hash, config_hash,
     )
     start_holdout_evaluation_attempt(
         registry, vintage.vintage_id, candidate_set_hash, evaluation_id,
     )
+    return _FinalizeSetup(
+        registry=registry,
+        vintage_id=vintage.vintage_id,
+        candidate_set_identity=candidate_set_identity,
+        policy=policy,
+        config_path=config_path,
+        plan_id=plan_id,
+        times=(t0, t1, t2),
+        evaluation_identity=evaluation_identity,
+        evaluation_id=evaluation_id,
+    )
+
+
+@pytest.mark.parametrize("missing_policy", ["zero_exposure", "burn"])
+def test_finalize_coverage_rule_follows_plan_policy(
+    tmp_path: Path, missing_policy: str, skip_terminal_attestation: None,
+) -> None:
+    """终态登记：zero_exposure 接受声明缺失柱，burn 仍要求逐柱覆盖。"""
+    setup = _finalize_setup(tmp_path, missing_policy)
+    registry = setup.registry
+    vintage_id = setup.vintage_id
+    candidate_set_identity = setup.candidate_set_identity
+    policy = setup.policy
+    config_path = setup.config_path
+    plan_id = setup.plan_id
+    t0, t1, t2 = setup.times
+    evaluation_identity = setup.evaluation_identity
+    evaluation_id = setup.evaluation_id
     if missing_policy == "burn":
         terminal, manifest_path, manifest_sha256 = _write_evidence(
-            tmp_path, registry, vintage.vintage_id, evaluation_identity,
+            tmp_path, registry, vintage_id, evaluation_identity,
             candidate_set_identity, policy, config_path, (t0, t1, t2), plan_id,
             missing_policy=missing_policy, missing_decision_times=(t1,),
         )
         with pytest.raises(ValueError, match="burn 政策不得声明缺失决策柱"):
             finalize_holdout_evaluation(
-                registry, vintage.vintage_id, evaluation_id, terminal,
+                registry, vintage_id, evaluation_id, terminal,
                 manifest_path, manifest_sha256, repository_root=tmp_path,
             )
         terminal, manifest_path, manifest_sha256 = _write_evidence(
-            tmp_path, registry, vintage.vintage_id, evaluation_identity,
+            tmp_path, registry, vintage_id, evaluation_identity,
             candidate_set_identity, policy, config_path, (t0, t1, t2), plan_id,
             missing_policy=missing_policy, missing_decision_times=(t1,),
             declare_missing=False,
         )
         with pytest.raises(ValueError, match="必须完整等于评分柱数"):
             finalize_holdout_evaluation(
-                registry, vintage.vintage_id, evaluation_id, terminal,
+                registry, vintage_id, evaluation_id, terminal,
                 manifest_path, manifest_sha256, repository_root=tmp_path,
             )
         return
     # 未声明缺失时预测数与评分柱不等，仍拒绝
     undeclared, undeclared_path, undeclared_sha = _write_evidence(
-        tmp_path, registry, vintage.vintage_id, evaluation_identity,
+        tmp_path, registry, vintage_id, evaluation_identity,
         candidate_set_identity, policy, config_path, (t0, t1, t2), plan_id,
         missing_policy=missing_policy, missing_decision_times=(t1,),
         declare_missing=False,
     )
     with pytest.raises(ValueError, match="必须完整等于评分柱数"):
         finalize_holdout_evaluation(
-            registry, vintage.vintage_id, evaluation_id, undeclared,
+            registry, vintage_id, evaluation_id, undeclared,
             undeclared_path, undeclared_sha, repository_root=tmp_path,
         )
     # 声明错误缺失时点（已有预测的柱）被拒绝
     wrong, wrong_path, wrong_sha = _write_evidence(
-        tmp_path, registry, vintage.vintage_id, evaluation_identity,
+        tmp_path, registry, vintage_id, evaluation_identity,
         candidate_set_identity, policy, config_path, (t0, t1, t2), plan_id,
         missing_policy=missing_policy, missing_decision_times=(t2,),
     )
     with pytest.raises(ValueError, match="未逐柱匹配"):
         finalize_holdout_evaluation(
-            registry, vintage.vintage_id, evaluation_id, wrong,
+            registry, vintage_id, evaluation_id, wrong,
             wrong_path, wrong_sha, repository_root=tmp_path,
         )
     terminal, manifest_path, manifest_sha256 = _write_evidence(
-        tmp_path, registry, vintage.vintage_id, evaluation_identity,
+        tmp_path, registry, vintage_id, evaluation_identity,
         candidate_set_identity, policy, config_path, (t0, t1, t2), plan_id,
         missing_policy=missing_policy, missing_decision_times=(t1,),
     )
     finalized, attempt = finalize_holdout_evaluation(
-        registry, vintage.vintage_id, evaluation_id, terminal,
+        registry, vintage_id, evaluation_id, terminal,
         manifest_path, manifest_sha256, repository_root=tmp_path,
     )
     assert finalized.verdict == terminal
@@ -914,6 +971,11 @@ def _build_holdout_fixture(
         "guvolu.research.panel.attest_trade_input_receipt",
         lambda *_args, **_kwargs: inputs,
     )
+    # 终态复核真实执行，只替换数据面输入
+    monkeypatch.setattr(
+        "guvolu.research.holdout.attest_trade_input_receipt",
+        lambda *_args, **_kwargs: inputs,
+    )
     monkeypatch.setattr(
         "guvolu.research.holdout.code_identity",
         lambda _root, _paths: CodeIdentity(
@@ -957,6 +1019,10 @@ def _build_holdout_fixture(
             decision_time=decisions[-1],
             latest_available_time=decisions[-1],
         ),
+    )
+    monkeypatch.setattr(
+        "guvolu.research.holdout.load_panel_bars",
+        lambda *_args: bars,
     )
     monkeypatch.setattr(
         "guvolu.research.holdout.compute_features",
@@ -1089,3 +1155,260 @@ def test_preflight_coverage_gap_severity_follows_policy(
         assert report["blockers"] == []
     assert report["registered_predictions"] == 0
     assert report["expected_predictions"] > 0
+
+
+@pytest.mark.parametrize(
+    ("registered", "expect_ratio_warning"), [(8, False), (2, True)],
+)
+def test_preflight_zero_exposure_flags_high_gap_ratio(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    registered: int,
+    expect_ratio_warning: bool,
+) -> None:
+    """zero_exposure 下缺口占已过去决策窗比例超阈值才追加占比告警。"""
+    preflight = _load_preflight()
+    registry = tmp_path / "governance.sqlite3"
+    vintage = seal_holdout_vintage(
+        registry, "market-one",
+        _time("2027-01-01T00:00:00"), _time("2027-02-01T00:00:00"),
+    )
+    plan_id, path, sha256 = _write_plan(
+        tmp_path, vintage.vintage_id, "1" * 64, "candidate-set-one",
+        "2" * 64, "tree-one", missing_policy="zero_exposure",
+    )
+    register_frozen_forward_plan(
+        registry, vintage.vintage_id, "1" * 64, "candidate-set-one",
+        "2" * 64, "tree-one", path, sha256, repository_root=tmp_path,
+    )
+    grid = [vintage.start_time + timedelta(hours=offset) for offset in range(10)]
+    for decision in grid[:registered]:
+        _register_prediction(
+            registry, tmp_path, plan_id, vintage.vintage_id, decision,
+            "2" * 64, "tree-one",
+        )
+    # 尾部宽限后应有 10 个决策窗
+    monkeypatch.setattr(
+        preflight, "_utc_now",
+        lambda: vintage.start_time + timedelta(hours=13),
+    )
+    report = preflight.run_preflight(
+        tmp_path, registry, vintage.vintage_id, verify_artifacts=False,
+    )
+    assert report["expected_predictions"] == 10
+    assert report["registered_predictions"] == registered
+    assert report["status"] == "degraded"
+    warnings = {item["issue"]: item for item in report["warnings"]}
+    assert "prediction_coverage_gap" in warnings
+    if expect_ratio_warning:
+        ratio_warning = warnings["prediction_coverage_gap_ratio_high"]
+        assert ratio_warning["gap_ratio"] == 0.8
+        assert ratio_warning["threshold"] == preflight._COVERAGE_GAP_RATIO_WARNING
+    else:
+        assert "prediction_coverage_gap_ratio_high" not in warnings
+
+
+def test_upgrade_rechecks_policy_column_after_write_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """锁前探测缺列而锁后列已存在时不重复加列，不抛裸 OperationalError。"""
+    registry = tmp_path / "governance.sqlite3"
+    seal_holdout_vintage(
+        registry, "market-one",
+        _time("2027-01-01T00:00:00"), _time("2027-02-01T00:00:00"),
+    )
+    original = governance_module._has_missing_policy_column
+    outcomes: list[bool] = []
+
+    def stale_probe(connection: sqlite3.Connection) -> bool:
+        # 首次探测谎报缺列，模拟并发者抢先加列
+        outcome = False if not outcomes else original(connection)
+        outcomes.append(outcome)
+        return outcome
+
+    monkeypatch.setattr(
+        governance_module, "_has_missing_policy_column", stale_probe,
+    )
+    assert list_holdout_vintages(registry)[0].status == "sealed"
+    assert outcomes[:2] == [False, True]
+    with sqlite3.connect(registry) as connection:
+        columns = [
+            str(row[1]) for row in connection.execute(
+                "PRAGMA table_info(frozen_forward_plan)"
+            ).fetchall()
+        ]
+        assert columns.count("missing_policy") == 1
+        assert connection.execute(
+            "SELECT value FROM governance_meta WHERE key='schema_version'"
+        ).fetchone() == (str(GOVERNANCE_SCHEMA_VERSION),)
+
+
+def test_upgrade_translates_sqlite_operational_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """锁后仍误判缺列导致重复加列时转译为中文 ValueError。"""
+    registry = tmp_path / "governance.sqlite3"
+    seal_holdout_vintage(
+        registry, "market-one",
+        _time("2027-01-01T00:00:00"), _time("2027-02-01T00:00:00"),
+    )
+    monkeypatch.setattr(
+        governance_module, "_has_missing_policy_column",
+        lambda _connection: False,
+    )
+    with pytest.raises(ValueError, match="研究治理注册表升级失败") as info:
+        list_holdout_vintages(registry)
+    assert isinstance(info.value.__cause__, sqlite3.OperationalError)
+    assert "duplicate column" in str(info.value)
+
+
+def _tamper_prediction(root: Path, plan_id: str, decision_time: datetime) -> None:
+    """改写已登记预测的目标值，使制品散列与注册行不符。"""
+    stamp = decision_time.strftime("%Y%m%dT%H%M%SZ")
+    path = root / "reports" / plan_id / "predictions" / f"{stamp}.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["families"][0]["family_target"] = 1.0
+    payload["families"][0]["portfolio_target_contribution"] = 0.4
+    payload["aggregate_target"] = 0.4
+    path.write_text(canonical_json(payload) + "\n", encoding="utf-8")
+
+
+def test_tampered_prediction_is_error_not_missing_under_zero_exposure(
+    tmp_path: Path,
+) -> None:
+    """zero_exposure 下已登记预测被篡改时复核报错，不得视为缺失记零。"""
+    registry = tmp_path / "governance.sqlite3"
+    vintage = seal_holdout_vintage(
+        registry, "market-one",
+        _time("2027-01-01T00:00:00"), _time("2027-02-01T00:00:00"),
+    )
+    plan_id, path, sha256 = _write_plan(
+        tmp_path, vintage.vintage_id, "1" * 64, "candidate-set-one",
+        "2" * 64, "tree-one", missing_policy="zero_exposure",
+    )
+    register_frozen_forward_plan(
+        registry, vintage.vintage_id, "1" * 64, "candidate-set-one",
+        "2" * 64, "tree-one", path, sha256, repository_root=tmp_path,
+    )
+    t0 = vintage.start_time
+    t1 = t0 + timedelta(hours=1)
+    t2 = t0 + timedelta(hours=2)
+    for decision in (t0, t2):
+        _register_prediction(
+            registry, tmp_path, plan_id, vintage.vintage_id, decision,
+            "2" * 64, "tree-one",
+        )
+    _tamper_prediction(tmp_path, plan_id, t2)
+    with pytest.raises(ValueError, match="冻结前向预测制品散列不匹配"):
+        verify_frozen_forward(tmp_path, plan_id, registry_path=registry)
+    with pytest.raises(ValueError, match="冻结前向预测制品散列不匹配"):
+        load_verified_prediction_targets(
+            tmp_path, plan_id, registry_path=registry,
+            decision_times=(t0, t1, t2),
+        )
+
+
+@pytest.mark.parametrize("plan_policy", ["burn", "zero_exposure"])
+def test_finalize_rejects_policy_mixing(
+    tmp_path: Path, plan_policy: str, skip_terminal_attestation: None,
+) -> None:
+    """证据政策与注册计划不一致、manifest 与 result 不一致均被拦截。"""
+    setup = _finalize_setup(tmp_path, plan_policy)
+    t0, t1, t2 = setup.times
+    other_policy = "zero_exposure" if plan_policy == "burn" else "burn"
+    # 证据按各自政策自洽的日程与缺失柱
+    schedule_for = {
+        "zero_exposure": ((t0, t1, t2), (t1,)),
+        "burn": ((t0, t2), ()),
+    }
+    schedule, missing = schedule_for[other_policy]
+    terminal, manifest_path, manifest_sha256 = _write_evidence(
+        tmp_path, setup.registry, setup.vintage_id, setup.evaluation_identity,
+        setup.candidate_set_identity, setup.policy, setup.config_path,
+        schedule, setup.plan_id,
+        missing_policy=other_policy, missing_decision_times=missing,
+    )
+    with pytest.raises(ValueError, match="缺预测处置政策与注册计划不一致"):
+        finalize_holdout_evaluation(
+            setup.registry, setup.vintage_id, setup.evaluation_id, terminal,
+            manifest_path, manifest_sha256, repository_root=tmp_path,
+        )
+    schedule, missing = schedule_for[plan_policy]
+    terminal, manifest_path, manifest_sha256 = _write_evidence(
+        tmp_path, setup.registry, setup.vintage_id, setup.evaluation_identity,
+        setup.candidate_set_identity, setup.policy, setup.config_path,
+        schedule, setup.plan_id,
+        missing_policy=plan_policy, missing_decision_times=missing,
+        manifest_policy=other_policy,
+    )
+    with pytest.raises(ValueError, match="manifest 的 missing_policy 与 result 不一致"):
+        finalize_holdout_evaluation(
+            setup.registry, setup.vintage_id, setup.evaluation_id, terminal,
+            manifest_path, manifest_sha256, repository_root=tmp_path,
+        )
+    attempt = get_holdout_evaluation_attempt(setup.registry, setup.evaluation_id)
+    assert attempt.status == "incomplete"
+
+
+def _tamper_result(
+    manifest_path: Path, result_path: Path, **changes: object,
+) -> None:
+    """改写 result 并同步 manifest 内制品散列，模拟篡改后重签。"""
+    payload = json.loads(result_path.read_text(encoding="utf-8"))
+    payload.update(changes)
+    result_path.write_text(canonical_json(payload) + "\n", encoding="utf-8")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["artifacts"]["result"].update({
+        "sha256": sha256_file(result_path),
+        "bytes": result_path.stat().st_size,
+    })
+    manifest_path.write_text(canonical_json(manifest) + "\n", encoding="utf-8")
+
+
+def test_terminal_attestation_rejects_forged_missing_times(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """真实终态复核下 result 声明缺失柱与预测记录不符即拒绝。"""
+    _registry, config, summary, vintage_id, decisions, _captured = (
+        _build_holdout_fixture(tmp_path, monkeypatch, missing_policy="zero_exposure")
+    )
+    result = run_holdout_validation(tmp_path, config, summary, vintage_id)
+    # 未替换的复核对真实证据通过
+    attest_holdout_terminal_artifacts(tmp_path, result.manifest_path)
+    # 声明 t2 缺失（实有预测）而隐去 t1
+    _tamper_result(
+        result.manifest_path, result.result_path,
+        missing_decision_times=[decisions[2].isoformat()],
+    )
+    with pytest.raises(ValueError, match="缺失决策柱登记不能由计划政策与预测重建"):
+        attest_holdout_terminal_artifacts(tmp_path, result.manifest_path)
+    # 伪称无缺失同样被拒
+    _tamper_result(
+        result.manifest_path, result.result_path,
+        missing_decision_times=[], missing_decision_count=0,
+    )
+    with pytest.raises(ValueError, match="缺失决策柱登记不能由计划政策与预测重建"):
+        attest_holdout_terminal_artifacts(tmp_path, result.manifest_path)
+
+
+def test_terminal_attestation_rejects_tampered_prediction_hidden_as_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """篡改已登记预测并伪造缺失柱掩盖时，复核仍因散列不符报错。"""
+    _registry, config, summary, vintage_id, decisions, _captured = (
+        _build_holdout_fixture(tmp_path, monkeypatch, missing_policy="zero_exposure")
+    )
+    result = run_holdout_validation(tmp_path, config, summary, vintage_id)
+    payload = json.loads(result.result_path.read_text(encoding="utf-8"))
+    plan_id = payload["frozen_forward_plan_id"]
+    _tamper_prediction(tmp_path, plan_id, decisions[2])
+    _tamper_result(
+        result.manifest_path, result.result_path,
+        missing_decision_times=[
+            decisions[1].isoformat(), decisions[2].isoformat(),
+        ],
+        missing_decision_count=2,
+        frozen_forward_prediction_count=1,
+    )
+    with pytest.raises(ValueError, match="冻结前向预测制品散列不匹配"):
+        attest_holdout_terminal_artifacts(tmp_path, result.manifest_path)
