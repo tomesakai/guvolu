@@ -4,7 +4,7 @@
 > - **【已锁定】** —— 由 [SKILLS.md](../SKILLS.md) 铁律推导，不经讨论不得变更。
 > - **【TBD-nn】** —— 尚未确定，讨论后回填。**任何人不得擅自实现 TBD 项**（A-05）。
 >
-> 更新日期：2026-08-15
+> 更新日期：2026-08-22
 >
 > 当前项目根为 `C:\Users\wu_zh\dev\guvolu`；`GUVOLU_DATA_ROOT=data`
 > 解析为 `C:\Users\wu_zh\dev\guvolu\data`。路径是部署位置，不进入
@@ -258,6 +258,10 @@ flowchart LR
 | **TBD-33** | 报警规则实例与 alert_event 派生表 | 提案 2026-08-08 见 [footprint-design.md](footprint-design.md) 第 6.8 节；随 OFL 页实施；提案实施中（2026-08-09）后端半场：`alert_event` 表（schema v3）、规则实例配置 `config/alert_rules.json`、报警清单与确认端点、区域判读落库即流上匹配；2026-08-10 规则实例增带几何维度（band_bp 标准带或显式价带，匹配器按规则带评估，缺省沿用请求带并记录来源），缺省规则带几何按复核快照 4.4 节再现几何取值；自动检测器属 TBD-30 未做 |
 | **TBD-34** | LLM 决策管线的输入输出构造与台账 | 提案 2026-08-09 见 [llm-pipeline-design.md](llm-pipeline-design.md)；研究进程内、无下单通路、输入内容寻址、输出 schema 校验 |
 | **TBD-35** | 热冷存储根、路径解析与迁移事务 | 【已实现首批 2026-08-22】逻辑 `storage_path` 继续保持数据根相对路径；物理存储根以稳定 `storage_root_id`、卷 GUID、分区 GUID、卷标、哨兵 SHA-256 和逻辑前缀路由共同识别。冷盘离线、身份不符或哨兵变异时读取失败，不按盘符猜测。E 盘兼作受控温层，但只接已封口、有散列、可重放制品；SQLite、锁、开放段与执行状态固定在 C 盘。迁移固定为规划、复制、双端散列、登记、切换、观察和热副本释放七阶段；原始事实不改写。结构见 [materialization-design.md](materialization-design.md) 第 8 节，操作见 [runtime-ops.md](runtime-ops.md) 第 8 节 |
+| **TBD-36** | raw v3.1 压缩封口段 | 【提案 2026-08-22】现行 raw v3 封口段为未压缩 JSONL，逐行 payload SHA-256 加段级 manifest 散列（TBD-02）。提案新增 v3.1：封口后压缩为单一容器文件，manifest 双登记容器文件散列与解压后内容散列，两者均进入 artifact 身份与审计；L3 采集因事件量级必须使用 v3.1。已封口 v3 段不重写（D-02）。L3 合同见 [order-flow-data-contract.md](order-flow-data-contract.md) 第 11 节 |
+| **TBD-37** | 运行根与权威注册库的物理落位 | 【提案 2026-08-22】冻结前向 shadow 的运行根与其登记前向预测的治理注册库当前位于 E 盘温层运行根（[runtime-ops.md](runtime-ops.md) 第 8 节；`scripts/run_frozen_shadow.py` 的 `--registry` 指向运行根内注册库）；E 盘为 USB 外置 SSD，桥接器不提供可信序列号（[materialization-design.md](materialization-design.md) 第 8.1 节）。提案把运行根与权威注册库落内置盘，E 盘只作不可变冷层，不承担运行时权威读写；与 TBD-35 关联，确认后同步修订该条职责表述 |
+| **TBD-38** | 容量阶梯改双判据 | 【提案 2026-08-22】现行 D 盘阶梯以剩余百分比为唯一判据（[runtime-ops.md](runtime-ops.md) 第 8 节）。背景：2026-08-22 观测 D 盘剩余仅约 19%，占用主体为非项目数据，guvolu 实占约 16 GB，百分比判据触发的处置与本项目占用不相称。提案改为「项目配额 + 绝对剩余」双判据，任一越限才动作；阈值为版本化配置（G-06） |
+| **TBD-39** | 决策生成 I/O 契约 v2 | 【提案 2026-08-22】把冻结前向预测拆为决策输入、决策记录、执行目标三份契约：显式有效期、单一目标域、决策输入内容寻址、意图账本回链与计划级缺预测处置。提案全文见 [决策生成 I/O 契约 v2 提案](2026-08-22-decision-io-contract-v2.md)；确认前现行 `frozen-forward-v1` 与执行仓适配器契约继续有效 |
 
 ## 3. 执行架构
 
@@ -352,9 +356,9 @@ DuckDB 列裁剪、CPU 完成 schema/PIT/散列验证、盘口重放与 Decimal/
 
 | 编号 | 未决问题 | 备注 |
 |---|---|---|
-| **TBD-18** | GPU 技术栈（CuPy / PyTorch / RAPIDS / 原生 CUDA） | 【目标机基准 2026-08-14】RTX 5070 12 GB / compute 12.0 已用 PyTorch 2.11 cu128 跑通 SearchFast f32 与 CPU f64 数值对照；首阶段采用隔离 PyTorch worker，后续以全管线 profile 决定是否下沉原生 CUDA。CuPy/RAPIDS 暂无引入证据。见 [策略研究管线](strategy-research.md) |
-| **TBD-19** | 因子库的组织方式与注册机制 | 【提案 2026-08-14，typed CPU reference 已实现】五个流派使用带 shape/unit/frequency/availability/missing policy/numeric domain 的规范 AST；expression identity 绑定公式，candidate identity 绑定表达式与规范参数。公共子表达式 DAG、typed mutation/crossover 与长期 promotion registry 仍未决。见 [策略研究管线](strategy-research.md) |
-| **TBD-20** | 回测引擎形态（事件驱动 / 向量化 / 两者） | 【提案 2026-08-14，向量化基线已实现】中频系列使用前一决策目标、gap 门禁和完整主动成本的 CPU walk-forward；做市、queue、部分成交和撤单失败仍需事件驱动模拟器，当前保持 disabled/shadow。见 [策略研究管线](strategy-research.md) |
+| **TBD-18** | GPU 技术栈（CuPy / PyTorch / RAPIDS / 原生 CUDA） | 【目标机基准 2026-08-14】RTX 5070 12 GB / compute 12.0 已用 PyTorch 2.11 cu128 跑通 SearchFast f32 与 CPU f64 数值对照；首阶段采用隔离 PyTorch worker，后续以全管线 profile 决定是否下沉原生 CUDA。CuPy/RAPIDS 暂无引入证据。见 [策略研究管线](strategy-research.md)。实施案见 [GPU SearchFast 架构](2026-08-22-gpu-searchfast-architecture.md) |
+| **TBD-19** | 因子库的组织方式与注册机制 | 【提案 2026-08-14，typed CPU reference 已实现】五个流派使用带 shape/unit/frequency/availability/missing policy/numeric domain 的规范 AST；expression identity 绑定公式，candidate identity 绑定表达式与规范参数。公共子表达式 DAG、typed mutation/crossover 与长期 promotion registry 仍未决。见 [策略研究管线](strategy-research.md)。实施案见 [GPU SearchFast 架构](2026-08-22-gpu-searchfast-architecture.md) |
+| **TBD-20** | 回测引擎形态（事件驱动 / 向量化 / 两者） | 【提案 2026-08-14，向量化基线已实现】中频系列使用前一决策目标、gap 门禁和完整主动成本的 CPU walk-forward；做市、queue、部分成交和撤单失败仍需事件驱动模拟器，当前保持 disabled/shadow。见 [策略研究管线](strategy-research.md)。实施案见 [GPU SearchFast 架构](2026-08-22-gpu-searchfast-architecture.md) |
 | **TBD-21** | 因子存储格式与版本管理 | 【已锁定 2026-08-11 基础面，2026-08-14 扩展】规范化事实先以内容寻址 Parquet 物化；研究层已新增内容寻址紧凑面板、特征、label/cost/replay、全候选 trial ledger、目标位置与 manifest，并以 SQLite 原子注册表实施 adaptive exposure、一次性 holdout vintage、开始前冻结计划和逐决策不可变前向预测。完整因子生命周期/promotion registry 仍随 GPU 阶段定义。见 [materialization-design.md](materialization-design.md) 与 [策略研究管线](strategy-research.md) |
 | **TBD-22** | 硬件环境（GPU 型号、显存、是否本机） | 【已测 2026-08-14】本机 Windows、RTX 5070 12,227 MiB、compute 12.0、驱动 580.88；Windows TDR 约束要求 GPU 计算分块并保持独立进程。 |
 
@@ -419,5 +423,10 @@ DuckDB 列裁剪、CPU 完成 schema/PIT/散列验证、盘口重放与 Decimal/
 | TBD-32 | 法币汇率来源 | 9 |
 | TBD-33 | 报警规则与事件表 | 7 |
 | TBD-34 | LLM 管线接入 | 9 |
+| TBD-35 | 热冷存储根与迁移 | — |
+| TBD-36 | raw v3.1 压缩封口段 | — |
+| TBD-37 | 运行根与权威注册库落位 | — |
+| TBD-38 | 容量阶梯双判据 | — |
+| TBD-39 | 决策生成 I/O 契约 v2 | 8 |
 
 *讨论确定后，将 TBD 条目改写为【已锁定】并说明理由；若上升为不可协商约束，同时补入 SKILLS.md 对应章节，并同步 0 号文档登记（W-01）。*

@@ -230,6 +230,11 @@
 | 报警 | alert | アラート | 判读信号匹配规则实例后的触发通知 |
 | 确认（报警） | acknowledge | 確認 | 将触发态报警标记为已阅的本地操作 |
 | 跟随模式 | follow mode | 追従モード | 盘口梯形随刷新保持中间价居中的缺省态 |
+| 决策输入（DecisionInput） | decision input | 決定入力 | 每根决策柱冻结并内容寻址的预测输入束，含身份、输入收据、质量、调节输入与代码身份 |
+| 决策记录（DecisionRecord） | decision record | 決定記録 | 由决策输入产生、带有效期与目标域声明的不可变预测制品 |
+| 执行目标（ExecutionTarget） | execution target | 執行目標 | 适配器由决策记录生成、仅供执行域消费的暴露目标快照 |
+| 搜索束（SearchBundle） | search bundle | 探索バンドル | GPU 搜索的内容寻址只读输入集合，含面板张量、掩码、搜索计划与容差身份 |
+| 三态逻辑 | three-valued logic | 三値論理 | 布尔运算含真、假与未知三种取值，未知表示缺失或不可判定 |
 
 ### 用语铁律
 
