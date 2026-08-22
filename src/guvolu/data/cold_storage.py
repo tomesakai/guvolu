@@ -543,16 +543,63 @@ def activate_plan(data_root: Path, plan_path: Path) -> dict[str, object]:
     return result
 
 
-def rollback_plan(data_root: Path, plan_path: Path) -> dict[str, object]:
-    """验证热副本后停用冷路由。"""
+def _active_head_artifact_ids(data_root: Path, logical_prefix: str) -> set[str]:
+    """只读列出前缀内仍被活动 head 引用的制品。"""
+    conn = store.connect_readonly(data_root)
+    if conn is None:
+        raise FileNotFoundError(data_root / store.DB_FILE_NAME)
+    prefix = logical_prefix.rstrip("/")
+    try:
+        conn.execute("PRAGMA query_only=ON")
+        rows = conn.execute(
+            "SELECT o.artifact_id FROM materialization_partition_head h "
+            "JOIN materialization_output o ON o.attempt_id=h.attempt_id "
+            "JOIN artifact a ON a.artifact_id=o.artifact_id "
+            "WHERE a.storage_path=? OR substr(a.storage_path,1,?)=?",
+            (prefix, len(prefix) + 1, prefix + "/"),
+        ).fetchall()
+    finally:
+        conn.close()
+    return {str(row[0]) for row in rows}
+
+
+def rollback_plan(
+    data_root: Path,
+    plan_path: Path,
+    *,
+    allow_missing_superseded: bool = False,
+) -> dict[str, object]:
+    """验证热副本后停用冷路由；可容忍非活动 head 制品缺失。"""
     root = data_root.resolve()
     plan = load_plan(plan_path)
-    verify_plan(root, plan_path, side="hot")
+    superseded_missing: list[str] = []
+    if allow_missing_superseded:
+        # 不触碰冷根，只验证热层
+        _validate_catalog(plan, root)
+        active = _active_head_artifact_ids(root, plan.logical_prefix)
+        for item in plan.items:
+            hot = _source_path(root, item.logical_path)
+            if not hot.exists():
+                if item.artifact_id in active:
+                    raise StoragePathError(
+                        f"活动 head 制品热副本缺失: {item.logical_path}"
+                    )
+                superseded_missing.append(item.logical_path)
+                continue
+            if not hot.is_file() or hot.stat().st_size != item.byte_count or (
+                _sha256(hot) != item.sha256
+            ):
+                raise StoragePathError(f"热副本验证失败: {item.logical_path}")
+    else:
+        verify_plan(root, plan_path, side="hot")
     config_sha = _set_route_status(
         root, plan, from_status="active", to_status="planned",
     )
     resolver = StorageResolver(root)
+    skipped = set(superseded_missing)
     for item in plan.items:
+        if item.logical_path in skipped:
+            continue
         actual = resolver.resolve(item.logical_path)
         if not actual.is_file() or _sha256(actual) != item.sha256:
             raise StoragePathError(f"回滚后解析验证失败: {item.logical_path}")
@@ -561,6 +608,8 @@ def rollback_plan(data_root: Path, plan_path: Path) -> dict[str, object]:
         "migration_id": plan.migration_id,
         "rolled_back_at": datetime.now(UTC).isoformat(),
         "status": "planned",
+        "superseded_missing": superseded_missing,
+        "superseded_missing_items": len(superseded_missing),
     }
     _atomic_json(_receipt_path(plan_path, "rolled-back"), result)
     return result
@@ -916,9 +965,14 @@ def main() -> None:
     subparsers.add_parser("status")
     plan_parser = subparsers.add_parser("plan")
     plan_parser.add_argument("--logical-prefix", required=True)
-    for command in ("copy", "activate", "rollback"):
+    for command in ("copy", "activate"):
         child = subparsers.add_parser(command)
         child.add_argument("--plan", type=Path, required=True)
+    rollback_parser = subparsers.add_parser("rollback")
+    rollback_parser.add_argument("--plan", type=Path, required=True)
+    rollback_parser.add_argument(
+        "--allow-missing-superseded", action="store_true",
+    )
     release_parser = subparsers.add_parser("release-hot")
     release_parser.add_argument("--plan", type=Path, required=True)
     release_parser.add_argument("--apply", action="store_true")
@@ -955,7 +1009,11 @@ def main() -> None:
         elif args.command == "activate":
             _json_result(activate_plan(root, args.plan.resolve()))
         elif args.command == "rollback":
-            _json_result(rollback_plan(root, args.plan.resolve()))
+            _json_result(rollback_plan(
+                root,
+                args.plan.resolve(),
+                allow_missing_superseded=bool(args.allow_missing_superseded),
+            ))
         elif args.command == "release-hot":
             _json_result(release_hot_plan(
                 root,

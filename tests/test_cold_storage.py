@@ -156,6 +156,39 @@ def test_restore_hot_recovers_released_parquet_then_rollback_works(
     assert rollback_plan(root, path)["status"] == "planned"
 
 
+def test_rollback_allows_missing_superseded_non_head_items(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root, _, prefix = _fixture(tmp_path)
+    plan, path = create_plan(root, prefix)
+    copy_plan(root, path)
+    activate_plan(root, path)
+    release_hot_plan(
+        root, path, apply=True, confirm_migration_id=plan.migration_id,
+    )
+    a_id = artifact_id(hashlib.sha256(b"aaa").hexdigest())
+
+    # 缺省回滚仍要求全部热副本
+    with pytest.raises(StoragePathError, match="缺失"):
+        rollback_plan(root, path)
+    # 活动 head 制品缺失即拒绝
+    monkeypatch.setattr(
+        "guvolu.data.cold_storage._active_head_artifact_ids",
+        lambda *_args: {a_id},
+    )
+    with pytest.raises(StoragePathError, match="活动 head"):
+        rollback_plan(root, path, allow_missing_superseded=True)
+    # 非活动 head 制品允许缺失并登记
+    monkeypatch.setattr(
+        "guvolu.data.cold_storage._active_head_artifact_ids",
+        lambda *_args: set(),
+    )
+    result = rollback_plan(root, path, allow_missing_superseded=True)
+    assert result["status"] == "planned"
+    assert result["superseded_missing_items"] == 1
+    assert result["superseded_missing"] == [f"{prefix}/a.parquet"]
+
+
 def test_activate_rejects_overlapping_active_route_without_persisting(
     tmp_path: Path,
 ) -> None:
