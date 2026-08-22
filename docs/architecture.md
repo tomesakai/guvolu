@@ -261,7 +261,7 @@ flowchart LR
 | **TBD-36** | raw v3.1 压缩封口段 | 【提案 2026-08-22】现行 raw v3 封口段为未压缩 JSONL，逐行 payload SHA-256 加段级 manifest 散列（TBD-02）。提案新增 v3.1：封口后压缩为单一容器文件，manifest 双登记容器文件散列与解压后内容散列，两者均进入 artifact 身份与审计；L3 采集因事件量级必须使用 v3.1。已封口 v3 段不重写（D-02）。L3 合同见 [order-flow-data-contract.md](order-flow-data-contract.md) 第 11 节 |
 | **TBD-37** | 运行根与权威注册库的物理落位 | 【提案 2026-08-22】冻结前向 shadow 的运行根与其登记前向预测的治理注册库当前位于 E 盘温层运行根（[runtime-ops.md](runtime-ops.md) 第 8 节；`scripts/run_frozen_shadow.py` 的 `--registry` 指向运行根内注册库）；E 盘为 USB 外置 SSD，桥接器不提供可信序列号（[materialization-design.md](materialization-design.md) 第 8.1 节）。提案把运行根与权威注册库落内置盘，E 盘只作不可变冷层，不承担运行时权威读写；与 TBD-35 关联，确认后同步修订该条职责表述。2026-08-22 晚 E 盘 USB 挂死事故见 [理论体系整理与最快实盘路径快照](2026-08-22-theory-system-and-fastest-live-path.md) 第 1.3 节 |
 | **TBD-38** | 容量阶梯改双判据 | 【提案 2026-08-22】现行 D 盘阶梯以剩余百分比为唯一判据（[runtime-ops.md](runtime-ops.md) 第 8 节）。背景：2026-08-22 观测 D 盘剩余仅约 19%，占用主体为非项目数据，guvolu 实占约 16 GB，百分比判据触发的处置与本项目占用不相称。提案改为「项目配额 + 绝对剩余」双判据，任一越限才动作；阈值为版本化配置（G-06） |
-| **TBD-39** | 决策生成 I/O 契约 v2 | 【提案 2026-08-22】把冻结前向预测拆为决策输入、决策记录、执行目标三份契约：显式有效期、单一目标域、决策输入内容寻址、意图账本回链与计划级缺预测处置。提案全文见 [决策生成 I/O 契约 v2 提案](2026-08-22-decision-io-contract-v2.md)；确认前现行 `frozen-forward-v1` 与执行仓适配器契约继续有效 |
+| **TBD-39** | 决策生成 I/O 契约 v2 | 【提案 2026-08-22】把冻结前向预测拆为决策输入、决策记录、执行目标三份契约：显式有效期、单一目标域、决策输入内容寻址、意图账本回链与计划级缺预测处置。提案全文见 [决策生成 I/O 契约 v2 提案](2026-08-22-decision-io-contract-v2.md)；确认前现行 `frozen-forward-v1` 与执行仓适配器契约继续有效。计划级 `missing_policy` 已实现（分支 `research/missing-policy`，治理 schema v8，见 [strategy-research.md](strategy-research.md) 第 6.1 节），其余项仍为提案 |
 
 ## 3. 执行架构
 

@@ -400,6 +400,30 @@ vintage，防止失败重跑窥视，但注册表会保留最后成功阶段，�
 Rust、CUDA 和 C/C++ 执行源码，以及存在的 Cargo、Python 与 uv 构建合同；未来 GPU 内核和本机
 任务包装器因此不能脱离研究身份变化。
 
+### 6.1 缺预测处置政策
+
+冻结前向计划在封存前以 `missing_policy` 预登记预测窗口内无预测时的处置方式（TBD-39 提案项，
+实现于分支 `research/missing-policy`）：
+
+| 取值 | holdout 处理 | 适用 |
+|---|---|---|
+| `burn` | 任一评分柱缺少冻结目标即抛错，vintage 已消费且永久失效 | 缺省；现行 vintage 与无该字段的旧 `plan.json` 均按此读取 |
+| `zero_exposure` | 缺失柱对全部候选的 `family_target` 记 0，覆盖校验据此视为完整 | 新 vintage 在 `manage_frozen_forward.py plan --missing-policy zero_exposure` 时登记 |
+
+身份绑定：政策写入 `plan.json` 并进入 `plan_id` 的身份输入，治理库 `frozen_forward_plan`
+表（schema v8 只增列 `missing_policy`，旧行缺省 `burn`）同时登记；`prediction_id` 由
+`plan_id` 派生。事后增补或改写政策会同时改变制品 SHA-256、重算的 `plan_id` 与注册行对照，
+复核、预测登记与终态登记均拒绝。旧 `plan.json` 无该字段时不进入身份，既有 `plan_id` 不变。
+
+holdout 处理：期末评估先复核全部预测，再按计划政策补齐评分日程；`zero_exposure` 下缺失柱
+不抛错、不烧毁，`result.json` 登记 `missing_policy`、`missing_decision_times` 与
+`missing_decision_count`，manifest 与最终 verdict 记录政策与缺失计数；治理终态登记要求
+预测行集恰等于评分日程减去声明缺失时点，且 `frozen_forward_prediction_count +
+missing_decision_count == score_bars`。预测存在但 `quality.eligible=false` 的柱本就记零目标，
+与政策无关。预测生成侧不因政策改变：窗口内仍只登记真实预测，不补写缺失柱。
+[preflight_holdout.py](../scripts/preflight_holdout.py) 在 `zero_exposure` 下把覆盖缺口从
+blocker 降为 warning，状态最多为 `degraded`。
+
 ## 7. 当前策略生成方式
 
 当前版本是可解释的 CPU 小网格，不是自动发现系统。版本化 JSON 展开趋势、量价确认趋势、
