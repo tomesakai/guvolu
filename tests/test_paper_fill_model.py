@@ -220,3 +220,56 @@ def test_fee_cache_expires(tmp_path: Path) -> None:
 
     assert quote.source == FEE_SOURCE_SYMBOLS
     assert quote.bps == Decimal("7.0000")
+
+
+@pytest.mark.parametrize(
+    ("entry", "note"),
+    [
+        ({"taker_fee_bps": "abc", "fetched_at": OBSERVED.isoformat()}, "缓存项损坏 InvalidOperation"),
+        ({"taker_fee_bps": "5", "fetched_at": "not-a-time"}, "缓存项损坏 ValueError"),
+        ({"taker_fee_bps": "5"}, "缓存项损坏 KeyError"),
+        ({"taker_fee_bps": 5, "fetched_at": 12}, "缓存项损坏 TypeError"),
+        ({"taker_fee_bps": "5", "fetched_at": "2026-08-22T01:00:00"}, "缓存项字段非法"),
+        ({"taker_fee_bps": "NaN", "fetched_at": OBSERVED.isoformat()}, "缓存项字段非法"),
+        (["5"], "缓存项非对象"),
+    ],
+)
+def test_corrupt_fee_cache_is_a_miss_and_labelled(
+    tmp_path: Path, entry: object, note: str,
+) -> None:
+    """损坏缓存按未命中处理，原因随费率来源带出。"""
+    cache = tmp_path / "fee.json"
+    cache.write_text(
+        json.dumps({"schema_version": 1, "BTC": entry}), encoding="utf-8",
+    )
+    resolver = TakerFeeResolver(
+        cache, fallback_bps=Decimal("5"), cache_seconds=3600,
+    )
+
+    fetched = resolver.resolve(BTC, lambda: _rules("0.0007"))
+    assert fetched.source == FEE_SOURCE_SYMBOLS
+    assert fetched.bps == Decimal("7.0000")
+    assert fetched.detail == note
+
+    healed = resolver.resolve(BTC, lambda: _rules("0.0009"))
+    assert healed.source == FEE_SOURCE_CACHE
+    assert healed.bps == Decimal("7.0000")
+    assert healed.detail is None
+
+
+def test_corrupt_fee_cache_note_survives_fetch_failure(tmp_path: Path) -> None:
+    cache = tmp_path / "fee.json"
+    cache.write_text("{not json", encoding="utf-8")
+    resolver = TakerFeeResolver(
+        cache, fallback_bps=Decimal("5"), cache_seconds=3600,
+    )
+
+    def failing() -> tuple[SymbolRule, ...]:
+        raise RuntimeError("offline")
+
+    quote = resolver.resolve(BTC, failing)
+
+    assert quote.source == FEE_SOURCE_FALLBACK
+    assert quote.detail == (
+        "拉取失败 RuntimeError: offline；缓存不可读 JSONDecodeError"
+    )

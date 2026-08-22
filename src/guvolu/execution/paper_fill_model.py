@@ -12,7 +12,7 @@ import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Protocol
 
@@ -146,6 +146,11 @@ class FeeQuote:
     detail: str | None = None
 
 
+def _join_detail(primary: str, note: str | None) -> str:
+    """拼接降级原因与缓存说明。"""
+    return primary if note is None else f"{primary}；{note}"
+
+
 class TakerFeeResolver:
     """运行时读取 GET /v1/symbols 的 takerFee，带缓存与降级。
 
@@ -169,24 +174,31 @@ class TakerFeeResolver:
         symbol: SpotSymbol,
         fetch: Callable[[], Sequence[SymbolRule]],
     ) -> FeeQuote:
-        """取费率：缓存命中优先，其次拉取，最后降级。"""
-        cached = self._read_cache(symbol)
+        """取费率：缓存命中优先，其次拉取，最后降级。
+
+        缓存损坏按未命中处理，原因随 detail 带出；拉取失败的
+        detail 记录异常类型名与文本，不静默吞掉。
+        """
+        cached, cache_note = self._read_cache(symbol)
         if cached is not None:
             return cached
         try:
             rules = fetch()
         except Exception as exc:  # noqa: BLE001
-            return self._fallback(f"拉取失败: {exc}")
+            return self._fallback(_join_detail(
+                f"拉取失败 {type(exc).__name__}: {exc}", cache_note,
+            ))
         for rule in rules:
             if rule.symbol == str(symbol):
                 quote = FeeQuote(
                     bps=rule.taker_fee * BPS,
                     source=FEE_SOURCE_SYMBOLS,
                     fetched_at=datetime.now(UTC),
+                    detail=cache_note,
                 )
                 self._write_cache(symbol, quote)
                 return quote
-        return self._fallback("品种缺失")
+        return self._fallback(_join_detail("品种缺失", cache_note))
 
     def _fallback(self, detail: str) -> FeeQuote:
         """退回配置费率并保留降级原因，不静默伪造。"""
@@ -197,31 +209,38 @@ class TakerFeeResolver:
             detail=detail,
         )
 
-    def _read_cache(self, symbol: SpotSymbol) -> FeeQuote | None:
+    def _read_cache(
+        self, symbol: SpotSymbol
+    ) -> tuple[FeeQuote | None, str | None]:
+        """读缓存；第二项为损坏原因，正常未命中为空。"""
         if not self._cache_path.is_file():
-            return None
+            return None, None
         try:
             payload: object = json.loads(
                 self._cache_path.read_text(encoding="utf-8")
             )
-        except (OSError, json.JSONDecodeError):
-            return None
+        except (OSError, json.JSONDecodeError) as exc:
+            return None, f"缓存不可读 {type(exc).__name__}"
         if not isinstance(payload, dict):
-            return None
+            return None, "缓存根非对象"
         entry = payload.get(str(symbol))
+        if entry is None:
+            return None, None
         if not isinstance(entry, dict):
-            return None
-        fetched_raw = entry.get("fetched_at")
-        bps_raw = entry.get("taker_fee_bps")
-        if not isinstance(fetched_raw, str) or not isinstance(bps_raw, str):
-            return None
-        fetched_at = datetime.fromisoformat(fetched_raw)
+            return None, "缓存项非对象"
+        try:
+            fetched_at = datetime.fromisoformat(entry["fetched_at"])
+            bps = Decimal(entry["taker_fee_bps"])
+        except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
+            return None, f"缓存项损坏 {type(exc).__name__}"
+        if fetched_at.tzinfo is None or not bps.is_finite() or bps < 0:
+            return None, "缓存项字段非法"
         age = (datetime.now(UTC) - fetched_at).total_seconds()
         if age < 0 or age > self._cache_seconds:
-            return None
+            return None, None
         return FeeQuote(
-            bps=Decimal(bps_raw), source=FEE_SOURCE_CACHE, fetched_at=fetched_at,
-        )
+            bps=bps, source=FEE_SOURCE_CACHE, fetched_at=fetched_at,
+        ), None
 
     def _write_cache(self, symbol: SpotSymbol, quote: FeeQuote) -> None:
         payload: dict[str, object] = {}
