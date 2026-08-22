@@ -8,7 +8,7 @@ import pytest
 
 from guvolu.domain.config import Limits
 from guvolu.risk.errors import LimitAdjustmentRejected, LimitExceeded
-from guvolu.risk.limits import LimitGate, trading_day
+from guvolu.risk.limits import DayUsage, LimitGate, trading_day
 
 LIMITS = Limits(
     order_jpy_max=Decimal("500"),
@@ -131,3 +131,32 @@ def test_naive_moment_rejected() -> None:
     gate = LimitGate(LIMITS)
     with pytest.raises(ValueError, match="时区"):
         gate.commit(Decimal("1"), datetime(2026, 8, 16, 0, 0))
+
+
+def test_seed_usage_accumulates_and_gates_subsequent_commits() -> None:
+    """重放预置的用量与后续过闸累计，超限照常拒绝（T-11）。"""
+    gate = LimitGate(LIMITS)
+    day = trading_day(T0)
+    gate.seed_usage(day, Decimal("1500"), 48)
+    gate.seed_usage(day, Decimal("300"), 1)
+    usage = gate.usage()
+    assert usage.day == day
+    assert usage.total_jpy == Decimal("1800")
+    assert usage.order_count == 49
+    with pytest.raises(LimitExceeded, match="当日累计"):
+        gate.commit(Decimal("201"), T0)
+    gate.commit(Decimal("100"), T0)
+    with pytest.raises(LimitExceeded, match="当日笔数"):
+        gate.commit(Decimal("1"), T0)
+
+
+def test_seed_usage_other_day_replaces_and_negative_rejected() -> None:
+    """预置到另一交易日即替换当日累计；负值拒绝。"""
+    gate = LimitGate(LIMITS)
+    gate.seed_usage(date(2026, 8, 15), Decimal("1000"), 10)
+    gate.seed_usage(date(2026, 8, 16), Decimal("1"), 1)
+    assert gate.usage() == DayUsage(date(2026, 8, 16), Decimal("1"), 1)
+    with pytest.raises(ValueError, match="不得为负"):
+        gate.seed_usage(date(2026, 8, 16), Decimal("-1"), 0)
+    with pytest.raises(ValueError, match="不得为负"):
+        gate.seed_usage(date(2026, 8, 16), Decimal("0"), -1)

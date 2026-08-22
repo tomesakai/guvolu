@@ -78,6 +78,24 @@ class LimitGate:
             raise LimitAdjustmentRejected("限额只可调低，不可调高")
         self._limits = new_limits
 
+    def seed_usage(
+        self, day: date, total_jpy: Decimal, order_count: int
+    ) -> None:
+        """以账本重放的历史用量预置当日累计，只增不减。
+
+        跨进程单发时闸门只在内存，调用方按交易日重放已过闸的
+        名义与笔数后在此预置；同日多次预置累加，不做限额校验，
+        超限由随后的 check 按既有口径拒绝（T-11）。
+        """
+        if total_jpy < 0 or order_count < 0:
+            raise ValueError("预置用量不得为负")
+        if self._day != day:
+            self._day = day
+            self._total_jpy = Decimal("0")
+            self._order_count = 0
+        self._total_jpy += total_jpy
+        self._order_count += order_count
+
     def _roll_day(self, moment: datetime) -> None:
         """跨交易日清零累计。"""
         day = trading_day(moment)
