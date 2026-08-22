@@ -295,6 +295,14 @@ class IntentLedger:
         """按落盘顺序列出全部意图。"""
         return tuple(self._entries)
 
+    def intent_ids_for_prediction(self, prediction_id: str) -> tuple[str, ...]:
+        """按血缘 prediction_id 列出意图，供同预测去重（X-08）。"""
+        return tuple(
+            intent_id
+            for intent_id, entry in self._entries.items()
+            if entry.intent.prediction_id == prediction_id
+        )
+
     def in_flight(
         self, symbol: SpotSymbol | None = None
     ) -> tuple[str, ...]:

@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -290,3 +291,101 @@ def test_default_location_under_data_root(
     monkeypatch.setenv("GUVOLU_DATA_ROOT", str(tmp_path))
     ledger = IntentLedger.at_default_location()
     assert ledger.path == tmp_path / "execution" / "intent_ledger.jsonl"
+
+
+def test_v1_rows_without_lineage_are_read_compatibly(tmp_path: Path) -> None:
+    """第 1 版意图行无血缘字段，按空值兼容读取（D-06）。"""
+    path = tmp_path / "intent_ledger.jsonl"
+    rows = [
+        {
+            "schema_version": 1, "record": "intent",
+            "at": CREATED_AT.isoformat(), "intent_id": "v1-01",
+            "correlation_id": "co-v1", "symbol": "BTC", "side": "BUY",
+            "execution_type": "LIMIT", "size": "0.0001",
+            "price": "1000000", "time_in_force": None,
+            "created_at": CREATED_AT.isoformat(),
+        },
+        {
+            "schema_version": 1, "record": "transition",
+            "at": CREATED_AT.isoformat(), "intent_id": "v1-01",
+            "source": "RECORDED", "target": "SENDING",
+            "order_id": None, "reason": None, "evidence": None,
+        },
+        {
+            "schema_version": 1, "record": "transition",
+            "at": CREATED_AT.isoformat(), "intent_id": "v1-01",
+            "source": "SENDING", "target": "DRY_RUN_BLOCKED",
+            "order_id": None, "reason": "模拟拦截", "evidence": None,
+        },
+    ]
+    path.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8",
+    )
+
+    ledger = IntentLedger(path)
+
+    intent = ledger.intent("v1-01")
+    assert intent.prediction_id is None
+    assert intent.decision_time is None
+    assert intent.correlation_id == "co-v1"
+    assert ledger.state("v1-01") is IntentState.DRY_RUN_BLOCKED
+    assert ledger.intent_ids_for_prediction("anything") == ()
+
+
+def test_paper_fill_and_reject_are_local_terminal_paths(tmp_path: Path) -> None:
+    """paper 结算与拒绝只能自 SENDING 进入，证据与理由落盘（T-04）。"""
+    ledger = open_ledger(tmp_path)
+    filled = make_intent("pf01")
+    ledger.record_intent(filled)
+    with pytest.raises(IntentTransitionError):
+        ledger.paper_fill("pf01", reason="早", evidence={"fill_basis": "x"})
+    ledger.begin_send("pf01")
+    ledger.paper_fill(
+        "pf01", reason="结算", evidence={"fill_basis": "public_orderbook"},
+    )
+    assert ledger.state("pf01") is IntentState.PAPER_FILLED
+    assert ledger.in_flight(SpotSymbol("BTC")) == ()
+
+    rejected = make_intent("pr01")
+    ledger.record_intent(rejected)
+    ledger.begin_send("pr01")
+    ledger.paper_reject("pr01", reason="深度不足")
+    assert ledger.state("pr01") is IntentState.PAPER_REJECTED
+    with pytest.raises(IntentTransitionError):
+        ledger.paper_reject("pr01", reason="重复")
+
+    reopened = IntentLedger(ledger.path)
+    assert reopened.state("pf01") is IntentState.PAPER_FILLED
+    assert reopened.state("pr01") is IntentState.PAPER_REJECTED
+    rows = [
+        json.loads(line)
+        for line in ledger.path.read_text(encoding="utf-8").splitlines()
+    ]
+    fill_row = next(row for row in rows if row.get("target") == "PAPER_FILLED")
+    assert fill_row["evidence"] == {"fill_basis": "public_orderbook"}
+    reject_row = next(
+        row for row in rows if row.get("target") == "PAPER_REJECTED"
+    )
+    assert reject_row["reason"] == "深度不足"
+
+
+def test_intent_ids_for_prediction_filters_by_lineage(tmp_path: Path) -> None:
+    ledger = open_ledger(tmp_path)
+    ledger.record_intent(make_intent("a"))
+    ledger.record_intent(make_intent("b", symbol="ETH"))
+    ledger.record_intent(OrderIntent(
+        intent_id="c",
+        correlation_id="co0002",
+        symbol=SpotSymbol("BTC"),
+        side=Side.BUY,
+        execution_type=ExecutionType.LIMIT,
+        size=Decimal("0.0001"),
+        price=Decimal("1000000"),
+        time_in_force=None,
+        created_at=CREATED_AT,
+        prediction_id="pred-1",
+        decision_time=CREATED_AT,
+    ))
+    assert ledger.intent_ids_for_prediction("pred-1") == ("c",)
+    assert ledger.intent_ids_for_prediction("pred-2") == ()
+    assert IntentLedger(ledger.path).intent_ids_for_prediction("pred-1") == ("c",)
