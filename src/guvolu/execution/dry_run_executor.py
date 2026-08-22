@@ -27,7 +27,7 @@ from guvolu.data.intent_ledger import LEDGER_RELATIVE_PATH, IntentLedger
 from guvolu.data.paths import data_root
 from guvolu.domain.config import Config, load_config
 from guvolu.domain.enums import ExecutionType, RunMode, ServiceStatus
-from guvolu.domain.errors import GuvoluError
+from guvolu.domain.errors import DryRunBlocked, GuvoluError
 from guvolu.domain.ids import new_correlation_id, new_intent_id
 from guvolu.domain.intent import IntentState, OrderIntent
 from guvolu.domain.models import SymbolRule
@@ -37,7 +37,11 @@ from guvolu.execution.conversion import (
     OrderProposal,
     convert_target_to_order,
 )
-from guvolu.execution.dispatch import DispatchResult, dispatch_order_intent
+from guvolu.execution.dispatch import (
+    DispatchResult,
+    OrderSender,
+    dispatch_order_intent,
+)
 from guvolu.execution.reconcile import (
     ReconcileAmbiguity,
     resolve_send_timeout,
@@ -63,6 +67,14 @@ EXPECTED_END_STATES = frozenset(
 
 class ExecutorError(GuvoluError):
     """执行器输入非法或制品契约不符。"""
+
+
+class _DryRunSender:
+    """无私钥的模拟发送边界；绝不构造私有客户端。"""
+
+    def send(self, intent: OrderIntent) -> int:
+        del intent
+        raise DryRunBlocked("dry-run 模式禁止私有写请求")
 
 
 @dataclass(frozen=True, slots=True)
@@ -206,7 +218,7 @@ def execute_plan(
     breaker: CircuitBreaker,
     service_status: ServiceStatus,
     whitelist: frozenset[SpotSymbol],
-    sender: TradeClientSender,
+    sender: OrderSender,
     moment: datetime | None = None,
 ) -> tuple[OrderIntent, DispatchResult] | None:
     """把计划落为意图并经发送编排执行，账本留痕全程。
@@ -311,7 +323,9 @@ def _emit_report(report: Mapping[str, object], destination: str) -> None:
     if destination == "-":
         print(text)
     else:
-        Path(destination).write_text(text + "\n", encoding="utf-8")
+        path = Path(destination)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text + "\n", encoding="utf-8")
 
 
 def _decimal_argument(raw: str, name: str) -> Decimal:
@@ -461,7 +475,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     breaker_config: Path = args.breaker_config
     breaker = CircuitBreaker(load_breaker_thresholds(breaker_config))
     limit_gate = LimitGate(config.limits)
-    sender = TradeClientSender(TradeClient.from_config(config))
+    sender: OrderSender
+    if config.mode is RunMode.DRY_RUN:
+        sender = _DryRunSender()
+    else:
+        sender = TradeClientSender(TradeClient.from_config(config))
     outcome = execute_plan(
         plan,
         ledger=ledger,

@@ -261,14 +261,14 @@ def test_cli_dry_run_offline(
 ) -> None:
     """命令行离线彩排：预期终点返回零，报告与账本齐备。"""
     forbid_network(monkeypatch)
-    monkeypatch.setenv("GMO_COIN_TRADE_API_KEY", "dummy-key")
-    monkeypatch.setenv("GMO_COIN_TRADE_API_SECRET", "dummy-secret")
+    monkeypatch.delenv("GMO_COIN_TRADE_API_KEY", raising=False)
+    monkeypatch.delenv("GMO_COIN_TRADE_API_SECRET", raising=False)
     monkeypatch.delenv("GUVOLU_MODE", raising=False)
     monkeypatch.setenv("GUVOLU_LOG_DIR", str(tmp_path / "logs"))
     target = write_artifact(tmp_path, 0.6)
     rules = write_rules(tmp_path)
     ledger_path = tmp_path / "intent_ledger.jsonl"
-    report_path = tmp_path / "report.json"
+    report_path = tmp_path / "reports" / "report.json"
     code = main(
         [
             "--target", str(target),
