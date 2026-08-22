@@ -1848,7 +1848,10 @@ def _upgrade_governance_state(
         if owns_transaction:
             connection.execute("BEGIN IMMEDIATE")
         try:
-            if policy_column_missing:
+            # 获写锁后复查，避免并发重复加列
+            if policy_column_missing and not _has_missing_policy_column(
+                connection,
+            ):
                 # v8 只增列，旧行缺省 burn
                 connection.execute(
                     "ALTER TABLE frozen_forward_plan ADD COLUMN "
@@ -1907,6 +1910,13 @@ def _upgrade_governance_state(
                 )
             if owns_transaction:
                 connection.execute("COMMIT")
+        except sqlite3.OperationalError as error:
+            if owns_transaction and connection.in_transaction:
+                connection.execute("ROLLBACK")
+            # 含重复加列等 sqlite 操作失败
+            raise ValueError(
+                "研究治理注册表升级失败: " + str(error)
+            ) from error
         except BaseException:
             if owns_transaction and connection.in_transaction:
                 connection.execute("ROLLBACK")
