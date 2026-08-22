@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -11,24 +12,29 @@ import pytest
 
 from guvolu.data.intent_ledger import IntentLedger
 from guvolu.domain.config import Limits
-from guvolu.domain.enums import ServiceStatus, Side
-from guvolu.domain.intent import IntentState
+from guvolu.domain.enums import ExecutionType, ServiceStatus, Side
+from guvolu.domain.intent import IntentState, OrderIntent
 from guvolu.domain.models import SymbolRule
 from guvolu.domain.symbols import SpotSymbol
 from guvolu.execution.conversion import MarketRule
 from guvolu.execution.frozen_target_adapter import persist_operational_target
 from guvolu.execution.paper_executor import (
+    CLAIM_LEDGER_NAME,
     DIFFERENCE_LEDGER_NAME,
     INTENT_LEDGER_NAME,
+    NEEDS_RECONCILIATION,
     POSITION_LEDGER_NAME,
+    DifferenceLedger,
     PaperExecutorError,
     PaperPositionLedger,
     PaperRuntime,
+    PredictionClaims,
     StaticBookSource,
     evaluate_overlay,
     load_execution_target,
     main,
     read_difference_rows,
+    replay_limit_usage,
     run_paper_decision,
 )
 from guvolu.execution.paper_fill_model import (
@@ -43,6 +49,7 @@ from guvolu.execution.paper_ledger_summary import main as summarize_main
 from guvolu.execution.paper_ledger_summary import summarize_ledger
 from guvolu.execution.paper_config import load_paper_config
 from guvolu.risk.circuit_breaker import BreakerThresholds, CircuitBreaker
+from guvolu.risk.errors import LimitExceeded
 from guvolu.risk.limits import LimitGate
 
 MARKET = "mkt__gmo__btc__r0"
@@ -567,3 +574,269 @@ def test_cli_end_to_end_offline_and_summary(tmp_path: Path) -> None:
     assert summarize_main([
         "--config", str(config_path), "--ledger-root", str(root),
     ]) == 0
+
+
+def crash_append(self: DifferenceLedger, row: Mapping[str, object]) -> None:
+    """模拟差异行写入前进程中断。"""
+    raise RuntimeError("模拟进程中断")
+
+
+def seeded_intent(
+    intent_id: str, *, prediction_id: str, created_at: datetime = MOMENT,
+) -> OrderIntent:
+    return OrderIntent(
+        intent_id=intent_id,
+        correlation_id="co-seed",
+        symbol=BTC,
+        side=Side.BUY,
+        execution_type=ExecutionType.LIMIT,
+        size=Decimal("0.0001"),
+        price=Decimal("1000000"),
+        time_in_force=None,
+        created_at=created_at,
+        prediction_id=prediction_id,
+        decision_time=DECISION,
+    )
+
+
+def cli_args(
+    tmp_path: Path, target: Path, *, report: str, env_file: Path | None = None,
+) -> list[str]:
+    config_path = write_config(tmp_path)
+    rules_path = tmp_path / "rules.json"
+    rules_path.write_text(json.dumps(RULE_ROWS), encoding="utf-8")
+    book_path = tmp_path / "book.json"
+    book_path.write_text(json.dumps({"data": BOOK_PAYLOAD}), encoding="utf-8")
+    env = env_file if env_file is not None else tmp_path / "absent.env"
+    return [
+        "--target", str(target),
+        "--config", str(config_path),
+        "--rules", str(rules_path),
+        "--book", str(book_path),
+        "--service-status", "OPEN",
+        "--ledger-root", str(tmp_path / "root"),
+        "--env-file", str(env),
+        "--now", MOMENT.isoformat(),
+        "--report", str(tmp_path / report),
+    ]
+
+
+def test_interrupt_after_settlement_before_difference_row_is_not_replayed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """意图账与持仓账已落盘、差异行未写即中断，重跑不生成第二笔意图。"""
+    runtime = build_runtime(tmp_path)
+    target = load_execution_target(write_target(tmp_path, target=1.0))
+    original = DifferenceLedger.append
+    monkeypatch.setattr(DifferenceLedger, "append", crash_append)
+    with pytest.raises(RuntimeError, match="中断"):
+        run_paper_decision(target, runtime, moment=MOMENT)
+    monkeypatch.setattr(DifferenceLedger, "append", original)
+
+    intent_path = runtime.ledger_directory / INTENT_LEDGER_NAME
+    first_ids = IntentLedger(intent_path).intent_ids()
+    assert len(first_ids) == 1
+    assert not (runtime.ledger_directory / DIFFERENCE_LEDGER_NAME).exists()
+    claims = PredictionClaims(runtime.ledger_directory / CLAIM_LEDGER_NAME)
+    assert claims.has_claim("prediction-one")
+
+    again = run_paper_decision(target, runtime, moment=MOMENT)
+
+    assert again.status == NEEDS_RECONCILIATION
+    assert again.intent is None and again.dispatch is None
+    assert again.reconciliation is not None
+    assert again.reconciliation["intents"] == [
+        {"intent_id": first_ids[0], "state": "PAPER_FILLED"},
+    ]
+    assert again.reconciliation["claim"] is not None
+    assert IntentLedger(intent_path).intent_ids() == first_ids
+    assert len(ledger_rows(claims.path)) == 1
+    assert not (runtime.ledger_directory / DIFFERENCE_LEDGER_NAME).exists()
+    assert again.position_before == Decimal("0.0005")
+    assert again.position_after == Decimal("0.0005")
+    with pytest.raises(PaperExecutorError, match="已认领"):
+        claims.claim(
+            prediction_id="prediction-one", correlation_id="x", at=MOMENT,
+        )
+
+
+def test_interrupt_after_claim_before_intent_reports_reconciliation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """认领已落盘、意图未落盘即中断，重跑同样拒绝自动生成。"""
+    runtime = build_runtime(tmp_path)
+    target = load_execution_target(write_target(tmp_path, target=1.0))
+
+    def crash_dispatch(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("模拟进程中断")
+
+    monkeypatch.setattr(
+        "guvolu.execution.paper_executor.dispatch_order_intent", crash_dispatch,
+    )
+    with pytest.raises(RuntimeError, match="中断"):
+        run_paper_decision(target, runtime, moment=MOMENT)
+    monkeypatch.undo()
+
+    again = run_paper_decision(target, runtime, moment=MOMENT)
+
+    assert again.status == NEEDS_RECONCILIATION
+    assert again.reconciliation is not None
+    assert again.reconciliation["intents"] == []
+    assert again.reconciliation["claim"]["prediction_id"] == "prediction-one"
+    assert not (runtime.ledger_directory / INTENT_LEDGER_NAME).exists()
+
+
+def test_cli_needs_reconciliation_returns_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = write_target(tmp_path, target=1.0)
+    original = DifferenceLedger.append
+    monkeypatch.setattr(DifferenceLedger, "append", crash_append)
+    with pytest.raises(RuntimeError, match="中断"):
+        main(cli_args(tmp_path, target, report="crash.json"))
+    monkeypatch.setattr(DifferenceLedger, "append", original)
+
+    code = main(cli_args(tmp_path, target, report="again.json"))
+    report = json.loads((tmp_path / "again.json").read_text(encoding="utf-8"))
+
+    assert code == 1
+    assert report["status"] == NEEDS_RECONCILIATION
+    assert report["reconciliation"]["intents"][0]["state"] == "PAPER_FILLED"
+    assert report["endpoints"]["write_touched"] == []
+    assert Path(report["ledger_paths"]["claim_ledger"]).exists()
+
+
+def test_cli_startup_recovers_interrupted_sending_and_reports(
+    tmp_path: Path,
+) -> None:
+    """上次遗留 SENDING 在启动时结清为 PAPER_REJECTED 并列入报告。"""
+    ledger_path = tmp_path / "root" / "execution" / "paper" / INTENT_LEDGER_NAME
+    ledger_path.parent.mkdir(parents=True)
+    seeded = IntentLedger(ledger_path)
+    seeded.record_intent(
+        seeded_intent("it-stale", prediction_id="prediction-zero"), at=MOMENT,
+    )
+    seeded.begin_send("it-stale", at=MOMENT)
+    target = write_target(tmp_path, target=1.0)
+
+    code = main(cli_args(tmp_path, target, report="report.json"))
+    report = json.loads((tmp_path / "report.json").read_text(encoding="utf-8"))
+
+    assert code == 0
+    assert report["status"] == "PAPER_FILLED"
+    assert report["startup"]["recovered_sends"]["intent_ids"] == ["it-stale"]
+    assert report["startup"]["recovered_sends"]["state"] == "PAPER_REJECTED"
+    assert report["startup"]["limit_usage"]["order_count"] == 1
+    assert report["startup"]["limit_usage"]["replayed_intents"] == ["it-stale"]
+    reopened = IntentLedger(ledger_path)
+    assert reopened.state("it-stale") is IntentState.PAPER_REJECTED
+    assert reopened.in_flight(BTC) == ()
+    assert len(reopened.intent_ids()) == 2
+
+    stale_target = write_target(
+        tmp_path, target=1.0, prediction_id="prediction-zero",
+    )
+    again = main(cli_args(tmp_path, stale_target, report="stale.json"))
+    stale_report = json.loads((tmp_path / "stale.json").read_text(encoding="utf-8"))
+    assert again == 1
+    assert stale_report["status"] == NEEDS_RECONCILIATION
+    assert stale_report["reconciliation"]["claim"] is None
+    assert stale_report["reconciliation"]["intents"] == [
+        {"intent_id": "it-stale", "state": "PAPER_REJECTED"},
+    ]
+
+
+def test_replay_limit_usage_counts_only_gated_intents_of_the_day(
+    tmp_path: Path,
+) -> None:
+    ledger = IntentLedger(tmp_path / INTENT_LEDGER_NAME)
+    ledger.record_intent(seeded_intent("a", prediction_id="pa"), at=MOMENT)
+    ledger.begin_send("a", at=MOMENT)
+    ledger.paper_fill("a", reason="结算", evidence={"fill_basis": "x"}, at=MOMENT)
+    ledger.record_intent(seeded_intent("b", prediction_id="pb"), at=MOMENT)
+    ledger.begin_send("b", at=MOMENT)
+    ledger.paper_reject("b", reason="深度不足", at=MOMENT)
+    ledger.record_intent(seeded_intent("c", prediction_id="pc"), at=MOMENT)
+    ledger.gate_reject("c", reason="维护", at=MOMENT)
+    earlier = MOMENT - timedelta(days=2)
+    ledger.record_intent(
+        seeded_intent("d", prediction_id="pd", created_at=earlier), at=earlier,
+    )
+    ledger.begin_send("d", at=earlier)
+    ledger.paper_fill("d", reason="结算", evidence={"fill_basis": "x"}, at=earlier)
+    gate = LimitGate(Limits(
+        order_jpy_max=Decimal("500"),
+        day_jpy_max=Decimal("300"),
+        day_count_max=3,
+    ))
+
+    usage = replay_limit_usage(gate, ledger, moment=MOMENT)
+
+    assert usage["replayed_intents"] == ["a", "b"]
+    assert usage["order_count"] == 2
+    assert Decimal(str(usage["total_jpy"])) == Decimal("200")
+    assert gate.usage().order_count == 2
+    with pytest.raises(LimitExceeded, match="当日累计"):
+        gate.commit(Decimal("101"), MOMENT)
+    gate.commit(Decimal("50"), MOMENT)
+    with pytest.raises(LimitExceeded, match="当日笔数"):
+        gate.commit(Decimal("1"), MOMENT)
+
+
+@pytest.mark.parametrize(
+    ("env_line", "match"),
+    [
+        ("GUVOLU_DAY_COUNT_MAX=1", "当日笔数"),
+        ("GUVOLU_DAY_JPY_MAX=600", "当日累计"),
+    ],
+)
+def test_cli_day_limits_accumulate_across_invocations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env_line: str, match: str,
+) -> None:
+    """逐小时单发命令行，当日限额用量跨进程累计（T-11）。"""
+    for name in ("GUVOLU_DAY_COUNT_MAX", "GUVOLU_DAY_JPY_MAX"):
+        monkeypatch.delenv(name, raising=False)
+    env_file = tmp_path / "limits.env"
+    env_file.write_text(env_line + "\n", encoding="utf-8")
+
+    first = main(cli_args(
+        tmp_path, write_target(tmp_path, target=1.0),
+        report="first.json", env_file=env_file,
+    ))
+    first_report = json.loads((tmp_path / "first.json").read_text(encoding="utf-8"))
+    assert first == 0
+    assert first_report["status"] == "PAPER_FILLED"
+    assert first_report["startup"]["limit_usage"]["order_count"] == 0
+
+    second = main(cli_args(
+        tmp_path,
+        write_target(tmp_path, target=0.5, prediction_id="prediction-two"),
+        report="second.json", env_file=env_file,
+    ))
+    second_report = json.loads(
+        (tmp_path / "second.json").read_text(encoding="utf-8")
+    )
+
+    assert second == 1
+    assert second_report["status"] == "GATE_REJECTED"
+    assert match in second_report["intent"]["reason"]
+    usage = second_report["startup"]["limit_usage"]
+    assert usage["order_count"] == 1
+    assert Decimal(usage["total_jpy"]) == Decimal("500")
+    assert usage["replayed_intents"] == [first_report["intent"]["intent_id"]]
+    assert second_report["endpoints"]["write_touched"] == []
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), "0.5", True])
+def test_target_loader_rejects_non_finite_and_non_numeric_exposure(
+    tmp_path: Path, bad: object,
+) -> None:
+    path = write_target(tmp_path, target=0.5)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    broken = tmp_path / "broken.json"
+    broken.write_text(
+        json.dumps({**payload, "exposure_target": bad}), encoding="utf-8",
+    )
+
+    with pytest.raises(PaperExecutorError, match="exposure_target"):
+        load_execution_target(broken)

@@ -66,21 +66,28 @@ from guvolu.risk.circuit_breaker import (
     CircuitBreaker,
     load_breaker_thresholds,
 )
-from guvolu.risk.limits import LimitGate
+from guvolu.risk.limits import LimitGate, trading_day
 from guvolu.risk.service_gate import allows_new_intent
 
 # 执行目标快照的最低可消费版本
 MIN_TARGET_SCHEMA_VERSION = 2
 # 执行器只消费 paper 模式目标
 PAPER_MODE = "paper"
-# 差异账与持仓账的版本
+# 差异账、持仓账与认领账的版本
 DIFFERENCE_LEDGER_SCHEMA_VERSION = 1
 POSITION_LEDGER_SCHEMA_VERSION = 1
+CLAIM_LEDGER_SCHEMA_VERSION = 1
 # 账目目录下的文件名
 INTENT_LEDGER_NAME = "intent_ledger.jsonl"
 POSITION_LEDGER_NAME = "positions.jsonl"
 DIFFERENCE_LEDGER_NAME = "difference_ledger.jsonl"
+CLAIM_LEDGER_NAME = "prediction_claims.jsonl"
 FEE_CACHE_NAME = "taker_fee_cache.json"
+# 不生成意图的决策状态
+DUPLICATE_PREDICTION = "duplicate_prediction"
+NEEDS_RECONCILIATION = "needs_reconciliation"
+# 启动恢复结清遗留发送的理由
+PAPER_RECOVERY_REASON = "进程恢复，paper 发送中断，未触达写端点"
 # 覆盖层门控输入不可得时的标注
 GATE_UNAVAILABLE = "unavailable"
 GATE_EVALUATED = "evaluated"
@@ -381,6 +388,80 @@ class DifferenceLedger:
                 self._prediction_ids.add(prediction_id)
 
 
+class PredictionClaims:
+    """预测认领账：发送前先认领，重跑据此拒绝重复意图。
+
+    追加式 JSONL，认领行先于意图账本与持仓账落盘。进程在认领
+    与差异行之间中断时，重跑发现认领无差异行即报告待对账，
+    不自动新增意图；认领行只增不改，同一预测至多一行。
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._claims: dict[str, dict[str, object]] = {}
+        self._load()
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    def claim_of(self, prediction_id: str) -> Mapping[str, object] | None:
+        """取预测的认领行；未认领返回空。"""
+        return self._claims.get(prediction_id)
+
+    def has_claim(self, prediction_id: str) -> bool:
+        """预测是否已认领。"""
+        return prediction_id in self._claims
+
+    def claim(
+        self, *, prediction_id: str, correlation_id: str, at: datetime
+    ) -> Mapping[str, object]:
+        """为预测追加一行认领并 fsync；已认领即拒绝。"""
+        if not prediction_id:
+            raise PaperExecutorError("认领缺少 prediction_id")
+        if prediction_id in self._claims:
+            raise PaperExecutorError(f"预测 {prediction_id} 已认领")
+        record: dict[str, object] = {
+            "schema_version": CLAIM_LEDGER_SCHEMA_VERSION,
+            "record": "claim",
+            "prediction_id": prediction_id,
+            "correlation_id": correlation_id,
+            "claimed_at": at.isoformat(),
+        }
+        _append_json_line(self._path, record)
+        self._claims[prediction_id] = record
+        return record
+
+    def _load(self) -> None:
+        if not self._path.exists():
+            return
+        for number, line in enumerate(
+            self._path.read_text(encoding="utf-8").splitlines(), 1
+        ):
+            if not line.strip():
+                continue
+            try:
+                parsed: object = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise PaperExecutorError(
+                    f"认领账第 {number} 行不是合法 JSON"
+                ) from exc
+            if not isinstance(parsed, dict) or parsed.get("record") != "claim":
+                raise PaperExecutorError(f"认领账第 {number} 行不是认领行")
+            prediction_id = parsed.get("prediction_id")
+            if not isinstance(prediction_id, str) or not prediction_id:
+                raise PaperExecutorError(
+                    f"认领账第 {number} 行缺少 prediction_id"
+                )
+            if prediction_id in self._claims:
+                raise PaperExecutorError(
+                    f"认领账第 {number} 行重复认领 {prediction_id}"
+                )
+            self._claims[prediction_id] = {
+                str(key): value for key, value in parsed.items()
+            }
+
+
 def read_difference_rows(path: Path) -> list[dict[str, object]]:
     """读取差异账全部行；文件缺失视为空账。"""
     if not path.exists():
@@ -618,6 +699,7 @@ class PaperDecisionOutcome:
     read_touched: tuple[str, ...]
     write_touched: tuple[str, ...]
     difference_row: Mapping[str, object] = field(default_factory=dict)
+    reconciliation: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -648,6 +730,10 @@ class PaperRuntime:
     @property
     def difference_ledger_path(self) -> Path:
         return self.ledger_directory / DIFFERENCE_LEDGER_NAME
+
+    @property
+    def claim_ledger_path(self) -> Path:
+        return self.ledger_directory / CLAIM_LEDGER_NAME
 
 
 def _delta_record(delta: DeltaDecision | None) -> dict[str, object] | None:
@@ -680,21 +766,30 @@ def run_paper_decision(
     """执行一次 paper 决策并在差异账追加一行。
 
     流程：校验目标、同预测去重、取 paper 库存、差分转换、
-    意图携带血缘经闸门链到 paper 发送边界、结算后更新持仓账、
-    记录覆盖层门控与差异行。
+    发送前认领预测、意图携带血缘经闸门链到 paper 发送边界、
+    结算后更新持仓账、记录覆盖层门控与差异行。
+
+    去重判定分两层：差异账已有该预测的决策行即为重复；差异账
+    无行但认领账或意图账本已有该预测，说明上次运行在认领与
+    差异行之间中断，报告待对账并拒绝自动重跑，不新增意图。
     """
     now = moment if moment is not None else datetime.now(UTC)
     config = runtime.config
     validate_execution_target(target, config, now=now)
     runtime.ledger_directory.mkdir(parents=True, exist_ok=True)
     difference = DifferenceLedger(runtime.difference_ledger_path)
+    claims = PredictionClaims(runtime.claim_ledger_path)
+    ledger = IntentLedger(runtime.intent_ledger_path)
     positions = PaperPositionLedger(runtime.position_ledger_path)
     position_before = positions.position_size(target.symbol)
     read_before = len(runtime.read_touched)
-    if difference.has_prediction(target.prediction_id):
+
+    def without_intent(
+        status: str, reconciliation: Mapping[str, object] | None = None
+    ) -> PaperDecisionOutcome:
         return PaperDecisionOutcome(
             target=target,
-            status="duplicate_prediction",
+            status=status,
             reference_price=None,
             position_before=position_before,
             position_after=position_before,
@@ -706,7 +801,26 @@ def run_paper_decision(
             overlay={},
             read_touched=tuple(runtime.read_touched[read_before:]),
             write_touched=(),
+            reconciliation=reconciliation,
         )
+
+    if difference.has_prediction(target.prediction_id):
+        return without_intent(DUPLICATE_PREDICTION)
+    prior_claim = claims.claim_of(target.prediction_id)
+    prior_intents = ledger.intent_ids_for_prediction(target.prediction_id)
+    if prior_claim is not None or prior_intents:
+        return without_intent(NEEDS_RECONCILIATION, {
+            "reason": "预测已认领或已有意图，但差异账无决策行",
+            "claim": None if prior_claim is None else dict(prior_claim),
+            "intents": [
+                {
+                    "intent_id": intent_id,
+                    "state": ledger.state(intent_id).value,
+                }
+                for intent_id in prior_intents
+            ],
+            "claim_ledger": str(runtime.claim_ledger_path),
+        })
     book: BookSnapshot | None
     book_error: str | None = None
     try:
@@ -747,6 +861,7 @@ def run_paper_decision(
             and delta.proposal.size > position_before
         ):
             # 纯多头：卖出不得超过 paper 持仓
+            # 差分转换已保证不可达，纵深防御
             status = "sell_exceeds_position"
         else:
             sender = PaperFillSender(
@@ -767,7 +882,12 @@ def run_paper_decision(
                 prediction_id=target.prediction_id,
                 decision_time=target.decision_time,
             )
-            ledger = IntentLedger(runtime.intent_ledger_path)
+            # 认领先于意图落盘，中断后重跑不重复生成
+            claims.claim(
+                prediction_id=target.prediction_id,
+                correlation_id=target.correlation_id,
+                at=now,
+            )
             dispatch = dispatch_order_intent(
                 intent,
                 ledger=ledger,
@@ -869,8 +989,63 @@ def run_paper_decision(
     )
 
 
+def recover_interrupted_paper_sends(
+    ledger: IntentLedger, *, at: datetime
+) -> tuple[str, ...]:
+    """paper 恢复：遗留 SENDING 结清为 PAPER_REJECTED。
+
+    paper 发送边界不触达任何写端点，SENDING 中断不存在未知的
+    交易所结果，故不转超时态等待查询，而直接以拒绝结清，品种
+    不再被在途占用。只可用于 paper 专用账本（T-04、T-06）。
+    """
+    marked = ledger.interrupted_sends()
+    for intent_id in marked:
+        ledger.paper_reject(intent_id, reason=PAPER_RECOVERY_REASON, at=at)
+    return marked
+
+
+def replay_limit_usage(
+    limit_gate: LimitGate, ledger: IntentLedger, *, moment: datetime
+) -> dict[str, object]:
+    """自意图账本重放当日已过限额闸门的用量（T-11）。
+
+    逐小时单发命令行的闸门只在内存，须按交易日重建累计。
+    口径与内存闸门一致：进入 SENDING 及其后状态的意图在过闸
+    时已计入，paper 拒绝亦不回退，保守计数。
+    """
+    day = trading_day(moment)
+    total_jpy = Decimal("0")
+    order_count = 0
+    replayed: list[str] = []
+    for intent_id in ledger.intent_ids():
+        state = ledger.state(intent_id)
+        if state in {IntentState.RECORDED, IntentState.GATE_REJECTED}:
+            continue
+        intent = ledger.intent(intent_id)
+        if trading_day(intent.created_at) != day:
+            continue
+        if intent.price is None:
+            raise PaperExecutorError(
+                f"paper 意图账本含非限价意图 {intent_id}"
+            )
+        total_jpy += intent.notional_jpy()
+        order_count += 1
+        replayed.append(intent_id)
+    limit_gate.seed_usage(day, total_jpy, order_count)
+    usage = limit_gate.usage()
+    return {
+        "trading_day": day.isoformat(),
+        "total_jpy": format(usage.total_jpy, "f"),
+        "order_count": usage.order_count,
+        "replayed_intents": replayed,
+    }
+
+
 def render_report(
-    outcome: PaperDecisionOutcome, runtime: PaperRuntime
+    outcome: PaperDecisionOutcome,
+    runtime: PaperRuntime,
+    *,
+    startup: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """生成运行报告：目标、差分、成交、成本与触碰端点（A-03）。"""
     report: dict[str, object] = dict(outcome.difference_row)
@@ -879,6 +1054,7 @@ def render_report(
         "intent_ledger": str(runtime.intent_ledger_path),
         "position_ledger": str(runtime.position_ledger_path),
         "difference_ledger": str(runtime.difference_ledger_path),
+        "claim_ledger": str(runtime.claim_ledger_path),
     }
     if not outcome.difference_row:
         report.update({
@@ -890,6 +1066,10 @@ def render_report(
                 "write_touched": list(outcome.write_touched),
             },
         })
+    if outcome.reconciliation is not None:
+        report["reconciliation"] = dict(outcome.reconciliation)
+    if startup is not None:
+        report["startup"] = dict(startup)
     return report
 
 
@@ -1042,6 +1222,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         read_touched.append(STATUS_ENDPOINT)
     breaker_config: Path = args.breaker_config
     anchor_age: int | None = args.anchor_age_seconds
+    # 启动恢复：结清遗留发送，重建当日用量
+    ledger_directory.mkdir(parents=True, exist_ok=True)
+    startup_ledger = IntentLedger(ledger_directory / INTENT_LEDGER_NAME)
+    recovered = recover_interrupted_paper_sends(startup_ledger, at=moment)
+    limit_gate = LimitGate(process_config.limits)
+    usage = replay_limit_usage(limit_gate, startup_ledger, moment=moment)
+    startup: dict[str, object] = {
+        "recovered_sends": {
+            "intent_ids": list(recovered),
+            "state": IntentState.PAPER_REJECTED.value,
+            "reason": PAPER_RECOVERY_REASON,
+        },
+        "limit_usage": usage,
+    }
     runtime = PaperRuntime(
         config=config,
         rule=rule,
@@ -1054,16 +1248,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         fee_fetch=fee_fetch,
         service_status=service_status,
         ledger_directory=ledger_directory,
-        limit_gate=LimitGate(process_config.limits),
+        limit_gate=limit_gate,
         breaker=CircuitBreaker(load_breaker_thresholds(breaker_config)),
         whitelist=process_config.spot_whitelist,
         anchor_age_seconds=anchor_age,
         read_touched=read_touched,
     )
     outcome = run_paper_decision(target, runtime, moment=moment)
-    _emit(render_report(outcome, runtime), str(args.report))
+    _emit(
+        render_report(outcome, runtime, startup=startup), str(args.report)
+    )
     if outcome.write_touched:
         return 2
+    if outcome.status == NEEDS_RECONCILIATION:
+        return 1
     if outcome.dispatch is None:
         return 0
     return 0 if outcome.dispatch.state in EXPECTED_END_STATES else 1
