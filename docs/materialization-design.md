@@ -262,7 +262,11 @@ planned
 `route_activated` 在短写锁窗口内切换逻辑前缀；热副本继续保留作为回滚来源。
 至少一个完整物化、查询和 full audit 周期通过后才能进入 `observed`。释放热副本是
 独立显式阶段，只允许删除已经证明有冷盘等字节副本的可重建 Parquet；raw、archive、
-SQLite、manifest、拒绝证据和 quarantine 不在本阶段删除范围。
+SQLite、manifest、拒绝证据和 quarantine 不在本阶段删除范围。释放后可用
+`restore-hot` 按同一计划由已验证冷副本逐项恢复热 Parquet（临时名独占创建、fsync、
+散列复核后原子替换，幂等），路由状态不变；恢复后 `rollback` 重新可用。研究面板或
+冻结前向仍在读取的逻辑前缀（如历史 `trade-normalization-v1`）不得长期只存冷层：冷盘
+离线即中断研究，须保留或恢复热副本后再释放。
 
 首批只迁静态大制品：OKX 历史 L2 schema v2 和历史
 `trade-normalization-v1`。日元三所实时 L2、实时逐笔、book-state、OFL、质量摘要、
