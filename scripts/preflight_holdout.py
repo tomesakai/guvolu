@@ -198,12 +198,17 @@ def run_preflight(
     )
     missing = sorted(tick for tick in expected if tick not in predicted_times)
     if missing:
-        blockers.append({
+        coverage_gap = {
             "issue": "prediction_coverage_gap",
             "missing_count": len(missing),
             "first_missing": _iso(missing[0]),
             "last_missing": _iso(missing[-1]),
-        })
+        }
+        # 零暴露政策下缺口降为告警
+        if plan.missing_policy == "zero_exposure":
+            warnings.append(coverage_gap)
+        else:
+            blockers.append(coverage_gap)
 
     candidates = payload.get("candidates")
     plan_candidate_ids = {
@@ -244,6 +249,7 @@ def run_preflight(
         "vintage_window": [_iso(vintage.start_time), _iso(vintage.end_time)],
         "vintage_status": vintage.status,
         "plan_id": plan.plan_id,
+        "missing_policy": plan.missing_policy,
         "interval": interval,
         "vintage_started": started,
         "expected_predictions": len(expected),
