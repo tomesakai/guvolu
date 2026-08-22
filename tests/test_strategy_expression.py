@@ -12,6 +12,7 @@ from guvolu.strategy.expression import (
     ExpressionNode,
     Unit,
     candidate_identity,
+    evaluate_expression,
     expression_id,
     strategy_expression,
     strategy_expression_payload,
@@ -20,7 +21,9 @@ from guvolu.strategy.expression import (
 from guvolu.strategy.generation import (
     build_family_batches,
     candidate_registry_payload,
+    candidate_search_plan_payload,
 )
+from guvolu.strategy.search_plan import evaluate_search_plan_candidate
 
 
 FAMILIES = (
@@ -28,6 +31,7 @@ FAMILIES = (
     "flow_trend",
     "grid_shadow",
     "mean_reversion",
+    "price_breakout",
     "trend",
 )
 
@@ -164,9 +168,89 @@ def test_single_family_generation_does_not_require_unrelated_configs() -> None:
     candidate = batches[0].candidates[0]
     assert candidate.expression_id == expression_id(strategy_expression("trend"))
     registry = candidate_registry_payload(batches, "config-hash")
+    assert registry["schema_version"] == 2
     family = registry["families"][0]  # type: ignore[index]
     assert family["expression_id"] == candidate.expression_id  # type: ignore[index]
     assert family["expression"]["family"] == "trend"  # type: ignore[index]
+    assert family["candidate_budget"] == 1  # type: ignore[index]
+    search_plan = registry["search_plan"]
+    assert search_plan["search_plan_id"].startswith("search-plan-")  # type: ignore[index, union-attr]
+    legacy = candidate_registry_payload(
+        batches,
+        "config-hash",
+        "scripted-typed-family-grid-v3",
+    )
+    assert legacy["schema_version"] == 1
+    assert "search_plan" not in legacy
+    legacy_family = legacy["families"][0]  # type: ignore[index]
+    assert "candidate_budget" not in legacy_family
+
+
+def test_price_breakout_generation_is_independent_and_bounded() -> None:
+    """结构消融流派只展开预登记的三个价格回看轴。"""
+    config = {
+        "features": {"lookbacks": [24, 72, 168]},
+        "strategies": {
+            "price_breakout": {
+                "lookbacks": [24, 72, 168],
+                "annual_volatility_target": 0.4,
+                "maximum_target": 1.0,
+            },
+        },
+        "evolution": {"maximum_candidates_per_family": 24},
+    }
+    batch = build_family_batches(config, ("price_breakout",))[0]
+    assert batch.family == "price_breakout"
+    assert tuple(item.parameters["lookback"] for item in batch.candidates) == (
+        24,
+        72,
+        168,
+    )
+    assert len({item.candidate_id for item in batch.candidates}) == 3
+
+
+def test_search_plan_deduplicates_typed_nodes_and_is_topological() -> None:
+    """多流派计划必须共享同型子表达式并保持子节点先于父节点。"""
+    config = _trend_only_config()
+    strategies = config["strategies"]
+    assert isinstance(strategies, dict)
+    strategies["flow_trend"] = {
+        "lookbacks": [24],
+        "entry_scores": [1.0],
+        "flow_confirmations": [0.0],
+        "minimum_volume_score": 0.0,
+        "exit_score": 0.0,
+        "annual_volatility_target": 0.4,
+        "maximum_target": 1.0,
+    }
+    batches = build_family_batches(config, ("flow_trend", "trend"))
+    plan = candidate_search_plan_payload(batches)
+    nodes = plan["nodes"]
+    order = plan["evaluation_order"]
+    assert isinstance(nodes, list)
+    assert isinstance(order, list)
+    trend_nodes = [node for node in nodes if node["op"] == "trend_score"]
+    assert len(trend_nodes) == 1
+    positions = {str(node_id): index for index, node_id in enumerate(order)}
+    for node in nodes:
+        assert isinstance(node, dict)
+        for child_id in node["args"]:
+            assert positions[str(child_id)] < positions[str(node["node_id"])]
+    reversed_plan = candidate_search_plan_payload(tuple(reversed(batches)))
+    assert reversed_plan == plan
+
+
+def test_family_generation_rejects_candidate_budget_overflow() -> None:
+    """参数轴在生成阶段即不得突破预登记候选预算。"""
+    config = _trend_only_config()
+    strategies = config["strategies"]
+    assert isinstance(strategies, dict)
+    trend = strategies["trend"]
+    assert isinstance(trend, dict)
+    trend["entry_scores"] = [0.5, 1.0]
+    config["evolution"] = {"maximum_candidates_per_family": 1}
+    with pytest.raises(ValueError, match="策略家族候选超过预算"):
+        build_family_batches(config, ("trend",))
 
 
 @pytest.mark.parametrize(
@@ -178,6 +262,10 @@ def test_single_family_generation_does_not_require_unrelated_configs() -> None:
             {"trend": 10.0, "price_score": 1.0, "prior_high": 100.0},
         ),
         ("breakout", {"trend": 1.0, "price_score": 1.0, "prior_high": 100.0}),
+        (
+            "price_breakout",
+            {"trend": 1.0, "price_score": 1.0, "prior_high": 100.0},
+        ),
         (
             "mean_reversion",
             {"trend": 0.0, "price_score": -10.0, "prior_high": 100.0},
@@ -192,7 +280,7 @@ def test_cpu_reference_generates_targets_for_each_family(
     family: str,
     feature_values: dict[str, float],
 ) -> None:
-    """五个流派必须通过同一个 CPU reference 产生有限目标。"""
+    """六个流派必须通过同一个 CPU reference 产生有限目标。"""
     config = _trend_only_config()
     if family != "trend":
         strategies = config["strategies"]
@@ -213,6 +301,48 @@ def test_cpu_reference_generates_targets_for_each_family(
     targets = generate_targets(candidate, (bar,), (feature,), periods_per_year=1.0)
     assert len(targets) == 1
     assert 0.0 < targets[0] <= float(candidate.parameters["maximum_target"])
+    plan = candidate_search_plan_payload(build_family_batches(config, (family,)))
+    compiled = evaluate_search_plan_candidate(
+        plan, candidate.candidate_id, bar, feature,
+    )
+    template = strategy_expression(family)
+    assert compiled["required"] == tuple(
+        evaluate_expression(node, candidate.parameters, bar, feature)
+        for node in template.required
+    )
+    for name, node in (
+        ("entry", template.entry),
+        ("exit", template.exit),
+        ("target", template.target),
+    ):
+        expected = (
+            None if node is None
+            else evaluate_expression(node, candidate.parameters, bar, feature)
+        )
+        assert compiled[name] == expected
+
+
+def test_price_breakout_is_a_flow_independent_structural_ablation() -> None:
+    """纯价格突破不得因成交方向或经济成交量缺失而失去入场。"""
+    config = _trend_only_config()
+    strategies = config["strategies"]
+    assert isinstance(strategies, dict)
+    strategies.clear()
+    strategies["price_breakout"] = {
+        "lookbacks": [24],
+        "annual_volatility_target": 0.4,
+        "maximum_target": 1.0,
+    }
+    candidate = build_family_batches(config, ("price_breakout",))[0].candidates[0]
+    bar, feature = _row(
+        trend=0.0,
+        price_score=1.0,
+        prior_high=100.0,
+        flow=None,
+        volume=None,
+    )
+    targets = generate_targets(candidate, (bar,), (feature,), periods_per_year=1.0)
+    assert targets[0] > 0.0
 
 
 def test_generate_targets_rejects_tampered_expression_identity() -> None:
@@ -221,4 +351,4 @@ def test_generate_targets_rejects_tampered_expression_identity() -> None:
     tampered = replace(candidate, expression_id="expression-" + "0" * 64)
     bar, feature = _row(trend=10.0, price_score=1.0, prior_high=100.0)
     with pytest.raises(ValueError, match="候选表达式身份"):
-        generate_targets(tampered, (bar,), (feature,))
+        generate_targets(tampered, (bar,), (feature,), periods_per_year=1.0)

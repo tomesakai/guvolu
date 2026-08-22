@@ -141,7 +141,7 @@ def allocate(
     )
     eligible = {
         item.family: item for item in evaluations
-        if item.eligible and item.mode == "paper" and item.latest_target > 0
+        if item.eligible and item.mode == "paper"
     }
     if not eligible or (trend_cap == 0 and reversion_cap == 0):
         return flat_allocation(state.regime, family_names)

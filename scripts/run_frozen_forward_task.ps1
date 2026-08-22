@@ -1,5 +1,6 @@
 param(
     [Parameter(Mandatory = $true)]
+    [ValidatePattern('^frozen-forward-plan-[0-9a-f]{64}$')]
     [string]$PlanId,
     [Parameter(Mandatory = $true)]
     [string]$Repository,
@@ -8,6 +9,10 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$Utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = $Utf8NoBom
+$OutputEncoding = $Utf8NoBom
+$env:PYTHONUTF8 = "1"
 $Root = (Resolve-Path -LiteralPath $Repository).Path
 $Python = Join-Path $Root ".venv\Scripts\python.exe"
 $Runner = Join-Path $Root "scripts\manage_frozen_forward.py"
@@ -15,26 +20,68 @@ $LogDirectory = Join-Path $Root "logs\research\frozen-forward"
 $LogPath = Join-Path $LogDirectory "task.jsonl"
 New-Item -ItemType Directory -Path $LogDirectory -Force | Out-Null
 $StartedAt = [datetime]::UtcNow.ToString("o")
-[System.Management.Automation.ActionPreference]$PreviousErrorActionPreference =
-    [System.Management.Automation.ActionPreference]$ErrorActionPreference
+$RunToken = [guid]::NewGuid().ToString("N")
+$StdoutPath = Join-Path $LogDirectory ("." + $RunToken + ".stdout.tmp")
+$StderrPath = Join-Path $LogDirectory ("." + $RunToken + ".stderr.tmp")
+$ExitCode = 1
+$PredictionExitCode = $null
+$WrapperError = $null
+$Output = ""
 try {
-    # 完整保存原生错误。
-    $ErrorActionPreference =
-        [System.Management.Automation.ActionPreference]::Continue
-    $Output = & $Python $Runner --root $Root predict $PlanId `
-        --registry $Registry 2>&1
-    $ExitCode = $LASTEXITCODE
-} finally {
-    $ErrorActionPreference = $PreviousErrorActionPreference
+    $Arguments = @(
+        ('"' + $Runner + '"'),
+        "--root",
+        ('"' + $Root + '"'),
+        "predict",
+        ('"' + $PlanId + '"'),
+        "--registry",
+        ('"' + $Registry + '"')
+    )
+    $Process = Start-Process `
+        -FilePath $Python `
+        -ArgumentList $Arguments `
+        -RedirectStandardOutput $StdoutPath `
+        -RedirectStandardError $StderrPath `
+        -WindowStyle Hidden `
+        -Wait `
+        -PassThru
+    $PredictionExitCode = $Process.ExitCode
+    $ExitCode = $PredictionExitCode
+    $Streams = @()
+    $Stdout = Get-Content -LiteralPath $StdoutPath -Raw -Encoding UTF8
+    $Stderr = Get-Content -LiteralPath $StderrPath -Raw -Encoding UTF8
+    if (-not [string]::IsNullOrWhiteSpace($Stdout)) {
+        $Streams += $Stdout.TrimEnd()
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Stderr)) {
+        $Streams += $Stderr.TrimEnd()
+    }
+    $Output = $Streams -join "`n"
+}
+catch {
+    $ExitCode = 1
+    $WrapperError = $_.Exception.ToString()
+    $Output = $WrapperError
+}
+finally {
+    Remove-Item -LiteralPath $StdoutPath -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $StderrPath -Force -ErrorAction SilentlyContinue
 }
 $Record = [ordered]@{
     started_at = $StartedAt
     completed_at = [datetime]::UtcNow.ToString("o")
     plan_id = $PlanId
     exit_code = $ExitCode
-    output = ($Output -join "`n")
+    prediction_exit_code = $PredictionExitCode
+    wrapper_error = $WrapperError
+    output = $Output
 }
-Add-Content -LiteralPath $LogPath -Value ($Record | ConvertTo-Json -Compress)
+$Json = $Record | ConvertTo-Json -Compress
+[System.IO.File]::AppendAllText(
+    $LogPath,
+    $Json + [Environment]::NewLine,
+    $Utf8NoBom
+)
 if ($ExitCode -ne 0) {
     exit $ExitCode
 }

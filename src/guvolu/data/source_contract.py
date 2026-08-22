@@ -185,12 +185,13 @@ def validate_endpoint_natural_key(
 def live_jpy_realtime_endpoint_revisions() -> tuple[EndpointRevisionRow, ...]:
     """返回现行三所实时公共数据采集使用的端点修订。
 
-    EP-0002、EP-0005、EP-0007 逐字段来自 2026-08-12 工作簿。工作簿把
+    EP-0002、EP-0005、EP-0007 r0 逐字段来自 2026-08-12 工作簿。工作簿把
     bitbank 的同一 Socket.IO 地址只登记为 L2，因此本地以 EP-0075 追加
     ``transactions`` 的 trades 身份；另以 EP-0005 r1 表达同一稳定 WSS
     身份新增 ``circuit_break_info`` 频道。两者的 ``source_schema_revision``
-    明示本地扩展，不伪装成工作簿原行。EP-0005 r0 保持不可变；r0/r1 的
-    有效期有意重叠，因为修订只能由 raw 行显式绑定，绝不按时间猜测。
+    明示本地扩展，不伪装成工作簿原行。EP-0007 r1 仅增加成交频道的
+    ``TAKER_ONLY`` 订阅约束。EP-0005 与 EP-0007 的 r0 保持不可变；修订
+    有效期有意重叠，因为只能由 raw 行显式绑定，绝不按时间猜测。
     """
     observed = "2026-08-12T00:00:00+00:00"
     valid_until = "9999-12-31T23:59:59+00:00"
@@ -307,6 +308,34 @@ def live_jpy_realtime_endpoint_revisions() -> tuple[EndpointRevisionRow, ...]:
             effective_from=observed,
             valid_until=valid_until,
             registered_at=observed,
+        ),
+        EndpointRevisionRow(
+            endpoint_id="EP-0007",
+            revision_id=1,
+            venue_id="gmo",
+            identity=EndpointNaturalIdentity(
+                legal_entity="GMO Coin, Inc.",
+                venue_brand="GMO Coin",
+                product="Spot/Leverage",
+                environment="prod",
+                region="Japan",
+                transport="WSS",
+                protocol="public",
+                auth_mode="P0",
+                host="api.coin.z.com",
+                port=443,
+                base_path_or_channel="/ws/public",
+                data_level="L2/trades",
+            ),
+            scope="public/trades:TAKER_ONLY",
+            source_schema_revision=(
+                "local_registry_extension:trades-TAKER_ONLY@2026-08-14"
+            ),
+            documentation_uri="https://api.coin.z.com/docs/",
+            documentation_sha256=None,
+            effective_from="2026-08-14T00:00:00+00:00",
+            valid_until=valid_until,
+            registered_at="2026-08-14T00:00:00+00:00",
         ),
         EndpointRevisionRow(
             endpoint_id="EP-0075",

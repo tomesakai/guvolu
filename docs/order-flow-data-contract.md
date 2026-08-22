@@ -9,7 +9,7 @@
 > `C:\Users\wu_zh\dev\guvolu\data`。
 > 当前版本边界：SQLite schema v20；实时 raw v3；三所日元市场 L2 物理
 > schema v3 / `book-l2-normalization-v5`；实时逐笔 schema v3 /
-> `trade-realtime-normalization-v3`；OKX 历史 L2 schema v2 /
+> `trade-realtime-normalization-v4`；OKX 历史 L2 schema v2 /
 > `book-l2-normalization-v2`；book-state 当前代码契约为 schema v1 /
 > `book-state-checkpoint-v3`，OFL 当前代码契约为 schema v2 /
 > `orderflow-tile-sparse-v8`。
@@ -74,7 +74,7 @@ subscribe-ack 事件，`opened_at` 和 `subscribed_at` 均以
 
 归档逐笔 schema v2 保存 `mapping_revision`、`capability_revision`、
 `source_endpoint` 和来源行身份；实时逐笔 schema v3 /
-`trade-realtime-normalization-v3` 进一步保存端点修订、连接/频道、单调接收时钟、
+`trade-realtime-normalization-v4` 进一步保存端点修订、连接/频道、单调接收时钟、
 payload SHA-256、`data_quality` 与 `raw_schema_version`。三所实时 L2 使用 schema v3 /
 `book-l2-normalization-v5` 保存同一组采集身份与质量证据。bitbank 的
 `depth_diff` 与 `depth_whole` 按 connection + room 分别验证严格递增；跨 room
@@ -516,7 +516,7 @@ market_id + dataset + bucket/interval + partition/window
 
 只有 URL 含内容 generation 时才允许 `immutable`。实时最后一个 bar/tile 使用
 增量 update；已封口范围读取版本化成品。五分钟实时逐笔物化器固定为 schema v3 /
-`trade-realtime-normalization-v3`：先验证 raw v3 端点/连接/频道与 payload 散列，
+`trade-realtime-normalization-v4`：先验证 raw v3 端点/连接/频道与 payload 散列，
 再按来源帧原子归一；bitFlyer 含空 side 的来源帧整帧 reject，不会阻断
 GMO/bitbank 后续 segment，也不会重复刷同配置失败 attempt。旧 raw v1 仍可重投影，
 但端点修订和连接/频道列保持 NULL 并带质量降级，不能获得 raw v3 的完整性结论。
@@ -524,6 +524,14 @@ GMO/bitbank 后续 segment，也不会重复刷同配置失败 attempt。旧 raw
 GMO 实时逐笔把服务端 `error`/`errors` 帧先按 raw v3 原样落盘，再触发退避重连；
 无限期模式同样有九十秒静默超时。只有正常 `trades` 数据帧成功持久化才清零连续
 失败计数，因此 `ERR-5003` 或无数据静默不能被误判成仍在健康采集。
+
+GMO `EP-0007` r1 订阅固定携带 `option=TAKER_ONLY`，其成交方向才登记为 `taker`。
+旧 r0 与未记录修订的原件保持可重投影，但方向降级为
+`participant_side_unfiltered`；价格与时钟覆盖仍保留，但其 base/quote volume、
+economic trade count、signed flow 与 capacity notional 均不得进入决策级研究。
+不得用除以二或时间/价/量镜像启发式猜测真实成交量；只有来源合同提供可证明的
+配对身份时才能另行去重。
+这是 normalization v4 相对 v3 的语义修正，旧制品不原地改写。
 
 MON 与 OFL 已完成市场身份迁移：市场选择来自 Query Catalog，K线、
 Footprint、盘口与 OFL 主热图读取 v2 成品。来源 ticker、私有委托、成交、特征和

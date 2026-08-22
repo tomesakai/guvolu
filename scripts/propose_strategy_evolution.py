@@ -3,21 +3,12 @@ from __future__ import annotations
 
 import argparse
 import json
-from collections.abc import Mapping
 from pathlib import Path
 from typing import Sequence
 
 from guvolu.data.durable_io import atomic_write_text
-from guvolu.research.provenance import canonical_json, sha256_file, sha256_text
+from guvolu.research.provenance import canonical_json, sha256_text
 from guvolu.research.tuning import propose_family_evolution
-
-
-def _load_object(path: Path) -> Mapping[str, object]:
-    """读取 JSON 对象。"""
-    value = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(value, Mapping):
-        raise ValueError(f"JSON 必须为对象: {path}")
-    return {str(key): item for key, item in value.items()}
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -36,26 +27,48 @@ def main(argv: Sequence[str] | None = None) -> int:
         metavar="DIRECTORY",
         help="内容寻址提案与派生配置的输出目录（不是 JSON 文件路径）",
     )
+    parser.add_argument(
+        "--prior-proposal",
+        action="append",
+        type=Path,
+        default=[],
+        help="额外纳入去重门禁的历史提案；可重复传入",
+    )
     arguments = parser.parse_args(argv)
     root = arguments.root.resolve()
     config_path = arguments.config if arguments.config.is_absolute() else root / arguments.config
     monitor_path = arguments.monitor if arguments.monitor.is_absolute() else root / arguments.monitor
-    config = _load_object(config_path)
-    monitor = _load_object(monitor_path)
-    parent_hash = sha256_file(config_path)
-    proposal, proposed_config = propose_family_evolution(
-        config,
-        monitor,
-        parent_hash,
+    monitor_payload = json.loads(monitor_path.read_text(encoding="utf-8"))
+    family = monitor_payload.get("family")
+    if not isinstance(family, str) or not family or Path(family).name != family:
+        raise ValueError("monitor.family 不能用于提案目录")
+    canonical_history = (
+        root / "reports" / "strategy-research" / "evolution-proposals"
+        / family
     )
     output = arguments.output
     if output is None:
-        output = (
-            root / "reports" / "strategy-research" / "evolution-proposals"
-            / str(proposal["family"])
-        )
+        output = canonical_history
     elif not output.is_absolute():
         output = root / output
+    discovered = sorted({
+        *canonical_history.glob("proposal-sha256-*.json"),
+        *output.glob("proposal-sha256-*.json"),
+    })
+    explicit = [
+        path if path.is_absolute() else root / path
+        for path in arguments.prior_proposal
+    ]
+    prior_paths = tuple(sorted(
+        {path.resolve() for path in (*discovered, *explicit)},
+        key=lambda path: path.as_posix(),
+    ))
+    proposal, proposed_config = propose_family_evolution(
+        root,
+        config_path,
+        monitor_path,
+        prior_paths,
+    )
     proposal_content = canonical_json(proposal) + "\n"
     proposal_hash = sha256_text(proposal_content)
     proposal_path = output / f"proposal-sha256-{proposal_hash}.json"
@@ -66,6 +79,21 @@ def main(argv: Sequence[str] | None = None) -> int:
         config_hash = sha256_text(config_content)
         config_path_output = output / f"strategy-research-sha256-{config_hash}.json"
         atomic_write_text(config_path_output, config_content)
+    atomic_write_text(output / "latest.json", canonical_json({
+        "schema_version": 1,
+        "family": proposal["family"],
+        "proposal_method_version": proposal["proposal_method_version"],
+        "proposal": proposal_path.name,
+        "proposal_sha256": proposal_hash,
+        "status": proposal["status"],
+        "source_monitor_sha256": proposal["source_monitor_sha256"],
+        "derived_config": (
+            config_path_output.name if config_path_output is not None else None
+        ),
+        "derived_config_sha256": (
+            config_hash if config_path_output is not None else None
+        ),
+    }) + "\n")
     print(canonical_json({
         "proposal": proposal_path.as_posix(),
         "status": proposal["status"],

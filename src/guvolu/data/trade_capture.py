@@ -24,7 +24,7 @@ BITFLYER_WS_URL = "wss://ws.lightstream.bitflyer.com/json-rpc"
 SILENCE_TIMEOUT_SECONDS = 90.0
 CHECKPOINT_SECONDS = 60.0
 ENDPOINT_BINDINGS = {
-    "gmo": ("EP-0007", 0),
+    "gmo": ("EP-0007", 1),
     "bitbank": ("EP-0075", 0),
     "bitflyer": ("EP-0002", 0),
 }
@@ -143,7 +143,7 @@ async def _record_gmo(
                 connection_id = _opened_connection(writer, stats)
                 await connection.send(json.dumps({
                     "command": "subscribe", "channel": "trades",
-                    "symbol": writer.venue_symbol,
+                    "symbol": writer.venue_symbol, "option": "TAKER_ONLY",
                 }))
                 while _active(deadline):
                     try:

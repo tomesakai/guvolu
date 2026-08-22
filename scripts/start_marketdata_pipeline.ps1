@@ -1,20 +1,76 @@
 param(
     [ValidateSet('Normal', 'Hidden')]
     [string]$WindowStyle = 'Normal',
+    [ValidateSet('Full', 'ForwardMinimal')]
+    [string]$Profile = 'Full',
+    [string]$Repository = '',
     [switch]$L2LatestRunOnly
 )
 
 $ErrorActionPreference = 'Stop'
-$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$RepoRoot = if ($Repository) {
+    (Resolve-Path -LiteralPath $Repository).Path
+} else {
+    (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+}
 $PythonPath = Join-Path $RepoRoot '.venv\Scripts\python.exe'
+$DataRoot = Join-Path $RepoRoot 'data'
+$RunnerRoot = $PSScriptRoot
+$DataRootPattern = (
+    '--data-root\s+"?' + [regex]::Escape($DataRoot) + '"?(?:\s|$)'
+)
+$RepositoryPattern = (
+    '-Repository\s+"?' + [regex]::Escape($RepoRoot) + '"?(?:\s|$)'
+)
 
 if (-not (Test-Path -LiteralPath $PythonPath -PathType Leaf)) {
     throw "Project Python runtime is missing: $PythonPath"
 }
+Set-Location -LiteralPath $RepoRoot
+
+function Get-RepositoryPythonProcess {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Module,
+        [Parameter(Mandatory = $true)]
+        [string]$Command
+    )
+    Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
+        Where-Object {
+            $_.CommandLine -and
+            $_.CommandLine -like "*-m $Module* $Command *" -and
+            $_.CommandLine -match $DataRootPattern
+        }
+}
+
+function Get-RepositoryMaterializerProcess {
+    param(
+        [Parameter(Mandatory = $true)]
+        [hashtable]$Materializer
+    )
+    Get-CimInstance Win32_Process |
+        Where-Object {
+            $_.CommandLine -and (
+                (
+                    $_.Name -eq 'python.exe' -and
+                    $_.CommandLine -like (
+                        "*-m $($Materializer.Module)* watch*"
+                    ) -and
+                    $_.CommandLine -match $DataRootPattern
+                ) -or (
+                    $_.Name -eq 'powershell.exe' -and
+                    $_.CommandLine -like "*$($Materializer.Runner)*" -and
+                    $_.CommandLine -match $RepositoryPattern
+                )
+            )
+        }
+}
 
 # Recover only stale crash tails; a fresh checkpoint protects sparse live runs.
-& $PythonPath -m guvolu.data.l2_capture recover --older-minutes 60
-& $PythonPath -m guvolu.data.trade_capture recover --older-minutes 60
+& $PythonPath -m guvolu.data.l2_capture --data-root $DataRoot `
+    recover --older-minutes 60
+& $PythonPath -m guvolu.data.trade_capture --data-root $DataRoot `
+    recover --older-minutes 60
 
 $Collectors = @(
     @{ Name = 'l2-gmo-btc'; Module = 'guvolu.data.l2_capture'; Runner = 'run_l2_collector.ps1'; Venue = 'gmo'; Symbol = 'BTC'; MaxMiB = 128 },
@@ -28,26 +84,25 @@ $Collectors = @(
 foreach ($Collector in $Collectors) {
     $Venue = $Collector.Venue
     $Symbol = $Collector.Symbol
-    $CommandTail = (
-        "-m $($Collector.Module) record --venue $Venue --symbol $Symbol " +
-        "--minutes 0 --segment-seconds 300 --segment-max-mib $($Collector.MaxMiB)"
-    )
     $Existing = @(
-        Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
-            Where-Object { $_.CommandLine -like "*$CommandTail*" }
+        Get-RepositoryPythonProcess `
+            -Module $Collector.Module -Command 'record' |
+            Where-Object {
+                $_.CommandLine -like "*--venue $Venue*" -and
+                $_.CommandLine -like "*--symbol $Symbol*"
+            }
     )
     if ($Existing.Count -gt 0) {
         Write-Host "[$($Collector.Name)] already running PID=$(($Existing.ProcessId -join ','))"
         continue
     }
-    $RunnerPath = Join-Path $PSScriptRoot $Collector.Runner
-    $Arguments = @(
-        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $RunnerPath,
-        '-Venue', $Venue, '-Symbol', $Symbol, '-Name', $Collector.Name
+    $RunnerPath = Join-Path $RunnerRoot $Collector.Runner
+    $NoExit = if ($WindowStyle -eq 'Normal') { ' -NoExit' } else { '' }
+    $Arguments = (
+        "-NoProfile$NoExit -ExecutionPolicy Bypass " +
+        "-File `"$RunnerPath`" -Repository `"$RepoRoot`" " +
+        "-Venue $Venue -Symbol $Symbol -Name $($Collector.Name)"
     )
-    if ($WindowStyle -eq 'Normal') {
-        $Arguments = @('-NoProfile', '-NoExit') + $Arguments[1..($Arguments.Count - 1)]
-    }
     $Started = Start-Process -FilePath 'powershell.exe' `
         -ArgumentList $Arguments -WorkingDirectory $RepoRoot `
         -WindowStyle $WindowStyle -PassThru
@@ -60,37 +115,54 @@ $Materializers = @(
     @{ Name = 'book-state-materializer'; Module = 'guvolu.data.book_state_materialize'; Runner = 'run_book_state_materializer.ps1' },
     @{ Name = 'orderflow-tile-watcher'; Module = 'guvolu.data.orderflow_tile_materialize'; Runner = 'run_orderflow_tile_watcher.ps1' }
 )
-foreach ($Materializer in $Materializers) {
-    $IntervalArgument = if ($Materializer.Name -in @('book-state-materializer', 'orderflow-tile-watcher')) {
-        '--poll-seconds'
-    } else {
-        '--interval-seconds'
-    }
-    $CommandTail = if ($Materializer.Name -eq 'orderflow-tile-watcher') {
-        "-m $($Materializer.Module) watch --bucket 5s $IntervalArgument 300"
-    } elseif ($Materializer.Name -eq 'l2-materializer' -and $L2LatestRunOnly) {
-        "-m $($Materializer.Module) watch $IntervalArgument 300 --latest-run-only"
-    } else {
-        "-m $($Materializer.Module) watch $IntervalArgument 300"
-    }
-    $Existing = @(
-        Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
-            Where-Object { $_.CommandLine -like "*$CommandTail*" }
+if ($Profile -eq 'ForwardMinimal') {
+    $PausedMaterializers = @(
+        $Materializers |
+            Where-Object { $_.Name -ne 'trade-realtime-materializer' }
     )
+    foreach ($Materializer in $PausedMaterializers) {
+        $Existing = @(Get-RepositoryMaterializerProcess $Materializer)
+        foreach ($Process in $Existing) {
+            Stop-Process -Id $Process.ProcessId -Force -ErrorAction SilentlyContinue
+        }
+        if ($Existing.Count -gt 0) {
+            Start-Sleep -Milliseconds 200
+            $Remaining = @(Get-RepositoryMaterializerProcess $Materializer)
+            if ($Remaining.Count -gt 0) {
+                throw (
+                    "[$($Materializer.Name)] failed to pause PID=" +
+                    ($Remaining.ProcessId -join ',')
+                )
+            }
+        }
+        if ($Existing.Count -gt 0) {
+            Write-Host (
+                "[$($Materializer.Name)] paused for ForwardMinimal " +
+                "PID=$(($Existing.ProcessId -join ','))"
+            )
+        }
+    }
+    $Materializers = @(
+        $Materializers |
+            Where-Object { $_.Name -eq 'trade-realtime-materializer' }
+    )
+}
+foreach ($Materializer in $Materializers) {
+    $Existing = @(Get-RepositoryPythonProcess `
+        -Module $Materializer.Module -Command 'watch')
     if ($Existing.Count -gt 0) {
         Write-Host "[$($Materializer.Name)] already running PID=$(($Existing.ProcessId -join ','))"
         continue
     }
-    $RunnerPath = Join-Path $PSScriptRoot $Materializer.Runner
-    $Arguments = @(
-        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $RunnerPath,
-        '-IntervalSeconds', '300'
+    $RunnerPath = Join-Path $RunnerRoot $Materializer.Runner
+    $NoExit = if ($WindowStyle -eq 'Normal') { ' -NoExit' } else { '' }
+    $Arguments = (
+        "-NoProfile$NoExit -ExecutionPolicy Bypass " +
+        "-File `"$RunnerPath`" -Repository `"$RepoRoot`" " +
+        '-IntervalSeconds 300'
     )
     if ($Materializer.Name -eq 'l2-materializer' -and $L2LatestRunOnly) {
-        $Arguments += '-LatestRunOnly'
-    }
-    if ($WindowStyle -eq 'Normal') {
-        $Arguments = @('-NoProfile', '-NoExit') + $Arguments[1..($Arguments.Count - 1)]
+        $Arguments += ' -LatestRunOnly'
     }
     $Started = Start-Process -FilePath 'powershell.exe' `
         -ArgumentList $Arguments -WorkingDirectory $RepoRoot `

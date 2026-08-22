@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "pipeline_version": "passive-grid-shadow-cpu-v2",
+  "market_id": "mkt__bitbank__btc_jpy__r0",
+  "bucket": "5s",
+  "order_size_base": 0.001,
+  "quote_offset_rows": [0, 1, 2],
+  "maximum_inventory_steps": [2, 4, 8],
+  "latency_buckets": 1,
+  "quote_lifetime_buckets": 1,
+  "maker_fee_bps": -2.0,
+  "terminal_rebalance_bps_assumption": 14.0,
+  "markout_horizons_seconds": [5, 30, 60],
+  "quality": {
+    "maximum_mirrored_trade_ratio": 0.01,
+    "minimum_clean_buckets": 5000,
+    "minimum_clean_hours": 12.0,
+    "minimum_lower_fill_events": 30
+  }
+}

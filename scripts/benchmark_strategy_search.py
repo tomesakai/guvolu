@@ -17,7 +17,7 @@ from typing import Sequence
 from guvolu.data.durable_io import atomic_write_text
 from guvolu.strategy.expression import expression_id, strategy_expression
 
-BENCHMARK_METHOD_VERSION = "typed-searchfast-threshold-grid-v1"
+BENCHMARK_METHOD_VERSION = "typed-searchfast-threshold-grid-v2"
 
 
 def _inputs(
@@ -122,7 +122,7 @@ def run_benchmark(
     repeats: int,
     require_gpu: bool,
 ) -> dict[str, object]:
-    """执行 CPU 基准，并在可用时执行 CUDA 一致性与性能基准。"""
+    """执行 CPU 基准，并在可用时硬门禁 CUDA 数值一致性。"""
     scores, returns, thresholds = _inputs(bars, candidates)
     cpu_result_raw, cpu_timings = _timed(
         lambda: _cpu_search(scores, returns, thresholds),
@@ -195,6 +195,11 @@ def run_benchmark(
     maximum_absolute_difference = max(differences, default=0.0)
     maximum_reference = max((abs(value) for value in cpu_result), default=0.0)
     tolerance = max(1e-6, maximum_reference * 2e-5)
+    if maximum_absolute_difference > tolerance:
+        raise RuntimeError(
+            "CUDA SearchFast 与 CPU ValidationExact 数值差异超出容差: "
+            f"{maximum_absolute_difference} > {tolerance}"
+        )
     gpu_median = statistics.median(gpu_timings)
     capability = torch.cuda.get_device_capability(0)
     payload["cuda"] = {
@@ -211,7 +216,7 @@ def run_benchmark(
         "parity": {
             "maximum_absolute_difference": maximum_absolute_difference,
             "tolerance": tolerance,
-            "passed": maximum_absolute_difference <= tolerance,
+            "passed": True,
         },
     }
     return payload

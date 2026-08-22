@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import math
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -10,8 +9,25 @@ from typing import Any, Mapping, Sequence
 
 from guvolu.data.durable_io import atomic_write_text
 from guvolu.research.allocator import allocate, allocation_payload, flat_allocation
-from guvolu.research.contracts import AllocationResult, PanelSnapshot, QualityVector
+from guvolu.research.artifact_contracts import (
+    INTERVAL_SECONDS as _INTERVAL_SECONDS,
+    PIPELINE_SCHEMA_VERSION,
+    POSITION_CONTRACT_METHOD_VERSION,
+    SECONDS_PER_YEAR,
+    cost_replay_body,
+    family_payload as _family_payload,
+    market_state_payload as _market_state_payload,
+    position_contract_payload as _position_contract_payload,
+    trial_ledger_body,
+)
+from guvolu.research.config_lineage import (
+    load_governed_strategy_config_with_paths,
+    snapshot_verified_config_lineage,
+)
+from guvolu.research.contracts import CodeIdentity, PanelSnapshot, QualityVector
+from guvolu.research.data_location import data_root_locator
 from guvolu.research.features import (
+    FEATURE_METHOD_VERSION,
     MarketState,
     classify_market_state,
     compute_features,
@@ -19,14 +35,19 @@ from guvolu.research.features import (
 )
 from guvolu.research.governance import (
     GOVERNANCE_METHOD_VERSION,
+    register_active_head_receipt,
     register_research_exposure,
 )
 from guvolu.research.panel import (
+    PANEL_METHOD_VERSION,
+    PANEL_SCHEMA_VERSION,
+    TRADE_INPUT_RECEIPT_METHOD_VERSION,
     build_panel_snapshot,
-    freeze_trade_inputs,
+    capture_trade_input_receipt,
     panel_inputs_payload,
     parse_time,
 )
+from guvolu.data.trade_economics import TRADE_FLOW_INPUT_METHOD_VERSION
 from guvolu.research.provenance import (
     artifact_record,
     canonical_json,
@@ -36,6 +57,8 @@ from guvolu.research.provenance import (
     stable_identifier,
 )
 from guvolu.research.quality import (
+    OPERATIONAL_GATE_METHOD_VERSION,
+    gate_economic_trade_volume,
     gate_feature_snapshot,
     panel_quality,
     quality_payload,
@@ -45,6 +68,7 @@ from guvolu.research.shadow import (
     l2_overlay_from_shadow,
     latest_common_l2_decision,
 )
+from guvolu.research.suite_data_snapshot import suite_data_snapshot_record
 from guvolu.research.validation import (
     BLOCK_BOOTSTRAP_METHOD_VERSION,
     DEFLATED_SHARPE_METHOD_VERSION,
@@ -52,10 +76,10 @@ from guvolu.research.validation import (
     PARAMETER_STABILITY_METHOD_VERSION,
     PBO_METHOD_VERSION,
     P_VALUE_METHOD_VERSION,
+    REGIME_ATTRIBUTION_METHOD_VERSION,
     ValidationResult,
     evaluate_targets,
     metrics_payload,
-    strategy_returns,
     walk_forward_validate,
 )
 from guvolu.strategy.contracts import FeatureRow
@@ -65,16 +89,7 @@ from guvolu.strategy.generation import (
     candidate_registry_payload,
 )
 
-PIPELINE_SCHEMA_VERSION = 1
-PIPELINE_METHOD_VERSION = "strategy-research-pipeline-v9"
-POSITION_CONTRACT_METHOD_VERSION = "risk-weighted-family-target-v1"
-SECONDS_PER_YEAR = 365.0 * 24.0 * 60.0 * 60.0
-_INTERVAL_SECONDS = {
-    "5min": 300.0,
-    "15min": 900.0,
-    "1hour": 3600.0,
-    "4hour": 14_400.0,
-}
+PIPELINE_METHOD_VERSION = "strategy-research-pipeline-v14"
 
 
 @dataclass(frozen=True)
@@ -101,6 +116,17 @@ def _mapping(value: object, name: str) -> Mapping[str, object]:
     return {str(key): item for key, item in value.items()}
 
 
+def _attest_stable_code_identity(
+    root: Path,
+    config_source_paths: Sequence[Path],
+    initial: CodeIdentity,
+) -> None:
+    """长运行发布前重新确认代码树没有在执行期间变化。"""
+    current = code_identity(root, config_source_paths)
+    if current != initial:
+        raise ValueError("研究运行期间代码身份发生变化")
+
+
 def _integer(value: object, name: str) -> int:
     """验证正整数配置。"""
     if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
@@ -120,12 +146,6 @@ def _text(value: object, name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{name} 必须为非空文本")
     return value.strip()
-
-
-def _load_config(path: Path) -> Mapping[str, object]:
-    """读取版本化研究配置。"""
-    value = json.loads(path.read_text(encoding="utf-8"))
-    return _mapping(value, "root")
 
 
 def _governance_registry_path(
@@ -169,6 +189,23 @@ def _write_content_text(
     return path, digest
 
 
+def _research_output_paths(
+    output_base: Path,
+    research_identity: str,
+    execution_evaluated_at: datetime,
+) -> tuple[str, Path, Path]:
+    """分离执行快照目录与可复用的研究制品目录。"""
+    run_id = stable_identifier("research-run", {
+        "research_identity": research_identity,
+        "execution_evaluated_at": execution_evaluated_at.isoformat(),
+    })
+    return (
+        run_id,
+        output_base / run_id,
+        output_base / "research-artifacts" / research_identity,
+    )
+
+
 def _feature_artifact(
     directory: Path,
     features: Sequence[FeatureRow],
@@ -200,39 +237,14 @@ def _feature_artifact(
 def _trial_artifact(
     directory: Path,
     validation: ValidationResult,
-    run_id: str,
+    research_identity: str,
 ) -> tuple[Path, str]:
     """发布包含所有候选事实的追加式台账。"""
-    rows = [canonical_json({
-        "record_type": "trial_ledger_header",
-        "schema_version": PIPELINE_SCHEMA_VERSION,
-        "run_id": run_id,
-        "candidate_evaluations": len(validation.trials),
-        "p_value_method_version": P_VALUE_METHOD_VERSION,
-        "pbo_method_version": PBO_METHOD_VERSION,
-        "block_bootstrap_method_version": BLOCK_BOOTSTRAP_METHOD_VERSION,
-    })]
-    for trial in sorted(validation.trials, key=lambda item: item.evaluation_id):
-        rows.append(canonical_json({
-            "record_type": "trial",
-            "evaluation_id": trial.evaluation_id,
-            "candidate_id": trial.candidate.candidate_id,
-            "family": trial.candidate.family,
-            "mode": trial.candidate.mode,
-            "parameters": dict(trial.candidate.parameters),
-            "complexity": trial.candidate.complexity,
-            "fold_id": trial.fold_id,
-            "segment": trial.segment,
-            "start_time": trial.start_time.isoformat(),
-            "end_time": trial.end_time.isoformat(),
-            "selected": trial.selected,
-            "metrics": metrics_payload(trial.metrics),
-        }))
     return _write_content_text(
         directory,
         "trial-ledger",
         ".jsonl",
-        "\n".join(rows) + "\n",
+        trial_ledger_body(validation, research_identity),
     )
 
 
@@ -241,203 +253,15 @@ def _cost_replay_artifact(
     panel: PanelSnapshot,
     validation: ValidationResult,
     config: Mapping[str, object],
-    run_id: str,
+    research_identity: str,
 ) -> tuple[Path, str]:
     """发布与特征隔离的 label、成本和回放事实。"""
-    cost_config = _mapping(config.get("cost_model"), "cost_model")
-    cost_bps = sum(_number(cost_config.get(name), name) for name in (
-        "fee_bps_assumption",
-        "half_spread_bps_assumption",
-        "slippage_bps_assumption",
-        "impact_bps_assumption",
-    ))
-    cost_rate = cost_bps / 10_000.0
-    interval = _text(config.get("bar_interval"), "bar_interval")
-    interval_seconds = _INTERVAL_SECONDS.get(interval)
-    if interval_seconds is None:
-        raise ValueError("bar_interval 不支持 label 回放")
-    feature_config = _mapping(config.get("features"), "features")
-    maximum_gap = interval_seconds * _integer(
-        feature_config.get("maximum_structural_gap_bars_assumption"),
-        "maximum_structural_gap_bars_assumption",
-    )
-    deployment_candidates = {
-        item.family: item.deployment_candidate for item in validation.families
-    }
-    deployment_targets = {
-        family: validation.candidate_targets[candidate.candidate_id]
-        for family, candidate in deployment_candidates.items()
-    }
-    validation_targets = validation.family_validation_targets
-    replay_targets = {
-        "deployment": deployment_targets,
-        "walk_forward_stitched": validation_targets,
-    }
-    replay_returns = {
-        replay: {
-            family: strategy_returns(
-                panel.bars,
-                family_targets,
-                cost_rate,
-                maximum_gap,
-            )
-            for family, family_targets in targets.items()
-        }
-        for replay, targets in replay_targets.items()
-    }
-    if set(deployment_targets) != set(validation_targets):
-        raise ValueError("部署与 walk-forward 流派范围不一致")
-    rows = [canonical_json({
-        "record_type": "label_cost_header",
-        "schema_version": PIPELINE_SCHEMA_VERSION,
-        "run_id": run_id,
-        "panel_sha256": panel.panel_sha256,
-        "cost_bps": cost_bps,
-        "maximum_gap_seconds": maximum_gap,
-        "deployment_candidates": {
-            family: candidate.candidate_id
-            for family, candidate in deployment_candidates.items()
-        },
-        "walk_forward_selection_paths": {
-            item.family: list(item.fold_selected_candidate_ids)
-            for item in validation.families
-        },
-        "replay_semantics": {
-            "deployment": "one full-history deployment candidate per family",
-            "walk_forward_stitched": "fold-selected validation path used by gates",
-        },
-    })]
-    for index in range(1, len(panel.bars)):
-        previous = panel.bars[index - 1]
-        current = panel.bars[index]
-        gap_seconds = (current.open_time - previous.open_time).total_seconds()
-        hard_gap = gap_seconds > maximum_gap
-        market_return = (
-            None if hard_gap else math.log(current.close / previous.close)
-        )
-        replay_rows: dict[str, object] = {}
-        for replay, targets in replay_targets.items():
-            family_rows: dict[str, object] = {}
-            for family in sorted(targets):
-                target = targets[family][index - 1]
-                prior_target = targets[family][index - 2] if index >= 2 else 0.0
-                turnover = abs(target - prior_target)
-                if hard_gap:
-                    turnover += abs(target)
-                family_rows[family] = {
-                    "target_at_decision": target,
-                    "turnover": turnover,
-                    "cost": turnover * cost_rate,
-                    "next_net_return": replay_returns[replay][family][index],
-                }
-            replay_rows[replay] = family_rows
-        rows.append(canonical_json({
-            "record_type": "label_cost",
-            "decision_time": previous.decision_time.isoformat(),
-            "label_available_time": current.decision_time.isoformat(),
-            "gap_seconds": gap_seconds,
-            "hard_gap": hard_gap,
-            "next_market_log_return": market_return,
-            "replays": replay_rows,
-        }))
     return _write_content_text(
         directory,
         "label-cost-replay",
         ".jsonl",
-        "\n".join(rows) + "\n",
+        cost_replay_body(panel, validation, config, research_identity),
     )
-def _market_state_payload(value: MarketState) -> Mapping[str, object]:
-    """把市场状态转换为 JSON 载荷。"""
-    return {
-        "trend": value.trend,
-        "volatility": value.volatility,
-        "liquidity": value.liquidity,
-        "flow": value.flow,
-        "carry": value.carry,
-        "cross_venue": value.cross_venue,
-        "relative": value.relative,
-        "jump": value.jump,
-        "regime": value.regime,
-        "uncertainty": value.uncertainty,
-    }
-
-
-def _family_payload(validation: ValidationResult) -> list[Mapping[str, object]]:
-    """生成家族级评估摘要。"""
-    return [{
-        "family": item.family,
-        "mode": item.mode,
-        "deployment_candidate_id": item.deployment_candidate.candidate_id,
-        "deployment_parameters": dict(item.deployment_candidate.parameters),
-        "walk_forward_selection_path": list(item.fold_selected_candidate_ids),
-        "latest_unallocated_target": item.latest_target,
-        "metrics": metrics_payload(item.metrics),
-        "adjusted_sharpe": item.adjusted_sharpe,
-        "fdr_q": item.fdr_q,
-        "eligible": item.eligible,
-        "rejection_reasons": list(item.rejection_reasons),
-        "positive_fold_ratio": item.positive_fold_ratio,
-        "most_selected_candidate_share": item.most_selected_candidate_share,
-        "median_selected_fold_sharpe": item.median_selected_fold_sharpe,
-        "probability_backtest_overfitting": item.probability_backtest_overfitting,
-        "median_cscv_oos_rank": item.median_cscv_oos_rank,
-        "cscv_split_count": item.cscv_split_count,
-        "cscv_in_sample_fold_count": item.cscv_in_sample_fold_count,
-        "cscv_out_sample_fold_count": item.cscv_out_sample_fold_count,
-        "block_bootstrap_sharpe_lower_bound": (
-            item.block_bootstrap_sharpe_lower_bound
-        ),
-        "block_bootstrap_p_value": item.block_bootstrap_p_value,
-        "block_bootstrap_sample_count": item.block_bootstrap_sample_count,
-        "deflated_sharpe_probability_raw": (
-            item.deflated_sharpe_probability_raw
-        ),
-        "deflated_sharpe_probability_effective": (
-            item.deflated_sharpe_probability_effective
-        ),
-        "deflated_sharpe_benchmark_raw": item.deflated_sharpe_benchmark_raw,
-        "deflated_sharpe_benchmark_effective": (
-            item.deflated_sharpe_benchmark_effective
-        ),
-        "raw_trial_count": item.raw_trial_count,
-        "effective_trial_count": item.effective_trial_count,
-        "parameter_neighbor_count": item.parameter_neighbor_count,
-        "positive_parameter_neighbor_ratio": (
-            item.positive_parameter_neighbor_ratio
-        ),
-        "median_parameter_neighbor_sharpe_retention": (
-            item.median_parameter_neighbor_sharpe_retention
-        ),
-    } for item in validation.families]
-
-
-def _position_contract_payload(
-    validation: ValidationResult,
-    allocation: AllocationResult,
-) -> Mapping[str, object]:
-    """把家族风险权重与方向目标合成为可审计的组合目标。"""
-    families: list[Mapping[str, object]] = []
-    aggregate_target = 0.0
-    for item in validation.families:
-        weight = float(allocation.weights.get(item.family, 0.0))
-        contribution = weight * item.latest_target
-        aggregate_target += contribution
-        families.append({
-            "family": item.family,
-            "deployment_candidate_id": item.deployment_candidate.candidate_id,
-            "eligible": item.eligible,
-            "family_target": item.latest_target,
-            "allocation_weight": weight,
-            "portfolio_target_contribution": contribution,
-        })
-    return {
-        "method_version": POSITION_CONTRACT_METHOD_VERSION,
-        "unit": "risk_weighted_directional_target",
-        "aggregate_target": aggregate_target,
-        "families": families,
-    }
-
-
 def _disabled_families() -> list[Mapping[str, object]]:
     """列出缺少事实闭环而固定为零的系列。"""
     return [
@@ -500,14 +324,18 @@ def _markdown_summary(summary: Mapping[str, Any]) -> str:
         )
     research = summary["research_position"]
     operational = summary["operational_position"]
+    research_contract = summary["research_target_contract"]
+    operational_contract = summary["operational_target_contract"]
     lines.extend([
         "",
-        "## 3. 目标位置",
+        "## 3. 资本分配与组合目标",
         "",
         "```json",
         json.dumps({
-            "research_replay": research,
-            "operational": operational,
+            "research_allocation_weights": research,
+            "operational_allocation_weights": operational,
+            "research_target_contract": research_contract,
+            "operational_target_contract": operational_contract,
         }, ensure_ascii=False, indent=2),
         "```",
         "",
@@ -528,22 +356,37 @@ def run_research(
     config_path: Path,
     output_root: Path | None = None,
     family_scope: Sequence[str] | None = None,
+    data_root: Path | None = None,
 ) -> ResearchRunResult:
     """运行完整 CPU 策略研究闭环。"""
     root = repository_root.resolve()
     config_file = config_path.resolve()
-    config = _load_config(config_file)
-    data_root = root / "data"
+    (
+        config,
+        config_hash,
+        lineage_root_config_hash,
+        config_lineage_depth,
+        config_source_paths,
+    ) = load_governed_strategy_config_with_paths(root, config_file)
+    research_data_root = root / "data"
+    source_data_root = (data_root or research_data_root).resolve()
+    source_data_root_record = data_root_locator(root, source_data_root)
+    source_data_snapshot = suite_data_snapshot_record(source_data_root)
     output_base = (output_root or root / "reports" / "strategy-research").resolve()
-    config_hash = sha256_file(config_file)
-    identity = code_identity(root, (config_file,))
+    identity = code_identity(root, config_source_paths)
     batches = build_family_batches(config, family_scope)
     resolved_family_scope = tuple(batch.family for batch in batches)
     candidates = tuple(
         candidate for batch in batches for candidate in batch.candidates
     )
     market_id = _text(config.get("market_id"), "market_id")
-    inputs = freeze_trade_inputs(data_root, market_id)
+    inputs = capture_trade_input_receipt(
+        source_data_root,
+        market_id,
+        research_data_root / "research" / "input-receipts",
+    )
+    if inputs.receipt_path is None or inputs.receipt_sha256 is None:
+        raise AssertionError("研究输入没有生成活动 head 收据")
     input_event = inputs.maximum_event_time
     execution_evaluated_at = datetime.now(UTC)
     exposure_start = parse_time(config.get("from_time"), "from_time")
@@ -553,14 +396,33 @@ def run_research(
         "p_value_method_version": P_VALUE_METHOD_VERSION,
         "pbo_method_version": PBO_METHOD_VERSION,
         "block_bootstrap_method_version": BLOCK_BOOTSTRAP_METHOD_VERSION,
+        "regime_attribution_method_version": REGIME_ATTRIBUTION_METHOD_VERSION,
         "deflated_sharpe_method_version": DEFLATED_SHARPE_METHOD_VERSION,
         "effective_trial_method_version": EFFECTIVE_TRIAL_METHOD_VERSION,
         "parameter_stability_method_version": PARAMETER_STABILITY_METHOD_VERSION,
         "position_contract_method_version": POSITION_CONTRACT_METHOD_VERSION,
+        "panel_method_version": PANEL_METHOD_VERSION,
+        "panel_schema_version": PANEL_SCHEMA_VERSION,
+        "feature_method_version": FEATURE_METHOD_VERSION,
+        "trade_flow_input_method_version": TRADE_FLOW_INPUT_METHOD_VERSION,
+        "trade_input_receipt_method_version": (
+            TRADE_INPUT_RECEIPT_METHOD_VERSION
+        ),
+        "operational_gate_method_version": OPERATIONAL_GATE_METHOD_VERSION,
         "config_hash": config_hash,
+        "config_lineage_root_hash": lineage_root_config_hash,
+        "config_lineage_depth": config_lineage_depth,
         "head_generation": inputs.head_generation,
         "attempt_ids": inputs.attempt_ids,
         "artifact_ids": inputs.artifact_ids,
+        "input_receipt_sha256": inputs.receipt_sha256,
+        "trade_input_qualification": {
+            "source_trade_rows": inputs.source_trade_rows,
+            "economic_trade_rows": inputs.economic_trade_rows,
+            "unqualified_trade_rows": inputs.unqualified_trade_rows,
+            "volume_qualified": inputs.volume_qualified,
+        },
+        "source_data_snapshot": source_data_snapshot,
         "code_tree_digest": identity.tree_digest,
         "dirty_digest": identity.dirty_digest,
         "generator_method_version": GENERATOR_METHOD_VERSION,
@@ -569,23 +431,35 @@ def run_research(
         "governance_method_version": GOVERNANCE_METHOD_VERSION,
         "data_scope": data_scope,
     })
-    run_id = stable_identifier("research-run", {
-        "research_identity": research_identity,
-        "execution_evaluated_at": execution_evaluated_at.isoformat(),
-    })
-    run_directory = output_base / run_id
-    artifact_directory = run_directory / "artifacts"
+    run_id, run_directory, artifact_directory = _research_output_paths(
+        output_base,
+        research_identity,
+        execution_evaluated_at,
+    )
+    config_snapshot = snapshot_verified_config_lineage(
+        root, config_file, artifact_directory,
+    )
     exposure = register_research_exposure(
         governance_path,
         research_identity,
         market_id,
         exposure_start,
         input_event,
-        recorded_at=execution_evaluated_at,
+    )
+    receipt_registration = register_active_head_receipt(
+        governance_path,
+        "research",
+        research_identity,
+        market_id,
+        inputs.head_generation,
+        _relative(inputs.receipt_path, root),
+        inputs.receipt_sha256,
+        repository_root=root,
+        data_root=source_data_root,
     )
     panel = build_panel_snapshot(
         inputs,
-        data_root / "research" / "physical" / market_id,
+        research_data_root / "research" / "physical" / market_id,
         _text(config.get("bar_interval"), "bar_interval"),
         exposure_start,
         input_event,
@@ -611,7 +485,6 @@ def run_research(
     valid_indices = [
         index for index, feature in enumerate(features)
         if feature.contiguous
-        and feature.volume_score is not None
         and feature.trend_scores.get(state_lookback) is not None
     ]
     if not valid_indices:
@@ -624,13 +497,14 @@ def run_research(
         raise ValueError("不支持的研究节拍")
     periods_per_year = SECONDS_PER_YEAR / interval_seconds
     validation = walk_forward_validate(
-        run_id,
+        research_identity,
         panel.bars,
         features,
         candidates,
         config,
         decision_index=decision_index,
     )
+    _attest_stable_code_identity(root, config_source_paths, identity)
     maximum_age = _integer(
         config.get("strategy_decision_max_age_seconds"),
         "strategy_decision_max_age_seconds",
@@ -655,6 +529,11 @@ def run_research(
         strategy_decision_time,
         execution_evaluated_at,
         maximum_age,
+    )
+    operational_quality = gate_economic_trade_volume(
+        operational_quality,
+        validation.families,
+        features[decision_index],
     )
     if not identity.decision_grade:
         operational_quality = QualityVector(
@@ -682,12 +561,12 @@ def run_research(
     if not isinstance(raw_market_ids, list):
         raise ValueError("cross_venue_shadow.market_ids 必须为数组")
     l2_decision = latest_common_l2_decision(
-        data_root,
+        source_data_root,
         tuple(str(value) for value in raw_market_ids),
     )
-    shadow = cross_venue_shadow(data_root, l2_decision, cross_config)
+    shadow = cross_venue_shadow(source_data_root, l2_decision, cross_config)
     decision_shadow = cross_venue_shadow(
-        data_root,
+        source_data_root,
         strategy_decision_time,
         cross_config,
     )
@@ -701,7 +580,11 @@ def run_research(
         market_state,
         research_quality,
         allocation_config,
-        l2_overlay=overlay,
+        # L2 尚无成交 head 的历史收据。
+        # 研究和冻结权重只使用
+        # 受保护的成交 panel，
+        # 并采用可重建的零 overlay。
+        l2_overlay=0.0,
     )
     operational_position = allocate(
         validation.families,
@@ -782,14 +665,14 @@ def run_research(
     trial_path, trial_hash = _trial_artifact(
         artifact_directory,
         validation,
-        run_id,
+        research_identity,
     )
     replay_path, replay_hash = _cost_replay_artifact(
         artifact_directory,
         panel,
         validation,
         config,
-        run_id,
+        research_identity,
     )
     registry_path, registry_hash = _write_content_text(
         artifact_directory,
@@ -830,6 +713,22 @@ def run_research(
         canonical_json(shadow) + "\n",
     )
     artifacts = {
+        "input_receipt": {
+            **artifact_record(inputs.receipt_path, "active_trade_head_receipt"),
+            "path": _relative(inputs.receipt_path, root),
+        },
+        "config": {
+            **artifact_record(
+                config_snapshot.leaf_config_path, "research_config_snapshot",
+            ),
+            "path": _relative(config_snapshot.leaf_config_path, root),
+        },
+        "config_lineage": {
+            **artifact_record(
+                config_snapshot.bundle_path, "research_config_lineage",
+            ),
+            "path": _relative(config_snapshot.bundle_path, root),
+        },
         "panel": {
             **artifact_record(panel.panel_path, "research_physical_panel"),
             "path": _relative(panel.panel_path, root),
@@ -877,10 +776,19 @@ def run_research(
         "p_value_method_version": P_VALUE_METHOD_VERSION,
         "pbo_method_version": PBO_METHOD_VERSION,
         "block_bootstrap_method_version": BLOCK_BOOTSTRAP_METHOD_VERSION,
+        "regime_attribution_method_version": REGIME_ATTRIBUTION_METHOD_VERSION,
         "deflated_sharpe_method_version": DEFLATED_SHARPE_METHOD_VERSION,
         "effective_trial_method_version": EFFECTIVE_TRIAL_METHOD_VERSION,
         "parameter_stability_method_version": PARAMETER_STABILITY_METHOD_VERSION,
         "position_contract_method_version": POSITION_CONTRACT_METHOD_VERSION,
+        "panel_method_version": PANEL_METHOD_VERSION,
+        "panel_schema_version": PANEL_SCHEMA_VERSION,
+        "feature_method_version": FEATURE_METHOD_VERSION,
+        "trade_flow_input_method_version": TRADE_FLOW_INPUT_METHOD_VERSION,
+        "trade_input_receipt_method_version": (
+            TRADE_INPUT_RECEIPT_METHOD_VERSION
+        ),
+        "operational_gate_method_version": OPERATIONAL_GATE_METHOD_VERSION,
         "governance_method_version": GOVERNANCE_METHOD_VERSION,
         "run_id": run_id,
         "research_identity": research_identity,
@@ -889,15 +797,22 @@ def run_research(
         "market_id": market_id,
         "decision_time": strategy_decision_time.isoformat(),
         "execution_evaluated_at": execution_evaluated_at.isoformat(),
+        "source_data_root": source_data_root_record,
+        "source_data_snapshot": source_data_snapshot,
         "decision_grade": identity.decision_grade,
         "code_identity": asdict(identity),
         "config_hash": config_hash,
+        "config_lineage_root_hash": lineage_root_config_hash,
+        "config_lineage_depth": config_lineage_depth,
         "data_governance": {
             "scope": data_scope,
             "exposure_id": exposure.exposure_id,
             "from_time": exposure.start_time.isoformat(),
             "to_time": exposure.end_time.isoformat(),
             "registry": _relative(governance_path, root),
+            "input_receipt_sha256": (
+                receipt_registration.receipt_artifact_sha256
+            ),
         },
         "input": panel_inputs_payload(inputs),
         "panel": {
@@ -906,6 +821,14 @@ def run_research(
             "to_time": panel.bars[-1].decision_time.isoformat(),
             "latest_available_time": panel.latest_available_time.isoformat(),
             "sha256": panel.panel_sha256,
+            "research_economic_volume_qualified": all(
+                bar.volume_qualified for bar in panel.bars
+            ),
+            "latest_economic_volume_qualified": (
+                features[decision_index].volume_qualified
+                and features[decision_index].volume_score is not None
+                and features[decision_index].flow_imbalance is not None
+            ),
         },
         "strategy_decision": {
             "feature_index": decision_index,
@@ -933,6 +856,7 @@ def run_research(
         "disabled_families": _disabled_families(),
         "artifacts": artifacts,
     }
+    _attest_stable_code_identity(root, config_source_paths, identity)
     summary_path = run_directory / "summary.json"
     atomic_write_text(summary_path, canonical_json(summary) + "\n")
     summary_text_path = run_directory / "summary.txt"
@@ -943,10 +867,19 @@ def run_research(
         "p_value_method_version": P_VALUE_METHOD_VERSION,
         "pbo_method_version": PBO_METHOD_VERSION,
         "block_bootstrap_method_version": BLOCK_BOOTSTRAP_METHOD_VERSION,
+        "regime_attribution_method_version": REGIME_ATTRIBUTION_METHOD_VERSION,
         "deflated_sharpe_method_version": DEFLATED_SHARPE_METHOD_VERSION,
         "effective_trial_method_version": EFFECTIVE_TRIAL_METHOD_VERSION,
         "parameter_stability_method_version": PARAMETER_STABILITY_METHOD_VERSION,
         "position_contract_method_version": POSITION_CONTRACT_METHOD_VERSION,
+        "panel_method_version": PANEL_METHOD_VERSION,
+        "panel_schema_version": PANEL_SCHEMA_VERSION,
+        "feature_method_version": FEATURE_METHOD_VERSION,
+        "trade_flow_input_method_version": TRADE_FLOW_INPUT_METHOD_VERSION,
+        "trade_input_receipt_method_version": (
+            TRADE_INPUT_RECEIPT_METHOD_VERSION
+        ),
+        "operational_gate_method_version": OPERATIONAL_GATE_METHOD_VERSION,
         "governance_method_version": GOVERNANCE_METHOD_VERSION,
         "run_id": run_id,
         "research_identity": research_identity,
@@ -954,14 +887,25 @@ def run_research(
         "family_scope": list(resolved_family_scope),
         "decision_time": strategy_decision_time.isoformat(),
         "execution_evaluated_at": execution_evaluated_at.isoformat(),
+        "source_data_root": source_data_root_record,
+        "source_data_snapshot": source_data_snapshot,
         "code_identity": asdict(identity),
         "config_hash": config_hash,
+        "config_lineage_root_hash": lineage_root_config_hash,
+        "config_lineage_depth": config_lineage_depth,
         "data_scope": data_scope,
         "research_exposure_id": exposure.exposure_id,
         "input_head_generation": panel.head_generation,
+        "input_receipt_sha256": inputs.receipt_sha256,
         "input_attempt_ids": list(panel.attempt_ids),
         "input_artifact_ids": list(panel.artifact_ids),
         "normalization_versions": list(panel.normalization_versions),
+        "trade_input_qualification": {
+            "source_trade_rows": inputs.source_trade_rows,
+            "economic_trade_rows": inputs.economic_trade_rows,
+            "unqualified_trade_rows": inputs.unqualified_trade_rows,
+            "volume_qualified": inputs.volume_qualified,
+        },
         "artifacts": {
             **artifacts,
             "summary_json": {
@@ -997,8 +941,11 @@ def run_research(
             item.family for item in validation.families if item.eligible
         ),
         operational_nonzero_families=tuple(
-            family for family, weight in operational_position.weights.items()
-            if weight > 0
+            item.family for item in validation.families
+            if abs(
+                operational_position.weights.get(item.family, 0.0)
+                * item.latest_target
+            ) > 1e-12
         ),
         family_scope=resolved_family_scope,
     )

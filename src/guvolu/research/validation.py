@@ -13,19 +13,31 @@ from dataclasses import dataclass, field
 from guvolu.research.contracts import (
     FamilyEvaluation,
     PerformanceMetrics,
+    RegimeAttribution,
     TrialRecord,
 )
+from guvolu.research.features import classify_market_state
 from guvolu.research.provenance import stable_identifier
 from guvolu.strategy.baselines import generate_targets
 from guvolu.strategy.contracts import CandidateSpec, FeatureRow, ResearchBar
 
 SECONDS_PER_YEAR = 365.0 * 24.0 * 60.0 * 60.0
 P_VALUE_METHOD_VERSION = "probabilistic-sharpe-nonnormal-v1"
-PBO_METHOD_VERSION = "cscv-balanced-fold-block-v2"
-BLOCK_BOOTSTRAP_METHOD_VERSION = "circular-block-bootstrap-sharpe-v1"
+PBO_METHOD_VERSION = "cscv-recent-even-window-tie-average-v4"
+LEGACY_BLOCK_BOOTSTRAP_METHOD_VERSION = "circular-block-bootstrap-sharpe-v1"
+BLOCK_BOOTSTRAP_METHOD_VERSION = "studentized-circular-block-sharpe-v2"
 DEFLATED_SHARPE_METHOD_VERSION = "deflated-sharpe-family-effective-gate-v3"
 EFFECTIVE_TRIAL_METHOD_VERSION = "fold-score-correlation-participation-v1"
 PARAMETER_STABILITY_METHOD_VERSION = "one-axis-nearest-neighbor-v1"
+REGIME_ATTRIBUTION_METHOD_VERSION = "predecision-stitched-oos-regime-v1"
+_REGIME_ATTRIBUTION_ORDER = (
+    "jump_risk",
+    "positive_trend",
+    "negative_trend",
+    "range",
+    "mixed",
+    "unavailable",
+)
 _INTERVAL_SECONDS = {
     "5min": 300.0,
     "15min": 900.0,
@@ -56,6 +68,8 @@ class ValidationResult:
     family_validation_targets: Mapping[str, tuple[float, ...]] = field(
         default_factory=dict,
     )
+    block_bootstrap_method_version: str = BLOCK_BOOTSTRAP_METHOD_VERSION
+    regime_attribution_method_version: str | None = None
 
 
 @dataclass(frozen=True)
@@ -78,6 +92,7 @@ class _PendingFamily:
     bootstrap_lower: float
     bootstrap_p: float
     bootstrap_count: int
+    regime_attribution: tuple[RegimeAttribution, ...]
 
 
 def _mapping(value: object, name: str) -> Mapping[str, object]:
@@ -279,9 +294,13 @@ def _probability_backtest_overfitting(
         len(fold_scores[identifier]) != fold_count for identifier in identifiers
     ):
         raise ValueError("PBO 需要至少四个同长测试折")
+    usable_scores = {
+        identifier: tuple(fold_scores[identifier][fold_count % 2 :])
+        for identifier in identifiers
+    }
+    fold_count -= fold_count % 2
     half = fold_count // 2
-    paired_halves = fold_count % 2 == 0
-    total_unique = math.comb(fold_count, half) // (2 if paired_halves else 1)
+    total_unique = math.comb(fold_count, half) // 2
     target = min(split_budget, total_unique)
     subsets: set[tuple[int, ...]] = set()
     if total_unique <= split_budget:
@@ -289,7 +308,7 @@ def _probability_backtest_overfitting(
             complement = tuple(
                 index for index in range(fold_count) if index not in raw_subset
             )
-            subsets.add(min(raw_subset, complement) if paired_halves else raw_subset)
+            subsets.add(min(raw_subset, complement))
     else:
         generator = random.Random(seed)
         while len(subsets) < target:
@@ -297,7 +316,7 @@ def _probability_backtest_overfitting(
             complement = tuple(
                 index for index in range(fold_count) if index not in raw_subset
             )
-            subsets.add(min(raw_subset, complement) if paired_halves else raw_subset)
+            subsets.add(min(raw_subset, complement))
     below_median = 0
     ranks: list[float] = []
     for subset in sorted(subsets):
@@ -306,26 +325,32 @@ def _probability_backtest_overfitting(
         )
         in_sample = {
             identifier: statistics.fmean(
-                fold_scores[identifier][index] for index in subset
+                usable_scores[identifier][index] for index in subset
             )
             for identifier in identifiers
         }
         out_sample = {
             identifier: statistics.fmean(
-                fold_scores[identifier][index] for index in complement
+                usable_scores[identifier][index] for index in complement
             )
             for identifier in identifiers
         }
-        winner = min(
-            identifiers,
-            key=lambda identifier: (-in_sample[identifier], identifier),
+        winning_score = max(in_sample.values())
+        winners = tuple(
+            identifier for identifier in identifiers
+            if in_sample[identifier] == winning_score
         )
-        winner_score = out_sample[winner]
-        lower_count = sum(score < winner_score for score in out_sample.values())
-        tie_count = sum(score == winner_score for score in out_sample.values())
-        relative_rank = (lower_count + tie_count / 2.0) / len(identifiers)
+        winner_ranks: list[float] = []
+        for winner in winners:
+            winner_score = out_sample[winner]
+            lower_count = sum(score < winner_score for score in out_sample.values())
+            tie_count = sum(score == winner_score for score in out_sample.values())
+            winner_ranks.append(
+                (lower_count + tie_count / 2.0) / len(identifiers)
+            )
+        relative_rank = statistics.fmean(winner_ranks)
         ranks.append(relative_rank)
-        below_median += int(relative_rank <= 0.5)
+        below_median += int(relative_rank < 0.5)
     return (
         below_median / len(subsets),
         statistics.median(ranks),
@@ -403,12 +428,265 @@ def _circular_block_bootstrap_sharpe(
     )
 
 
+def _sharpe_from_moments(
+    mean: float,
+    second_moment: float,
+    periods_per_year: float,
+) -> float:
+    """由一阶、二阶总体矩计算年化 Sharpe 点估计。"""
+    variance = max(second_moment - mean * mean, 0.0)
+    if variance <= 0.0:
+        return 0.0
+    return mean / math.sqrt(variance) * math.sqrt(periods_per_year)
+
+
+def _sharpe_standard_error(
+    mean: float,
+    second_moment: float,
+    covariance: tuple[float, float, float],
+    count: int,
+    periods_per_year: float,
+) -> float:
+    """以矩函数梯度和长程协方差计算 Sharpe 标准误。"""
+    variance = second_moment - mean * mean
+    if variance <= 0.0 or count <= 0:
+        return 0.0
+    scale = math.sqrt(periods_per_year)
+    gradient_mean = scale * second_moment / (variance ** 1.5)
+    gradient_second = -scale * mean / (2.0 * variance ** 1.5)
+    covariance_mean, covariance_cross, covariance_second = covariance
+    long_run_variance = (
+        gradient_mean * gradient_mean * covariance_mean
+        + 2.0 * gradient_mean * gradient_second * covariance_cross
+        + gradient_second * gradient_second * covariance_second
+    )
+    return math.sqrt(max(long_run_variance / count, 0.0))
+
+
+def _circular_block_moment_covariance(
+    values: Sequence[float],
+    block_bars: int,
+    mean: float,
+    second_moment: float,
+) -> tuple[float, float, float]:
+    """以所有循环块的矩和估计原序列长程协方差。"""
+    count = len(values)
+    doubled = tuple(values) + tuple(values)
+    prefix = [0.0]
+    prefix_square = [0.0]
+    for value in doubled:
+        prefix.append(prefix[-1] + value)
+        prefix_square.append(prefix_square[-1] + value * value)
+    covariance_mean = 0.0
+    covariance_cross = 0.0
+    covariance_second = 0.0
+    normalization = math.sqrt(block_bars)
+    for start in range(count):
+        end = start + block_bars
+        centered_mean = (
+            prefix[end] - prefix[start] - block_bars * mean
+        ) / normalization
+        centered_second = (
+            prefix_square[end]
+            - prefix_square[start]
+            - block_bars * second_moment
+        ) / normalization
+        covariance_mean += centered_mean * centered_mean
+        covariance_cross += centered_mean * centered_second
+        covariance_second += centered_second * centered_second
+    return (
+        covariance_mean / count,
+        covariance_cross / count,
+        covariance_second / count,
+    )
+
+
+def _studentized_circular_block_bootstrap_sharpe(
+    values: Sequence[float],
+    block_bars: int,
+    samples: int,
+    one_sided_alpha: float,
+    seed: int,
+    periods_per_year: float = 365.0 * 24.0,
+) -> tuple[float, float, int]:
+    """以循环块和逐样本自然标准误构造一侧 bootstrap-t 门禁。"""
+    count = len(values)
+    if count < 2:
+        raise ValueError("studentized bootstrap 需要至少两个收益观测")
+    if block_bars <= 0 or block_bars * 2 > count:
+        raise ValueError("studentized bootstrap 折块长度超出收益序列")
+    if samples <= 0:
+        raise ValueError("studentized bootstrap 样本数必须为正")
+    if one_sided_alpha <= 0.0 or one_sided_alpha >= 0.5:
+        raise ValueError("studentized bootstrap 单侧 alpha 必须位于 (0, 0.5)")
+    mean = statistics.fmean(values)
+    second_moment = statistics.fmean(value * value for value in values)
+    sharpe = _sharpe_from_moments(mean, second_moment, periods_per_year)
+    covariance = _circular_block_moment_covariance(
+        values, block_bars, mean, second_moment,
+    )
+    standard_error = _sharpe_standard_error(
+        mean, second_moment, covariance, count, periods_per_year,
+    )
+    if standard_error <= 0.0:
+        return 0.0, 1.0, samples
+    doubled = tuple(values) + tuple(values)
+    prefix = [0.0]
+    prefix_square = [0.0]
+    for value in doubled:
+        prefix.append(prefix[-1] + value)
+        prefix_square.append(prefix_square[-1] + value * value)
+    full_blocks, remainder = divmod(count, block_bars)
+    generator = random.Random(seed)
+    statistics_t: list[float] = []
+    normalization = math.sqrt(block_bars)
+    for _sample in range(samples):
+        block_moments: list[tuple[float, float]] = []
+        total = 0.0
+        total_square = 0.0
+        for _block in range(full_blocks):
+            start = generator.randrange(count)
+            end = start + block_bars
+            block_sum = prefix[end] - prefix[start]
+            block_square = prefix_square[end] - prefix_square[start]
+            block_moments.append((block_sum, block_square))
+            total += block_sum
+            total_square += block_square
+        if remainder:
+            start = generator.randrange(count)
+            end = start + remainder
+            total += prefix[end] - prefix[start]
+            total_square += prefix_square[end] - prefix_square[start]
+        bootstrap_mean = total / count
+        bootstrap_second = total_square / count
+        bootstrap_sharpe = _sharpe_from_moments(
+            bootstrap_mean, bootstrap_second, periods_per_year,
+        )
+        covariance_mean = 0.0
+        covariance_cross = 0.0
+        covariance_second = 0.0
+        for block_sum, block_square in block_moments:
+            centered_mean = (
+                block_sum - block_bars * bootstrap_mean
+            ) / normalization
+            centered_second = (
+                block_square - block_bars * bootstrap_second
+            ) / normalization
+            covariance_mean += centered_mean * centered_mean
+            covariance_cross += centered_mean * centered_second
+            covariance_second += centered_second * centered_second
+        divisor = max(len(block_moments), 1)
+        bootstrap_error = _sharpe_standard_error(
+            bootstrap_mean,
+            bootstrap_second,
+            (
+                covariance_mean / divisor,
+                covariance_cross / divisor,
+                covariance_second / divisor,
+            ),
+            count,
+            periods_per_year,
+        )
+        statistic = (
+            (bootstrap_sharpe - sharpe) / bootstrap_error
+            if bootstrap_error > 0.0 else 0.0
+        )
+        statistics_t.append(statistic)
+    observed = sharpe / standard_error
+    upper_quantile = _quantile(statistics_t, 1.0 - one_sided_alpha)
+    exceedances = sum(value >= observed for value in statistics_t)
+    return (
+        sharpe - upper_quantile * standard_error,
+        (exceedances + 1) / (samples + 1),
+        samples,
+    )
+
+
+def _stitched_oos_regime_attribution(
+    features: Sequence[FeatureRow],
+    targets: Sequence[float],
+    returns: Sequence[float],
+    oos_mask: Sequence[bool],
+    state_lookback: int,
+    periods_per_year: float,
+) -> tuple[RegimeAttribution, ...]:
+    """按收益区间开始前的状态归因 stitched OOS，不参与选择。"""
+    count = len(features)
+    if not (
+        len(targets) == count
+        and len(returns) == count
+        and len(oos_mask) == count
+    ):
+        raise ValueError("regime attribution 输入长度不一致")
+    if state_lookback <= 1 or periods_per_year <= 0.0:
+        raise ValueError("regime attribution 配置无效")
+    buckets: dict[str, list[tuple[float, float]]] = {
+        regime: [] for regime in _REGIME_ATTRIBUTION_ORDER
+    }
+    for index in range(1, count):
+        if not oos_mask[index]:
+            continue
+        feature = features[index - 1]
+        if (
+            not feature.contiguous
+            or feature.trend_scores.get(state_lookback) is None
+        ):
+            regime = "unavailable"
+        else:
+            regime = classify_market_state(
+                feature,
+                state_lookback,
+                feature.volume_score,
+                periods_per_year,
+            ).regime
+        buckets[regime].append((returns[index], targets[index - 1]))
+    total_bars = sum(len(values) for values in buckets.values())
+    result: list[RegimeAttribution] = []
+    for regime in _REGIME_ATTRIBUTION_ORDER:
+        values = buckets[regime]
+        regime_bars = len(values)
+        regime_returns = [value for value, _target in values]
+        regime_targets = [target for _value, target in values]
+        mean_return = statistics.fmean(regime_returns) if values else 0.0
+        period_volatility = statistics.pstdev(regime_returns) if values else 0.0
+        annualized_sharpe = (
+            mean_return / period_volatility * math.sqrt(periods_per_year)
+            if period_volatility > 0.0 else 0.0
+        )
+        result.append(RegimeAttribution(
+            regime=regime,
+            bars=regime_bars,
+            bar_share=regime_bars / total_bars if total_bars else 0.0,
+            net_log_return=sum(regime_returns),
+            mean_return=mean_return,
+            period_volatility=period_volatility,
+            annualized_sharpe=annualized_sharpe,
+            hit_rate=(
+                sum(value > 0.0 for value in regime_returns) / regime_bars
+                if regime_bars else 0.0
+            ),
+            active_target_share=(
+                sum(abs(target) > 1e-12 for target in regime_targets) / regime_bars
+                if regime_bars else 0.0
+            ),
+            mean_absolute_target=(
+                statistics.fmean(abs(target) for target in regime_targets)
+                if regime_bars else 0.0
+            ),
+        ))
+    return tuple(result)
+
+
 def make_folds(bar_count: int, config: Mapping[str, object]) -> tuple[WalkForwardFold, ...]:
     """生成带 embargo 的扩展 walk-forward。"""
     minimum_train = _integer(config.get("minimum_train_bars"), "minimum_train_bars")
     test_bars = _integer(config.get("test_bars"), "test_bars")
     step_bars = _integer(config.get("step_bars"), "step_bars")
     embargo = _integer(config.get("embargo_bars"), "embargo_bars")
+    if step_bars != test_bars:
+        raise ValueError(
+            "当前 stitched walk-forward 要求 step_bars 与 test_bars 相等"
+        )
     folds: list[WalkForwardFold] = []
     test_start = minimum_train + embargo
     ordinal = 1
@@ -680,8 +958,23 @@ def walk_forward_validate(
     candidates: Sequence[CandidateSpec],
     config: Mapping[str, object],
     decision_index: int | None = None,
+    *,
+    block_bootstrap_method_version: str = BLOCK_BOOTSTRAP_METHOD_VERSION,
+    regime_attribution_method_version: str | None = (
+        REGIME_ATTRIBUTION_METHOD_VERSION
+    ),
 ) -> ValidationResult:
     """按家族训练选择并只消费被选测试路径。"""
+    if block_bootstrap_method_version not in {
+        LEGACY_BLOCK_BOOTSTRAP_METHOD_VERSION,
+        BLOCK_BOOTSTRAP_METHOD_VERSION,
+    }:
+        raise ValueError("block bootstrap 方法版本不受支持")
+    if regime_attribution_method_version not in {
+        None,
+        REGIME_ATTRIBUTION_METHOD_VERSION,
+    }:
+        raise ValueError("regime attribution 方法版本不受支持")
     cost = _mapping(config.get("cost_model"), "cost_model")
     cost_bps = sum(_number(cost.get(name), name) for name in (
         "fee_bps_assumption",
@@ -697,6 +990,9 @@ def walk_forward_validate(
     if not isinstance(interval, str) or interval not in _INTERVAL_SECONDS:
         raise ValueError("bar_interval 不支持成本回放")
     feature_config = _mapping(config.get("features"), "features")
+    state_lookback = _integer(
+        feature_config.get("state_lookback"), "state_lookback",
+    )
     structural_gap_bars = _integer(
         feature_config.get("maximum_structural_gap_bars_assumption"),
         "maximum_structural_gap_bars_assumption",
@@ -752,6 +1048,7 @@ def walk_forward_validate(
     if resolved_decision_index < 0 or resolved_decision_index >= len(bars):
         raise ValueError("策略决策索引超出面板")
     common_oos_mask = [False] * len(bars)
+    cscv_used_fold_count = len(folds) - len(folds) % 2
     for fold in folds:
         for index in range(fold.test_start, fold.test_end):
             common_oos_mask[index] = True
@@ -918,7 +1215,7 @@ def walk_forward_validate(
         })
         bootstrap_seed = block_bootstrap_seed ^ int(
             hashlib.sha256(
-                f"{family}:{BLOCK_BOOTSTRAP_METHOD_VERSION}".encode("utf-8")
+                f"{family}:{block_bootstrap_method_version}".encode("utf-8")
             ).hexdigest()[:16],
             16,
         )
@@ -927,8 +1224,14 @@ def walk_forward_validate(
             for index in range(1, len(bars))
             if oos_mask[index]
         )
+        bootstrap_function = (
+            _circular_block_bootstrap_sharpe
+            if block_bootstrap_method_version
+            == LEGACY_BLOCK_BOOTSTRAP_METHOD_VERSION
+            else _studentized_circular_block_bootstrap_sharpe
+        )
         bootstrap_lower, bootstrap_p, bootstrap_count = (
-            _circular_block_bootstrap_sharpe(
+            bootstrap_function(
                 compact_oos_returns,
                 block_bootstrap_bars,
                 block_bootstrap_samples,
@@ -938,6 +1241,18 @@ def walk_forward_validate(
             )
         )
         family_validation_targets[family] = tuple(oos_targets)
+        regime_attribution = (
+            _stitched_oos_regime_attribution(
+                features,
+                oos_targets,
+                oos_returns,
+                oos_mask,
+                state_lookback,
+                periods_per_year,
+            )
+            if regime_attribution_method_version is not None
+            else ()
+        )
         pending.append(_PendingFamily(
             family=family,
             mode=selected_full.mode,
@@ -955,6 +1270,7 @@ def walk_forward_validate(
             bootstrap_lower=bootstrap_lower,
             bootstrap_p=bootstrap_p,
             bootstrap_count=bootstrap_count,
+            regime_attribution=regime_attribution,
         ))
     candidate_oos_metrics: dict[str, PerformanceMetrics] = {}
     for candidate in candidates:
@@ -1131,6 +1447,14 @@ def walk_forward_validate(
             latest_target=candidate_targets[item.deployment_candidate.candidate_id][
                 resolved_decision_index
             ],
+            deployment_oos_metrics=candidate_oos_metrics[
+                item.deployment_candidate.candidate_id
+            ],
+            deployment_oos_returns=tuple(
+                candidate_returns[item.deployment_candidate.candidate_id][index]
+                for index in range(1, len(bars))
+                if common_oos_mask[index]
+            ),
             metrics=item.metrics,
             adjusted_sharpe=item.adjusted_sharpe,
             fdr_q=q_value,
@@ -1160,9 +1484,11 @@ def walk_forward_validate(
                 median_neighbor_retention
             ),
             fold_selected_candidate_ids=item.fold_selected_candidate_ids,
-            cscv_in_sample_fold_count=len(folds) // 2,
-            cscv_out_sample_fold_count=len(folds) - len(folds) // 2,
+            cscv_in_sample_fold_count=cscv_used_fold_count // 2,
+            cscv_out_sample_fold_count=cscv_used_fold_count // 2,
+            cscv_excluded_fold_count=len(folds) - cscv_used_fold_count,
             periods_per_year=periods_per_year,
+            regime_attribution=item.regime_attribution,
         ))
     return ValidationResult(
         families=tuple(sorted(evaluations, key=lambda item: item.family)),
@@ -1170,6 +1496,8 @@ def walk_forward_validate(
         candidate_targets=candidate_targets,
         folds=folds,
         family_validation_targets=family_validation_targets,
+        block_bootstrap_method_version=block_bootstrap_method_version,
+        regime_attribution_method_version=regime_attribution_method_version,
     )
 
 

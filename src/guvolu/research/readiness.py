@@ -6,6 +6,10 @@ from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from guvolu.research.config_lineage import (
+    load_governed_strategy_config_with_paths,
+)
+from guvolu.research.data_location import resolve_data_root_locator
 from guvolu.research.features import compute_features
 from guvolu.research.governance import (
     HoldoutVintage,
@@ -13,11 +17,13 @@ from guvolu.research.governance import (
     list_holdout_vintages,
 )
 from guvolu.research.panel import freeze_trade_inputs, load_panel_bars
-from guvolu.research.provenance import code_identity, sha256_file
-from guvolu.research.verification import verify_research_run
+from guvolu.research.provenance import code_identity
+from guvolu.research.verification_attestation import (
+    verify_research_run_cached as verify_research_run,
+)
 from guvolu.strategy.contracts import ResearchBar
 
-READINESS_METHOD_VERSION = "strategy-readiness-v2"
+READINESS_METHOD_VERSION = "strategy-readiness-v4"
 _INTERVAL_SECONDS = {
     "5min": 300,
     "15min": 900,
@@ -112,9 +118,18 @@ def strategy_readiness(
     """验证当前研究来源，并报告 operational 与 holdout 就绪度。"""
     root = repository_root.resolve()
     config_file = config_path if config_path.is_absolute() else root / config_path
-    config = _read_object(config_file, "strategy config")
+    (
+        config,
+        config_hash,
+        config_lineage_root_hash,
+        config_lineage_depth,
+        config_source_paths,
+    ) = load_governed_strategy_config_with_paths(root, config_file)
     verified = verify_research_run(root, manifest_path)
     manifest = _read_object(verified.manifest_path, "research manifest")
+    source_data_root = resolve_data_root_locator(
+        root, manifest.get("source_data_root"),
+    )
     artifacts = _object(manifest.get("artifacts"), "manifest.artifacts")
     summary_record = _object(
         artifacts.get("summary_json"), "manifest.artifacts.summary_json",
@@ -122,14 +137,19 @@ def strategy_readiness(
     summary_path = _resolve(root, summary_record.get("path"), "summary path")
     summary = _read_object(summary_path, "research summary")
     market_id = _text(summary.get("market_id"), "summary.market_id")
-    current_inputs = freeze_trade_inputs(root / "data", market_id)
-    identity = code_identity(root, (config_file,))
+    current_inputs = freeze_trade_inputs(source_data_root, market_id)
+    identity = code_identity(root, config_source_paths)
     source_identity = _object(summary.get("code_identity"), "summary.code_identity")
     source_tree_digest = _text(
         source_identity.get("tree_digest"), "source tree digest",
     )
     tree_matches = source_tree_digest == identity.tree_digest
-    config_matches = summary.get("config_hash") == sha256_file(config_file)
+    config_matches = (
+        summary.get("config_hash") == config_hash
+        and summary.get("config_lineage_root_hash")
+        == config_lineage_root_hash
+        and summary.get("config_lineage_depth") == config_lineage_depth
+    )
 
     panel_record = _object(artifacts.get("panel"), "manifest.artifacts.panel")
     panel_path = _resolve(root, panel_record.get("path"), "panel path")
@@ -155,11 +175,31 @@ def strategy_readiness(
         volume_lookback,
         maximum_gap,
     )
+    raw_evaluations = summary.get("family_evaluations")
+    if not isinstance(raw_evaluations, list):
+        raise ValueError("summary.family_evaluations 必须为数组")
+    eligible_families = tuple(
+        str(item.get("family"))
+        for item in raw_evaluations
+        if isinstance(item, Mapping)
+        and item.get("eligible") is True
+        and item.get("mode") == "paper"
+    )
+    flow_sensitive = any(
+        family in {"flow_trend", "breakout"}
+        for family in eligible_families
+    )
     valid_indices = [
         index for index, feature in enumerate(features)
         if feature.contiguous
-        and feature.volume_score is not None
         and feature.trend_scores.get(state_lookback) is not None
+        and (
+            not flow_sensitive
+            or (
+                feature.volume_score is not None
+                and feature.flow_imbalance is not None
+            )
+        )
     ]
     if not valid_indices:
         raise ValueError("研究面板没有任何可用策略决策时点")
@@ -185,6 +225,17 @@ def strategy_readiness(
     feature_age_seconds = (evaluated_at - latest_valid_time).total_seconds()
     input_summary = _object(summary.get("input"), "summary.input")
     head_matches = input_summary.get("head_generation") == current_inputs.head_generation
+    current_trade_semantics = (
+        summary.get("pipeline_method_version") == "strategy-research-pipeline-v14"
+        and summary.get("panel_method_version") == "trade-bars-pit-v2"
+        and summary.get("feature_method_version") == "research-features-v2"
+        and summary.get("trade_flow_input_method_version")
+        == "economic-trade-basis-v1"
+        and summary.get("trade_input_receipt_method_version")
+        == "active-trade-head-receipt-v2"
+        and summary.get("operational_gate_method_version")
+        == "economic-trade-operational-gate-v1"
+    )
     operational_blockers: list[str] = []
     if latest_valid_index != len(features) - 1:
         operational_blockers.append("latest_panel_feature_not_mature")
@@ -198,6 +249,21 @@ def strategy_readiness(
         operational_blockers.append("current_code_not_decision_grade")
     if not tree_matches:
         operational_blockers.append("source_code_tree_mismatch")
+    if not config_matches:
+        operational_blockers.append("source_config_mismatch")
+    if not current_trade_semantics:
+        operational_blockers.append("source_trade_semantics_outdated")
+    latest_volume_qualified = (
+        features[-1].volume_qualified
+        and features[-1].volume_score is not None
+        and features[-1].flow_imbalance is not None
+    )
+    research_volume_qualified = all(bar.volume_qualified for bar in bars)
+    if (
+        flow_sensitive
+        and not latest_volume_qualified
+    ):
+        operational_blockers.append("latest_economic_trade_volume_unqualified")
 
     governance = _object(config.get("data_governance"), "data_governance")
     registry_path = _resolve(root, governance.get("registry"), "governance registry")
@@ -216,16 +282,6 @@ def strategy_readiness(
             registry_path, item.vintage_id,
         ) is None
     )
-    raw_evaluations = summary.get("family_evaluations")
-    if not isinstance(raw_evaluations, list):
-        raise ValueError("summary.family_evaluations 必须为数组")
-    eligible_families = tuple(
-        str(item.get("family"))
-        for item in raw_evaluations
-        if isinstance(item, Mapping)
-        and item.get("eligible") is True
-        and item.get("mode") == "paper"
-    )
     promotion_blockers: list[str] = []
     if summary.get("decision_grade") is not True:
         promotion_blockers.append("source_run_not_decision_grade")
@@ -235,6 +291,13 @@ def strategy_readiness(
         promotion_blockers.append("source_code_tree_mismatch")
     if not config_matches:
         promotion_blockers.append("source_config_mismatch")
+    if not current_trade_semantics:
+        promotion_blockers.append("source_trade_semantics_outdated")
+    if (
+        flow_sensitive
+        and not research_volume_qualified
+    ):
+        promotion_blockers.append("source_economic_trade_volume_unqualified")
     if not eligible_families:
         promotion_blockers.append("no_frozen_paper_eligible_family")
     if not sealed:
@@ -271,12 +334,22 @@ def strategy_readiness(
         "evaluated_at": evaluated_at.isoformat(),
         "run_id": verified.run_id,
         "manifest_sha256": verified.manifest_sha256,
+        "verification_cache_hit": verified.cache_hit,
         "summary_path": summary_path.relative_to(root).as_posix(),
         "market_id": market_id,
         "source": {
+            "data_root": manifest.get("source_data_root"),
             "decision_grade": summary.get("decision_grade"),
             "eligible_families": list(eligible_families),
             "config_matches": config_matches,
+            "source_config_hash": summary.get("config_hash"),
+            "current_config_hash": config_hash,
+            "source_config_lineage_root_hash": (
+                summary.get("config_lineage_root_hash")
+            ),
+            "current_config_lineage_root_hash": config_lineage_root_hash,
+            "source_config_lineage_depth": summary.get("config_lineage_depth"),
+            "current_config_lineage_depth": config_lineage_depth,
             "source_git_hash": source_identity.get("git_hash"),
             "current_git_hash": identity.git_hash,
             "source_tree_digest": source_tree_digest,

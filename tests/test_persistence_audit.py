@@ -2,7 +2,9 @@
 import gzip
 import json
 import multiprocessing
+import os
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -30,6 +32,11 @@ def _concurrent_raw_worker(root: str, run_id: str, records: int) -> None:
     for at in range(records):
         writer.ws("nested/ws_public", "orderbooks", "BTC", {"at": at})
     writer.finish()
+
+
+def _atomic_write_worker(path: str, body: str, writes: int) -> None:
+    for _ in range(writes):
+        atomic_write_text(Path(path), body)
 
 
 def _write_valid_tile(root: Path) -> tuple[Path, Path]:
@@ -244,6 +251,57 @@ def test_atomic_pointers_cursor_and_sqlite_foreign_keys(tmp_path: Path) -> None:
             "(feature_id, rule_id, triggered_at) VALUES (999, 'x', 't')"
         )
     conn.close()
+
+
+def test_atomic_write_supports_parallel_writers(tmp_path: Path) -> None:
+    """不同流派并行发布同一收据时不得争用临时文件。"""
+    pointer = tmp_path / "shared-receipt.json"
+    bodies = tuple(f'{{"writer":{index}}}\n' for index in range(32))
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        tuple(executor.map(lambda body: atomic_write_text(pointer, body), bodies))
+
+    assert pointer.read_text(encoding="utf-8") in bodies
+    assert tuple(tmp_path.glob(".shared-receipt.json.tmp-*")) == ()
+    if os.name != "nt":
+        assert pointer.stat().st_mode & 0o777 == 0o644
+
+
+def test_atomic_write_closes_descriptor_when_chmod_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """权限设置失败时不得泄漏句柄或掩盖原异常。"""
+    pointer = tmp_path / "failed-pointer.json"
+
+    def fail_chmod(_path: Path, _mode: int) -> None:
+        raise OSError("chmod failure")
+
+    monkeypatch.setattr(Path, "chmod", fail_chmod)
+    with pytest.raises(OSError, match="chmod failure"):
+        atomic_write_text(pointer, "{}\n")
+    assert tuple(tmp_path.glob(".failed-pointer.json.tmp-*")) == ()
+
+
+def test_atomic_write_is_cross_process_serialized(tmp_path: Path) -> None:
+    """不同进程同时替换一个指针时不得留下坏字节或临时文件。"""
+    pointer = tmp_path / "shared-pointer.json"
+    bodies = ('{"writer":"a"}\n', '{"writer":"b"}\n')
+    context = multiprocessing.get_context("spawn")
+    processes = [
+        context.Process(
+            target=_atomic_write_worker,
+            args=(str(pointer), body, 24),
+        )
+        for body in bodies
+    ]
+    for process in processes:
+        process.start()
+    for process in processes:
+        process.join(timeout=30)
+        assert process.exitcode == 0
+    assert pointer.read_text(encoding="utf-8") in bodies
+    assert tuple(tmp_path.glob(".shared-pointer.json.tmp-*")) == ()
 
 
 def test_raw_append_is_cross_process_serialized(tmp_path: Path) -> None:

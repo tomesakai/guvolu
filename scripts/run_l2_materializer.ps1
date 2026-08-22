@@ -1,11 +1,17 @@
 param(
     [int]$IntervalSeconds = 300,
+    [string]$Repository = '',
     [switch]$LatestRunOnly
 )
 
 $ErrorActionPreference = 'Stop'
-$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$RepoRoot = if ($Repository) {
+    (Resolve-Path -LiteralPath $Repository).Path
+} else {
+    (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+}
 $PythonPath = Join-Path $RepoRoot '.venv\Scripts\python.exe'
+$DataRoot = Join-Path $RepoRoot 'data'
 $LogDirectory = Join-Path $RepoRoot 'logs'
 $LogPath = Join-Path $LogDirectory 'l2-materializer.log'
 
@@ -23,7 +29,7 @@ try {
     if ($LatestRunOnly) {
         $Arguments += '--latest-run-only'
     }
-    & $PythonPath -m guvolu.data.l2_materialize @Arguments
+    & $PythonPath -m guvolu.data.l2_materialize --data-root $DataRoot @Arguments
 } finally {
     Write-Host 'guvolu l2-materializer exited.'
     Stop-Transcript | Out-Null

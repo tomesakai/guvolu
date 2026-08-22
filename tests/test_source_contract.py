@@ -127,7 +127,7 @@ def test_registers_live_endpoint_revisions_idempotently_and_rejects_duplicate(
     conn = connect(tmp_path)
     _insert_live_venues(conn)
     rows = live_jpy_realtime_endpoint_revisions()
-    assert register_endpoint_revisions(conn, rows) == 5
+    assert register_endpoint_revisions(conn, rows) == 6
     assert register_endpoint_revisions(conn, rows) == 0
     stored = conn.execute(
         "SELECT endpoint_id, revision_id, venue_brand, base_path_or_channel, data_level, "
@@ -156,6 +156,11 @@ def test_registers_live_endpoint_revisions_idempotently_and_rejects_duplicate(
             "public-websocket-schema@2026-08-12",
         ),
         (
+            "EP-0007", 1, "GMO Coin", "/ws/public", "L2/trades",
+            "public/trades:TAKER_ONLY",
+            "local_registry_extension:trades-TAKER_ONLY@2026-08-14",
+        ),
+        (
             "EP-0075", 0, "bitbank",
             "/socket.io/?EIO=4&transport=websocket", "trades", "transactions",
             "local_registry_extension:transactions@2026-08-12",
@@ -164,7 +169,7 @@ def test_registers_live_endpoint_revisions_idempotently_and_rejects_duplicate(
     hashes = conn.execute(
         "SELECT natural_key_sha256 FROM endpoint_revision"
     ).fetchall()
-    assert len(hashes) == 5
+    assert len(hashes) == 6
     assert len(set(hashes)) == 4
 
     first = rows[0]
@@ -183,7 +188,7 @@ def test_registers_live_endpoint_revisions_idempotently_and_rejects_duplicate(
     )
     with pytest.raises(ValueError, match="conflicts"):
         register_endpoint_revisions(conn, (duplicate,))
-    assert conn.execute("SELECT COUNT(*) FROM endpoint_revision").fetchone()[0] == 5
+    assert conn.execute("SELECT COUNT(*) FROM endpoint_revision").fetchone()[0] == 6
     conn.close()
 
 
@@ -422,9 +427,10 @@ def test_production_registry_registers_workbook_rows_plus_local_extension(
         ("EP-0003", None),
         ("EP-0005", None),
         ("EP-0005", None),
-        ("EP-0006", None),
-        ("EP-0007", None),
-        ("EP-0032", None),
+            ("EP-0006", None),
+            ("EP-0007", None),
+            ("EP-0007", None),
+            ("EP-0032", None),
         ("EP-0075", None),
     ]
     conn.close()

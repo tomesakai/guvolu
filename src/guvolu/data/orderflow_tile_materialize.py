@@ -291,7 +291,9 @@ def _load_trades(
             SELECT (floor(epoch(event_time)/?)*?)::BIGINT AS bucket_epoch,side,
                    floor(try_cast(price AS DECIMAL(38,12))/?::DECIMAL(38,12))::BIGINT,
                    SUM(try_cast(size AS DECIMAL(38,12))),COUNT(*)
-            FROM accepted WHERE selected=1 AND side IN ('buy','sell')
+            FROM accepted
+            WHERE selected=1 AND side IN ('buy','sell')
+              AND source_side_basis LIKE 'taker%'
             GROUP BY 1,2,3 ORDER BY 1,2,3
             """,
             [files, snapshot.market["market_id"], start, end, datetime.now(UTC),

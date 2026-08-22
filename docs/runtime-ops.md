@@ -5,7 +5,7 @@
 > [订单流数据事实契约](order-flow-data-contract.md)。
 > 控制面使用 SQLite schema v20；新采集段使用 raw v3，三所 L2 与实时逐笔
 > 分别物化为 L2 物理 schema v3 / `book-l2-normalization-v5` 与 trade schema v3 /
-> `trade-realtime-normalization-v3`；OKX 历史 L2 仍为 schema v2 /
+> `trade-realtime-normalization-v4`；OKX 历史 L2 仍为 schema v2 /
 > `book-l2-normalization-v2`；book-state 为 schema v1 /
 > `book-state-checkpoint-v3`，OFL 为 schema v2 /
 > `orderflow-tile-sparse-v8`。
@@ -109,8 +109,20 @@ OKX live books 已完成有界真实隔离小样本，但尚未证明重连和�
   `guvolu-marketdata-guard` 每五分钟调用同一幂等入口。
 - 两条任务只调用 `scripts/start_marketdata_pipeline.ps1 -WindowStyle Hidden`；
   重复实例策略为 IgnoreNew，不以 TCP 端口替代采集 checkpoint。
+- `start_marketdata_pipeline.ps1 -Profile ForwardMinimal -Repository <冻结仓库>`
+  是磁盘余量低于 20% 时的冻结前向配置：六条不可回补 raw 采集保持运行，且仅
+  保留冻结预测所需的实时逐笔物化；L2、book-state 与 OFL 派生物化暂停，之后可
+  从 sealed raw 确定性重建。`Repository` 只改变数据与 Python 运行根，不改变
+  脚本自身的版本身份。守护向每条 Python 命令显式传入已解析的绝对
+  `--data-root`；判活、收编和暂停均同时匹配模块与该数据根，不能跨 worktree
+  认领或终止同名写者。
 - `scripts/register_marketdata_tasks.ps1` 负责登记、查询和精确清理旧
-  `guvolu-api-*` 任务；不含任意命令执行能力。
+  `guvolu-api-*` 任务，并把受枚举约束的 profile 与已解析仓库绝对路径写入任务
+  动作；不含任意命令执行能力。
+- 从未显式携带 `--data-root` 的旧守护升级时不得热覆盖：先禁用 logon/guard，
+  精确停止并复查旧 wrapper 与 Python 写者，再部署固定脚本、单次启动新配置并
+  复核命令行身份，最后重新登记和启用任务。新守护只收编已携带同一绝对
+  data-root 的实例，不把旧参数形态猜测为同一写者。
 - NSSM 服务化保留为后续选项（宿主常态 24 小时运行且需要免登录守护时启用）。
 
 任务定义与任务当前是否启用是两件事。版本切换期间可临时禁用 guard；是否已经
@@ -272,6 +284,18 @@ manifest/SHA、登记精确 run 前缀路由并观察一个完整物化周期，
 最近二十四至四十八小时 OFL、Query/MON。每一所先追到 sealed 输入再运行专用 audit，
 前一所不通过时不启动后一所。已知不可回补区间只登记 gap，不用 REST、其他来源或
 K 线补写为该所 L2 事实。
+
+冻结前向期间允许将逻辑路径 `data/raw/realtime/book_l2` 做成指向另一健康 NTFS
+卷的目录联接，但必须先停止 L2 写者、完整复制并核对文件数、逻辑字节数和抽样
+SHA-256，再原子切换并恢复写者。应用仍只使用 C 盘项目下的逻辑数据根；物理卷
+不得通过修改配置或冻结代码路径暴露给研究身份。目标目录继续启用 NTFS 透明
+压缩，ACL 不得比原逻辑目录更宽，且迁移前副本在新段成功封存、物化和哈希
+复核前不得删除。L2 物化器只允许 manifest 精确指向该逻辑
+`raw/realtime/book_l2` 根内的同目录 segment；解析后的物理路径还必须位于此
+逻辑根对应的唯一物理目标下，不能把 junction 变成任意越界白名单。TBD-35
+落地后，该联接只作兼容入口：物理根按
+[分析物化与血缘设计](materialization-design.md) 第 8.1 节登记的存储根与启用
+路由识别；联接目标未登记启用路由时，解析器按 fail-closed 拒绝读取。
 
 当前可重复命令为：
 

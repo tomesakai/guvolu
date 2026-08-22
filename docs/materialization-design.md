@@ -7,7 +7,7 @@
 > `C:\Users\wu_zh\dev\guvolu\data`。
 > 当前控制面契约为 SQLite schema v20；实时主线为 raw v3、三所日元市场
 > L2 物理 schema v3 / `book-l2-normalization-v5` 与实时逐笔 schema v3 /
-> `trade-realtime-normalization-v3`，OKX 历史盘口继续使用物理 schema v2 /
+> `trade-realtime-normalization-v4`，OKX 历史盘口继续使用物理 schema v2 /
 > `book-l2-normalization-v2`；book-state 当前代码契约为 schema v1 /
 > `book-state-checkpoint-v3`，OFL 当前代码契约为 schema v2 /
 > `orderflow-tile-sparse-v8`。

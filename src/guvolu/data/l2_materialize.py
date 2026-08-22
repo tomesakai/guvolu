@@ -384,10 +384,29 @@ def _sealed_inputs(
         manifests.append((manifest_path, body))
     for manifest_path, body in manifests:
         recorded = str(body["storage_path"])
-        path = _resolve_recorded_path(root, recorded)
-        expected_path = manifest_path.with_name(
+        relative = PurePosixPath(recorded)
+        if (
+            relative.is_absolute()
+            or relative.as_posix() != recorded
+            or relative.parts[:3] != ("raw", "realtime", "book_l2")
+            or ".." in relative.parts
+        ):
+            raise ValueError(f"segment 逻辑路径非法: {recorded}")
+        expected_logical_path = manifest_path.with_name(
             manifest_path.name.removesuffix(".manifest.json") + ".jsonl"
-        ).resolve()
+        )
+        expected_logical = PurePosixPath(
+            "raw/realtime/book_l2",
+            expected_logical_path.relative_to(base).as_posix(),
+        )
+        if relative != expected_logical:
+            raise ValueError(f"manifest 与 segment 不同目录: {recorded}")
+        expected_path = expected_logical_path.resolve()
+        try:
+            expected_path.relative_to(base)
+        except ValueError as exc:
+            raise ValueError(f"segment 路径越界: {recorded}") from exc
+        path = _resolve_recorded_path(root, recorded)
         if path != expected_path:
             raise ValueError(f"manifest 与 segment 不同目录: {recorded}")
         sha = sha256_file(path)

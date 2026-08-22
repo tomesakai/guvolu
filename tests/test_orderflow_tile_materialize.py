@@ -13,6 +13,7 @@ from guvolu.data.orderflow_tile_materialize import (
     Level,
     TileBuild,
     _load_frames,
+    _load_trades,
     build_tiles,
     main,
 )
@@ -140,6 +141,41 @@ def test_load_frames_carries_source_run_from_frame_fact(tmp_path: Path) -> None:
 
     assert len(frames) == 1
     assert frames[0].source_run == "run-from-fact/segment-1"
+
+
+def test_load_trades_excludes_unfiltered_participant_side(tmp_path: Path) -> None:
+    """旧 GMO 参与方方向不得重新进入 tile 的 taker 成交列。"""
+    path = tmp_path / "trade.parquet"
+    db = duckdb.connect(":memory:")
+    try:
+        db.execute(
+            f"""COPY (SELECT * FROM (VALUES
+            ('a','m',TIMESTAMPTZ '2026-08-01 00:00:01+00',
+             TIMESTAMPTZ '2026-08-01 00:00:01+00',
+             TIMESTAMPTZ '2026-08-01 00:00:01+00','buy','taker','100','1'),
+            ('b','m',TIMESTAMPTZ '2026-08-01 00:00:02+00',
+             TIMESTAMPTZ '2026-08-01 00:00:02+00',
+             TIMESTAMPTZ '2026-08-01 00:00:02+00','sell',
+             'participant_side_unfiltered','100','2'))
+            AS t(observation_id,market_id,event_time,available_time,ingest_time,
+                 side,source_side_basis,price,size))
+            TO '{path.as_posix()}' (FORMAT PARQUET)"""
+        )
+    finally:
+        db.close()
+    output = ActiveOutput(
+        "trade_realtime", "p", "v", "trade-attempt", "trade_observation",
+        "trade-artifact", path, 2, START, START,
+    )
+    snapshot = ActiveOutputSnapshot(
+        {**MARKET, "market_id": "m"}, (output,), "sha256-source",
+    )
+
+    trades = _load_trades(
+        snapshot, START, START + timedelta(seconds=5), 5, Decimal("1"),
+    )
+
+    assert trades == {(int(START.timestamp()), "buy", 100): (Decimal("1"), 1)}
 
 
 def test_load_frames_prefers_connection_boundary_over_run(tmp_path: Path) -> None:

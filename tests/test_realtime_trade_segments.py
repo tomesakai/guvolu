@@ -20,11 +20,15 @@ from guvolu.data.trade_realtime_materialize import (
 
 def _write_segment(
     root: Path, venue: str, symbol: str, payloads: list[str], run_id: str,
+    *, endpoint_revision: int | None = None,
 ) -> Path:
-    endpoint_id, endpoint_revision = trade_capture.ENDPOINT_BINDINGS[venue]
+    endpoint_id, current_revision = trade_capture.ENDPOINT_BINDINGS[venue]
+    selected_revision = (
+        current_revision if endpoint_revision is None else endpoint_revision
+    )
     writer = SegmentedRawWriter(
         root, venue, symbol, domain="trade_realtime", run_id=run_id,
-        endpoint_id=endpoint_id, endpoint_revision=endpoint_revision,
+        endpoint_id=endpoint_id, endpoint_revision=selected_revision,
         segment_seconds=3600, segment_max_bytes=1024 * 1024,
     )
     source_endpoints = {
@@ -196,6 +200,11 @@ def test_three_venue_realtime_trade_fact_contract(tmp_path: Path) -> None:
             "ORDER BY venue_id,venue_trade_id",
             [[str(path) for path in paths]],
         ).fetchall()
+        side_basis = db.execute(
+            "SELECT venue_id,source_side_basis FROM "
+            "read_parquet(?, union_by_name=true) ORDER BY venue_id",
+            [[str(path) for path in paths]],
+        ).fetchall()
     finally:
         db.close()
     assert len(rows) == 4
@@ -208,7 +217,7 @@ def test_three_venue_realtime_trade_fact_contract(tmp_path: Path) -> None:
     assert all(row[3] == 0 for row in rows)
     assert all(row[4] == TRADE_REALTIME_NORMALIZATION_VERSION for row in rows)
     assert {(row[0], row[5], row[6]) for row in rows} == {
-        ("gmo", "EP-0007", 0),
+        ("gmo", "EP-0007", 1),
         ("bitbank", "EP-0075", 0),
         ("bitflyer", "EP-0002", 0),
     }
@@ -220,6 +229,39 @@ def test_three_venue_realtime_trade_fact_contract(tmp_path: Path) -> None:
     assert all(row[12] == 3 for row in rows)
     assert controls == (3, 3, 1, 1, 1)
     assert channels == (3, 3, 1, 1)
+    assert ("gmo", "taker") in side_basis
+
+
+def test_legacy_gmo_raw_v3_preserves_unfiltered_participant_side(
+    tmp_path: Path,
+) -> None:
+    """旧 GMO r0 不得把公开双方成交腿继续声明为 taker。"""
+    _write_segment(
+        tmp_path,
+        "gmo",
+        "BTC",
+        [json.dumps({
+            "channel": "trades", "price": "17000000", "size": "0.01",
+            "side": "BUY", "timestamp": "2026-08-11T00:00:00.000Z",
+        })],
+        "run-trade-gmo-r0",
+        endpoint_revision=0,
+    )
+    conn = store.connect(tmp_path)
+    try:
+        result = materialize_all(tmp_path, conn, report_reused=False)[0]
+        assert audit_realtime_trades(tmp_path, conn)["ok"] is True
+    finally:
+        conn.close()
+    db = duckdb.connect(":memory:")
+    try:
+        row = db.execute(
+            "SELECT endpoint_revision,source_side_basis FROM read_parquet(?)",
+            [str(tmp_path / result.output_path)],
+        ).fetchone()
+    finally:
+        db.close()
+    assert row == (0, "participant_side_unfiltered")
 
 
 def test_bitflyer_bad_item_rejects_whole_frame_without_blocking_gmo(

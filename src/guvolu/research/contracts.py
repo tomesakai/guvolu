@@ -8,6 +8,17 @@ from typing import Mapping
 
 from guvolu.strategy.contracts import CandidateSpec, ResearchBar
 
+HOLDOUT_MANIFEST_SCHEMA_VERSION = 1
+HOLDOUT_METHOD_VERSION = "frozen-candidate-holdout-v4"
+FROZEN_FORWARD_SCHEMA_VERSION = 1
+FROZEN_FORWARD_METHOD_VERSION = "frozen-forward-v2"
+INTERVAL_SUITE_FORWARD_SCHEMA_VERSION = 1
+INTERVAL_SUITE_FORWARD_METHOD_VERSION = "interval-suite-frozen-forward-v2"
+INTERVAL_SUITE_PREDICTION_SCHEMA_VERSION = 1
+INTERVAL_SUITE_PREDICTION_METHOD_VERSION = (
+    "interval-suite-frozen-prediction-v1"
+)
+
 
 @dataclass(frozen=True)
 class CodeIdentity:
@@ -22,6 +33,18 @@ class CodeIdentity:
 
 
 @dataclass(frozen=True)
+class FrozenPanelPartition:
+    """一个冻结输入文件及其控制面事件覆盖。"""
+
+    path: Path
+    row_count: int
+    min_event_time: datetime | None
+    max_event_time: datetime | None
+    domain: str | None = None
+    normalization_version: str | None = None
+
+
+@dataclass(frozen=True)
 class FrozenPanelInputs:
     """活动 head 冻结后的研究输入。"""
 
@@ -32,6 +55,14 @@ class FrozenPanelInputs:
     artifact_ids: tuple[str, ...]
     normalization_versions: tuple[str, ...]
     maximum_event_time: datetime
+    partitions: tuple[FrozenPanelPartition, ...] = ()
+    receipt_path: Path | None = None
+    receipt_sha256: str | None = None
+    trade_flow_input_method_version: str | None = None
+    source_trade_rows: int = 0
+    economic_trade_rows: int = 0
+    unqualified_trade_rows: int = 0
+    volume_qualified: bool = False
 
 
 @dataclass(frozen=True)
@@ -109,6 +140,22 @@ class TrialRecord:
 
 
 @dataclass(frozen=True)
+class RegimeAttribution:
+    """一个预决策状态桶对 stitched OOS 的条件贡献。"""
+
+    regime: str
+    bars: int
+    bar_share: float
+    net_log_return: float
+    mean_return: float
+    period_volatility: float
+    annualized_sharpe: float
+    hit_rate: float
+    active_target_share: float
+    mean_absolute_target: float
+
+
+@dataclass(frozen=True)
 class FamilyEvaluation:
     """一个策略家族的 walk-forward 结果。"""
 
@@ -116,6 +163,8 @@ class FamilyEvaluation:
     mode: str
     deployment_candidate: CandidateSpec
     latest_target: float
+    deployment_oos_metrics: PerformanceMetrics
+    deployment_oos_returns: tuple[float, ...]
     metrics: PerformanceMetrics
     adjusted_sharpe: float
     fdr_q: float
@@ -143,7 +192,9 @@ class FamilyEvaluation:
     fold_selected_candidate_ids: tuple[str, ...] = ()
     cscv_in_sample_fold_count: int = 0
     cscv_out_sample_fold_count: int = 0
+    cscv_excluded_fold_count: int = 0
     periods_per_year: float = 365.0 * 24.0
+    regime_attribution: tuple[RegimeAttribution, ...] = ()
 
 
 @dataclass(frozen=True)

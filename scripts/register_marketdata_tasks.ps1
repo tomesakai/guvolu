@@ -1,9 +1,16 @@
 param(
-    [switch]$Unregister
+    [switch]$Unregister,
+    [ValidateSet('Full', 'ForwardMinimal')]
+    [string]$Profile = 'Full',
+    [string]$Repository = ''
 )
 
 $ErrorActionPreference = 'Stop'
-$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$RepoRoot = if ($Repository) {
+    (Resolve-Path -LiteralPath $Repository).Path
+} else {
+    (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+}
 $StartScript = Join-Path $PSScriptRoot 'start_marketdata_pipeline.ps1'
 $CurrentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 $TaskNames = @('guvolu-marketdata-logon', 'guvolu-marketdata-guard')
@@ -28,7 +35,8 @@ if ($Unregister) {
 
 $Argument = (
     '-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden ' +
-    "-File `"$StartScript`" -WindowStyle Hidden"
+    "-File `"$StartScript`" -WindowStyle Hidden " +
+    "-Profile $Profile -Repository `"$RepoRoot`""
 )
 $Action = New-ScheduledTaskAction -Execute 'powershell.exe' `
     -Argument $Argument -WorkingDirectory $RepoRoot

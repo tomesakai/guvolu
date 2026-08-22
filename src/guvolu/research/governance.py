@@ -1,14 +1,60 @@
 """研究数据暴露与一次性封存段治理。"""
 from __future__ import annotations
 
+import json
+import math
 import sqlite3
+from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from guvolu.research.provenance import stable_identifier
+from guvolu.research import clock
+from guvolu.research.config_lineage import (
+    load_governed_strategy_config_with_paths,
+)
+from guvolu.research.contracts import (
+    FROZEN_FORWARD_METHOD_VERSION,
+    FROZEN_FORWARD_SCHEMA_VERSION,
+    HOLDOUT_MANIFEST_SCHEMA_VERSION,
+    HOLDOUT_METHOD_VERSION,
+    INTERVAL_SUITE_FORWARD_METHOD_VERSION,
+    INTERVAL_SUITE_FORWARD_SCHEMA_VERSION,
+    INTERVAL_SUITE_PREDICTION_METHOD_VERSION,
+    INTERVAL_SUITE_PREDICTION_SCHEMA_VERSION,
+    CodeIdentity,
+)
+from guvolu.research.data_location import (
+    data_root_locator,
+    resolve_data_root_locator,
+)
+from guvolu.research.interval_suite import (
+    LoadedIntervalConfig,
+    build_interval_suite_plan,
+)
+from guvolu.research.interval_suite_forward_identity import (
+    interval_suite_deployment_contract_id,
+    interval_suite_forward_plan_id,
+)
+from guvolu.research.interval_suite_prediction_identity import (
+    interval_suite_forward_prediction_id,
+    interval_suite_member_panel_set_hash,
+)
+from guvolu.research.provenance import (
+    canonical_json,
+    code_identity,
+    sha256_file,
+    sha256_text,
+    stable_identifier,
+)
+from guvolu.strategy.expression import (
+    candidate_identity,
+    expression_id,
+    strategy_expression,
+)
 
-GOVERNANCE_SCHEMA_VERSION = 2
+GOVERNANCE_SCHEMA_VERSION = 7
+SCHEMA_WRITE_CEILING_KEY = "schema_write_ceiling"
 GOVERNANCE_METHOD_VERSION = "research-data-governance-v2"
 _VINTAGE_STATUSES = ("sealed", "consumed")
 
@@ -43,6 +89,22 @@ class HoldoutVintage:
 
 
 @dataclass(frozen=True)
+class HoldoutEvaluationAttempt:
+    """一次烧毁 vintage 后不可重跑的评估尝试状态。"""
+
+    evaluation_id: str
+    vintage_id: str
+    candidate_set_hash: str
+    status: str
+    stage: str
+    started_at: datetime
+    updated_at: datetime
+    completed_at: datetime | None
+    result_manifest_path: str | None
+    result_manifest_sha256: str | None
+
+
+@dataclass(frozen=True)
 class FrozenForwardPlan:
     """在 vintage 开始前冻结的候选、公式与资金权重计划。"""
 
@@ -72,6 +134,84 @@ class FrozenForwardPrediction:
     recorded_at: datetime
 
 
+@dataclass(frozen=True)
+class IntervalSuiteForwardPlan:
+    """在 vintage 前冻结的跨节拍 sleeve、候选与资金权重。"""
+
+    plan_id: str
+    vintage_id: str
+    suite_plan_id: str
+    suite_evidence_id: str
+    source_git_hash: str
+    code_tree_digest: str
+    plan_artifact_path: str
+    plan_artifact_sha256: str
+    frozen_at: datetime
+
+
+@dataclass(frozen=True)
+class IntervalSuiteForwardPrediction:
+    """共同决策栅格上追加且不可改写的跨节拍预测。"""
+
+    prediction_id: str
+    plan_id: str
+    vintage_id: str
+    decision_time: datetime
+    input_head_generation: str
+    input_receipt_path: str
+    input_receipt_sha256: str
+    member_panel_set_hash: str
+    prediction_artifact_path: str
+    prediction_artifact_sha256: str
+    recorded_at: datetime
+
+
+@dataclass(frozen=True)
+class ActiveHeadReceiptRegistration:
+    """治理库中绑定某个消费者的完整活动输入收据。"""
+
+    consumer_kind: str
+    consumer_id: str
+    market_id: str
+    head_generation: str
+    receipt_artifact_path: str
+    receipt_artifact_sha256: str
+    recorded_at: datetime
+
+
+@dataclass(frozen=True)
+class _TerminalEvidence:
+    """已经现场复核、可与治理注册表交叉核对的终态证据。"""
+
+    manifest_path: str
+    candidate_set_hash: str
+    candidate_ids: tuple[str, ...]
+    config_hash: str
+    input_head_generation: str
+    input_receipt_path: str
+    input_receipt_sha256: str
+    require_forward_predictions: bool
+    forward_plan_id: str | None
+    forward_prediction_count: int
+    forward_prediction_row_set_hash: str | None
+    score_start: datetime
+    score_end: datetime
+    score_bars: int
+    score_decision_times: tuple[datetime, ...]
+
+
+@dataclass(frozen=True)
+class _ForwardPlanEvidence:
+    """现场复核后的冻结候选与资金权重合同。"""
+
+    path: Path
+    normalized_path: str
+    candidate_ids: tuple[str, ...]
+    candidate_families: tuple[tuple[str, str], ...]
+    weights: tuple[tuple[str, float], ...]
+    reserve: float
+
+
 def _utc(value: datetime) -> datetime:
     """把时间统一为有时区的 UTC。"""
     if value.tzinfo is None:
@@ -89,6 +229,1471 @@ def _parse_timestamp(value: str) -> datetime:
     return _utc(datetime.fromisoformat(value))
 
 
+def _canonical_sha256(value: str) -> bool:
+    """检查小写十六进制 SHA-256 的规范文本。"""
+    return len(value) == 64 and all(
+        character in "0123456789abcdef" for character in value
+    )
+
+
+def _evidence_file(root: Path, value: str, label: str) -> tuple[Path, str]:
+    """把证据路径约束在仓库内并返回规范相对路径。"""
+    repository = root.resolve()
+    relative = Path(value)
+    if relative.is_absolute():
+        raise ValueError(f"{label} 必须使用仓库内相对路径")
+    resolved = (repository / relative).resolve()
+    try:
+        normalized = resolved.relative_to(repository).as_posix()
+    except ValueError as error:
+        raise ValueError(f"{label} 超出仓库范围") from error
+    if not resolved.is_file():
+        raise ValueError(f"{label} 文件不存在")
+    return resolved, normalized
+
+
+def _json_file(path: Path, label: str) -> dict[str, object]:
+    """读取必须为 JSON 对象的终态证据。"""
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ValueError(f"{label} 不是可读 JSON") from error
+    if not isinstance(value, dict):
+        raise ValueError(f"{label} 必须为 JSON 对象")
+    return {str(key): item for key, item in value.items()}
+
+
+def _validated_artifact(
+    repository_root: Path,
+    artifacts: dict[object, object],
+    name: str,
+    expected_kind: str,
+) -> tuple[Path, str]:
+    """现场复核 manifest 中一个必需制品的完整内容身份。"""
+    value = artifacts.get(name)
+    if not isinstance(value, dict):
+        raise ValueError(f"holdout manifest 缺少 {name} 制品")
+    record = {str(key): item for key, item in value.items()}
+    path_value = record.get("path")
+    sha256 = record.get("sha256")
+    byte_count = record.get("bytes")
+    if record.get("kind") != expected_kind:
+        raise ValueError(f"holdout {name} 制品 kind 不匹配")
+    if not isinstance(path_value, str) or not isinstance(sha256, str):
+        raise ValueError(f"holdout {name} 制品身份不完整")
+    if not isinstance(byte_count, int) or isinstance(byte_count, bool) or byte_count <= 0:
+        raise ValueError(f"holdout {name} 制品字节数无效")
+    if not _canonical_sha256(sha256):
+        raise ValueError(f"holdout {name} SHA-256 必须是规范小写十六进制")
+    path, _ = _evidence_file(repository_root, path_value, f"holdout {name}")
+    if path.stat().st_size != byte_count:
+        raise ValueError(f"holdout {name} 现场字节数不匹配")
+    if sha256_file(path) != sha256:
+        raise ValueError(f"holdout {name} 现场 SHA-256 不匹配")
+    return path, sha256
+
+
+def _validated_forward_plan_artifact(
+    repository_root: Path,
+    plan_id: str,
+    vintage_id: str,
+    source_manifest_sha256: str,
+    candidate_set_hash: str,
+    config_hash: str,
+    code_tree_digest: str,
+    artifact_path: str,
+    artifact_sha256: str,
+    expected_candidate_ids: tuple[str, ...] | None = None,
+) -> _ForwardPlanEvidence:
+    """现场复核冻结前向计划制品与注册身份。"""
+    if not _canonical_sha256(artifact_sha256):
+        raise ValueError("冻结前向计划 SHA-256 无效")
+    path, normalized = _evidence_file(
+        repository_root, artifact_path, "frozen forward plan",
+    )
+    if sha256_file(path) != artifact_sha256:
+        raise ValueError("冻结前向计划现场 SHA-256 不匹配")
+    payload = _json_file(path, "frozen forward plan")
+    expected = {
+        "schema_version": FROZEN_FORWARD_SCHEMA_VERSION,
+        "method_version": FROZEN_FORWARD_METHOD_VERSION,
+        "governance_method_version": GOVERNANCE_METHOD_VERSION,
+        "scope": "FROZEN_FORWARD",
+        "plan_id": plan_id,
+        "config_hash": config_hash,
+        "code_tree_digest": code_tree_digest,
+        "candidate_set_hash": candidate_set_hash,
+    }
+    for field, value in expected.items():
+        if payload.get(field) != value:
+            raise ValueError(f"冻结前向计划 {field} 与注册身份不一致")
+    semantic_fields = {
+        "pipeline_method_version",
+        "panel_method_version",
+        "panel_schema_version",
+        "feature_method_version",
+        "trade_flow_input_method_version",
+        "trade_input_receipt_method_version",
+        "operational_gate_method_version",
+    }
+    present_semantics = semantic_fields.intersection(payload)
+    if present_semantics != semantic_fields:
+        raise ValueError("冻结前向计划成交语义身份不完整")
+    if present_semantics:
+        expected_semantics: Mapping[str, object] = {
+            "pipeline_method_version": "strategy-research-pipeline-v14",
+            "panel_method_version": "trade-bars-pit-v2",
+            "panel_schema_version": 2,
+            "feature_method_version": "research-features-v2",
+            "trade_flow_input_method_version": "economic-trade-basis-v1",
+            "trade_input_receipt_method_version": (
+                "active-trade-head-receipt-v2"
+            ),
+            "operational_gate_method_version": (
+                "economic-trade-operational-gate-v1"
+            ),
+        }
+        for field, value in expected_semantics.items():
+            if payload.get(field) != value:
+                raise ValueError(f"冻结前向计划 {field} 不受支持")
+    vintage = payload.get("vintage")
+    if not isinstance(vintage, dict) or vintage.get("vintage_id") != vintage_id:
+        raise ValueError("冻结前向计划 vintage_id 与注册身份不一致")
+    source = payload.get("source")
+    if (
+        not isinstance(source, dict)
+        or source.get("manifest_sha256") != source_manifest_sha256
+    ):
+        raise ValueError("冻结前向计划来源 manifest 与注册身份不一致")
+    raw_candidates = payload.get("candidates")
+    if not isinstance(raw_candidates, list) or not raw_candidates:
+        raise ValueError("冻结前向计划缺少 candidates")
+    candidate_families: list[tuple[str, str]] = []
+    for raw in raw_candidates:
+        if not isinstance(raw, dict):
+            raise ValueError("冻结前向计划 candidate 合同无效")
+        candidate = {str(key): item for key, item in raw.items()}
+        candidate_id = candidate.get("candidate_id")
+        family = candidate.get("family")
+        mode = candidate.get("mode")
+        expression_identity = candidate.get("expression_id")
+        parameters = candidate.get("parameters")
+        complexity = candidate.get("complexity")
+        if (
+            not isinstance(candidate_id, str) or not candidate_id
+            or not isinstance(family, str) or not family
+            or not isinstance(mode, str) or not mode
+            or not isinstance(expression_identity, str) or not expression_identity
+            or not isinstance(parameters, dict)
+            or not isinstance(complexity, int) or isinstance(complexity, bool)
+            or complexity <= 0
+        ):
+            raise ValueError("冻结前向计划 candidate 合同无效")
+        if any(
+            not isinstance(name, str) or not name
+            or not isinstance(value, (int, float)) or isinstance(value, bool)
+            or not math.isfinite(float(value))
+            for name, value in parameters.items()
+        ):
+            raise ValueError("冻结前向计划 candidate 参数无效")
+        numeric_parameters = {
+            str(name): value for name, value in parameters.items()
+            if isinstance(value, (int, float)) and not isinstance(value, bool)
+        }
+        try:
+            template = strategy_expression(family)
+        except ValueError as error:
+            raise ValueError("冻结前向计划包含不受支持的策略流派") from error
+        if expression_id(template) != expression_identity:
+            raise ValueError("冻结前向计划表达式身份不匹配")
+        if candidate_identity(template, numeric_parameters) != candidate_id:
+            raise ValueError("冻结前向计划候选身份未绑定公式与完整参数")
+        if mode != "paper":
+            raise ValueError("冻结前向计划只允许 paper 候选")
+        candidate_families.append((candidate_id, family))
+    candidate_ids = tuple(item[0] for item in candidate_families)
+    families = tuple(item[1] for item in candidate_families)
+    if (
+        candidate_ids != tuple(sorted(candidate_ids))
+        or len(set(candidate_ids)) != len(candidate_ids)
+        or len(set(families)) != len(families)
+    ):
+        raise ValueError("冻结前向计划候选必须有序且 candidate/family 唯一")
+    if expected_candidate_ids is not None and candidate_ids != expected_candidate_ids:
+        raise ValueError("冻结前向计划候选与 holdout 冻结候选全集不一致")
+    allocation = payload.get("allocation")
+    if not isinstance(allocation, dict) or not isinstance(allocation.get("weights"), dict):
+        raise ValueError("冻结前向计划缺少 allocation")
+    weights_value = allocation["weights"]
+    weights: dict[str, float] = {}
+    for family, value in weights_value.items():
+        if not isinstance(family, str):
+            raise ValueError("冻结前向计划权重流派无效")
+        weight = _finite_number(value, f"frozen allocation.{family}")
+        if weight < 0.0:
+            raise ValueError("冻结前向计划权重不得为负")
+        weights[family] = weight
+    if set(weights) != set(families):
+        raise ValueError("冻结前向计划权重未覆盖候选流派")
+    reserve = _finite_number(allocation.get("reserve"), "frozen allocation.reserve")
+    if reserve < 0.0 or sum(weights.values()) + reserve > 1.0 + 1e-9:
+        raise ValueError("冻结前向计划资金权重与 reserve 合同不成立")
+    return _ForwardPlanEvidence(
+        path=path,
+        normalized_path=normalized,
+        candidate_ids=candidate_ids,
+        candidate_families=tuple(candidate_families),
+        weights=tuple(sorted(weights.items())),
+        reserve=reserve,
+    )
+
+
+def _validated_interval_suite_forward_plan_artifact(
+    repository_root: Path,
+    plan_id: str,
+    vintage_id: str,
+    vintage_market_id: str,
+    vintage_start_time: str,
+    vintage_end_time: str,
+    suite_plan_id: str,
+    suite_evidence_id: str,
+    source_git_hash: str,
+    code_tree_digest: str,
+    deployment_contract_id: str,
+    governance_registry: str,
+    artifact_path: str,
+    artifact_sha256: str,
+) -> str:
+    """现场复核跨节拍冻结计划的身份并返回规范路径。"""
+    if not _canonical_sha256(artifact_sha256):
+        raise ValueError("套件冻结前向计划 SHA-256 无效")
+    path, normalized = _evidence_file(
+        repository_root, artifact_path, "interval suite forward plan",
+    )
+    if sha256_file(path) != artifact_sha256:
+        raise ValueError("套件冻结前向计划现场 SHA-256 不匹配")
+    payload = _json_file(path, "interval suite forward plan")
+    expected = {
+        "schema_version": INTERVAL_SUITE_FORWARD_SCHEMA_VERSION,
+        "method_version": INTERVAL_SUITE_FORWARD_METHOD_VERSION,
+        "governance_method_version": GOVERNANCE_METHOD_VERSION,
+        "scope": "INTERVAL_SUITE_FROZEN_FORWARD",
+        "governance_registry": governance_registry,
+        "plan_id": plan_id,
+        "suite_plan_id": suite_plan_id,
+        "suite_evidence_id": suite_evidence_id,
+        "source_git_hash": source_git_hash,
+        "code_tree_digest": code_tree_digest,
+        "deployment_contract_id": deployment_contract_id,
+    }
+    for key, value in expected.items():
+        if payload.get(key) != value:
+            raise ValueError(f"套件冻结前向计划 {key} 与登记身份不一致")
+    vintage = payload.get("vintage")
+    if not isinstance(vintage, dict):
+        raise ValueError("套件冻结前向计划 vintage 身份不一致")
+    raw_start = vintage.get("start_time")
+    raw_end = vintage.get("end_time")
+    if (
+        vintage.get("vintage_id") != vintage_id
+        or vintage.get("market_id") != vintage_market_id
+        or not isinstance(raw_start, str)
+        or not isinstance(raw_end, str)
+        or _parse_timestamp(raw_start) != _parse_timestamp(vintage_start_time)
+        or _parse_timestamp(raw_end) != _parse_timestamp(vintage_end_time)
+    ):
+        raise ValueError("套件冻结前向计划 vintage 身份不一致")
+    source_record = payload.get("source_evidence")
+    if not isinstance(source_record, dict):
+        raise ValueError("套件冻结前向计划缺少 source_evidence")
+    source_path_value = source_record.get("path")
+    source_sha = source_record.get("sha256")
+    if not isinstance(source_path_value, str) or not isinstance(source_sha, str):
+        raise ValueError("套件冻结前向计划 evidence 身份无效")
+    if not _canonical_sha256(source_sha):
+        raise ValueError("套件冻结前向计划 evidence SHA-256 无效")
+    source_path, _source_normalized = _evidence_file(
+        repository_root, source_path_value, "interval suite evidence",
+    )
+    if sha256_file(source_path) != source_sha:
+        raise ValueError("套件冻结前向计划 evidence 现场 SHA-256 不匹配")
+    evidence = _json_file(source_path, "interval suite evidence")
+    if (
+        evidence.get("suite_plan_id") != suite_plan_id
+        or evidence.get("suite_evidence_id") != suite_evidence_id
+        or evidence.get("source_git_hash") != source_git_hash
+    ):
+        raise ValueError("套件冻结前向计划 evidence 顶层身份不一致")
+    raw_live_data_root = payload.get("live_data_root")
+    if raw_live_data_root is None:
+        raise ValueError("套件冻结前向计划缺少 live_data_root")
+    live_data_root = resolve_data_root_locator(
+        repository_root, raw_live_data_root,
+    )
+    if not live_data_root.is_dir():
+        raise ValueError("套件冻结前向 live_data_root 不存在")
+    if (live_data_root / "snapshot-manifest.json").exists():
+        raise ValueError("套件冻结前向 live_data_root 不得是研究 snapshot")
+    if data_root_locator(repository_root, live_data_root) != raw_live_data_root:
+        raise ValueError("套件冻结前向 live_data_root 不是规范定位对象")
+    raw_evidence_members = evidence.get("members")
+    raw_members = payload.get("members")
+    if not isinstance(raw_evidence_members, list) or not isinstance(
+        raw_members, list,
+    ):
+        raise ValueError("套件冻结前向计划缺少 members")
+    evidence_members: dict[str, dict[str, object]] = {}
+    for raw in raw_evidence_members:
+        if not isinstance(raw, dict):
+            raise ValueError("套件 evidence member 合同无效")
+        member_id = raw.get("member_id")
+        if not isinstance(member_id, str) or not member_id:
+            raise ValueError("套件 evidence member_id 无效")
+        if member_id in evidence_members:
+            raise ValueError("套件 evidence 包含重复 member_id")
+        evidence_members[member_id] = {str(key): value for key, value in raw.items()}
+    frozen_member_ids: set[str] = set()
+    loaded_configs: dict[Path, LoadedIntervalConfig] = {}
+    normalized_members: list[dict[str, object]] = []
+    for raw in raw_members:
+        if not isinstance(raw, dict):
+            raise ValueError("套件冻结前向 member 合同无效")
+        member_id = raw.get("member_id")
+        interval = raw.get("bar_interval")
+        config_path_value = raw.get("config_source_path")
+        config_hash = raw.get("config_source_sha256")
+        root_hash = raw.get("config_lineage_root_sha256")
+        depth = raw.get("config_lineage_depth")
+        raw_source_paths = raw.get("config_source_paths")
+        config_contract = raw.get("config_contract")
+        contract_sha = raw.get("config_contract_sha256")
+        if (
+            not isinstance(member_id, str) or not member_id
+            or not isinstance(interval, str) or not interval
+            or not isinstance(config_path_value, str) or not config_path_value
+            or not isinstance(config_hash, str) or not _canonical_sha256(config_hash)
+            or not isinstance(root_hash, str) or not _canonical_sha256(root_hash)
+            or not isinstance(depth, int) or isinstance(depth, bool) or depth < 0
+            or not isinstance(raw_source_paths, list) or not raw_source_paths
+            or not isinstance(config_contract, dict)
+            or not isinstance(contract_sha, str) or not _canonical_sha256(contract_sha)
+        ):
+            raise ValueError("套件冻结前向 member 身份无效")
+        if sha256_text(canonical_json(config_contract)) != contract_sha:
+            raise ValueError("套件冻结前向 member config_contract SHA-256 不匹配")
+        if member_id in frozen_member_ids:
+            raise ValueError("套件冻结前向计划包含重复 member_id")
+        evidence_member = evidence_members.get(member_id)
+        if evidence_member is None or evidence_member.get("bar_interval") != interval:
+            raise ValueError("套件冻结前向 member 与 evidence 不一致")
+        config_path, _normalized_config = _evidence_file(
+            repository_root, config_path_value, "interval suite member config",
+        )
+        if config_path_value != _normalized_config:
+            raise ValueError("套件冻结前向 member config_source_path 不规范")
+        if sha256_file(config_path) != config_hash:
+            raise ValueError("套件冻结前向 member config SHA-256 不匹配")
+        source_paths: list[Path] = []
+        for source_path_value in raw_source_paths:
+            if not isinstance(source_path_value, str) or not source_path_value:
+                raise ValueError("套件冻结前向 member config_source_paths 无效")
+            source_path, _normalized_source = _evidence_file(
+                repository_root, source_path_value,
+                "interval suite member config lineage",
+            )
+            if source_path_value != _normalized_source:
+                raise ValueError("套件冻结前向 member config_source_paths 不规范")
+            source_paths.append(source_path)
+        current = load_governed_strategy_config_with_paths(
+            repository_root, config_path,
+        )
+        current_config, current_hash, current_root, current_depth, current_paths = current
+        if (
+            canonical_json(current_config) != canonical_json(config_contract)
+            or current_hash != config_hash
+            or current_root != root_hash
+            or current_depth != depth
+            or tuple(source_paths) != current_paths
+        ):
+            raise ValueError("套件冻结前向 member 配置快照不能由现场谱系重建")
+        # 配置 registry 只记录研究血缘。
+        # 后继库由部署合同绑定。
+        # 隔离迁移时允许二者不同。
+        loaded_configs[config_path] = (
+            config_contract, config_hash, root_hash, depth, tuple(source_paths),
+        )
+        normalized_members.append({str(key): value for key, value in raw.items()})
+        frozen_member_ids.add(member_id)
+    if frozen_member_ids != set(evidence_members):
+        raise ValueError("套件冻结前向 members 未完整覆盖 evidence")
+    rebuilt_plan = build_interval_suite_plan(
+        repository_root, tuple(loaded_configs), loaded_configs=loaded_configs,
+    )
+    if rebuilt_plan.get("suite_plan_id") != suite_plan_id:
+        raise ValueError("套件冻结前向配置不能重建 suite_plan_id")
+    if (
+        rebuilt_plan.get("market_id") != evidence.get("market_id")
+        or evidence.get("market_id") != vintage_market_id
+    ):
+        raise ValueError("套件冻结前向配置、evidence 与 vintage 市场不一致")
+    raw_rebuilt_members = rebuilt_plan.get("members")
+    if not isinstance(raw_rebuilt_members, list):
+        raise ValueError("重建 suite plan 缺少 members")
+    rebuilt_members = {
+        str(item.get("member_id")): str(item.get("bar_interval"))
+        for item in raw_rebuilt_members
+        if isinstance(item, dict)
+    }
+    if rebuilt_members != {
+        member_id: str(member.get("bar_interval"))
+        for member_id, member in evidence_members.items()
+    }:
+        raise ValueError("套件冻结前向配置成员与 evidence 不一致")
+    raw_evidence_sleeves = evidence.get("sleeves")
+    if not isinstance(raw_evidence_sleeves, list):
+        raise ValueError("套件 evidence 缺少 sleeves")
+    eligible_evidence: dict[str, dict[str, object]] = {}
+    for raw in raw_evidence_sleeves:
+        if not isinstance(raw, dict) or raw.get("suite_eligible") is not True:
+            continue
+        sleeve_id = raw.get("sleeve_id")
+        if not isinstance(sleeve_id, str) or not sleeve_id:
+            raise ValueError("套件 evidence sleeve_id 无效")
+        if sleeve_id in eligible_evidence:
+            raise ValueError("套件 evidence 包含重复 eligible sleeve")
+        eligible_evidence[sleeve_id] = {
+            str(key): item for key, item in raw.items()
+        }
+    raw_sleeves = payload.get("sleeves")
+    if not isinstance(raw_sleeves, list) or not raw_sleeves:
+        raise ValueError("套件冻结前向计划没有 sleeve")
+    sleeve_weights: dict[str, float] = {}
+    for raw in raw_sleeves:
+        if not isinstance(raw, dict):
+            raise ValueError("套件冻结前向 sleeve 合同无效")
+        sleeve = {str(key): item for key, item in raw.items()}
+        sleeve_id = sleeve.get("sleeve_id")
+        member_id = sleeve.get("member_id")
+        bar_interval = sleeve.get("bar_interval")
+        family = sleeve.get("family")
+        candidate = sleeve.get("candidate")
+        if (
+            not isinstance(sleeve_id, str) or not sleeve_id
+            or not isinstance(member_id, str) or not member_id
+            or not isinstance(bar_interval, str) or not bar_interval
+            or not isinstance(family, str) or not family
+            or not isinstance(candidate, dict)
+        ):
+            raise ValueError("套件冻结前向 sleeve 合同无效")
+        if sleeve_id in sleeve_weights:
+            raise ValueError("套件冻结前向计划包含重复 sleeve")
+        candidate_id = candidate.get("candidate_id")
+        expression_identity = candidate.get("expression_id")
+        parameters = candidate.get("parameters")
+        mode = candidate.get("mode")
+        if (
+            not isinstance(candidate_id, str) or not candidate_id
+            or candidate.get("family") != family
+            or mode != "paper"
+            or not isinstance(expression_identity, str)
+            or not isinstance(parameters, dict)
+        ):
+            raise ValueError("套件冻结前向候选合同无效")
+        numeric_parameters: dict[str, int | float] = {}
+        for name, value in parameters.items():
+            if (
+                not isinstance(name, str) or not name
+                or not isinstance(value, (int, float))
+                or isinstance(value, bool) or not math.isfinite(float(value))
+            ):
+                raise ValueError("套件冻结前向候选参数无效")
+            numeric_parameters[name] = value
+        try:
+            template = strategy_expression(family)
+        except ValueError as error:
+            raise ValueError("套件冻结前向包含不受支持的策略流派") from error
+        if (
+            expression_id(template) != expression_identity
+            or candidate_identity(template, numeric_parameters) != candidate_id
+        ):
+            raise ValueError("套件冻结前向候选未绑定公式与完整参数")
+        evidence_sleeve = eligible_evidence.get(sleeve_id)
+        if evidence_sleeve is None or any((
+            evidence_sleeve.get("member_id") != member_id,
+            evidence_sleeve.get("bar_interval") != bar_interval,
+            evidence_sleeve.get("family") != family,
+            evidence_sleeve.get("deployment_candidate_id") != candidate_id,
+        )):
+            raise ValueError("套件冻结前向 sleeve 与 evidence 不一致")
+        sleeve_weights[sleeve_id] = _finite_number(
+            sleeve.get("weight"), f"suite sleeve weight.{sleeve_id}",
+        )
+        if sleeve_weights[sleeve_id] < 0.0:
+            raise ValueError("套件冻结前向 sleeve 权重不得为负")
+    if set(sleeve_weights) != set(eligible_evidence):
+        raise ValueError("套件冻结前向计划未覆盖全部 eligible sleeve")
+    allocation = payload.get("allocation")
+    if not isinstance(allocation, dict) or not isinstance(
+        allocation.get("weights"), dict,
+    ):
+        raise ValueError("套件冻结前向计划 allocation 无效")
+    allocation_weights = {
+        str(key): _finite_number(value, f"suite allocation.{key}")
+        for key, value in allocation["weights"].items()
+    }
+    if allocation_weights != sleeve_weights:
+        raise ValueError("套件冻结前向 allocation 未精确覆盖 sleeve")
+    reserve = _finite_number(allocation.get("reserve"), "suite reserve")
+    if reserve < 0.0 or sum(allocation_weights.values()) + reserve > 1.0 + 1e-9:
+        raise ValueError("套件冻结前向资金权重与 reserve 合同不成立")
+    shared_caps = allocation.get("shared_caps")
+    if not isinstance(shared_caps, dict) or any(
+        not isinstance(key, str) or not key
+        or _finite_number(value, f"shared cap.{key}") < 0.0
+        for key, value in shared_caps.items()
+    ):
+        raise ValueError("套件冻结前向 shared caps 无效")
+    evidence_allocation = evidence.get("suite_research_allocation")
+    if not isinstance(evidence_allocation, dict) or (
+        evidence_allocation.get("weights") != allocation_weights
+        or evidence_allocation.get("reserve") != reserve
+        or evidence_allocation.get("shared_caps") != shared_caps
+    ):
+        raise ValueError("套件冻结前向 allocation 与 evidence 不一致")
+    decision_grid = payload.get("decision_grid")
+    if not isinstance(decision_grid, dict) or any(
+        not isinstance(decision_grid.get(key), int)
+        or isinstance(decision_grid.get(key), bool)
+        or int(decision_grid[key]) <= 0
+        for key in ("interval_seconds", "maximum_recording_lag_seconds")
+    ):
+        raise ValueError("套件冻结前向共同决策栅格无效")
+    if (
+        decision_grid.get("utc_epoch_offset_seconds") != 0
+        or decision_grid.get("interval_seconds")
+        != evidence.get("alignment_interval_seconds")
+    ):
+        raise ValueError("套件冻结前向共同决策栅格与 evidence 不一致")
+    input_record = payload.get("input")
+    if not isinstance(input_record, dict) or any(
+        not isinstance(input_record.get(key), str) or not input_record.get(key)
+        for key in ("head_generation", "receipt_sha256")
+    ):
+        raise ValueError("套件冻结前向 input 身份无效")
+    if (
+        input_record.get("head_generation") != evidence.get("input_head_generation")
+        or input_record.get("receipt_sha256")
+        != evidence.get("input_receipt_sha256")
+    ):
+        raise ValueError("套件冻结前向 input 与 evidence 不一致")
+    evidence_body = {
+        str(key): value for key, value in evidence.items()
+        if key != "suite_evidence_id"
+    }
+    if stable_identifier("interval-suite-evidence", evidence_body) != suite_evidence_id:
+        raise ValueError("套件冻结前向 evidence 内容身份不一致")
+    normalized_members.sort(key=lambda item: str(item.get("bar_interval")))
+    computed_deployment_id = interval_suite_deployment_contract_id(
+        governance_registry,
+        data_root_locator(repository_root, live_data_root),
+        normalized_members,
+        {str(key): value for key, value in decision_grid.items()},
+    )
+    if computed_deployment_id != deployment_contract_id:
+        raise ValueError("套件冻结前向 deployment_contract_id 不一致")
+    return normalized
+
+
+def _validated_interval_suite_prediction_code_identity(
+    repository_root: Path,
+    plan: sqlite3.Row,
+    plan_payload: Mapping[str, object],
+) -> CodeIdentity:
+    """按冻结配置谱系复核当前代码树仍是计划的 clean commit。"""
+    raw_identity_members = plan_payload.get("members")
+    if not isinstance(raw_identity_members, list):
+        raise ValueError("套件冻结计划缺少成员配置身份")
+    config_sources: set[Path] = set()
+    for raw_member in raw_identity_members:
+        if not isinstance(raw_member, dict):
+            raise ValueError("套件冻结计划成员配置身份无效")
+        raw_sources = raw_member.get("config_source_paths")
+        if not isinstance(raw_sources, list) or not raw_sources:
+            raise ValueError("套件冻结计划成员配置谱系无效")
+        for raw_source in raw_sources:
+            if not isinstance(raw_source, str) or not raw_source:
+                raise ValueError("套件冻结计划成员配置谱系无效")
+            source_path, normalized_source = _evidence_file(
+                repository_root,
+                raw_source,
+                "interval suite member config lineage",
+            )
+            if raw_source != normalized_source:
+                raise ValueError("套件冻结计划成员配置谱系路径不规范")
+            config_sources.add(source_path)
+    live_identity = code_identity(
+        repository_root, tuple(sorted(config_sources)),
+    )
+    if any((
+        not live_identity.decision_grade,
+        live_identity.dirty,
+        live_identity.git_hash != str(plan["source_git_hash"]),
+        live_identity.tree_digest != str(plan["code_tree_digest"]),
+    )):
+        raise ValueError("套件冻结预测登记代码树不是计划的 clean commit")
+    return live_identity
+
+
+def _validated_interval_suite_forward_prediction_artifact(
+    repository_root: Path,
+    plan: sqlite3.Row,
+    vintage: sqlite3.Row,
+    prediction_id: str,
+    decision_time: datetime,
+    input_head_generation: str,
+    input_receipt_path: str,
+    input_receipt_sha256: str,
+    member_panel_set_hash: str,
+    artifact_path: str,
+    artifact_sha256: str,
+    reference_time: datetime,
+) -> tuple[str, str, CodeIdentity]:
+    """复核套件预测的输入、成员面板、sleeve 与聚合仓位。"""
+    if not _canonical_sha256(input_receipt_sha256):
+        raise ValueError("套件冻结预测输入收据 SHA-256 无效")
+    if not _canonical_sha256(artifact_sha256):
+        raise ValueError("套件冻结预测制品 SHA-256 无效")
+    plan_path, _ = _evidence_file(
+        repository_root,
+        str(plan["plan_artifact_path"]),
+        "interval suite forward plan",
+    )
+    if sha256_file(plan_path) != str(plan["plan_artifact_sha256"]):
+        raise ValueError("套件冻结计划现场 SHA-256 不匹配")
+    plan_payload = _json_file(plan_path, "interval suite forward plan")
+    path, normalized_path = _evidence_file(
+        repository_root, artifact_path, "interval suite forward prediction",
+    )
+    if sha256_file(path) != artifact_sha256:
+        raise ValueError("套件冻结预测现场 SHA-256 不匹配")
+    payload = _json_file(path, "interval suite forward prediction")
+    expected = {
+        "schema_version": INTERVAL_SUITE_PREDICTION_SCHEMA_VERSION,
+        "method_version": INTERVAL_SUITE_PREDICTION_METHOD_VERSION,
+        "governance_method_version": GOVERNANCE_METHOD_VERSION,
+        "scope": "INTERVAL_SUITE_FROZEN_FORWARD_PREDICTION",
+        "prediction_id": prediction_id,
+        "plan_id": str(plan["plan_id"]),
+        "suite_plan_id": str(plan["suite_plan_id"]),
+        "suite_evidence_id": str(plan["suite_evidence_id"]),
+        "deployment_contract_id": plan_payload.get("deployment_contract_id"),
+        "decision_time": decision_time.isoformat(),
+        "member_panel_set_hash": member_panel_set_hash,
+    }
+    for field, value in expected.items():
+        if payload.get(field) != value:
+            raise ValueError(f"套件冻结预测 {field} 与登记身份不一致")
+    decision_grid = plan_payload.get("decision_grid")
+    if not isinstance(decision_grid, dict):
+        raise ValueError("套件冻结计划缺少共同决策栅格")
+    maximum_lag = decision_grid.get("maximum_recording_lag_seconds")
+    generated_at = payload.get("generated_at")
+    quality_reference = payload.get("quality_reference_time")
+    if (
+        not isinstance(maximum_lag, int)
+        or isinstance(maximum_lag, bool)
+        or maximum_lag <= 0
+        or not isinstance(generated_at, str)
+        or not isinstance(quality_reference, str)
+    ):
+        raise ValueError("套件冻结预测质量参考时点无效")
+    generated = _parse_timestamp(generated_at)
+    if not decision_time <= generated <= reference_time:
+        raise ValueError("套件冻结预测生成时点不在登记窗口")
+    if _parse_timestamp(quality_reference) != (
+        decision_time + timedelta(seconds=maximum_lag)
+    ):
+        raise ValueError("套件冻结预测质量参考时点未绑定登记期限")
+    raw_vintage = payload.get("vintage")
+    raw_start = raw_vintage.get("start_time") if isinstance(raw_vintage, dict) else None
+    raw_end = raw_vintage.get("end_time") if isinstance(raw_vintage, dict) else None
+    if not isinstance(raw_vintage, dict) or any((
+        raw_vintage.get("vintage_id") != str(vintage["vintage_id"]),
+        raw_vintage.get("market_id") != str(vintage["market_id"]),
+        not isinstance(raw_start, str),
+        not isinstance(raw_end, str),
+        isinstance(raw_start, str) and _parse_timestamp(raw_start)
+        != _parse_timestamp(str(vintage["start_time"])),
+        isinstance(raw_end, str) and _parse_timestamp(raw_end)
+        != _parse_timestamp(str(vintage["end_time"])),
+    )):
+        raise ValueError("套件冻结预测 vintage 身份不一致")
+    raw_input = payload.get("input")
+    if not isinstance(raw_input, dict) or any((
+        raw_input.get("head_generation") != input_head_generation,
+        raw_input.get("receipt_path") != input_receipt_path,
+        raw_input.get("receipt_sha256") != input_receipt_sha256,
+    )):
+        raise ValueError("套件冻结预测 input 身份不一致")
+    receipt_path, normalized_receipt_path = _evidence_file(
+        repository_root, input_receipt_path, "interval suite input receipt",
+    )
+    if input_receipt_path != normalized_receipt_path:
+        raise ValueError("套件冻结预测输入收据路径不规范")
+    if sha256_file(receipt_path) != input_receipt_sha256:
+        raise ValueError("套件冻结预测输入收据现场 SHA-256 不匹配")
+    live_root_record = plan_payload.get("live_data_root")
+    if live_root_record is None:
+        raise ValueError("套件冻结计划缺少 live_data_root")
+    live_root = resolve_data_root_locator(repository_root, live_root_record)
+    from guvolu.research.panel import attest_trade_input_receipt
+
+    inputs = attest_trade_input_receipt(
+        live_root, receipt_path, require_current_head=True,
+    )
+    if (
+        inputs.head_generation != input_head_generation
+        or str(inputs.market.get("market_id")) != str(vintage["market_id"])
+    ):
+        raise ValueError("套件冻结预测收据与市场或 head 不一致")
+    code_identity_value = payload.get("code_identity")
+    if not isinstance(code_identity_value, dict) or any((
+        code_identity_value.get("git_hash") != str(plan["source_git_hash"]),
+        code_identity_value.get("tree_digest") != str(plan["code_tree_digest"]),
+        code_identity_value.get("decision_grade") is not True,
+        code_identity_value.get("dirty") is not False,
+    )):
+        raise ValueError("套件冻结预测不是计划代码身份下的 clean 决策")
+    live_identity = _validated_interval_suite_prediction_code_identity(
+        repository_root, plan, plan_payload,
+    )
+
+    raw_plan_members = plan_payload.get("members")
+    raw_members = payload.get("member_panels")
+    raw_plan_sleeves = plan_payload.get("sleeves")
+    if (
+        not isinstance(raw_plan_members, list)
+        or not isinstance(raw_members, list)
+        or not isinstance(raw_plan_sleeves, list)
+    ):
+        raise ValueError("套件冻结预测缺少成员面板")
+    plan_members = {
+        str(member.get("member_id")): str(member.get("bar_interval"))
+        for member in raw_plan_members if isinstance(member, dict)
+    }
+    selected_member_ids = {
+        str(sleeve.get("member_id"))
+        for sleeve in raw_plan_sleeves if isinstance(sleeve, dict)
+    }
+    expected_members = {
+        member_id: interval for member_id, interval in plan_members.items()
+        if member_id in selected_member_ids
+    }
+    if not expected_members or set(selected_member_ids) != set(expected_members):
+        raise ValueError("套件冻结 sleeve 引用了未知成员")
+    normalized_members: list[dict[str, object]] = []
+    member_quality: dict[str, bool] = {}
+    for raw_member in raw_members:
+        if not isinstance(raw_member, dict):
+            raise ValueError("套件冻结预测成员面板合同无效")
+        member = {str(key): value for key, value in raw_member.items()}
+        member_id = member.get("member_id")
+        interval = member.get("bar_interval")
+        panel_path_value = member.get("panel_path")
+        panel_sha = member.get("panel_sha256")
+        latest_available = member.get("latest_available_time")
+        quality = member.get("quality")
+        if (
+            not isinstance(member_id, str) or not member_id
+            or expected_members.get(member_id) != interval
+            or not isinstance(panel_path_value, str) or not panel_path_value
+            or not isinstance(panel_sha, str) or not _canonical_sha256(panel_sha)
+            or member.get("decision_time") != decision_time.isoformat()
+            or member.get("input_head_generation") != input_head_generation
+            or member.get("attempt_ids") != list(inputs.attempt_ids)
+            or member.get("artifact_ids") != list(inputs.artifact_ids)
+            or member.get("normalization_versions")
+            != list(inputs.normalization_versions)
+            or not isinstance(latest_available, str)
+            or not isinstance(quality, dict)
+            or not isinstance(quality.get("eligible"), bool)
+            or not isinstance(quality.get("reasons"), list)
+        ):
+            raise ValueError("套件冻结预测成员面板身份无效")
+        if _parse_timestamp(latest_available) > decision_time:
+            raise ValueError("套件冻结预测成员面板包含决策后可得数据")
+        panel_path, normalized_panel = _evidence_file(
+            repository_root, panel_path_value, "interval suite member panel",
+        )
+        if (
+            panel_path_value != normalized_panel
+            or sha256_file(panel_path) != panel_sha
+            or member.get("panel_bytes") != panel_path.stat().st_size
+        ):
+            raise ValueError("套件冻结预测成员面板现场身份不一致")
+        if member_id in member_quality:
+            raise ValueError("套件冻结预测包含重复成员面板")
+        if any(not isinstance(reason, str) or not reason for reason in quality["reasons"]):
+            raise ValueError("套件冻结预测成员质量原因无效")
+        member_quality[member_id] = bool(quality["eligible"])
+        normalized_members.append(member)
+    if set(member_quality) != set(expected_members):
+        raise ValueError("套件冻结预测成员面板未完整覆盖冻结计划")
+    expected_panel_set = interval_suite_member_panel_set_hash(
+        str(plan["plan_id"]), decision_time, normalized_members,
+    )
+    if expected_panel_set != member_panel_set_hash:
+        raise ValueError("套件冻结预测成员面板 row-set 身份不一致")
+
+    raw_sleeves = payload.get("sleeves")
+    if not isinstance(raw_sleeves, list):
+        raise ValueError("套件冻结预测缺少 sleeves")
+    expected_sleeves = {
+        str(item.get("sleeve_id")): item
+        for item in raw_plan_sleeves if isinstance(item, dict)
+    }
+    operational = payload.get("operational")
+    if not isinstance(operational, dict):
+        raise ValueError("套件冻结预测缺少 operational 门禁")
+    all_members_ready = all(member_quality.values())
+    raw_reasons = operational.get("reasons")
+    if (
+        operational.get("eligible") is not all_members_ready
+        or not isinstance(raw_reasons, list)
+        or (all_members_ready and raw_reasons)
+        or (not all_members_ready and not raw_reasons)
+    ):
+        raise ValueError("套件冻结预测 operational 门禁与成员质量不一致")
+    seen_sleeves: set[str] = set()
+    aggregate = 0.0
+    for raw_sleeve in raw_sleeves:
+        if not isinstance(raw_sleeve, dict):
+            raise ValueError("套件冻结预测 sleeve 合同无效")
+        sleeve = {str(key): value for key, value in raw_sleeve.items()}
+        sleeve_id = sleeve.get("sleeve_id")
+        expected_sleeve = expected_sleeves.get(str(sleeve_id))
+        if expected_sleeve is None or str(sleeve_id) in seen_sleeves:
+            raise ValueError("套件冻结预测 sleeve 不属于计划或重复")
+        candidate = expected_sleeve.get("candidate")
+        if not isinstance(candidate, dict) or any((
+            sleeve.get("member_id") != expected_sleeve.get("member_id"),
+            sleeve.get("bar_interval") != expected_sleeve.get("bar_interval"),
+            sleeve.get("family") != expected_sleeve.get("family"),
+            sleeve.get("candidate_id") != candidate.get("candidate_id"),
+        )):
+            raise ValueError("套件冻结预测 sleeve 与冻结计划不一致")
+        weight = _finite_number(sleeve.get("weight"), "suite sleeve weight")
+        raw_target = _finite_number(sleeve.get("raw_target"), "raw target")
+        target = _finite_number(
+            sleeve.get("operational_target"), "operational target",
+        )
+        if weight != _finite_number(expected_sleeve.get("weight"), "plan weight"):
+            raise ValueError("套件冻结预测 sleeve 权重与计划不一致")
+        expected_target = weight * raw_target if all_members_ready else 0.0
+        if not math.isclose(target, expected_target, abs_tol=1e-12):
+            raise ValueError("套件冻结预测 sleeve 仓位未执行质量硬门")
+        aggregate += target
+        seen_sleeves.add(str(sleeve_id))
+    if seen_sleeves != set(expected_sleeves):
+        raise ValueError("套件冻结预测 sleeves 未完整覆盖冻结计划")
+    allocation = payload.get("allocation")
+    plan_allocation = plan_payload.get("allocation")
+    if not isinstance(allocation, dict) or not isinstance(plan_allocation, dict):
+        raise ValueError("套件冻结预测 allocation 无效")
+    if allocation.get("reserve") != plan_allocation.get("reserve"):
+        raise ValueError("套件冻结预测 reserve 与计划不一致")
+    aggregate_target = _finite_number(
+        allocation.get("aggregate_target"), "suite aggregate target",
+    )
+    if not math.isclose(aggregate_target, aggregate, abs_tol=1e-12):
+        raise ValueError("套件冻结预测 aggregate target 与 sleeve 合计不一致")
+    return normalized_path, normalized_receipt_path, live_identity
+
+
+def _validated_forward_prediction_artifact(
+    repository_root: Path,
+    prediction_id: str,
+    plan_id: str,
+    vintage_id: str,
+    decision_time: datetime,
+    input_head_generation: str,
+    panel_sha256: str,
+    config_hash: str,
+    code_tree_digest: str,
+    plan_evidence: _ForwardPlanEvidence,
+    artifact_path: str,
+    artifact_sha256: str,
+    reference_time: datetime,
+) -> tuple[Path, str, str, str]:
+    """现场复核冻结预测制品的计划、时点、输入和代码身份。"""
+    if not _canonical_sha256(artifact_sha256):
+        raise ValueError("冻结前向预测 SHA-256 无效")
+    path, normalized = _evidence_file(
+        repository_root, artifact_path, "frozen forward prediction",
+    )
+    if sha256_file(path) != artifact_sha256:
+        raise ValueError("冻结前向预测现场 SHA-256 不匹配")
+    payload = _json_file(path, "frozen forward prediction")
+    expected = {
+        "schema_version": FROZEN_FORWARD_SCHEMA_VERSION,
+        "method_version": FROZEN_FORWARD_METHOD_VERSION,
+        "scope": "FROZEN_FORWARD",
+        "prediction_id": prediction_id,
+        "plan_id": plan_id,
+        "vintage_id": vintage_id,
+        "decision_time": decision_time.isoformat(),
+        "input_head_generation": input_head_generation,
+        "panel_sha256": panel_sha256,
+        "config_hash": config_hash,
+    }
+    for field, value in expected.items():
+        if payload.get(field) != value:
+            raise ValueError(f"冻结前向预测 {field} 与注册身份不一致")
+    code = payload.get("code_identity")
+    if not isinstance(code, dict) or code.get("tree_digest") != code_tree_digest:
+        raise ValueError("冻结前向预测代码树与计划不一致")
+    quality = payload.get("quality")
+    quality_fields = ("integrity", "freshness", "clock", "coverage", "pit", "lineage")
+    if not isinstance(quality, dict) or any(
+        not isinstance(quality.get(field), bool) for field in quality_fields
+    ):
+        raise ValueError("冻结前向预测 quality 合同无效")
+    eligible = quality.get("eligible")
+    if eligible is not all(bool(quality[field]) for field in quality_fields):
+        raise ValueError("冻结前向预测 quality.eligible 推导不一致")
+    reasons = quality.get("reasons")
+    if not isinstance(reasons, list) or any(not isinstance(item, str) for item in reasons):
+        raise ValueError("冻结前向预测 quality.reasons 合同无效")
+    raw_families = payload.get("families")
+    if not isinstance(raw_families, list):
+        raise ValueError("冻结前向预测缺少 families")
+    expected_candidates = dict(plan_evidence.candidate_families)
+    expected_weights = dict(plan_evidence.weights)
+    seen: set[str] = set()
+    contribution_total = 0.0
+    for raw in raw_families:
+        if not isinstance(raw, dict):
+            raise ValueError("冻结前向预测 family 合同无效")
+        record = {str(key): item for key, item in raw.items()}
+        candidate_id = record.get("candidate_id")
+        family = record.get("family")
+        if (
+            not isinstance(candidate_id, str)
+            or candidate_id in seen
+            or not isinstance(family, str)
+            or expected_candidates.get(candidate_id) != family
+        ):
+            raise ValueError("冻结前向预测 candidate/family 与计划不一致")
+        seen.add(candidate_id)
+        weight = _finite_number(
+            record.get("frozen_allocation_weight"), "frozen prediction weight",
+        )
+        if not math.isclose(
+            weight, expected_weights[family], rel_tol=1e-12, abs_tol=1e-12,
+        ):
+            raise ValueError("冻结前向预测使用了计划外资金权重")
+        target = _finite_number(record.get("family_target"), "frozen family target")
+        contribution = _finite_number(
+            record.get("portfolio_target_contribution"), "frozen contribution",
+        )
+        if not math.isclose(
+            contribution, target * weight, rel_tol=1e-12, abs_tol=1e-12,
+        ):
+            raise ValueError("冻结前向预测流派贡献计算不一致")
+        if eligible is False and (
+            not math.isclose(target, 0.0, abs_tol=1e-12)
+            or not math.isclose(contribution, 0.0, abs_tol=1e-12)
+        ):
+            raise ValueError("冻结前向预测质量失败但存在非零目标")
+        contribution_total += contribution
+    if seen != set(plan_evidence.candidate_ids):
+        raise ValueError("冻结前向预测未覆盖计划候选全集")
+    reserve = _finite_number(payload.get("reserve"), "frozen prediction reserve")
+    if not math.isclose(
+        reserve, plan_evidence.reserve, rel_tol=1e-12, abs_tol=1e-12,
+    ):
+        raise ValueError("冻结前向预测 reserve 与计划不一致")
+    aggregate = _finite_number(payload.get("aggregate_target"), "aggregate_target")
+    if not math.isclose(
+        aggregate, contribution_total, rel_tol=1e-12, abs_tol=1e-12,
+    ):
+        raise ValueError("冻结前向预测组合目标聚合不一致")
+    if eligible is False and not math.isclose(aggregate, 0.0, abs_tol=1e-12):
+        raise ValueError("冻结前向预测质量失败但组合目标非零")
+    if payload.get("unit") != "risk_weighted_directional_target":
+        raise ValueError("冻结前向预测 unit 不受支持")
+    from guvolu.research.frozen_forward import attest_frozen_prediction_artifact
+
+    attest_frozen_prediction_artifact(
+        repository_root,
+        plan_evidence.path,
+        path,
+        reference_time,
+        require_current_head=True,
+    )
+    receipt = payload.get("input_receipt")
+    if not isinstance(receipt, dict):
+        raise ValueError("冻结前向预测缺少活动输入收据")
+    receipt_path, normalized_receipt = _evidence_file(
+        repository_root,
+        str(receipt.get("path") or ""),
+        "冻结预测活动输入收据",
+    )
+    receipt_sha256 = str(receipt.get("sha256") or "")
+    if (
+        not _canonical_sha256(receipt_sha256)
+        or sha256_file(receipt_path) != receipt_sha256
+        or payload.get("input_receipt_sha256") != receipt_sha256
+    ):
+        raise ValueError("冻结前向预测活动输入收据散列不匹配")
+    return path, normalized, normalized_receipt, receipt_sha256
+
+
+def _validated_candidate_set_identity(
+    manifest: dict[str, object],
+    candidate_set_hash: str,
+) -> list[str]:
+    """复算冻结候选全集身份并返回规范有序 candidate IDs。"""
+    value = manifest.get("candidate_set_identity")
+    if not isinstance(value, dict):
+        raise ValueError("holdout manifest 缺少 candidate_set_identity")
+    identity = {str(key): item for key, item in value.items()}
+    required = {
+        "holdout_method_version",
+        "source_manifest_sha256",
+        "source_summary_sha256",
+        "candidate_registry_sha256",
+        "candidate_ids",
+    }
+    if set(identity) != required:
+        raise ValueError("holdout candidate_set_identity 字段不完整")
+    if identity.get("holdout_method_version") != HOLDOUT_METHOD_VERSION:
+        raise ValueError("holdout candidate_set_identity 方法版本不匹配")
+    for name in (
+        "source_manifest_sha256",
+        "source_summary_sha256",
+        "candidate_registry_sha256",
+    ):
+        sha256 = identity.get(name)
+        if not isinstance(sha256, str) or not _canonical_sha256(sha256):
+            raise ValueError(f"holdout candidate_set_identity.{name} 无效")
+    raw_ids = identity.get("candidate_ids")
+    if (
+        not isinstance(raw_ids, list)
+        or not raw_ids
+        or any(not isinstance(item, str) or not item for item in raw_ids)
+    ):
+        raise ValueError("holdout candidate_set_identity.candidate_ids 无效")
+    candidate_ids = [str(item) for item in raw_ids]
+    if candidate_ids != sorted(candidate_ids) or len(set(candidate_ids)) != len(candidate_ids):
+        raise ValueError("holdout candidate IDs 必须有序且不重复")
+    if stable_identifier("candidate-set", identity) != candidate_set_hash:
+        raise ValueError("holdout candidate_set_hash 现场复算不匹配")
+    return candidate_ids
+
+
+def _validated_evaluation_identity(
+    manifest: dict[str, object],
+    vintage_id: str,
+    evaluation_id: str,
+    candidate_set_hash: str,
+) -> str:
+    """复算消费前已冻结且包含 config hash 的 evaluation 身份。"""
+    value = manifest.get("evaluation_identity")
+    if not isinstance(value, dict):
+        raise ValueError("holdout manifest 缺少 evaluation_identity")
+    identity = {str(key): item for key, item in value.items()}
+    required = {
+        "holdout_method_version",
+        "governance_method_version",
+        "vintage_id",
+        "candidate_set_hash",
+        "config_hash",
+        "code_tree_digest",
+        "input_head_generation",
+        "input_attempt_ids",
+        "input_artifact_ids",
+        "normalization_versions",
+        "input_receipt_sha256",
+    }
+    if set(identity) != required:
+        raise ValueError("holdout evaluation_identity 字段不完整")
+    if identity.get("holdout_method_version") != HOLDOUT_METHOD_VERSION:
+        raise ValueError("holdout evaluation_identity 方法版本不匹配")
+    if identity.get("governance_method_version") != GOVERNANCE_METHOD_VERSION:
+        raise ValueError("holdout evaluation_identity 治理版本不匹配")
+    if identity.get("vintage_id") != vintage_id:
+        raise ValueError("holdout evaluation_identity vintage_id 不匹配")
+    if identity.get("candidate_set_hash") != candidate_set_hash:
+        raise ValueError("holdout evaluation_identity candidate set 不匹配")
+    config_hash = identity.get("config_hash")
+    if not isinstance(config_hash, str) or not _canonical_sha256(config_hash):
+        raise ValueError("holdout evaluation_identity config_hash 无效")
+    for name in ("code_tree_digest", "input_head_generation"):
+        item = identity.get(name)
+        if not isinstance(item, str) or not item:
+            raise ValueError(f"holdout evaluation_identity.{name} 无效")
+    receipt_sha256 = identity.get("input_receipt_sha256")
+    if not isinstance(receipt_sha256, str) or not _canonical_sha256(receipt_sha256):
+        raise ValueError("holdout evaluation_identity.input_receipt_sha256 无效")
+    for name in (
+        "input_attempt_ids", "input_artifact_ids", "normalization_versions",
+    ):
+        values = identity.get(name)
+        if (
+            not isinstance(values, (list, tuple))
+            or not values
+            or any(not isinstance(item, str) or not item for item in values)
+        ):
+            raise ValueError(f"holdout evaluation_identity {name} 无效")
+        if list(values) != sorted(values) or len(set(values)) != len(values):
+            raise ValueError(f"holdout evaluation_identity {name} 必须有序且不重复")
+    if stable_identifier("holdout-evaluation", identity) != evaluation_id:
+        raise ValueError("holdout evaluation_id 现场复算不匹配")
+    return config_hash
+
+
+def _finite_number(value: object, label: str) -> float:
+    """读取可复核政策和指标中的有限数值。"""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        raise ValueError(f"{label} 必须为数值")
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError(f"{label} 必须为有限数值")
+    return number
+
+
+def _holdout_fdr(p_values: dict[str, float]) -> dict[str, float]:
+    """按冻结候选全集重算 Benjamini-Hochberg q 值。"""
+    ordered = sorted(p_values.items(), key=lambda item: (item[1], item[0]))
+    result: dict[str, float] = {}
+    running = 1.0
+    count = len(ordered)
+    for index in range(count - 1, -1, -1):
+        candidate_id, p_value = ordered[index]
+        rank = index + 1
+        running = min(running, p_value * count / rank)
+        result[candidate_id] = min(max(running, 0.0), 1.0)
+    return result
+
+
+def _validated_terminal_evidence(
+    repository_root: Path,
+    vintage_id: str,
+    evaluation_id: str,
+    verdict: str,
+    result_manifest_path: str,
+    result_manifest_sha256: str,
+) -> _TerminalEvidence:
+    """现场复核 manifest、result 与最终 verdict 的同一业务身份。"""
+    if not _canonical_sha256(result_manifest_sha256):
+        raise ValueError("holdout manifest SHA-256 必须是规范小写十六进制")
+    manifest_path, normalized_path = _evidence_file(
+        repository_root, result_manifest_path, "holdout manifest",
+    )
+    if sha256_file(manifest_path) != result_manifest_sha256:
+        raise ValueError("holdout manifest 现场 SHA-256 不匹配")
+    manifest = _json_file(manifest_path, "holdout manifest")
+    if manifest.get("schema_version") != HOLDOUT_MANIFEST_SCHEMA_VERSION:
+        raise ValueError("holdout manifest schema_version 不受支持")
+    if manifest.get("holdout_method_version") != HOLDOUT_METHOD_VERSION:
+        raise ValueError("holdout manifest method version 不匹配")
+    try:
+        verdict_value = json.loads(verdict)
+    except json.JSONDecodeError as error:
+        raise ValueError("holdout verdict 必须为 JSON 对象") from error
+    if not isinstance(verdict_value, dict):
+        raise ValueError("holdout verdict 必须为 JSON 对象")
+    terminal = {str(key): item for key, item in verdict_value.items()}
+    if manifest.get("vintage_id") != vintage_id:
+        raise ValueError("holdout manifest 的 vintage_id 不匹配")
+    if manifest.get("evaluation_id") != evaluation_id:
+        raise ValueError("holdout manifest 的 evaluation_id 不匹配")
+    if terminal.get("evaluation_id") != evaluation_id:
+        raise ValueError("holdout verdict 的 evaluation_id 不匹配")
+    if terminal.get("manifest_sha256") != result_manifest_sha256:
+        raise ValueError("holdout verdict 未绑定现场 manifest SHA-256")
+    terminal_verdict = terminal.get("verdict")
+    if terminal_verdict not in ("passed", "failed"):
+        raise ValueError("holdout verdict 只能是 passed 或 failed")
+    if manifest.get("verdict") != terminal_verdict:
+        raise ValueError("holdout manifest 与最终 verdict 不匹配")
+    candidate_set_hash = manifest.get("candidate_set_hash")
+    if not isinstance(candidate_set_hash, str) or not candidate_set_hash:
+        raise ValueError("holdout manifest 缺少 candidate_set_hash")
+    candidate_ids = _validated_candidate_set_identity(manifest, candidate_set_hash)
+    config_hash = _validated_evaluation_identity(
+        manifest, vintage_id, evaluation_id, candidate_set_hash,
+    )
+    evaluation_identity = manifest["evaluation_identity"]
+    assert isinstance(evaluation_identity, dict)
+    for name in (
+        "input_head_generation", "input_attempt_ids", "input_artifact_ids",
+        "normalization_versions",
+    ):
+        if manifest.get(name) != evaluation_identity.get(name):
+            raise ValueError(f"holdout manifest 的 {name} 未绑定 evaluation_identity")
+    if terminal.get("candidate_ids") != candidate_ids:
+        raise ValueError("holdout verdict 未绑定冻结 candidate IDs")
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, dict):
+        raise ValueError("holdout manifest 缺少 artifacts")
+    config_path, config_artifact_sha256 = _validated_artifact(
+        repository_root, artifacts, "config", "holdout_config",
+    )
+    if config_artifact_sha256 != config_hash:
+        raise ValueError("holdout config 制品与 evaluation_identity 不匹配")
+    receipt_path, receipt_sha256 = _validated_artifact(
+        repository_root,
+        artifacts,
+        "input_receipt",
+        "active_trade_head_receipt",
+    )
+    if (
+        receipt_sha256 != evaluation_identity.get("input_receipt_sha256")
+        or receipt_sha256 != manifest.get("input_receipt_sha256")
+    ):
+        raise ValueError("holdout 活动输入收据未绑定 evaluation_identity")
+    _, panel_sha256 = _validated_artifact(
+        repository_root, artifacts, "panel", "holdout_panel",
+    )
+    schedule_path, schedule_sha256 = _validated_artifact(
+        repository_root,
+        artifacts,
+        "score_schedule",
+        "holdout_score_schedule",
+    )
+    result_path, result_sha256 = _validated_artifact(
+        repository_root, artifacts, "result", "holdout_result",
+    )
+    if terminal.get("result_sha256") != result_sha256:
+        raise ValueError("holdout verdict 未绑定现场 result SHA-256")
+    result = _json_file(result_path, "holdout result")
+    if result.get("schema_version") != HOLDOUT_MANIFEST_SCHEMA_VERSION:
+        raise ValueError("holdout result schema_version 不受支持")
+    if result.get("holdout_method_version") != HOLDOUT_METHOD_VERSION:
+        raise ValueError("holdout result method version 不匹配")
+    vintage = result.get("vintage")
+    if not isinstance(vintage, dict) or vintage.get("vintage_id") != vintage_id:
+        raise ValueError("holdout result 的 vintage_id 不匹配")
+    if result.get("evaluation_id") != evaluation_id:
+        raise ValueError("holdout result 的 evaluation_id 不匹配")
+    if result.get("candidate_set_hash") != candidate_set_hash:
+        raise ValueError("holdout result 的 candidate_set_hash 不匹配")
+    if result.get("config_hash") != config_hash:
+        raise ValueError("holdout result 的 config_hash 不匹配")
+    if result.get("panel_sha256") != panel_sha256:
+        raise ValueError("holdout result 未绑定现场 panel SHA-256")
+    if result.get("score_schedule_sha256") != schedule_sha256:
+        raise ValueError("holdout result 未绑定现场 score schedule")
+    if result.get("verdict") != terminal_verdict:
+        raise ValueError("holdout result 与最终 verdict 不匹配")
+    candidate_results = result.get("candidate_results")
+    if not isinstance(candidate_results, list) or not candidate_results:
+        raise ValueError("holdout result 缺少候选评估结果")
+    if len(candidate_results) != len(candidate_ids):
+        raise ValueError("holdout candidate_results 未覆盖冻结候选全集")
+    config = _json_file(config_path, "holdout config")
+    governance = config.get("data_governance")
+    if not isinstance(governance, dict):
+        raise ValueError("holdout config 缺少 data_governance")
+    frozen_policy = governance.get("holdout_policy")
+    if not isinstance(frozen_policy, dict):
+        raise ValueError("holdout config 缺少 holdout_policy")
+    policy = result.get("policy")
+    if not isinstance(policy, dict) or policy != frozen_policy:
+        raise ValueError("holdout result 缺少固定 policy")
+    minimum_bars = policy.get("minimum_bars")
+    if (
+        not isinstance(minimum_bars, int)
+        or isinstance(minimum_bars, bool)
+        or minimum_bars <= 0
+    ):
+        raise ValueError("holdout policy.minimum_bars 无效")
+    score_bars = result.get("score_bars")
+    if (
+        not isinstance(score_bars, int)
+        or isinstance(score_bars, bool)
+        or score_bars < minimum_bars
+    ):
+        raise ValueError("holdout score_bars 低于冻结门槛")
+    score_start_value = result.get("score_start")
+    score_end_value = result.get("score_end")
+    if not isinstance(score_start_value, str) or not isinstance(score_end_value, str):
+        raise ValueError("holdout score 时间范围无效")
+    score_start = _parse_timestamp(score_start_value)
+    score_end = _parse_timestamp(score_end_value)
+    if score_start > score_end:
+        raise ValueError("holdout score 时间范围倒置")
+    schedule = _json_file(schedule_path, "holdout score schedule")
+    if schedule.get("schema_version") != HOLDOUT_MANIFEST_SCHEMA_VERSION:
+        raise ValueError("holdout score schedule schema_version 不受支持")
+    if schedule.get("holdout_method_version") != HOLDOUT_METHOD_VERSION:
+        raise ValueError("holdout score schedule method version 不匹配")
+    if schedule.get("evaluation_id") != evaluation_id:
+        raise ValueError("holdout score schedule evaluation_id 不匹配")
+    raw_decision_times = schedule.get("decision_times")
+    if (
+        not isinstance(raw_decision_times, list)
+        or len(raw_decision_times) != score_bars
+        or any(not isinstance(item, str) for item in raw_decision_times)
+    ):
+        raise ValueError("holdout score schedule 未完整覆盖评分柱")
+    decision_times = tuple(
+        _parse_timestamp(str(item)) for item in raw_decision_times
+    )
+    if (
+        decision_times != tuple(sorted(set(decision_times)))
+        or decision_times[0] != score_start
+        or decision_times[-1] != score_end
+    ):
+        raise ValueError("holdout score schedule 时点无序、重复或边界不一致")
+    require_forward_predictions = policy.get("require_frozen_forward_predictions")
+    if not isinstance(require_forward_predictions, bool):
+        raise ValueError("holdout policy 必须明确冻结前向预测要求")
+    target_source = result.get("target_source")
+    forward_plan_id = result.get("frozen_forward_plan_id")
+    forward_prediction_count = result.get("frozen_forward_prediction_count")
+    forward_prediction_row_set_hash = result.get("frozen_forward_row_set_hash")
+    if (
+        forward_prediction_row_set_hash
+        != manifest.get("frozen_forward_row_set_hash")
+    ):
+        raise ValueError("holdout 冻结预测 row-set 未绑定 manifest")
+    if (
+        not isinstance(forward_prediction_count, int)
+        or isinstance(forward_prediction_count, bool)
+        or forward_prediction_count < 0
+    ):
+        raise ValueError("holdout 冻结预测数量无效")
+    if require_forward_predictions:
+        if target_source != "recorded_frozen_forward":
+            raise ValueError("holdout 必须使用预先记录的冻结前向目标")
+        if not isinstance(forward_plan_id, str) or not forward_plan_id:
+            raise ValueError("holdout 缺少冻结前向 plan_id")
+        if forward_prediction_count != score_bars:
+            raise ValueError("holdout 冻结预测数量必须完整等于评分柱数")
+        if (
+            not isinstance(forward_prediction_row_set_hash, str)
+            or not forward_prediction_row_set_hash.startswith(
+                "frozen-forward-row-set-"
+            )
+        ):
+            raise ValueError("holdout 缺少冻结预测 row-set 身份")
+    else:
+        if target_source != "end_of_vintage_recompute":
+            raise ValueError("holdout target_source 与冻结 policy 不一致")
+        if forward_plan_id is not None or forward_prediction_count != 0:
+            raise ValueError("holdout 非冻结前向模式不得声称预测覆盖")
+        if forward_prediction_row_set_hash is not None:
+            raise ValueError("holdout 非冻结前向模式不得绑定预测 row-set")
+    minimum_sharpe = _finite_number(
+        policy.get("minimum_sharpe"), "holdout policy.minimum_sharpe",
+    )
+    maximum_drawdown = _finite_number(
+        policy.get("maximum_drawdown"), "holdout policy.maximum_drawdown",
+    )
+    maximum_fdr_q = _finite_number(
+        policy.get("maximum_fdr_q"), "holdout policy.maximum_fdr_q",
+    )
+    if maximum_drawdown < 0.0 or not 0.0 <= maximum_fdr_q <= 1.0:
+        raise ValueError("holdout policy 阈值范围无效")
+    records: list[tuple[str, str, dict[str, object], dict[str, object]]] = []
+    p_values: dict[str, float] = {}
+    for item in candidate_results:
+        if not isinstance(item, dict):
+            raise ValueError("holdout candidate_results 合同无效")
+        record = {str(key): value for key, value in item.items()}
+        candidate_id = record.get("candidate_id")
+        family = record.get("family")
+        metrics_value = record.get("metrics")
+        if (
+            not isinstance(candidate_id, str)
+            or not isinstance(family, str)
+            or not family
+            or not isinstance(metrics_value, dict)
+        ):
+            raise ValueError("holdout candidate_results 合同无效")
+        metrics = {str(key): value for key, value in metrics_value.items()}
+        p_value = _finite_number(
+            metrics.get("p_value"), f"holdout {candidate_id}.p_value",
+        )
+        if not 0.0 <= p_value <= 1.0:
+            raise ValueError("holdout candidate p_value 范围无效")
+        if candidate_id in p_values:
+            raise ValueError("holdout candidate_results 包含重复 candidate_id")
+        p_values[candidate_id] = p_value
+        records.append((candidate_id, family, metrics, record))
+    if [record[0] for record in records] != candidate_ids:
+        raise ValueError("holdout candidate_results 与冻结候选全集不一致")
+    q_values = _holdout_fdr(p_values)
+    candidate_outcomes: list[tuple[str, bool]] = []
+    for candidate_id, family, metrics, record in records:
+        reasons: list[str] = []
+        if _finite_number(
+            metrics.get("net_return"), f"holdout {candidate_id}.net_return",
+        ) <= 0.0:
+            reasons.append("non_positive_holdout_net_return")
+        if _finite_number(
+            metrics.get("sharpe"), f"holdout {candidate_id}.sharpe",
+        ) < minimum_sharpe:
+            reasons.append("holdout_sharpe_failed")
+        if _finite_number(
+            metrics.get("maximum_drawdown"),
+            f"holdout {candidate_id}.maximum_drawdown",
+        ) > maximum_drawdown:
+            reasons.append("holdout_drawdown_failed")
+        if q_values[candidate_id] > maximum_fdr_q:
+            reasons.append("holdout_fdr_failed")
+        stored_q = _finite_number(
+            record.get("fdr_q"), f"holdout {candidate_id}.fdr_q",
+        )
+        if not math.isclose(
+            stored_q, q_values[candidate_id], rel_tol=1e-12, abs_tol=1e-12,
+        ):
+            raise ValueError("holdout candidate fdr_q 现场重算不匹配")
+        passed = not reasons
+        if record.get("passed") is not passed:
+            raise ValueError("holdout candidate passed 现场重算不匹配")
+        if record.get("rejection_reasons") != reasons:
+            raise ValueError("holdout candidate rejection_reasons 不匹配")
+        candidate_outcomes.append((family, passed))
+    passed_families = sorted(
+        family for family, passed in candidate_outcomes if passed
+    )
+    expected_verdict = "passed" if all(
+        passed for _, passed in candidate_outcomes
+    ) else "failed"
+    if expected_verdict != terminal_verdict:
+        raise ValueError("holdout verdict 与候选评估结果不一致")
+    if result.get("passed_families") != passed_families:
+        raise ValueError("holdout result 的 passed_families 不一致")
+    if terminal.get("passed_families") != passed_families:
+        raise ValueError("holdout verdict 的 passed_families 不一致")
+    from guvolu.research.holdout import attest_holdout_terminal_artifacts
+
+    attest_holdout_terminal_artifacts(repository_root, manifest_path)
+    return _TerminalEvidence(
+        manifest_path=normalized_path,
+        candidate_set_hash=candidate_set_hash,
+        candidate_ids=tuple(candidate_ids),
+        config_hash=config_hash,
+        input_head_generation=str(evaluation_identity["input_head_generation"]),
+        input_receipt_path=receipt_path.resolve().relative_to(
+            repository_root.resolve()
+        ).as_posix(),
+        input_receipt_sha256=receipt_sha256,
+        require_forward_predictions=require_forward_predictions,
+        forward_plan_id=forward_plan_id,
+        forward_prediction_count=forward_prediction_count,
+        forward_prediction_row_set_hash=forward_prediction_row_set_hash,
+        score_start=score_start,
+        score_end=score_end,
+        score_bars=score_bars,
+        score_decision_times=decision_times,
+    )
+
+
 def _validate_range(start_time: datetime, end_time: datetime) -> tuple[datetime, datetime]:
     """验证左闭右开时间区间。"""
     start = _utc(start_time)
@@ -98,12 +1703,589 @@ def _validate_range(start_time: datetime, end_time: datetime) -> tuple[datetime,
     return start, end
 
 
-def _connect(path: Path) -> sqlite3.Connection:
-    """打开治理注册表并初始化固定 schema。"""
+def _terminal_invariant_violation(
+    connection: sqlite3.Connection,
+) -> sqlite3.Row | None:
+    """查找 vintage 与 evaluation attempt 的跨表非法终态。"""
+    row: sqlite3.Row | None = connection.execute(
+        """
+        SELECT v.vintage_id
+        FROM holdout_vintage AS v
+        LEFT JOIN holdout_evaluation_attempt AS a
+          ON a.vintage_id=v.vintage_id
+        WHERE
+          (v.status='sealed' AND a.evaluation_id IS NOT NULL)
+          OR
+          (v.status='consumed' AND (
+            a.evaluation_id IS NULL
+            OR a.evaluation_id<>v.evaluation_id
+            OR a.candidate_set_hash<>v.candidate_set_hash
+            OR (v.verdict IS NULL AND a.status<>'incomplete')
+            OR (v.verdict IS NOT NULL AND a.status<>'completed')
+            OR ((v.verdict IS NULL)<>(v.verdict_recorded_at IS NULL))
+          ))
+        LIMIT 1
+        """
+    ).fetchone()
+    return row
+
+
+def _upgrade_governance_state(
+    connection: sqlite3.Connection,
+    existing_version: str | None,
+) -> None:
+    """原子升级治理库，并把旧 consumed 记录变成可解释 incomplete 尝试。"""
+    supported = {
+        None, "1", "2", "3", "4", "5", "6",
+        str(GOVERNANCE_SCHEMA_VERSION),
+    }
+    if existing_version not in supported:
+        raise ValueError("不支持的研究治理注册表 schema_version")
+    orphan_count = int(connection.execute(
+        """
+        SELECT COUNT(*)
+        FROM holdout_vintage AS v
+        LEFT JOIN holdout_evaluation_attempt AS a
+          ON a.vintage_id=v.vintage_id
+        WHERE v.status='consumed' AND a.evaluation_id IS NULL
+        """
+    ).fetchone()[0])
+    needs_upgrade = existing_version != str(GOVERNANCE_SCHEMA_VERSION)
+    if needs_upgrade or orphan_count:
+        owns_transaction = not connection.in_transaction
+        if owns_transaction:
+            connection.execute("BEGIN IMMEDIATE")
+        try:
+            invalid_legacy = connection.execute(
+                """
+                SELECT v.vintage_id
+                FROM holdout_vintage AS v
+                LEFT JOIN holdout_evaluation_attempt AS a
+                  ON a.vintage_id=v.vintage_id
+                WHERE v.status='consumed' AND a.evaluation_id IS NULL
+                  AND v.verdict IS NOT NULL
+                LIMIT 1
+                """
+            ).fetchone()
+            if invalid_legacy is not None:
+                raise ValueError(
+                    "旧治理库存在无 manifest attempt 的已判定 consumed vintage: "
+                    + str(invalid_legacy["vintage_id"])
+                )
+            connection.execute(
+                """
+                INSERT INTO holdout_evaluation_attempt(
+                  evaluation_id,vintage_id,candidate_set_hash,status,stage,
+                  started_at,updated_at
+                )
+                SELECT
+                  v.evaluation_id,v.vintage_id,v.candidate_set_hash,
+                  'incomplete','legacy_consumed_without_attempt',
+                  v.consumed_at,v.consumed_at
+                FROM holdout_vintage AS v
+                LEFT JOIN holdout_evaluation_attempt AS a
+                  ON a.vintage_id=v.vintage_id
+                WHERE v.status='consumed' AND v.verdict IS NULL
+                  AND a.evaluation_id IS NULL
+                """
+            )
+            violation = _terminal_invariant_violation(connection)
+            if violation is not None:
+                raise ValueError(
+                    "治理库存在不一致的 holdout 终态: "
+                    + str(violation["vintage_id"])
+                )
+            if existing_version is None:
+                connection.execute(
+                    "INSERT INTO governance_meta(key,value) "
+                    "VALUES('schema_version',?)",
+                    (str(GOVERNANCE_SCHEMA_VERSION),),
+                )
+            else:
+                connection.execute(
+                    "UPDATE governance_meta SET value=? WHERE key='schema_version'",
+                    (str(GOVERNANCE_SCHEMA_VERSION),),
+                )
+            if owns_transaction:
+                connection.execute("COMMIT")
+        except BaseException:
+            if owns_transaction and connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+    violation = _terminal_invariant_violation(connection)
+    if violation is not None:
+        raise ValueError(
+            "治理库存在不一致的 holdout 终态: "
+            + str(violation["vintage_id"])
+        )
+
+
+def _schema_write_ceiling(
+    connection: sqlite3.Connection,
+) -> int | None:
+    """读取可选的部署写入上限；旧 reader 会忽略这个附加元数据。"""
+    table = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' "
+        "AND name='governance_meta'"
+    ).fetchone()
+    if table is None:
+        return None
+    row = connection.execute(
+        "SELECT value FROM governance_meta WHERE key=?",
+        (SCHEMA_WRITE_CEILING_KEY,),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        ceiling = int(str(row["value"]))
+    except ValueError as error:
+        raise ValueError("治理库 schema 写入上限不是整数") from error
+    if ceiling < 1 or ceiling > GOVERNANCE_SCHEMA_VERSION:
+        raise ValueError("治理库 schema 写入上限超出支持范围")
+    return ceiling
+
+
+def _validate_active_head_receipt_schema(
+    connection: sqlite3.Connection,
+    *,
+    probe_constraints: bool = False,
+) -> None:
+    """验证收据表列、复合主键和两项关键 CHECK 约束。"""
+    rows = connection.execute(
+        "PRAGMA table_info(active_head_receipt)"
+    ).fetchall()
+    expected = (
+        ("consumer_kind", "TEXT", 1, 1),
+        ("consumer_id", "TEXT", 1, 2),
+        ("market_id", "TEXT", 1, 0),
+        ("head_generation", "TEXT", 1, 0),
+        ("receipt_artifact_path", "TEXT", 1, 0),
+        ("receipt_artifact_sha256", "TEXT", 1, 0),
+        ("recorded_at", "TEXT", 1, 0),
+    )
+    actual = tuple(
+        (str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5]))
+        for row in rows
+    )
+    if actual != expected:
+        raise ValueError("治理库 active_head_receipt 表结构不兼容")
+    schema_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' "
+        "AND name='active_head_receipt'"
+    ).fetchone()
+    normalized_schema = "" if schema_row is None else "".join(
+        str(schema_row[0]).lower().split()
+    )
+    required_constraints = (
+        "check(consumer_kindin('research','frozen_forward','holdout'))",
+        "check(length(receipt_artifact_sha256)=64)",
+    )
+    if any(item not in normalized_schema for item in required_constraints):
+        raise ValueError("治理库 active_head_receipt 缺少必要约束")
+    if not probe_constraints:
+        return
+
+    def rejects(values: tuple[str, ...], suffix: str) -> bool:
+        savepoint = f"active_head_receipt_probe_{suffix}"
+        connection.execute(f"SAVEPOINT {savepoint}")
+        try:
+            try:
+                connection.execute(
+                    "INSERT INTO active_head_receipt("
+                    "consumer_kind,consumer_id,market_id,head_generation,"
+                    "receipt_artifact_path,receipt_artifact_sha256,recorded_at"
+                    ") VALUES(?,?,?,?,?,?,?)",
+                    values,
+                )
+            except sqlite3.IntegrityError:
+                return True
+            return False
+        finally:
+            connection.execute(f"ROLLBACK TO {savepoint}")
+            connection.execute(f"RELEASE {savepoint}")
+
+    probe = f"__guvolu_schema_probe_{id(connection)}"
+    common = (probe, probe, probe)
+    try:
+        kind_rejected = rejects(
+            ("invalid", f"{probe}_kind", *common, "0" * 64, probe),
+            "kind",
+        )
+        hash_rejected = rejects(
+            ("research", f"{probe}_hash", *common, "short", probe),
+            "hash",
+        )
+    except sqlite3.DatabaseError as error:
+        raise ValueError(
+            "治理库 active_head_receipt 约束探针失败"
+        ) from error
+    if not kind_rejected or not hash_rejected:
+        raise ValueError("治理库 active_head_receipt 缺少必要约束")
+
+
+def _validate_interval_suite_forward_plan_schema(
+    connection: sqlite3.Connection,
+) -> None:
+    """验证套件冻结计划表列、唯一性与内容散列约束。"""
+    rows = connection.execute(
+        "PRAGMA table_info(interval_suite_forward_plan)"
+    ).fetchall()
+    expected = (
+        ("plan_id", "TEXT", 0, 1),
+        ("vintage_id", "TEXT", 1, 0),
+        ("suite_plan_id", "TEXT", 1, 0),
+        ("suite_evidence_id", "TEXT", 1, 0),
+        ("source_git_hash", "TEXT", 1, 0),
+        ("code_tree_digest", "TEXT", 1, 0),
+        ("plan_artifact_path", "TEXT", 1, 0),
+        ("plan_artifact_sha256", "TEXT", 1, 0),
+        ("frozen_at", "TEXT", 1, 0),
+    )
+    actual = tuple(
+        (str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5]))
+        for row in rows
+    )
+    if actual != expected:
+        raise ValueError("治理库 interval_suite_forward_plan 表结构不兼容")
+    schema_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' "
+        "AND name='interval_suite_forward_plan'"
+    ).fetchone()
+    normalized = "" if schema_row is None else "".join(
+        str(schema_row[0]).lower().split()
+    )
+    if "check(length(plan_artifact_sha256)=64)" not in normalized:
+        raise ValueError("治理库套件冻结计划表缺少 SHA-256 约束")
+    indexes = connection.execute(
+        "PRAGMA index_list(interval_suite_forward_plan)"
+    ).fetchall()
+    unique_columns = {
+        tuple(str(row[2]) for row in connection.execute(
+            f"PRAGMA index_info('{str(index[1])}')"
+        ).fetchall())
+        for index in indexes if int(index[2]) == 1
+    }
+    if ("vintage_id",) not in unique_columns:
+        raise ValueError("治理库套件冻结计划表缺少 vintage 唯一约束")
+    foreign_keys = {
+        (str(row[3]), str(row[2]), str(row[4]))
+        for row in connection.execute(
+            "PRAGMA foreign_key_list(interval_suite_forward_plan)"
+        ).fetchall()
+    }
+    if ("vintage_id", "holdout_vintage", "vintage_id") not in foreign_keys:
+        raise ValueError("治理库套件冻结计划表缺少 vintage 外键")
+
+
+def _validate_interval_suite_forward_prediction_schema(
+    connection: sqlite3.Connection,
+) -> None:
+    """验证套件预测表列、唯一性、外键与散列约束。"""
+    rows = connection.execute(
+        "PRAGMA table_info(interval_suite_forward_prediction)"
+    ).fetchall()
+    expected = (
+        ("prediction_id", "TEXT", 0, 1),
+        ("plan_id", "TEXT", 1, 0),
+        ("vintage_id", "TEXT", 1, 0),
+        ("decision_time", "TEXT", 1, 0),
+        ("input_head_generation", "TEXT", 1, 0),
+        ("input_receipt_path", "TEXT", 1, 0),
+        ("input_receipt_sha256", "TEXT", 1, 0),
+        ("member_panel_set_hash", "TEXT", 1, 0),
+        ("prediction_artifact_path", "TEXT", 1, 0),
+        ("prediction_artifact_sha256", "TEXT", 1, 0),
+        ("recorded_at", "TEXT", 1, 0),
+    )
+    actual = tuple(
+        (str(row[1]), str(row[2]).upper(), int(row[3]), int(row[5]))
+        for row in rows
+    )
+    if actual != expected:
+        raise ValueError(
+            "治理库 interval_suite_forward_prediction 表结构不兼容"
+        )
+    schema_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' "
+        "AND name='interval_suite_forward_prediction'"
+    ).fetchone()
+    normalized = "" if schema_row is None else "".join(
+        str(schema_row[0]).lower().split()
+    )
+    required_constraints = (
+        "check(length(input_receipt_sha256)=64)",
+        "check(length(prediction_artifact_sha256)=64)",
+    )
+    if any(item not in normalized for item in required_constraints):
+        raise ValueError("治理库套件预测表缺少 SHA-256 约束")
+    indexes = connection.execute(
+        "PRAGMA index_list(interval_suite_forward_prediction)"
+    ).fetchall()
+    unique_columns = {
+        tuple(str(row[2]) for row in connection.execute(
+            f"PRAGMA index_info('{str(index[1])}')"
+        ).fetchall())
+        for index in indexes if int(index[2]) == 1
+    }
+    if ("plan_id", "decision_time") not in unique_columns:
+        raise ValueError("治理库套件预测表缺少计划时点唯一约束")
+    foreign_keys = {
+        (str(row[3]), str(row[2]), str(row[4]))
+        for row in connection.execute(
+            "PRAGMA foreign_key_list(interval_suite_forward_prediction)"
+        ).fetchall()
+    }
+    required_foreign_keys = {
+        ("plan_id", "interval_suite_forward_plan", "plan_id"),
+        ("vintage_id", "holdout_vintage", "vintage_id"),
+    }
+    if not required_foreign_keys.issubset(foreign_keys):
+        raise ValueError("治理库套件预测表缺少必要外键")
+
+
+def upgrade_governance_write_ceiling(
+    registry_path: Path,
+    backup_path: Path,
+    *,
+    expected_version: int,
+    expected_write_ceiling: int,
+) -> Path:
+    """备份并显式升级一个被旧部署固定写入版本的治理库。"""
+    registry = registry_path.resolve()
+    backup = backup_path.resolve()
+    if not registry.is_file():
+        raise FileNotFoundError(f"治理库不存在: {registry}")
+    if backup == registry:
+        raise ValueError("治理库备份路径不得指向原库")
+    if backup.exists():
+        raise FileExistsError(f"治理库备份已存在: {backup}")
+    if expected_version < 1 or expected_version >= GOVERNANCE_SCHEMA_VERSION:
+        raise ValueError("expected_version 必须是低于当前版本的正整数")
+    if expected_write_ceiling != expected_version:
+        raise ValueError("旧 schema 版本与写入上限必须一致")
+
+    backup.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(registry, timeout=30.0, isolation_level=None)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA foreign_keys=ON")
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        try:
+            existing = connection.execute(
+                "SELECT value FROM governance_meta WHERE key='schema_version'"
+            ).fetchone()
+            actual_version = (
+                None if existing is None else int(str(existing["value"]))
+            )
+            actual_ceiling = _schema_write_ceiling(connection)
+            if actual_version != expected_version:
+                raise ValueError(
+                    "治理库 schema 版本与显式预期不一致: "
+                    f"expected={expected_version}, actual={actual_version}"
+                )
+            if actual_ceiling != expected_write_ceiling:
+                raise ValueError(
+                    "治理库写入上限与显式预期不一致: "
+                    f"expected={expected_write_ceiling}, actual={actual_ceiling}"
+                )
+            _validate_pinned_read_schema(
+                connection,
+                str(actual_version),
+                actual_ceiling,
+            )
+
+            backup_source = sqlite3.connect(registry, timeout=30.0)
+            backup_connection = sqlite3.connect(backup)
+            try:
+                backup_source.backup(backup_connection)
+                integrity = backup_connection.execute(
+                    "PRAGMA integrity_check"
+                ).fetchall()
+                if integrity != [("ok",)]:
+                    raise ValueError("治理库备份完整性检查失败")
+            except BaseException:
+                backup_connection.close()
+                backup_source.close()
+                if backup.exists():
+                    backup.unlink()
+                raise
+            else:
+                backup_connection.close()
+                backup_source.close()
+
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS active_head_receipt (
+                  consumer_kind TEXT NOT NULL CHECK(
+                    consumer_kind IN ('research','frozen_forward','holdout')
+                  ),
+                  consumer_id TEXT NOT NULL,
+                  market_id TEXT NOT NULL,
+                  head_generation TEXT NOT NULL,
+                  receipt_artifact_path TEXT NOT NULL,
+                  receipt_artifact_sha256 TEXT NOT NULL CHECK(
+                    length(receipt_artifact_sha256)=64
+                  ),
+                  recorded_at TEXT NOT NULL,
+                  PRIMARY KEY(consumer_kind,consumer_id)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS interval_suite_forward_plan (
+                  plan_id TEXT PRIMARY KEY,
+                  vintage_id TEXT NOT NULL UNIQUE,
+                  suite_plan_id TEXT NOT NULL,
+                  suite_evidence_id TEXT NOT NULL,
+                  source_git_hash TEXT NOT NULL,
+                  code_tree_digest TEXT NOT NULL,
+                  plan_artifact_path TEXT NOT NULL,
+                  plan_artifact_sha256 TEXT NOT NULL CHECK(
+                    length(plan_artifact_sha256)=64
+                  ),
+                  frozen_at TEXT NOT NULL,
+                  FOREIGN KEY(vintage_id) REFERENCES holdout_vintage(vintage_id)
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS interval_suite_forward_prediction (
+                  prediction_id TEXT PRIMARY KEY,
+                  plan_id TEXT NOT NULL,
+                  vintage_id TEXT NOT NULL,
+                  decision_time TEXT NOT NULL,
+                  input_head_generation TEXT NOT NULL,
+                  input_receipt_path TEXT NOT NULL,
+                  input_receipt_sha256 TEXT NOT NULL CHECK(
+                    length(input_receipt_sha256)=64
+                  ),
+                  member_panel_set_hash TEXT NOT NULL,
+                  prediction_artifact_path TEXT NOT NULL,
+                  prediction_artifact_sha256 TEXT NOT NULL CHECK(
+                    length(prediction_artifact_sha256)=64
+                  ),
+                  recorded_at TEXT NOT NULL,
+                  FOREIGN KEY(plan_id)
+                    REFERENCES interval_suite_forward_plan(plan_id),
+                  FOREIGN KEY(vintage_id)
+                    REFERENCES holdout_vintage(vintage_id),
+                  UNIQUE(plan_id,decision_time)
+                )
+                """
+            )
+            _validate_active_head_receipt_schema(
+                connection, probe_constraints=True,
+            )
+            _validate_interval_suite_forward_plan_schema(connection)
+            _validate_interval_suite_forward_prediction_schema(connection)
+            _upgrade_governance_state(connection, str(actual_version))
+            connection.execute(
+                "UPDATE governance_meta SET value=? WHERE key=?",
+                (str(GOVERNANCE_SCHEMA_VERSION), SCHEMA_WRITE_CEILING_KEY),
+            )
+            connection.execute("COMMIT")
+        except BaseException:
+            if connection.in_transaction:
+                connection.execute("ROLLBACK")
+            raise
+    finally:
+        connection.close()
+
+    verified = _connect(registry)
+    verified.close()
+    return backup
+
+
+def _validate_pinned_read_schema(
+    connection: sqlite3.Connection,
+    existing_version: str | None,
+    ceiling: int,
+) -> None:
+    """证明低版本标记下的物理表足以供当前 reader 无副作用读取。"""
+    if existing_version != str(ceiling):
+        raise ValueError("治理库 schema 标记与写入上限不一致")
+    probes = (
+        "SELECT key,value FROM governance_meta LIMIT 0",
+        "SELECT exposure_id,research_identity,market_id,start_time,end_time,"
+        "recorded_at FROM research_exposure LIMIT 0",
+        "SELECT vintage_id,market_id,start_time,end_time,sealed_at,status,"
+        "consumed_at,candidate_set_hash,evaluation_id,verdict,"
+        "verdict_recorded_at FROM holdout_vintage LIMIT 0",
+        "SELECT plan_id,vintage_id,source_manifest_sha256,candidate_set_hash,"
+        "config_hash,code_tree_digest,plan_artifact_path,plan_artifact_sha256,"
+        "frozen_at FROM frozen_forward_plan LIMIT 0",
+        "SELECT evaluation_id,vintage_id,candidate_set_hash,status,stage,"
+        "started_at,updated_at,completed_at,result_manifest_path,"
+        "result_manifest_sha256 FROM holdout_evaluation_attempt LIMIT 0",
+        "SELECT prediction_id,plan_id,vintage_id,decision_time,"
+        "input_head_generation,panel_sha256,prediction_artifact_path,"
+        "prediction_artifact_sha256,recorded_at "
+        "FROM frozen_forward_prediction LIMIT 0",
+    )
+    suite_probes = (
+        "SELECT plan_id,vintage_id,suite_plan_id,suite_evidence_id,"
+        "source_git_hash,code_tree_digest,plan_artifact_path,"
+        "plan_artifact_sha256,frozen_at "
+        "FROM interval_suite_forward_plan LIMIT 0",
+    ) if ceiling >= 6 else ()
+    suite_prediction_probes = (
+        "SELECT prediction_id,plan_id,vintage_id,decision_time,"
+        "input_head_generation,input_receipt_path,input_receipt_sha256,"
+        "member_panel_set_hash,prediction_artifact_path,"
+        "prediction_artifact_sha256,recorded_at "
+        "FROM interval_suite_forward_prediction LIMIT 0",
+    ) if ceiling >= 7 else ()
+    try:
+        for statement in (*probes, *suite_probes, *suite_prediction_probes):
+            connection.execute(statement)
+        violation = _terminal_invariant_violation(connection)
+    except sqlite3.DatabaseError as error:
+        raise ValueError(
+            "治理库写入已冻结，但物理 schema 不兼容当前只读代码"
+        ) from error
+    if violation is not None:
+        raise ValueError(
+            "治理库存在不一致的 holdout 终态: "
+            + str(violation["vintage_id"])
+        )
+
+
+def _connect(
+    path: Path,
+    *,
+    write: bool = False,
+    compatible_schema: int | None = None,
+) -> sqlite3.Connection:
+    """打开治理库；版本固定时只允许已证明的向下兼容操作。"""
+    if compatible_schema is not None and not write:
+        raise ValueError("compatible_schema 只适用于治理写入")
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path, timeout=30.0, isolation_level=None)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys=ON")
+    try:
+        ceiling = _schema_write_ceiling(connection)
+        if ceiling is not None and GOVERNANCE_SCHEMA_VERSION > ceiling:
+            existing = connection.execute(
+                "SELECT value FROM governance_meta WHERE key='schema_version'"
+            ).fetchone()
+            if write and compatible_schema != ceiling:
+                raise ValueError(
+                    "治理库 schema 写入已冻结在版本 " + str(ceiling)
+                )
+            _validate_pinned_read_schema(
+                connection,
+                None if existing is None else str(existing["value"]),
+                ceiling,
+            )
+            if write:
+                connection.execute("PRAGMA synchronous=FULL")
+            return connection
+    except BaseException:
+        connection.close()
+        raise
     connection.execute("PRAGMA journal_mode=WAL")
     connection.execute("PRAGMA synchronous=FULL")
     connection.executescript(
@@ -154,6 +2336,29 @@ def _connect(path: Path) -> sqlite3.Connection:
           frozen_at TEXT NOT NULL,
           FOREIGN KEY(vintage_id) REFERENCES holdout_vintage(vintage_id)
         );
+        CREATE TABLE IF NOT EXISTS holdout_evaluation_attempt (
+          evaluation_id TEXT PRIMARY KEY,
+          vintage_id TEXT NOT NULL UNIQUE,
+          candidate_set_hash TEXT NOT NULL,
+          status TEXT NOT NULL CHECK(status IN ('incomplete','completed')),
+          stage TEXT NOT NULL,
+          started_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          completed_at TEXT,
+          result_manifest_path TEXT,
+          result_manifest_sha256 TEXT,
+          CHECK(
+            (status='incomplete' AND completed_at IS NULL
+             AND result_manifest_path IS NULL
+             AND result_manifest_sha256 IS NULL)
+            OR
+            (status='completed' AND completed_at IS NOT NULL
+             AND result_manifest_path IS NOT NULL
+             AND result_manifest_sha256 IS NOT NULL
+             AND length(result_manifest_sha256)=64)
+          ),
+          FOREIGN KEY(vintage_id) REFERENCES holdout_vintage(vintage_id)
+        );
         CREATE TABLE IF NOT EXISTS frozen_forward_prediction (
           prediction_id TEXT PRIMARY KEY,
           plan_id TEXT NOT NULL,
@@ -168,24 +2373,71 @@ def _connect(path: Path) -> sqlite3.Connection:
           FOREIGN KEY(vintage_id) REFERENCES holdout_vintage(vintage_id),
           UNIQUE(plan_id,decision_time)
         );
+        CREATE TABLE IF NOT EXISTS interval_suite_forward_plan (
+          plan_id TEXT PRIMARY KEY,
+          vintage_id TEXT NOT NULL UNIQUE,
+          suite_plan_id TEXT NOT NULL,
+          suite_evidence_id TEXT NOT NULL,
+          source_git_hash TEXT NOT NULL,
+          code_tree_digest TEXT NOT NULL,
+          plan_artifact_path TEXT NOT NULL,
+          plan_artifact_sha256 TEXT NOT NULL CHECK(
+            length(plan_artifact_sha256)=64
+          ),
+          frozen_at TEXT NOT NULL,
+          FOREIGN KEY(vintage_id) REFERENCES holdout_vintage(vintage_id)
+        );
+        CREATE TABLE IF NOT EXISTS interval_suite_forward_prediction (
+          prediction_id TEXT PRIMARY KEY,
+          plan_id TEXT NOT NULL,
+          vintage_id TEXT NOT NULL,
+          decision_time TEXT NOT NULL,
+          input_head_generation TEXT NOT NULL,
+          input_receipt_path TEXT NOT NULL,
+          input_receipt_sha256 TEXT NOT NULL CHECK(
+            length(input_receipt_sha256)=64
+          ),
+          member_panel_set_hash TEXT NOT NULL,
+          prediction_artifact_path TEXT NOT NULL,
+          prediction_artifact_sha256 TEXT NOT NULL CHECK(
+            length(prediction_artifact_sha256)=64
+          ),
+          recorded_at TEXT NOT NULL,
+          FOREIGN KEY(plan_id)
+            REFERENCES interval_suite_forward_plan(plan_id),
+          FOREIGN KEY(vintage_id) REFERENCES holdout_vintage(vintage_id),
+          UNIQUE(plan_id,decision_time)
+        );
+        CREATE TABLE IF NOT EXISTS active_head_receipt (
+          consumer_kind TEXT NOT NULL CHECK(
+            consumer_kind IN ('research','frozen_forward','holdout')
+          ),
+          consumer_id TEXT NOT NULL,
+          market_id TEXT NOT NULL,
+          head_generation TEXT NOT NULL,
+          receipt_artifact_path TEXT NOT NULL,
+          receipt_artifact_sha256 TEXT NOT NULL CHECK(
+            length(receipt_artifact_sha256)=64
+          ),
+          recorded_at TEXT NOT NULL,
+          PRIMARY KEY(consumer_kind,consumer_id)
+        );
         """
     )
+    _validate_active_head_receipt_schema(connection)
+    _validate_interval_suite_forward_plan_schema(connection)
+    _validate_interval_suite_forward_prediction_schema(connection)
     existing = connection.execute(
         "SELECT value FROM governance_meta WHERE key='schema_version'"
     ).fetchone()
-    if existing is None:
-        connection.execute(
-            "INSERT INTO governance_meta(key,value) VALUES('schema_version',?)",
-            (str(GOVERNANCE_SCHEMA_VERSION),),
+    try:
+        _upgrade_governance_state(
+            connection,
+            None if existing is None else str(existing["value"]),
         )
-    elif existing["value"] == "1":
-        connection.execute(
-            "UPDATE governance_meta SET value=? WHERE key='schema_version'",
-            (str(GOVERNANCE_SCHEMA_VERSION),),
-        )
-    elif existing["value"] != str(GOVERNANCE_SCHEMA_VERSION):
+    except BaseException:
         connection.close()
-        raise ValueError("不支持的研究治理注册表 schema_version")
+        raise
     return connection
 
 
@@ -199,18 +2451,195 @@ def _overlap_clause() -> str:
     return "market_id=? AND start_time<? AND end_time>?"
 
 
+def _active_head_receipt_from_row(
+    row: sqlite3.Row,
+) -> ActiveHeadReceiptRegistration:
+    """把治理库行转换为活动输入收据登记。"""
+    return ActiveHeadReceiptRegistration(
+        consumer_kind=str(row["consumer_kind"]),
+        consumer_id=str(row["consumer_id"]),
+        market_id=str(row["market_id"]),
+        head_generation=str(row["head_generation"]),
+        receipt_artifact_path=str(row["receipt_artifact_path"]),
+        receipt_artifact_sha256=str(row["receipt_artifact_sha256"]),
+        recorded_at=_parse_timestamp(str(row["recorded_at"])),
+    )
+
+
+def _frozen_forward_prediction_row_set(
+    connection: sqlite3.Connection,
+    plan_id: str,
+) -> tuple[str, tuple[datetime, ...]]:
+    """从不可改写预测行及其活动收据生成确定性 row-set 身份。"""
+    rows = connection.execute(
+        "SELECT * FROM frozen_forward_prediction WHERE plan_id=? "
+        "ORDER BY decision_time",
+        (plan_id,),
+    ).fetchall()
+    records: list[dict[str, object]] = []
+    decision_times: list[datetime] = []
+    for row in rows:
+        prediction_id = str(row["prediction_id"])
+        receipt = connection.execute(
+            "SELECT * FROM active_head_receipt "
+            "WHERE consumer_kind='frozen_forward' AND consumer_id=?",
+            (prediction_id,),
+        ).fetchone()
+        if receipt is None:
+            raise ValueError("冻结预测 row-set 缺少活动输入收据")
+        decision_time = _parse_timestamp(str(row["decision_time"]))
+        decision_times.append(decision_time)
+        records.append({
+            "prediction_id": prediction_id,
+            "decision_time": decision_time.isoformat(),
+            "input_head_generation": str(row["input_head_generation"]),
+            "panel_sha256": str(row["panel_sha256"]),
+            "prediction_artifact_path": str(row["prediction_artifact_path"]),
+            "prediction_artifact_sha256": str(row["prediction_artifact_sha256"]),
+            "recorded_at": _parse_timestamp(str(row["recorded_at"])).isoformat(),
+            "receipt_artifact_path": str(receipt["receipt_artifact_path"]),
+            "receipt_artifact_sha256": str(receipt["receipt_artifact_sha256"]),
+        })
+    identity = {
+        "method_version": "frozen-forward-registered-row-set-v1",
+        "plan_id": plan_id,
+        "rows": records,
+    }
+    return stable_identifier("frozen-forward-row-set", identity), tuple(decision_times)
+
+
+def get_frozen_forward_prediction_row_set(
+    registry_path: Path,
+    plan_id: str,
+) -> tuple[str, int, tuple[datetime, ...]]:
+    """读取已登记预测全集的确定性散列、数量与有序决策时点。"""
+    connection = _connect(registry_path)
+    try:
+        row_set_hash, decision_times = _frozen_forward_prediction_row_set(
+            connection, plan_id,
+        )
+    finally:
+        connection.close()
+    return row_set_hash, len(decision_times), decision_times
+
+
+def register_active_head_receipt(
+    registry_path: Path,
+    consumer_kind: str,
+    consumer_id: str,
+    market_id: str,
+    head_generation: str,
+    receipt_artifact_path: str,
+    receipt_artifact_sha256: str,
+    *,
+    repository_root: Path,
+    data_root: Path,
+) -> ActiveHeadReceiptRegistration:
+    """仅在收据等于完整当前 head 时将其不可改写地绑定消费者。"""
+    if consumer_kind not in {"research", "frozen_forward", "holdout"}:
+        raise ValueError("活动输入收据 consumer_kind 不受支持")
+    if not consumer_id:
+        raise ValueError("活动输入收据 consumer_id 不能为空")
+    if not _canonical_sha256(receipt_artifact_sha256):
+        raise ValueError("活动输入收据 SHA-256 必须为规范小写文本")
+    receipt_path, normalized_path = _evidence_file(
+        repository_root, receipt_artifact_path, "活动输入收据",
+    )
+    if sha256_file(receipt_path) != receipt_artifact_sha256:
+        raise ValueError("活动输入收据现场 SHA-256 不匹配")
+    from guvolu.research.panel import attest_trade_input_receipt
+
+    inputs = attest_trade_input_receipt(
+        data_root, receipt_path, require_current_head=True,
+    )
+    if (
+        str(inputs.market.get("market_id")) != market_id
+        or inputs.head_generation != head_generation
+    ):
+        raise ValueError("活动输入收据与消费者声明的市场或 head 不一致")
+    recorded = _utc(clock.utc_now())
+    expected = ActiveHeadReceiptRegistration(
+        consumer_kind=consumer_kind,
+        consumer_id=consumer_id,
+        market_id=market_id,
+        head_generation=head_generation,
+        receipt_artifact_path=normalized_path,
+        receipt_artifact_sha256=receipt_artifact_sha256,
+        recorded_at=recorded,
+    )
+    connection = _connect(registry_path, write=True)
+    try:
+        _begin(connection)
+        existing = connection.execute(
+            "SELECT * FROM active_head_receipt "
+            "WHERE consumer_kind=? AND consumer_id=?",
+            (consumer_kind, consumer_id),
+        ).fetchone()
+        if existing is not None:
+            registered = _active_head_receipt_from_row(existing)
+            if (
+                registered.consumer_kind != expected.consumer_kind
+                or registered.consumer_id != expected.consumer_id
+                or registered.market_id != expected.market_id
+                or registered.head_generation != expected.head_generation
+                or registered.receipt_artifact_path
+                != expected.receipt_artifact_path
+                or registered.receipt_artifact_sha256
+                != expected.receipt_artifact_sha256
+            ):
+                raise ValueError("消费者已绑定另一份活动输入收据")
+            connection.execute("COMMIT")
+            return registered
+        connection.execute(
+            "INSERT INTO active_head_receipt("
+            "consumer_kind,consumer_id,market_id,head_generation,"
+            "receipt_artifact_path,receipt_artifact_sha256,recorded_at"
+            ") VALUES(?,?,?,?,?,?,?)",
+            (
+                consumer_kind, consumer_id, market_id, head_generation,
+                normalized_path, receipt_artifact_sha256, _timestamp(recorded),
+            ),
+        )
+        connection.execute("COMMIT")
+        return expected
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+    finally:
+        connection.close()
+
+
+def get_active_head_receipt(
+    registry_path: Path,
+    consumer_kind: str,
+    consumer_id: str,
+) -> ActiveHeadReceiptRegistration:
+    """读取消费者已经不可改写登记的活动输入收据。"""
+    connection = _connect(registry_path)
+    try:
+        row = connection.execute(
+            "SELECT * FROM active_head_receipt "
+            "WHERE consumer_kind=? AND consumer_id=?",
+            (consumer_kind, consumer_id),
+        ).fetchone()
+    finally:
+        connection.close()
+    if row is None:
+        raise LookupError("消费者没有登记活动输入收据")
+    return _active_head_receipt_from_row(row)
+
+
 def register_research_exposure(
     registry_path: Path,
     research_identity: str,
     market_id: str,
     start_time: datetime,
     end_time: datetime,
-    *,
-    recorded_at: datetime | None = None,
 ) -> ResearchExposure:
     """登记开发研究暴露；未消费封存段与研究读取互斥。"""
     start, end = _validate_range(start_time, end_time)
-    recorded = _utc(recorded_at or datetime.now(UTC))
+    recorded = _utc(clock.utc_now())
     exposure_id = stable_identifier("research-exposure", {
         "governance_method_version": GOVERNANCE_METHOD_VERSION,
         "research_identity": research_identity,
@@ -218,7 +2647,11 @@ def register_research_exposure(
         "start_time": start.isoformat(),
         "end_time": end.isoformat(),
     })
-    connection = _connect(registry_path)
+    connection = _connect(
+        registry_path,
+        write=True,
+        compatible_schema=2,
+    )
     try:
         _begin(connection)
         protected = connection.execute(
@@ -286,12 +2719,10 @@ def seal_holdout_vintage(
     market_id: str,
     start_time: datetime,
     end_time: datetime,
-    *,
-    sealed_at: datetime | None = None,
 ) -> HoldoutVintage:
     """封存尚未被任何自适应研究读取且不重叠的新数据段。"""
     start, end = _validate_range(start_time, end_time)
-    sealed = _utc(sealed_at or datetime.now(UTC))
+    sealed = clock.utc_now()
     if sealed > start:
         raise ValueError("封存段必须在区间开始前登记，禁止事后挑选 holdout")
     vintage_id = stable_identifier("holdout-vintage", {
@@ -300,7 +2731,7 @@ def seal_holdout_vintage(
         "start_time": start.isoformat(),
         "end_time": end.isoformat(),
     })
-    connection = _connect(registry_path)
+    connection = _connect(registry_path, write=True)
     try:
         _begin(connection)
         exposed = connection.execute(
@@ -354,37 +2785,59 @@ def seal_holdout_vintage(
     return _vintage_from_row(row)
 
 
-def consume_holdout_vintage(
+def start_holdout_evaluation_attempt(
     registry_path: Path,
     vintage_id: str,
     candidate_set_hash: str,
     evaluation_id: str,
-    *,
-    consumed_at: datetime | None = None,
-) -> HoldoutVintage:
-    """原子消费封存段；事务提交后永久禁止第二次消费。"""
+) -> HoldoutEvaluationAttempt:
+    """原子烧毁 vintage 并登记不可重跑的评估尝试。"""
     if not candidate_set_hash or not evaluation_id:
-        raise ValueError("消费封存段必须绑定 candidate_set_hash 与 evaluation_id")
-    consumed = _utc(consumed_at or datetime.now(UTC))
-    connection = _connect(registry_path)
+        raise ValueError("评估封存段必须绑定 candidate_set_hash 与 evaluation_id")
+    started = clock.utc_now()
+    connection = _connect(registry_path, write=True)
     try:
         _begin(connection)
-        row = connection.execute(
-            "SELECT * FROM holdout_vintage WHERE vintage_id=?",
-            (vintage_id,),
+        vintage = connection.execute(
+            "SELECT * FROM holdout_vintage WHERE vintage_id=?", (vintage_id,),
         ).fetchone()
-        if row is None:
+        if vintage is None:
             raise LookupError(f"封存段不存在: {vintage_id}")
-        if row["status"] != "sealed":
+        if vintage["status"] != "sealed":
             raise ValueError(f"封存段已经消费: {vintage_id}")
+        try:
+            suite_plan = connection.execute(
+                "SELECT plan_id FROM interval_suite_forward_plan WHERE vintage_id=?",
+                (vintage_id,),
+            ).fetchone()
+        except sqlite3.OperationalError as error:
+            if "no such table" not in str(error).lower():
+                raise
+            suite_plan = None
+        if suite_plan is not None:
+            raise ValueError("套件冻结计划 vintage 必须由套件 holdout 入口消费")
+        if started < _parse_timestamp(str(vintage["end_time"])):
+            raise ValueError("封存段必须完整结束后才能开始评估")
         connection.execute(
             "UPDATE holdout_vintage SET status='consumed',consumed_at=?,"
             "candidate_set_hash=?,evaluation_id=? WHERE vintage_id=? AND status='sealed'",
-            (_timestamp(consumed), candidate_set_hash, evaluation_id, vintage_id),
+            (_timestamp(started), candidate_set_hash, evaluation_id, vintage_id),
         )
-        updated = connection.execute(
-            "SELECT * FROM holdout_vintage WHERE vintage_id=?",
-            (vintage_id,),
+        connection.execute(
+            "INSERT INTO holdout_evaluation_attempt("
+            "evaluation_id,vintage_id,candidate_set_hash,status,stage,started_at,updated_at"
+            ") VALUES(?,?,?,'incomplete','vintage_consumed',?,?)",
+            (
+                evaluation_id,
+                vintage_id,
+                candidate_set_hash,
+                _timestamp(started),
+                _timestamp(started),
+            ),
+        )
+        row = connection.execute(
+            "SELECT * FROM holdout_evaluation_attempt WHERE evaluation_id=?",
+            (evaluation_id,),
         ).fetchone()
         connection.execute("COMMIT")
     except BaseException:
@@ -393,47 +2846,40 @@ def consume_holdout_vintage(
         raise
     finally:
         connection.close()
-    if updated is None:
-        raise RuntimeError("消费后封存段不可见")
-    return _vintage_from_row(updated)
+    if row is None:
+        raise RuntimeError("holdout 评估尝试写入后不可见")
+    return _attempt_from_row(row)
 
 
-def record_holdout_verdict(
+def update_holdout_evaluation_attempt(
     registry_path: Path,
-    vintage_id: str,
-    verdict: str,
-    *,
-    recorded_at: datetime | None = None,
-) -> HoldoutVintage:
-    """为已消费封存段一次性记录最终结论。"""
-    normalized = verdict.strip()
+    evaluation_id: str,
+    stage: str,
+) -> HoldoutEvaluationAttempt:
+    """持久化 incomplete 尝试最后到达的评估阶段。"""
+    normalized = stage.strip()
     if not normalized:
-        raise ValueError("holdout verdict 不得为空")
-    recorded = _utc(recorded_at or datetime.now(UTC))
-    connection = _connect(registry_path)
+        raise ValueError("holdout 评估阶段不得为空")
+    updated = clock.utc_now()
+    connection = _connect(registry_path, write=True)
     try:
         _begin(connection)
         row = connection.execute(
-            "SELECT * FROM holdout_vintage WHERE vintage_id=?",
-            (vintage_id,),
+            "SELECT * FROM holdout_evaluation_attempt WHERE evaluation_id=?",
+            (evaluation_id,),
         ).fetchone()
         if row is None:
-            raise LookupError(f"封存段不存在: {vintage_id}")
-        if row["status"] != "consumed":
-            raise ValueError("封存段尚未消费，不能记录 verdict")
-        if row["verdict"] is not None:
-            if row["verdict"] != normalized:
-                raise ValueError("holdout verdict 已登记且不可改写")
-            connection.execute("COMMIT")
-            return _vintage_from_row(row)
+            raise LookupError(f"holdout 评估尝试不存在: {evaluation_id}")
+        if row["status"] != "incomplete":
+            raise ValueError("已完成 holdout 评估尝试不可修改")
         connection.execute(
-            "UPDATE holdout_vintage SET verdict=?,verdict_recorded_at=? "
-            "WHERE vintage_id=? AND verdict IS NULL",
-            (normalized, _timestamp(recorded), vintage_id),
+            "UPDATE holdout_evaluation_attempt SET stage=?,updated_at=? "
+            "WHERE evaluation_id=? AND status='incomplete'",
+            (normalized, _timestamp(updated), evaluation_id),
         )
-        updated = connection.execute(
-            "SELECT * FROM holdout_vintage WHERE vintage_id=?",
-            (vintage_id,),
+        current = connection.execute(
+            "SELECT * FROM holdout_evaluation_attempt WHERE evaluation_id=?",
+            (evaluation_id,),
         ).fetchone()
         connection.execute("COMMIT")
     except BaseException:
@@ -442,9 +2888,176 @@ def record_holdout_verdict(
         raise
     finally:
         connection.close()
-    if updated is None:
-        raise RuntimeError("verdict 写入后封存段不可见")
-    return _vintage_from_row(updated)
+    if current is None:
+        raise RuntimeError("holdout 评估阶段更新后不可见")
+    return _attempt_from_row(current)
+
+
+def finalize_holdout_evaluation(
+    registry_path: Path,
+    vintage_id: str,
+    evaluation_id: str,
+    verdict: str,
+    result_manifest_path: str,
+    result_manifest_sha256: str,
+    *,
+    repository_root: Path,
+) -> tuple[HoldoutVintage, HoldoutEvaluationAttempt]:
+    """现场复核终态证据，再原子写入 verdict 与 completed attempt。"""
+    normalized = verdict.strip()
+    if not normalized or not result_manifest_path:
+        raise ValueError("完成 holdout 必须绑定 verdict 与 manifest 身份")
+    evidence = _validated_terminal_evidence(
+        repository_root,
+        vintage_id,
+        evaluation_id,
+        normalized,
+        result_manifest_path,
+        result_manifest_sha256,
+    )
+    completed = clock.utc_now()
+    connection = _connect(registry_path, write=True)
+    try:
+        _begin(connection)
+        vintage = connection.execute(
+            "SELECT * FROM holdout_vintage WHERE vintage_id=?", (vintage_id,),
+        ).fetchone()
+        attempt = connection.execute(
+            "SELECT * FROM holdout_evaluation_attempt WHERE evaluation_id=?",
+            (evaluation_id,),
+        ).fetchone()
+        if vintage is None or attempt is None:
+            raise LookupError("holdout vintage 或评估尝试不存在")
+        if vintage["status"] != "consumed" or vintage["evaluation_id"] != evaluation_id:
+            raise ValueError("holdout vintage 与评估尝试身份不一致")
+        if attempt["vintage_id"] != vintage_id:
+            raise ValueError("holdout 评估尝试绑定了不同 vintage")
+        try:
+            suite_plan = connection.execute(
+                "SELECT plan_id FROM interval_suite_forward_plan WHERE vintage_id=?",
+                (vintage_id,),
+            ).fetchone()
+        except sqlite3.OperationalError as error:
+            if "no such table" not in str(error).lower():
+                raise
+            suite_plan = None
+        if suite_plan is not None:
+            raise ValueError("套件冻结计划 vintage 不能写入单成员 holdout 终态")
+        if (
+            vintage["candidate_set_hash"] != evidence.candidate_set_hash
+            or attempt["candidate_set_hash"] != evidence.candidate_set_hash
+        ):
+            raise ValueError("holdout manifest 的 candidate_set_hash 与注册表不匹配")
+        receipt = connection.execute(
+            "SELECT * FROM active_head_receipt "
+            "WHERE consumer_kind='holdout' AND consumer_id=?",
+            (evaluation_id,),
+        ).fetchone()
+        if (
+            receipt is None
+            or receipt["market_id"] != vintage["market_id"]
+            or receipt["head_generation"] != evidence.input_head_generation
+            or receipt["receipt_artifact_path"] != evidence.input_receipt_path
+            or receipt["receipt_artifact_sha256"] != evidence.input_receipt_sha256
+        ):
+            raise ValueError("holdout 终态缺少匹配的活动输入收据登记")
+        vintage_start = _parse_timestamp(str(vintage["start_time"]))
+        vintage_end = _parse_timestamp(str(vintage["end_time"]))
+        if evidence.score_start < vintage_start or evidence.score_end > vintage_end:
+            raise ValueError("holdout score 时间范围超出绑定 vintage")
+        plan = connection.execute(
+            "SELECT * FROM frozen_forward_plan WHERE vintage_id=?",
+            (vintage_id,),
+        ).fetchone()
+        if plan is not None:
+            if (
+                not evidence.require_forward_predictions
+                or plan["plan_id"] != evidence.forward_plan_id
+            ):
+                raise ValueError("holdout 冻结前向 plan 与注册表不一致")
+            assert evidence.forward_plan_id is not None
+            if (
+                plan["candidate_set_hash"] != evidence.candidate_set_hash
+                or plan["config_hash"] != evidence.config_hash
+            ):
+                raise ValueError("holdout 冻结前向 plan 身份不匹配")
+            _validated_forward_plan_artifact(
+                repository_root,
+                str(plan["plan_id"]),
+                vintage_id,
+                str(plan["source_manifest_sha256"]),
+                str(plan["candidate_set_hash"]),
+                str(plan["config_hash"]),
+                str(plan["code_tree_digest"]),
+                str(plan["plan_artifact_path"]),
+                str(plan["plan_artifact_sha256"]),
+                evidence.candidate_ids,
+            )
+            row_set_hash, prediction_times = _frozen_forward_prediction_row_set(
+                connection, evidence.forward_plan_id,
+            )
+            if len(prediction_times) != evidence.forward_prediction_count:
+                raise ValueError("holdout 冻结预测数量与注册表不一致")
+            if prediction_times != evidence.score_decision_times:
+                raise ValueError("holdout 冻结预测时点未逐柱匹配评分面板")
+            if row_set_hash != evidence.forward_prediction_row_set_hash:
+                raise ValueError("holdout 冻结预测 row-set 与注册表不一致")
+        elif evidence.require_forward_predictions:
+            raise ValueError("holdout 要求冻结前向预测但注册表没有 plan")
+        if vintage["verdict"] is not None or attempt["status"] != "incomplete":
+            raise ValueError("holdout 已经终结且不可改写")
+        connection.execute(
+            "UPDATE holdout_vintage SET verdict=?,verdict_recorded_at=? "
+            "WHERE vintage_id=? AND verdict IS NULL",
+            (normalized, _timestamp(completed), vintage_id),
+        )
+        connection.execute(
+            "UPDATE holdout_evaluation_attempt SET status='completed',stage='completed',"
+            "updated_at=?,completed_at=?,result_manifest_path=?,"
+            "result_manifest_sha256=? WHERE evaluation_id=? AND status='incomplete'",
+            (
+                _timestamp(completed),
+                _timestamp(completed),
+                evidence.manifest_path,
+                result_manifest_sha256,
+                evaluation_id,
+            ),
+        )
+        final_vintage = connection.execute(
+            "SELECT * FROM holdout_vintage WHERE vintage_id=?", (vintage_id,),
+        ).fetchone()
+        final_attempt = connection.execute(
+            "SELECT * FROM holdout_evaluation_attempt WHERE evaluation_id=?",
+            (evaluation_id,),
+        ).fetchone()
+        connection.execute("COMMIT")
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+    finally:
+        connection.close()
+    if final_vintage is None or final_attempt is None:
+        raise RuntimeError("holdout 终态写入后不可见")
+    return _vintage_from_row(final_vintage), _attempt_from_row(final_attempt)
+
+
+def get_holdout_evaluation_attempt(
+    registry_path: Path,
+    evaluation_id: str,
+) -> HoldoutEvaluationAttempt:
+    """读取评估尝试，包括永久 incomplete 状态。"""
+    connection = _connect(registry_path)
+    try:
+        row = connection.execute(
+            "SELECT * FROM holdout_evaluation_attempt WHERE evaluation_id=?",
+            (evaluation_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+    if row is None:
+        raise LookupError(f"holdout 评估尝试不存在: {evaluation_id}")
+    return _attempt_from_row(row)
 
 
 def list_holdout_vintages(registry_path: Path) -> tuple[HoldoutVintage, ...]:
@@ -505,7 +3118,7 @@ def register_frozen_forward_plan(
     plan_artifact_path: str,
     plan_artifact_sha256: str,
     *,
-    frozen_at: datetime | None = None,
+    repository_root: Path,
 ) -> FrozenForwardPlan:
     """在 vintage 开始前原子登记唯一冻结前向计划。"""
     values = (
@@ -518,18 +3131,41 @@ def register_frozen_forward_plan(
     )
     if any(not value.strip() for value in values):
         raise ValueError("冻结前向计划身份字段不得为空")
-    frozen = _utc(frozen_at or datetime.now(UTC))
-    plan_id = stable_identifier("frozen-forward-plan", {
+    raw_path, _normalized = _evidence_file(
+        repository_root, plan_artifact_path, "frozen forward plan",
+    )
+    if sha256_file(raw_path) != plan_artifact_sha256:
+        raise ValueError("冻结前向计划现场 SHA-256 不匹配")
+    raw_payload = _json_file(raw_path, "frozen forward plan")
+    semantic_names = (
+        "pipeline_method_version",
+        "panel_method_version",
+        "panel_schema_version",
+        "feature_method_version",
+        "trade_flow_input_method_version",
+        "trade_input_receipt_method_version",
+        "operational_gate_method_version",
+    )
+    present = tuple(name for name in semantic_names if name in raw_payload)
+    if len(present) != len(semantic_names):
+        raise ValueError("冻结前向计划成交语义身份不完整")
+    identity_payload: dict[str, object] = {
         "governance_method_version": GOVERNANCE_METHOD_VERSION,
         "vintage_id": vintage_id,
         "source_manifest_sha256": source_manifest_sha256,
         "candidate_set_hash": candidate_set_hash,
         "config_hash": config_hash,
         "code_tree_digest": code_tree_digest,
-    })
-    connection = _connect(registry_path)
+    }
+    if present:
+        identity_payload.update({
+            name: raw_payload.get(name) for name in semantic_names
+        })
+    plan_id = stable_identifier("frozen-forward-plan", identity_payload)
+    connection = _connect(registry_path, write=True)
     try:
         _begin(connection)
+        frozen = clock.utc_now()
         vintage = connection.execute(
             "SELECT * FROM holdout_vintage WHERE vintage_id=?", (vintage_id,),
         ).fetchone()
@@ -537,8 +3173,38 @@ def register_frozen_forward_plan(
             raise LookupError(f"封存段不存在: {vintage_id}")
         if vintage["status"] != "sealed":
             raise ValueError("冻结前向计划只能绑定未消费 vintage")
-        if frozen > _parse_timestamp(str(vintage["start_time"])):
+        if frozen >= _parse_timestamp(str(vintage["start_time"])):
             raise ValueError("冻结前向计划必须在 vintage 开始前登记")
+        suite_table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' "
+            "AND name='interval_suite_forward_plan'"
+        ).fetchone()
+        if suite_table is not None:
+            suite_plan = connection.execute(
+                "SELECT 1 FROM interval_suite_forward_plan WHERE vintage_id=?",
+                (vintage_id,),
+            ).fetchone()
+            if suite_plan is not None:
+                raise ValueError("vintage 已绑定跨节拍冻结前向计划")
+        plan_evidence = _validated_forward_plan_artifact(
+            repository_root,
+            plan_id,
+            vintage_id,
+            source_manifest_sha256,
+            candidate_set_hash,
+            config_hash,
+            code_tree_digest,
+            plan_artifact_path,
+            plan_artifact_sha256,
+        )
+        values = (
+            source_manifest_sha256,
+            candidate_set_hash,
+            config_hash,
+            code_tree_digest,
+            plan_evidence.normalized_path,
+            plan_artifact_sha256,
+        )
         existing = connection.execute(
             "SELECT * FROM frozen_forward_plan WHERE vintage_id=?", (vintage_id,),
         ).fetchone()
@@ -576,6 +3242,307 @@ def register_frozen_forward_plan(
     return _plan_from_row(row)
 
 
+def register_interval_suite_forward_plan(
+    registry_path: Path,
+    vintage_id: str,
+    suite_plan_id: str,
+    suite_evidence_id: str,
+    source_git_hash: str,
+    code_tree_digest: str,
+    deployment_contract_id: str,
+    plan_artifact_path: str,
+    plan_artifact_sha256: str,
+    *,
+    repository_root: Path,
+) -> IntervalSuiteForwardPlan:
+    """在 vintage 开始前原子登记唯一跨节拍冻结计划。"""
+    root = repository_root.resolve()
+    resolved_registry = (
+        registry_path.resolve()
+        if registry_path.is_absolute()
+        else (root / registry_path).resolve()
+    )
+    try:
+        governance_registry = resolved_registry.relative_to(root).as_posix()
+    except ValueError as error:
+        raise ValueError("套件治理注册表必须位于项目目录内") from error
+    identity_values = (
+        suite_plan_id, suite_evidence_id, source_git_hash, code_tree_digest,
+        deployment_contract_id,
+        plan_artifact_path, plan_artifact_sha256,
+    )
+    if any(not value.strip() for value in identity_values):
+        raise ValueError("套件冻结前向计划身份字段不得为空")
+    plan_id = interval_suite_forward_plan_id(
+        GOVERNANCE_METHOD_VERSION,
+        vintage_id,
+        suite_plan_id,
+        suite_evidence_id,
+        source_git_hash,
+        code_tree_digest,
+        deployment_contract_id,
+    )
+    connection = _connect(resolved_registry, write=True)
+    try:
+        _begin(connection)
+        frozen = clock.utc_now()
+        vintage = connection.execute(
+            "SELECT * FROM holdout_vintage WHERE vintage_id=?", (vintage_id,),
+        ).fetchone()
+        if vintage is None:
+            raise LookupError(f"封存段不存在: {vintage_id}")
+        if vintage["status"] != "sealed":
+            raise ValueError("套件冻结前向计划只能绑定未消费 vintage")
+        if frozen >= _parse_timestamp(str(vintage["start_time"])):
+            raise ValueError("套件冻结前向计划必须在 vintage 开始前登记")
+        legacy_plan = connection.execute(
+            "SELECT 1 FROM frozen_forward_plan WHERE vintage_id=?",
+            (vintage_id,),
+        ).fetchone()
+        if legacy_plan is not None:
+            raise ValueError("vintage 已绑定单成员冻结前向计划")
+        normalized_path = _validated_interval_suite_forward_plan_artifact(
+            repository_root, plan_id, vintage_id,
+            str(vintage["market_id"]), str(vintage["start_time"]),
+            str(vintage["end_time"]), suite_plan_id,
+            suite_evidence_id, source_git_hash, code_tree_digest,
+            deployment_contract_id,
+            governance_registry, plan_artifact_path, plan_artifact_sha256,
+        )
+        values = (
+            suite_plan_id, suite_evidence_id, source_git_hash,
+            code_tree_digest, normalized_path, plan_artifact_sha256,
+        )
+        existing = connection.execute(
+            "SELECT * FROM interval_suite_forward_plan WHERE vintage_id=?",
+            (vintage_id,),
+        ).fetchone()
+        if existing is not None:
+            expected = (plan_id, *values)
+            actual = (
+                existing["plan_id"], existing["suite_plan_id"],
+                existing["suite_evidence_id"], existing["source_git_hash"],
+                existing["code_tree_digest"], existing["plan_artifact_path"],
+                existing["plan_artifact_sha256"],
+            )
+            if actual != expected:
+                raise ValueError("vintage 已绑定不同的套件冻结前向计划")
+            connection.execute("COMMIT")
+            return _interval_suite_plan_from_row(existing)
+        connection.execute(
+            "INSERT INTO interval_suite_forward_plan("
+            "plan_id,vintage_id,suite_plan_id,suite_evidence_id,"
+            "source_git_hash,code_tree_digest,plan_artifact_path,"
+            "plan_artifact_sha256,frozen_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            (plan_id, vintage_id, *values, _timestamp(frozen)),
+        )
+        row = connection.execute(
+            "SELECT * FROM interval_suite_forward_plan WHERE plan_id=?",
+            (plan_id,),
+        ).fetchone()
+        connection.execute("COMMIT")
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+    finally:
+        connection.close()
+    if row is None:
+        raise RuntimeError("套件冻结前向计划写入后不可见")
+    return _interval_suite_plan_from_row(row)
+
+
+def register_interval_suite_forward_prediction(
+    registry_path: Path,
+    plan_id: str,
+    decision_time: datetime,
+    input_head_generation: str,
+    input_receipt_path: str,
+    input_receipt_sha256: str,
+    member_panel_set_hash: str,
+    prediction_artifact_path: str,
+    prediction_artifact_sha256: str,
+    *,
+    repository_root: Path,
+) -> IntervalSuiteForwardPrediction:
+    """在计划栅格上原子追加一个内容完整的套件预测。"""
+    identity_values = (
+        input_head_generation,
+        input_receipt_path,
+        member_panel_set_hash,
+        prediction_artifact_path,
+    )
+    if any(not value.strip() for value in identity_values):
+        raise ValueError("套件冻结预测身份字段不得为空")
+    decision = _utc(decision_time)
+    connection = _connect(registry_path, write=True)
+    try:
+        _begin(connection)
+        recorded = _utc(clock.utc_now())
+        plan = connection.execute(
+            "SELECT * FROM interval_suite_forward_plan WHERE plan_id=?",
+            (plan_id,),
+        ).fetchone()
+        if plan is None:
+            raise LookupError(f"套件冻结前向计划不存在: {plan_id}")
+        vintage_id = str(plan["vintage_id"])
+        vintage = connection.execute(
+            "SELECT * FROM holdout_vintage WHERE vintage_id=?", (vintage_id,),
+        ).fetchone()
+        if vintage is None or vintage["status"] != "sealed":
+            raise ValueError("套件冻结预测只能写入未消费 vintage")
+        start = _parse_timestamp(str(vintage["start_time"]))
+        end = _parse_timestamp(str(vintage["end_time"]))
+        if not start <= decision < end:
+            raise ValueError("套件冻结预测决策时间不在绑定 vintage 内")
+        plan_path, _ = _evidence_file(
+            repository_root,
+            str(plan["plan_artifact_path"]),
+            "interval suite forward plan",
+        )
+        if sha256_file(plan_path) != str(plan["plan_artifact_sha256"]):
+            raise ValueError("套件冻结计划现场 SHA-256 不匹配")
+        plan_payload = _json_file(plan_path, "interval suite forward plan")
+        decision_grid = plan_payload.get("decision_grid")
+        if not isinstance(decision_grid, dict):
+            raise ValueError("套件冻结计划缺少共同决策栅格")
+        interval_seconds = decision_grid.get("interval_seconds")
+        offset_seconds = decision_grid.get("utc_epoch_offset_seconds")
+        maximum_lag = decision_grid.get("maximum_recording_lag_seconds")
+        if (
+            not isinstance(interval_seconds, int)
+            or isinstance(interval_seconds, bool)
+            or not isinstance(offset_seconds, int)
+            or isinstance(offset_seconds, bool)
+            or not isinstance(maximum_lag, int)
+            or isinstance(maximum_lag, bool)
+        ):
+            raise ValueError("套件冻结计划共同决策栅格无效")
+        if interval_seconds <= 0 or maximum_lag <= 0:
+            raise ValueError("套件冻结计划共同决策栅格无效")
+        epoch_seconds = int(decision.timestamp())
+        if (epoch_seconds - offset_seconds) % interval_seconds != 0:
+            raise ValueError("套件冻结预测决策时间未对齐共同栅格")
+        lag = (recorded - decision).total_seconds()
+        if lag < 0 or lag > maximum_lag:
+            raise ValueError("套件冻结预测未在预登记时效窗口内生成")
+        prediction_id = interval_suite_forward_prediction_id(
+            GOVERNANCE_METHOD_VERSION,
+            INTERVAL_SUITE_PREDICTION_METHOD_VERSION,
+            plan_id,
+            decision,
+        )
+        normalized_artifact, normalized_receipt, initial_code_identity = (
+            _validated_interval_suite_forward_prediction_artifact(
+                repository_root,
+                plan,
+                vintage,
+                prediction_id,
+                decision,
+                input_head_generation,
+                input_receipt_path,
+                input_receipt_sha256,
+                member_panel_set_hash,
+                prediction_artifact_path,
+                prediction_artifact_sha256,
+                recorded,
+            )
+        )
+        from guvolu.research.interval_suite_prediction import (
+            attest_interval_suite_forward_prediction,
+        )
+
+        candidate_registration = IntervalSuiteForwardPrediction(
+            prediction_id=prediction_id,
+            plan_id=plan_id,
+            vintage_id=vintage_id,
+            decision_time=decision,
+            input_head_generation=input_head_generation,
+            input_receipt_path=normalized_receipt,
+            input_receipt_sha256=input_receipt_sha256,
+            member_panel_set_hash=member_panel_set_hash,
+            prediction_artifact_path=normalized_artifact,
+            prediction_artifact_sha256=prediction_artifact_sha256,
+            recorded_at=recorded,
+        )
+        attest_interval_suite_forward_prediction(
+            repository_root,
+            candidate_registration,
+            _interval_suite_plan_from_row(plan),
+            require_current_head=True,
+        )
+        final_code_identity = (
+            _validated_interval_suite_prediction_code_identity(
+                repository_root, plan, plan_payload,
+            )
+        )
+        if final_code_identity != initial_code_identity:
+            raise ValueError("套件冻结预测代码树在独立重放期间发生变化")
+        recorded = _utc(clock.utc_now())
+        lag = (recorded - decision).total_seconds()
+        if lag < 0 or lag > maximum_lag:
+            raise ValueError("套件冻结预测未在实际登记时效窗口内生成")
+        values = (
+            input_head_generation,
+            normalized_receipt,
+            input_receipt_sha256,
+            member_panel_set_hash,
+            normalized_artifact,
+            prediction_artifact_sha256,
+        )
+        existing = connection.execute(
+            "SELECT * FROM interval_suite_forward_prediction "
+            "WHERE plan_id=? AND decision_time=?",
+            (plan_id, _timestamp(decision)),
+        ).fetchone()
+        if existing is not None:
+            expected = (prediction_id, *values)
+            actual = (
+                existing["prediction_id"],
+                existing["input_head_generation"],
+                existing["input_receipt_path"],
+                existing["input_receipt_sha256"],
+                existing["member_panel_set_hash"],
+                existing["prediction_artifact_path"],
+                existing["prediction_artifact_sha256"],
+            )
+            if actual != expected:
+                raise ValueError("该共同决策时点的套件冻结预测不可改写")
+            connection.execute("COMMIT")
+            return _interval_suite_prediction_from_row(existing)
+        connection.execute(
+            "INSERT INTO interval_suite_forward_prediction("
+            "prediction_id,plan_id,vintage_id,decision_time,"
+            "input_head_generation,input_receipt_path,input_receipt_sha256,"
+            "member_panel_set_hash,prediction_artifact_path,"
+            "prediction_artifact_sha256,recorded_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                prediction_id,
+                plan_id,
+                vintage_id,
+                _timestamp(decision),
+                *values,
+                _timestamp(recorded),
+            ),
+        )
+        row = connection.execute(
+            "SELECT * FROM interval_suite_forward_prediction "
+            "WHERE prediction_id=?",
+            (prediction_id,),
+        ).fetchone()
+        connection.execute("COMMIT")
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+    finally:
+        connection.close()
+    if row is None:
+        raise RuntimeError("套件冻结预测写入后不可见")
+    return _interval_suite_prediction_from_row(row)
+
+
 def register_frozen_forward_prediction(
     registry_path: Path,
     plan_id: str,
@@ -586,23 +3553,20 @@ def register_frozen_forward_prediction(
     prediction_artifact_sha256: str,
     maximum_recording_lag_seconds: int,
     *,
-    recorded_at: datetime | None = None,
+    repository_root: Path,
 ) -> FrozenForwardPrediction:
     """原子追加一个及时生成的预测；同一时点内容永久不可改写。"""
     if maximum_recording_lag_seconds <= 0:
         raise ValueError("预测登记时效阈值必须为正数")
-    values = (
-        input_head_generation, panel_sha256,
-        prediction_artifact_path, prediction_artifact_sha256,
-    )
-    if any(not value.strip() for value in values):
+    identity_values = (input_head_generation, panel_sha256, prediction_artifact_path)
+    if any(not value.strip() for value in identity_values):
         raise ValueError("冻结前向预测身份字段不得为空")
     decision = _utc(decision_time)
-    recorded = _utc(recorded_at or datetime.now(UTC))
+    recorded = clock.utc_now()
     lag = (recorded - decision).total_seconds()
     if lag < 0 or lag > maximum_recording_lag_seconds:
         raise ValueError("冻结前向预测未在预登记时效窗口内生成")
-    connection = _connect(registry_path)
+    connection = _connect(registry_path, write=True)
     try:
         _begin(connection)
         plan = connection.execute(
@@ -620,11 +3584,48 @@ def register_frozen_forward_prediction(
         end = _parse_timestamp(str(vintage["end_time"]))
         if not start <= decision < end:
             raise ValueError("预测决策时间不在绑定 vintage 内")
+        plan_evidence = _validated_forward_plan_artifact(
+            repository_root,
+            str(plan["plan_id"]),
+            vintage_id,
+            str(plan["source_manifest_sha256"]),
+            str(plan["candidate_set_hash"]),
+            str(plan["config_hash"]),
+            str(plan["code_tree_digest"]),
+            str(plan["plan_artifact_path"]),
+            str(plan["plan_artifact_sha256"]),
+        )
         prediction_id = stable_identifier("frozen-forward-prediction", {
             "governance_method_version": GOVERNANCE_METHOD_VERSION,
             "plan_id": plan_id,
             "decision_time": decision.isoformat(),
         })
+        (
+            _,
+            normalized_artifact_path,
+            normalized_receipt_path,
+            receipt_sha256,
+        ) = _validated_forward_prediction_artifact(
+            repository_root,
+            prediction_id,
+            plan_id,
+            vintage_id,
+            decision,
+            input_head_generation,
+            panel_sha256,
+            str(plan["config_hash"]),
+            str(plan["code_tree_digest"]),
+            plan_evidence,
+            prediction_artifact_path,
+            prediction_artifact_sha256,
+            recorded,
+        )
+        values = (
+            input_head_generation,
+            panel_sha256,
+            normalized_artifact_path,
+            prediction_artifact_sha256,
+        )
         existing = connection.execute(
             "SELECT * FROM frozen_forward_prediction "
             "WHERE plan_id=? AND decision_time=?",
@@ -639,8 +3640,29 @@ def register_frozen_forward_prediction(
             )
             if actual != expected:
                 raise ValueError("该决策时间的冻结前向预测不可改写")
+            receipt = connection.execute(
+                "SELECT * FROM active_head_receipt "
+                "WHERE consumer_kind='frozen_forward' AND consumer_id=?",
+                (prediction_id,),
+            ).fetchone()
+            if (
+                receipt is None
+                or receipt["receipt_artifact_path"] != normalized_receipt_path
+                or receipt["receipt_artifact_sha256"] != receipt_sha256
+            ):
+                raise ValueError("冻结预测登记缺少匹配的活动输入收据")
             connection.execute("COMMIT")
             return _prediction_from_row(existing)
+        connection.execute(
+            "INSERT INTO active_head_receipt("
+            "consumer_kind,consumer_id,market_id,head_generation,"
+            "receipt_artifact_path,receipt_artifact_sha256,recorded_at"
+            ") VALUES('frozen_forward',?,?,?,?,?,?)",
+            (
+                prediction_id, str(vintage["market_id"]), input_head_generation,
+                normalized_receipt_path, receipt_sha256, _timestamp(recorded),
+            ),
+        )
         connection.execute(
             "INSERT INTO frozen_forward_prediction("
             "prediction_id,plan_id,vintage_id,decision_time,"
@@ -695,6 +3717,43 @@ def get_frozen_forward_plan_for_vintage(
     return None if row is None else _plan_from_row(row)
 
 
+def get_interval_suite_forward_plan_for_vintage(
+    registry_path: Path, vintage_id: str,
+) -> IntervalSuiteForwardPlan | None:
+    """读取 vintage 的唯一跨节拍冻结计划。"""
+    connection = _connect(registry_path)
+    try:
+        try:
+            row = connection.execute(
+                "SELECT * FROM interval_suite_forward_plan WHERE vintage_id=?",
+                (vintage_id,),
+            ).fetchone()
+        except sqlite3.OperationalError as error:
+            if "no such table" not in str(error).lower():
+                raise
+            row = None
+    finally:
+        connection.close()
+    return None if row is None else _interval_suite_plan_from_row(row)
+
+
+def get_interval_suite_forward_plan(
+    registry_path: Path, plan_id: str,
+) -> IntervalSuiteForwardPlan:
+    """按身份读取一个跨节拍冻结计划。"""
+    connection = _connect(registry_path)
+    try:
+        row = connection.execute(
+            "SELECT * FROM interval_suite_forward_plan WHERE plan_id=?",
+            (plan_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+    if row is None:
+        raise LookupError(f"套件冻结前向计划不存在: {plan_id}")
+    return _interval_suite_plan_from_row(row)
+
+
 def list_frozen_forward_predictions(
     registry_path: Path, plan_id: str,
 ) -> tuple[FrozenForwardPrediction, ...]:
@@ -708,6 +3767,61 @@ def list_frozen_forward_predictions(
     finally:
         connection.close()
     return tuple(_prediction_from_row(row) for row in rows)
+
+
+def list_interval_suite_forward_predictions(
+    registry_path: Path, plan_id: str,
+) -> tuple[IntervalSuiteForwardPrediction, ...]:
+    """按共同决策时间读取套件计划的不可变预测历史。"""
+    connection = _connect(registry_path)
+    try:
+        try:
+            rows = connection.execute(
+                "SELECT * FROM interval_suite_forward_prediction "
+                "WHERE plan_id=? ORDER BY decision_time",
+                (plan_id,),
+            ).fetchall()
+        except sqlite3.OperationalError as error:
+            if "no such table" not in str(error).lower():
+                raise
+            rows = []
+    finally:
+        connection.close()
+    return tuple(_interval_suite_prediction_from_row(row) for row in rows)
+
+
+def get_interval_suite_forward_prediction_row_set(
+    registry_path: Path,
+    plan_id: str,
+) -> tuple[str, int, tuple[datetime, ...]]:
+    """读取套件预测全集的确定性行集身份、数量与时点。"""
+    predictions = list_interval_suite_forward_predictions(
+        registry_path, plan_id,
+    )
+    records = [
+        {
+            "prediction_id": item.prediction_id,
+            "decision_time": item.decision_time.isoformat(),
+            "input_head_generation": item.input_head_generation,
+            "input_receipt_path": item.input_receipt_path,
+            "input_receipt_sha256": item.input_receipt_sha256,
+            "member_panel_set_hash": item.member_panel_set_hash,
+            "prediction_artifact_path": item.prediction_artifact_path,
+            "prediction_artifact_sha256": item.prediction_artifact_sha256,
+            "recorded_at": item.recorded_at.isoformat(),
+        }
+        for item in predictions
+    ]
+    identity = {
+        "method_version": "interval-suite-registered-row-set-v1",
+        "plan_id": plan_id,
+        "rows": records,
+    }
+    return (
+        stable_identifier("interval-suite-forward-row-set", identity),
+        len(predictions),
+        tuple(item.decision_time for item in predictions),
+    )
 
 
 def _exposure_from_row(row: sqlite3.Row) -> ResearchExposure:
@@ -752,6 +3866,25 @@ def _vintage_from_row(row: sqlite3.Row) -> HoldoutVintage:
     )
 
 
+def _attempt_from_row(row: sqlite3.Row) -> HoldoutEvaluationAttempt:
+    """把 SQLite 行转换为 holdout 评估尝试合同。"""
+    status = str(row["status"])
+    if status not in ("incomplete", "completed"):
+        raise ValueError(f"未知 holdout 评估尝试状态: {status}")
+    return HoldoutEvaluationAttempt(
+        evaluation_id=str(row["evaluation_id"]),
+        vintage_id=str(row["vintage_id"]),
+        candidate_set_hash=str(row["candidate_set_hash"]),
+        status=status,
+        stage=str(row["stage"]),
+        started_at=_parse_timestamp(str(row["started_at"])),
+        updated_at=_parse_timestamp(str(row["updated_at"])),
+        completed_at=_optional_time(row["completed_at"]),
+        result_manifest_path=_optional_text(row["result_manifest_path"]),
+        result_manifest_sha256=_optional_text(row["result_manifest_sha256"]),
+    )
+
+
 def _plan_from_row(row: sqlite3.Row) -> FrozenForwardPlan:
     """把 SQLite 行转换为冻结计划合同。"""
     return FrozenForwardPlan(
@@ -764,6 +3897,42 @@ def _plan_from_row(row: sqlite3.Row) -> FrozenForwardPlan:
         plan_artifact_path=str(row["plan_artifact_path"]),
         plan_artifact_sha256=str(row["plan_artifact_sha256"]),
         frozen_at=_parse_timestamp(str(row["frozen_at"])),
+    )
+
+
+def _interval_suite_plan_from_row(
+    row: sqlite3.Row,
+) -> IntervalSuiteForwardPlan:
+    """把 SQLite 行转换为跨节拍冻结计划合同。"""
+    return IntervalSuiteForwardPlan(
+        plan_id=str(row["plan_id"]),
+        vintage_id=str(row["vintage_id"]),
+        suite_plan_id=str(row["suite_plan_id"]),
+        suite_evidence_id=str(row["suite_evidence_id"]),
+        source_git_hash=str(row["source_git_hash"]),
+        code_tree_digest=str(row["code_tree_digest"]),
+        plan_artifact_path=str(row["plan_artifact_path"]),
+        plan_artifact_sha256=str(row["plan_artifact_sha256"]),
+        frozen_at=_parse_timestamp(str(row["frozen_at"])),
+    )
+
+
+def _interval_suite_prediction_from_row(
+    row: sqlite3.Row,
+) -> IntervalSuiteForwardPrediction:
+    """把 SQLite 行转换为跨节拍冻结预测合同。"""
+    return IntervalSuiteForwardPrediction(
+        prediction_id=str(row["prediction_id"]),
+        plan_id=str(row["plan_id"]),
+        vintage_id=str(row["vintage_id"]),
+        decision_time=_parse_timestamp(str(row["decision_time"])),
+        input_head_generation=str(row["input_head_generation"]),
+        input_receipt_path=str(row["input_receipt_path"]),
+        input_receipt_sha256=str(row["input_receipt_sha256"]),
+        member_panel_set_hash=str(row["member_panel_set_hash"]),
+        prediction_artifact_path=str(row["prediction_artifact_path"]),
+        prediction_artifact_sha256=str(row["prediction_artifact_sha256"]),
+        recorded_at=_parse_timestamp(str(row["recorded_at"])),
     )
 
 
