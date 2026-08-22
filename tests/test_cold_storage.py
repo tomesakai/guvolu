@@ -122,6 +122,38 @@ def test_plan_rejects_unregistered_file(tmp_path: Path) -> None:
         create_plan(root, prefix)
 
 
+def test_activate_rejects_overlapping_active_route_without_persisting(
+    tmp_path: Path,
+) -> None:
+    root, _, prefix = _fixture(tmp_path)
+    plan, path = create_plan(root, prefix)
+    copy_plan(root, path)
+
+    # 注入重叠的活动父前缀
+    config_path = root / "storage-roots.json"
+    body = json.loads(config_path.read_text(encoding="utf-8"))
+    body["routes"].append({
+        "logical_prefix": "materialized",
+        "physical_prefix": "artifacts/all",
+        "status": "active",
+        "storage_root_id": "storage-root__test__v1",
+    })
+    config_path.write_text(
+        json.dumps(body, sort_keys=True) + "\n", encoding="utf-8",
+    )
+
+    with pytest.raises(StoragePathError, match="重叠"):
+        activate_plan(root, path)
+
+    after = json.loads(config_path.read_text(encoding="utf-8"))
+    target_route = next(
+        item for item in after["routes"]
+        if item["logical_prefix"] == prefix
+    )
+    # 校验先于落盘不改坏配置
+    assert target_route["status"] == "planned"
+
+
 def test_copy_rejects_changed_catalog_and_wrong_target(tmp_path: Path) -> None:
     root, cold, prefix = _fixture(tmp_path)
     _, path = create_plan(root, prefix)

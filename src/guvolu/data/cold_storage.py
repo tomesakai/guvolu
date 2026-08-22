@@ -14,6 +14,7 @@ from pathlib import Path, PurePosixPath
 from typing import Literal, cast
 
 from guvolu.data import store
+from guvolu.data.sqlite_writer_lock import sqlite_writer_lock
 from guvolu.data.storage_paths import (
     CONFIG_FILE_NAME,
     StoragePathError,
@@ -370,7 +371,8 @@ def copy_plan(data_root: Path, plan_path: Path) -> dict[str, object]:
             reused_bytes += item.byte_count
         else:
             temporary = target.with_name(f".{target.name}.{plan.migration_id}.partial")
-            with source.open("rb") as incoming, temporary.open("wb", buffering=0) as outgoing:
+            temporary.unlink(missing_ok=True)
+            with source.open("rb") as incoming, temporary.open("xb", buffering=0) as outgoing:
                 shutil.copyfileobj(incoming, outgoing, COPY_BLOCK_BYTES)
                 outgoing.flush()
                 os.fsync(outgoing.fileno())
@@ -451,6 +453,27 @@ def verify_plan(
     return result
 
 
+def _assert_no_active_overlap(body: dict[str, object]) -> None:
+    """落盘前拦截活动路由前缀重叠，避免坏配置瘫痪全部解析。"""
+    routes = body.get("routes")
+    if not isinstance(routes, list):
+        raise StoragePathError("存储配置结构非法")
+    active: list[PurePosixPath] = []
+    for raw in cast(list[object], routes):
+        if not isinstance(raw, dict) or raw.get("status") != "active":
+            continue
+        prefix_value = raw.get("logical_prefix")
+        if not isinstance(prefix_value, str):
+            raise StoragePathError("路由 logical_prefix 非法")
+        logical = PurePosixPath(prefix_value)
+        for existing in active:
+            if logical == existing or logical.is_relative_to(existing) or (
+                existing.is_relative_to(logical)
+            ):
+                raise StoragePathError(f"活动路由前缀重叠: {logical}")
+        active.append(logical)
+
+
 def _set_route_status(
     data_root: Path,
     plan: MigrationPlan,
@@ -459,29 +482,33 @@ def _set_route_status(
     to_status: str,
 ) -> str:
     """原子切换单个路由状态。"""
-    config_path = data_root.resolve() / CONFIG_FILE_NAME
-    body = json.loads(config_path.read_text(encoding="utf-8"))
-    if not isinstance(body, dict) or not isinstance(body.get("routes"), list):
-        raise StoragePathError("存储配置结构非法")
-    matched = 0
-    for raw in cast(list[object], body["routes"]):
-        if not isinstance(raw, dict):
-            continue
-        if raw.get("logical_prefix") == plan.logical_prefix:
-            if raw.get("storage_root_id") != plan.storage_root_id or (
-                raw.get("physical_prefix") != plan.physical_prefix
-            ):
-                raise StoragePathError("迁移计划与路由身份不符")
-            if raw.get("status") != from_status:
-                raise StoragePathError(
-                    f"路由状态不是 {from_status}: {plan.logical_prefix}"
-                )
-            raw["status"] = to_status
-            matched += 1
-    if matched != 1:
-        raise StoragePathError("路由未唯一命中")
-    _atomic_json(config_path, body)
-    return hashlib.sha256(config_path.read_bytes()).hexdigest()
+    root = data_root.resolve()
+    config_path = root / CONFIG_FILE_NAME
+    # 跨进程互斥防并发丢更新
+    with sqlite_writer_lock(root):
+        body = json.loads(config_path.read_text(encoding="utf-8"))
+        if not isinstance(body, dict) or not isinstance(body.get("routes"), list):
+            raise StoragePathError("存储配置结构非法")
+        matched = 0
+        for raw in cast(list[object], body["routes"]):
+            if not isinstance(raw, dict):
+                continue
+            if raw.get("logical_prefix") == plan.logical_prefix:
+                if raw.get("storage_root_id") != plan.storage_root_id or (
+                    raw.get("physical_prefix") != plan.physical_prefix
+                ):
+                    raise StoragePathError("迁移计划与路由身份不符")
+                if raw.get("status") != from_status:
+                    raise StoragePathError(
+                        f"路由状态不是 {from_status}: {plan.logical_prefix}"
+                    )
+                raw["status"] = to_status
+                matched += 1
+        if matched != 1:
+            raise StoragePathError("路由未唯一命中")
+        _assert_no_active_overlap(body)
+        _atomic_json(config_path, body)
+        return hashlib.sha256(config_path.read_bytes()).hexdigest()
 
 
 def activate_plan(data_root: Path, plan_path: Path) -> dict[str, object]:
