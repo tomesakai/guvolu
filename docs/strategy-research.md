@@ -413,7 +413,9 @@ Rust、CUDA 和 C/C++ 执行源码，以及存在的 Cargo、Python 与 uv 构�
 身份绑定：政策写入 `plan.json` 并进入 `plan_id` 的身份输入，治理库 `frozen_forward_plan`
 表（schema v8 只增列 `missing_policy`，旧行缺省 `burn`）同时登记；`prediction_id` 由
 `plan_id` 派生。事后增补或改写政策会同时改变制品 SHA-256、重算的 `plan_id` 与注册行对照，
-复核、预测登记与终态登记均拒绝。旧 `plan.json` 无该字段时不进入身份，既有 `plan_id` 不变。
+复核、预测登记与终态登记均拒绝。旧 `plan.json` 无该字段时不进入身份，既有 `plan_id` 不变；
+显式声明 `burn` 的新计划与未声明该字段的旧计划 `plan_id` 不同，二者不互认，同一 vintage
+只能绑定其中之一。
 
 holdout 处理：期末评估先复核全部预测，再按计划政策补齐评分日程；`zero_exposure` 下缺失柱
 不抛错、不烧毁，`result.json` 登记 `missing_policy`、`missing_decision_times` 与
