@@ -7,7 +7,10 @@
 > 阶段一全程零资金、零写请求（T-04、T-13）：paper 路径不构造任何私有客户端，
 > 发送边界由成交模型结算或拒绝，报告中 `write_touched` 恒为空。
 > 本文局部用语：paper 持仓账指只由模型成交累积的本地库存账；差异账指每个决策
-> 一行、记录目标、差分意图、模型成交、成本分解与门控判定的追加式账目。
+> 一行、记录目标、差分意图、模型成交、成本分解与门控判定的追加式账目；认领账指
+> 发送前按预测追加一行认领、供中断重跑去重的追加式账目。
+> 2026-08-23 修订：按代码评审结论修正同预测去重落盘次序、启动恢复与限额用量重建、
+> 费率缓存损坏处理，第 9 节登记处置结论；其余内容不变。
 
 ## 1. 范围与结论
 
@@ -35,6 +38,9 @@
 | 意图血缘 | `src/guvolu/domain/intent.py` `OrderIntent.prediction_id`、`decision_time`；`src/guvolu/data/intent_ledger.py` `SCHEMA_VERSION = 2` | 意图行同时携带继承的 `correlation_id`（R-07、X-08） |
 | 发送边界 | `paper_executor.PaperFillSender`、`dispatch.dispatch_order_intent` | 闸门次序不变：账本落盘、白名单、熔断、服务状态、单在途、T-11 限额，随后由成交模型抛出 `PaperSettled` 或 `PaperRejected` |
 | 差异账 | `paper_executor.DifferenceLedger`，缺省 `data/execution/paper/difference_ledger.jsonl` | 每决策一行，同一 `prediction_id` 重跑记为 `duplicate_prediction` 且不再追加意图 |
+| 同预测去重落盘次序 | `paper_executor.PredictionClaims`，缺省 `data/execution/paper/prediction_claims.jsonl` | 发送前先为 `prediction_id` 追加一行认领并 fsync，再落意图账本与持仓账，差异行最后写；差异账无行而认领账或意图账本已有该预测时记为 `needs_reconciliation`，不新增意图，进程返回 1，报告列出认领行与既有意图状态，由人工对账 |
+| 启动恢复 | `paper_executor.recover_interrupted_paper_sends` | 启动时把遗留 `SENDING` 结清为 `PAPER_REJECTED`（paper 发送边界不触达写端点，不存在未知的交易所结果），报告 `startup.recovered_sends` 列出被结清的意图 |
+| 限额用量重建 | `paper_executor.replay_limit_usage`、`risk.limits.LimitGate.seed_usage` | 逐小时单发时闸门只在内存，启动时按 JST 06:00 交易日自意图账本重放已进入 `SENDING` 及其后状态的意图名义与笔数预置用量，报告 `startup.limit_usage` |
 | 按日汇总 | `src/guvolu/execution/paper_ledger_summary.py`、`scripts/summarize_paper_ledger.py` | 按 JST 06:00 交易日边界聚合（D-08） |
 
 ## 3. 与执行目标契约的逐项对应
@@ -53,8 +59,10 @@
 
 执行器义务逐项：`valid_until` 未过且 `market_id`、`symbol` 一致由 `validate_execution_target`
 承担；差分转换由 `convert_target_to_delta_order` 承担；库存来源在 paper 模式固定为 paper
-持仓账，不读 READ_ONLY 持仓，二者不得混用（T-03）；永不从零开卖单由目标域与库存
-双重非负保证并在执行器显式复核；意图账本行携带三项血缘字段。
+持仓账，不读 READ_ONLY 持仓，二者不得混用（T-03）。契约第 2.3 节以 READ_ONLY 确认的
+持仓为库存来源，paper 模式是该条的显式例外：paper 库存只来自 paper 持仓账中的模型成交，
+不来自 READ_ONLY；永不从零开卖单由目标域与库存双重非负保证并在执行器显式复核（差分
+转换已保证卖出不超过库存，执行器复核为纵深防御）；意图账本行携带三项血缘字段。
 
 ## 4. 状态机与账本
 
@@ -62,9 +70,11 @@
 |---|---|
 | 新增状态 | `PAPER_FILLED`、`PAPER_REJECTED`，均为终态且属本地终态集合 `LOCAL_TERMINAL_STATES` |
 | 新增迁移 | `SENDING -> PAPER_FILLED`（携带成交模型证据）、`SENDING -> PAPER_REJECTED`（记录拒绝理由） |
-| 账本方法 | `IntentLedger.paper_fill`、`IntentLedger.paper_reject` |
+| 账本方法 | `IntentLedger.paper_fill`、`IntentLedger.paper_reject`、`IntentLedger.intent_ids_for_prediction`（按血缘列出意图，供同预测去重） |
 | 报告口径 | dry-run 执行器、对账会话、浸泡运行的 `write_touched` 判定统一改用 `LOCAL_TERMINAL_STATES` |
-| 账目位置 | paper 意图账本、持仓账、差异账与费率缓存同置于 `data/execution/paper/`，与 dry-run 及 shadow 账本分离 |
+| 账目位置 | paper 意图账本、持仓账、差异账、认领账与费率缓存同置于 `data/execution/paper/`，与 dry-run 及 shadow 账本分离 |
+| 启动恢复 | paper 执行器启动时遗留 `SENDING` 经 `SENDING -> PAPER_REJECTED` 结清，理由固定为进程恢复；只适用于 paper 专用账本，dry-run 与真实账本仍走 `mark_interrupted_sends` 转超时态（T-06） |
+| 限额闸门 | `LimitGate.seed_usage(day, total_jpy, order_count)` 只增方法，以账本重放的历史用量预置当日累计；`tighten` 只可调低的语义不变 |
 
 ## 5. 成交模型与差异账
 
@@ -72,7 +82,7 @@
 
 | 字段 | 定义 |
 |---|---|
-| `fee_bps` | taker 费率；来源为 `GET /v1/symbols` 的 `takerFee`（`public_symbols_taker_fee`）、本地缓存（`public_symbols_taker_fee_cached`）或配置降级值（`config_fallback`，附降级原因） |
+| `fee_bps` | taker 费率；来源为 `GET /v1/symbols` 的 `takerFee`（`public_symbols_taker_fee`）、本地缓存（`public_symbols_taker_fee_cached`）或配置降级值（`config_fallback`，附降级原因）；缓存文件不可读、字段缺失或非法一律按未命中处理并把原因写入 `fee.detail`，拉取失败的 `detail` 含异常类型名 |
 | `half_spread_bps` | 最优买卖价差的一半相对中间价 |
 | `impact_bps` | 成交均价相对触价的不利偏移 |
 | `slippage_vs_reference_bps` | 成交均价相对参考价的不利偏移 |
@@ -92,15 +102,16 @@ python scripts/run_paper_executor.py --target <目标快照> --config config/pap
 python scripts/summarize_paper_ledger.py --config config/paper_executor.json [--ledger-root <账目根>]
 ```
 
-缺省经公开只读端点拉取取引ルール、盘口与服务状态，报告列明 `read_touched`（A-03）；测试一律以文件夹具离线运行。进程返回零当且仅当无意图、同预测去重或意图终态为 `PAPER_FILLED`、`PAPER_REJECTED`；`write_touched` 非空返回 2。
+缺省经公开只读端点拉取取引ルール、盘口与服务状态，报告列明 `read_touched`（A-03）；测试一律以文件夹具离线运行。进程返回零当且仅当无意图、同预测去重或意图终态为 `PAPER_FILLED`、`PAPER_REJECTED`；`needs_reconciliation` 与闸门拒绝返回 1；`write_touched` 非空返回 2。报告另含 `startup{recovered_sends, limit_usage}` 与 `ledger_paths.claim_ledger`。
 
 ## 8. 验证
 
 | 项 | 覆盖 |
 |---|---|
-| `tests/test_frozen_target_adapter.py` | 第 2 版字段、内容寻址幂等、有效期派生与继承、负值与越界拒绝、质量失败、非法有效期、预算硬顶、模式、目标域不一致、命令行预算来自配置 |
-| `tests/test_paper_fill_model.py` | 逐档吃单均价与成本分解、深度不足拒绝、盘口交叉与乱序拒绝、夹具装载、费率拉取、缓存、过期与降级标注 |
-| `tests/test_paper_executor.py` | 从零买入并记录三账、降目标卖出不低于库存、零目标零库存不开卖单、同预测去重、越期与未生效拒绝、市场、品种、模式与预算不符拒绝、目标装载拒绝越界与第 1 版、费率降级标注、覆盖层门控与不可得标注、维护状态闸门拒绝、持仓账不连续拒绝、命令行离线端到端与按日汇总、`write_touched` 为空 |
+| `tests/test_frozen_target_adapter.py` | 第 2 版字段、内容寻址幂等、有效期派生与继承、负值、越界、NaN、无穷、文本与布尔目标拒绝、质量失败、非法有效期、预算硬顶、模式、目标域不一致、命令行预算来自配置 |
+| `tests/test_paper_fill_model.py` | 逐档吃单均价与成本分解、深度不足拒绝、盘口交叉与乱序拒绝、夹具装载、费率拉取、缓存、过期与降级标注、损坏缓存按未命中并标注原因 |
+| `tests/test_paper_executor.py` | 从零买入并记录三账、降目标卖出不低于库存、零目标零库存不开卖单、同预测去重、账目落盘后差异行前中断重跑不生成第二笔意图、认领后意图前中断重跑待对账、命令行待对账返回 1、启动结清遗留 `SENDING`、限额用量重放与跨进程累计触发笔数与金额限额、越期与未生效拒绝、市场、品种、模式与预算不符拒绝、目标装载拒绝越界、NaN、无穷、文本、布尔与第 1 版、费率降级标注、覆盖层门控与不可得标注、维护状态闸门拒绝、持仓账不连续拒绝、命令行离线端到端与按日汇总、`write_touched` 为空 |
+| `tests/test_intent_ledger.py`、`tests/test_intent.py`、`tests/test_limits.py` | 第 1 版意图行兼容读取、`paper_fill` 与 `paper_reject` 路径、按血缘列出意图、决策时刻无时区与空 `prediction_id` 拒绝、`seed_usage` 累加与跨日替换 |
 | 类型 | 新增与修改模块通过 `mypy --strict` |
 
 ## 9. 已知限制与阶段二待办
@@ -112,4 +123,7 @@ python scripts/summarize_paper_ledger.py --config config/paper_executor.json [--
 | 3 | 限价排队 | 阶段一按 taker 口径估算，不模拟限价排队与部分成交 |
 | 4 | 覆盖层生效 | 阶段一只记录判定；是否施加乘子、阈值取值与原因码表由契约提案的未决项裁定 |
 | 5 | 调度接线 | paper 执行器尚未接入每小时 shadow 任务；接入前须确认 paper 账目目录与 shadow 账目分离 |
-| 6 | 费率缓存 | 缓存文件按品种保存并带时效；缓存读取失败静默退回拉取或降级，仅在差异账标注来源 |
+| 6 | 费率缓存 | 缓存文件按品种保存并带时效；已修正：缓存不可读或字段损坏按未命中处理并把原因写入 `fee.detail`，拉取失败记录异常类型名 |
+| 7 | 评审 A1 去重落盘次序 | 已修正：发送前先写认领行，去重判定为差异账有行、或认领账与意图账本有该预测；认领存在而无差异行报告 `needs_reconciliation` 并拒绝自动重跑。残余限制：待对账状态不自动修复，须人工核对意图账本、持仓账与认领账后补记差异行或另起预测；认领账引入前的历史账目无认领行，仅靠意图账本血缘去重 |
+| 8 | 评审 B1 启动恢复与缓存 | 已修正：启动时遗留 `SENDING` 结清为 `PAPER_REJECTED` 并在报告 `startup.recovered_sends` 列出；缓存损坏处理见第 6 项。残余限制：结清只依据「paper 发送边界不触达写端点」这一前提，账目目录若被指向非 paper 账本则不成立，配置须保持账目分离 |
+| 9 | 评审 B2 限额用量跨进程 | 已修正：启动时按交易日自意图账本重放已过限额闸门的意图预置 `LimitGate`，报告 `startup.limit_usage`。残余限制：重建只覆盖本账目目录的意图账本，与 dry-run、shadow 或其他账目目录的用量互不合并；熔断器状态仍只在内存，跨进程的连续失败计数不重建 |
