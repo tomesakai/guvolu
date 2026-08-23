@@ -9,7 +9,7 @@ const ROOT = fileURLToPath(new URL("..", import.meta.url));
 
 // 扫描排除目录，含外部资料与运行数据
 const EXCLUDE = new Set([
-  ".git", "__pycache__", ".venv", "venv", "node_modules",
+  ".git", "__pycache__", ".venv", ".venv-gpu", "venv", "node_modules",
   ".pytest_cache", ".mypy_cache", ".ruff_cache", "dist",
   "data", "logs",
   "gpu-factor-mining-v1.1", "outsides",
