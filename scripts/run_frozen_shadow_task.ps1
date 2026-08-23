@@ -6,7 +6,8 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$RuntimeRoot,
     [Parameter(Mandatory = $true)]
-    [string]$ExecutionRepository
+    [string]$ExecutionRepository,
+    [switch]$NoPaper
 )
 
 $ErrorActionPreference = "Stop"
@@ -21,6 +22,11 @@ $Runtime = $null
 $Execution = $null
 $ExitCode = 3
 $Output = @()
+# -NoPaper 透传为 --no-paper。
+$ExtraArguments = @()
+if ($NoPaper) {
+    $ExtraArguments += "--no-paper"
+}
 [System.Management.Automation.ActionPreference]$PreviousErrorActionPreference =
     [System.Management.Automation.ActionPreference]$ErrorActionPreference
 try {
@@ -39,7 +45,7 @@ try {
     $Output = & $Python $Runner --repository $Root `
         --runtime-root $Runtime `
         --execution-repository $Execution `
-        --plan-id $PlanId 2>&1
+        --plan-id $PlanId @ExtraArguments 2>&1
     $ExitCode = $LASTEXITCODE
 } catch {
     $Output = @($_.Exception.Message)
@@ -54,6 +60,7 @@ $Record = [ordered]@{
     runtime_root = $RuntimeRoot
     resolved_runtime_root = $Runtime
     execution_repository = $ExecutionRepository
+    no_paper = [bool]$NoPaper
     exit_code = $ExitCode
     output = ($Output -join "`n")
 }
