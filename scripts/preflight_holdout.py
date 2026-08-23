@@ -15,6 +15,7 @@ import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+from guvolu.research.config_lineage import attest_config_lineage_snapshot
 from guvolu.research.frozen_forward import verify_frozen_forward
 from guvolu.research.governance import (
     FrozenForwardPrediction,
@@ -184,7 +185,20 @@ def run_preflight(
 
     identity = None
     if isinstance(config_rel, str):
-        identity = code_identity(repository, (repository / config_rel,))
+        # 与预测器同法取配置谱系源文件
+        source_paths: tuple[Path, ...] = (repository / config_rel,)
+        lineage_rel = payload.get("config_lineage_path")
+        if isinstance(lineage_rel, str):
+            try:
+                source_paths = tuple(attest_config_lineage_snapshot(
+                    repository, repository / lineage_rel, repository / config_rel,
+                )[4])
+            except (ValueError, OSError) as error:
+                blockers.append({
+                    "issue": "config_lineage_attest_failed",
+                    "detail": str(error),
+                })
+        identity = code_identity(repository, source_paths)
         if not identity.decision_grade:
             warnings.append({"issue": "current_tree_not_decision_grade"})
         elif identity.tree_digest != plan.code_tree_digest:

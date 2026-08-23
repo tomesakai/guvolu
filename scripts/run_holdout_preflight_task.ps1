@@ -23,6 +23,11 @@ $Runtime = $null
 try {
     # 运行根不可达也必须留下调度记录。
     $Runtime = (Resolve-Path -LiteralPath $RuntimeRoot -ErrorAction Stop).Path
+    if (-not $Runtime) {
+        throw "运行根不可达: $RuntimeRoot"
+    }
+    # 预检以运行根代码树为准
+    $env:PYTHONPATH = Join-Path $Runtime "src"
     $Arguments = @("--root", $Runtime, "--json-output", $JsonOutput)
     if ($VintageId -ne "") {
         $Arguments += @("--vintage-id", $VintageId)
