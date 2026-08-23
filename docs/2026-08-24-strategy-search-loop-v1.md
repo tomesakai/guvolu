@@ -93,7 +93,29 @@ python scripts\run_strategy_research.py --config config\strategy_research_candid
 
 ## 7. 目标机实测
 
-REAL_RUN_SECTION
+环境：Windows、RTX 5070 12 GB（compute capability 12.0）、驱动 580.88、PyTorch 2.11.0+cu128、
+CUDA 12.8、cuDNN 91900，独立 `.venv-gpu`（Python 3.12），主机内存 16 GB。输入为 GMO BTC
+活动成交 head（`mkt__gmo__btc__r0`，3,000 个输入文件，19,661,810 源成交行），面板
+`from_time=2019-01-01T00:00Z`、`panel_to_time=2026-08-23T09:00Z`，66,314 根小时柱，127 列
+（7 个标量列加 30 个回看窗乘 4 字段），26 个 walk-forward 折（训练 8,760、测试 2,160、
+embargo 24），bootstrap 块 168、路径 1,024，CSCV 分割预算 512。候选为六流派注册网格 37 个、
+邻域网格 8,291 个、结构 challenger 20 个（对应候选 134 个），共 8,462 个；候选分块 512，
+扫描方法 `parallel`，粗筛与提案阈值见 `config/search_loop.json`。
+
+| 项 | 实测 |
+|---|---|
+| 面板冻结、紧凑化与特征 | 约 520 秒（DuckDB 紧凑化为主，CPU） |
+| GPU F1 加 P3-2 评估总耗时 | 约 25 秒，含 CUDA 上下文初始化、上载、DAG 求值、扫描、指标、折、bootstrap、CSCV 与制品写入 |
+| 吞吐 | 约 340 候选/秒，约 2.3e7 候选柱/秒（每候选含 26 折与 1,024 条 bootstrap 路径） |
+| 分流派耗时 | mean_reversion 4,050 候选 9.0 秒；trend 2,160 候选 4.2 秒；flow_trend 912 候选 1.8 秒；breakout 840 候选 2.0 秒；price_breakout 240 候选 0.5 秒；grid_shadow 126 候选 0.4 秒；各 challenger 条目 0.2 至 0.3 秒 |
+| 台账 | 8,462 行，F0 拒绝 0，F1 粗筛通过 1,028（trend 950、mean_reversion 6、challenger 72） |
+| F3 复算 | 上限 256（按粗筛 Sharpe 降序），约 133 秒；256 个全部在容差内 |
+| 对照最大绝对差 | 目标序列 1.25e-7（容差 1e-5）、Sharpe 4.6e-8（1e-3）、换手 7.8e-6（1e-5；P3-1 初值 1e-6 下会超出） |
+| 总耗时 | 约 815 秒 |
+| 提案 | trend `proposed`：锚点 lookback 288、entry_score 1.5、exit_score 0.0、annual_volatility_target 0.2、maximum_target 1.0（粗筛 OOS Sharpe 1.51、bootstrap 下界 0.83、p 0.001、正向折比例 0.58、流派 PBO 0.49、邻居 6 个、中位保留 0.85）；建议网格 lookbacks [264, 288, 312]、entry_scores [1.0, 1.25, 1.5]，乘积 9 不超过预算 24；F3 通过 249 个中 181 个因 lookback 越出 `evolution.constraints`（上限 336）不作锚点，`rejected_by_constraint` 登记 360 至 720；其余五流派 `no_proposal`（无 F3 通过候选，mean_reversion 粗筛通过 6 个但均未进入 F3 复算上限）；20 个结构 challenger 条目中 72 个候选通过粗筛，只登记证据 |
+
+该结果只说明循环吞吐与数值对照，不构成任何候选的研究资格；提案是否成立须由
+`run_strategy_research.py` 在同一面板范围内以完整门禁裁决。
 
 ## 8. 残余限制
 
