@@ -6,6 +6,7 @@ from collections.abc import Mapping, Sequence
 
 from guvolu.strategy.contracts import CandidateSpec, FeatureRow, ResearchBar
 from guvolu.strategy.expression import (
+    StrategyExpression,
     candidate_identity,
     evaluate_expression,
     expression_id,
@@ -240,14 +241,26 @@ def generate_targets(
     periods_per_year: float,
 ) -> tuple[float, ...]:
     """以同一纯函数生成回测与当前目标。"""
+    template = strategy_expression(candidate.family)
+    return generate_expression_targets(
+        template, candidate, bars, features, periods_per_year,
+    )
+
+
+def generate_expression_targets(
+    template: StrategyExpression,
+    candidate: CandidateSpec,
+    bars: Sequence[ResearchBar],
+    features: Sequence[FeatureRow],
+    periods_per_year: float,
+) -> tuple[float, ...]:
+    """按显式表达式模板生成目标，供未注册 challenger 复算。"""
     if len(bars) != len(features):
         raise ValueError("行情柱与特征数量不一致")
     if periods_per_year <= 0:
         raise ValueError("年化周期必须为正")
-    template = strategy_expression(candidate.family)
-    expected_expression_id = expression_id(template)
     if candidate.expression_id is not None:
-        if candidate.expression_id != expected_expression_id:
+        if candidate.expression_id != expression_id(template):
             raise ValueError("候选表达式身份与流派模板不一致")
         if candidate.candidate_id != candidate_identity(template, candidate.parameters):
             raise ValueError("候选身份与表达式及参数不一致")

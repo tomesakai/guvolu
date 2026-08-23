@@ -442,6 +442,74 @@ def strategy_expression_payload(template: StrategyExpression) -> Mapping[str, ob
     }
 
 
+def _node_from_payload(payload: object, path: str) -> ExpressionNode:
+    """由规范 AST 载荷重建不可变节点。"""
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"E_PAYLOAD_NODE:{path}")
+    op = payload.get("op")
+    if not isinstance(op, str) or not op:
+        raise ValueError(f"E_PAYLOAD_OP:{path}")
+    raw_args = payload.get("args", [])
+    if not isinstance(raw_args, list):
+        raise ValueError(f"E_PAYLOAD_ARGS:{path}")
+    args = tuple(
+        _node_from_payload(item, f"{path}.{index}")
+        for index, item in enumerate(raw_args)
+    )
+    value = payload.get("value")
+    if value is not None and (
+        isinstance(value, bool) or not isinstance(value, (str, int, float))
+    ):
+        raise ValueError(f"E_PAYLOAD_VALUE:{path}")
+    raw_unit = payload.get("unit")
+    unit = None if raw_unit is None else Unit(str(raw_unit))
+    return ExpressionNode(op, args, value, unit)
+
+
+def strategy_expression_from_payload(payload: Mapping[str, object]) -> StrategyExpression:
+    """由规范模板载荷重建并验证表达式。"""
+    if payload.get("expression_method_version") != EXPRESSION_METHOD_VERSION:
+        raise ValueError("E_PAYLOAD_METHOD_VERSION")
+    raw_types = payload.get("parameter_types")
+    if not isinstance(raw_types, Mapping):
+        raise ValueError("E_PAYLOAD_PARAMETER_TYPES")
+    parameter_types: dict[str, ExpressionType] = {}
+    for name, raw in raw_types.items():
+        if not isinstance(raw, Mapping):
+            raise ValueError(f"E_PAYLOAD_PARAMETER_TYPE:{name}")
+        parameter_types[str(name)] = ExpressionType(
+            shape=ValueShape(str(raw.get("shape"))),
+            unit=Unit(str(raw.get("unit"))),
+            frequency=str(raw.get("frequency")),
+            availability=str(raw.get("availability")),
+            missing_policy=str(raw.get("missing_policy")),
+            numeric_domain=str(raw.get("numeric_domain")),
+        )
+    raw_required = payload.get("required")
+    if not isinstance(raw_required, list):
+        raise ValueError("E_PAYLOAD_REQUIRED")
+
+    def optional(name: str) -> ExpressionNode | None:
+        value = payload.get(name)
+        return None if value is None else _node_from_payload(value, name)
+
+    template = StrategyExpression(
+        family=str(payload.get("family")),
+        mode=str(payload.get("mode")),
+        parameter_types=parameter_types,
+        required=tuple(
+            _node_from_payload(item, f"required.{index}")
+            for index, item in enumerate(raw_required)
+        ),
+        entry=optional("entry"),
+        exit=optional("exit"),
+        target=optional("target"),
+        sizing=str(payload.get("sizing")),
+    )
+    validate_strategy_expression(template)
+    return template
+
+
 def expression_id(template: StrategyExpression) -> str:
     """由规范 AST 字节生成表达式身份。"""
     body = json.dumps(

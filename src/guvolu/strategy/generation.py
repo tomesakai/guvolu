@@ -4,7 +4,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from guvolu.strategy.baselines import (
     STRATEGY_METHOD_VERSION,
@@ -16,6 +16,7 @@ from guvolu.strategy.expression import (
     EXPRESSION_METHOD_VERSION,
     ExpressionNode,
     ExpressionType,
+    StrategyExpression,
     expression_complexity,
     expression_id,
     infer_expression_type,
@@ -173,18 +174,46 @@ def _compile_node(
     return node_id
 
 
+@dataclass(frozen=True)
+class SearchPlanEntry:
+    """搜索计划中的一个流派或结构 challenger 条目。"""
+
+    label: str
+    mode: str
+    template: StrategyExpression
+    candidate_budget: int
+    candidates: tuple[CandidateSpec, ...]
+    extra: Mapping[str, object] = field(default_factory=dict)
+
+
 def candidate_search_plan_payload(
     batches: Sequence[FamilyCandidateBatch],
 ) -> Mapping[str, object]:
     """把多流派 AST 编译为 CPU/GPU 共享的类型化公共子表达式 DAG。"""
-    ordered = tuple(sorted(batches, key=lambda item: item.family))
-    if len({batch.family for batch in ordered}) != len(ordered):
+    return search_plan_payload(tuple(
+        SearchPlanEntry(
+            label=batch.family,
+            mode=batch.mode,
+            template=strategy_expression(batch.family),
+            candidate_budget=batch.candidate_budget,
+            candidates=batch.candidates,
+        )
+        for batch in batches
+    ))
+
+
+def search_plan_payload(
+    entries: Sequence[SearchPlanEntry],
+) -> Mapping[str, object]:
+    """按显式表达式条目编译搜索计划；注册流派与 challenger 共用。"""
+    ordered = tuple(sorted(entries, key=lambda item: item.label))
+    if len({entry.label for entry in ordered}) != len(ordered):
         raise ValueError("搜索计划不能包含重复策略家族")
     records: dict[str, Mapping[str, object]] = {}
     depths: dict[str, int] = {}
     families: list[Mapping[str, object]] = []
-    for batch in ordered:
-        template = strategy_expression(batch.family)
+    for entry in ordered:
+        template = entry.template
 
         def compile_optional(node: ExpressionNode | None) -> str | None:
             return None if node is None else _compile_node(
@@ -198,7 +227,7 @@ def candidate_search_plan_payload(
         parameter_names = sorted(template.parameter_types)
         candidate_rows = []
         for candidate in sorted(
-            batch.candidates,
+            entry.candidates,
             key=lambda item: item.candidate_id,
         ):
             if candidate.expression_id != expression_id(template):
@@ -208,12 +237,12 @@ def candidate_search_plan_payload(
                 "values": [candidate.parameters[name] for name in parameter_names],
             })
         families.append({
-            "family": batch.family,
-            "mode": batch.mode,
+            "family": entry.label,
+            "mode": entry.mode,
             "expression_id": expression_id(template),
             "sizing": template.sizing,
-            "candidate_count": len(batch.candidates),
-            "candidate_budget": batch.candidate_budget,
+            "candidate_count": len(entry.candidates),
+            "candidate_budget": entry.candidate_budget,
             "parameter_names": parameter_names,
             "candidate_parameter_rows": candidate_rows,
             "roots": {
@@ -222,6 +251,7 @@ def candidate_search_plan_payload(
                 "exit": compile_optional(template.exit),
                 "target": compile_optional(template.target),
             },
+            **dict(entry.extra),
         })
     evaluation_order = sorted(records, key=lambda item: (depths[item], item))
     body: dict[str, object] = {
