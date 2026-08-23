@@ -1,0 +1,121 @@
+{
+  "schema_version": 1,
+  "purpose": "搜索循环合成自检用研究配置：只供 run_search_loop.py --synthetic，不接真实数据",
+  "pipeline_version": "strategy-research-cpu-v9",
+  "market_id": "synthetic",
+  "bar_interval": "1hour",
+  "from_time": "2024-01-01T00:00:00+00:00",
+  "notional_scale": 100000000,
+  "strategy_decision_max_age_seconds": 3900,
+  "cost_model": {
+    "fee_bps_assumption": 5.0,
+    "half_spread_bps_assumption": 2.0,
+    "slippage_bps_assumption": 2.0,
+    "impact_bps_assumption": 1.0,
+    "capacity_notional_quote": 100000.0
+  },
+  "features": {
+    "lookbacks": [24, 72, 168],
+    "state_lookback": 72,
+    "volume_lookback": 168,
+    "maximum_structural_gap_bars_assumption": 4
+  },
+  "strategies": {
+    "trend": {
+      "lookbacks": [24, 72, 168],
+      "entry_scores": [0.5, 1.0],
+      "exit_score": 0.0,
+      "annual_volatility_target": 0.4,
+      "maximum_target": 1.0
+    },
+    "flow_trend": {
+      "lookbacks": [72, 168],
+      "entry_scores": [0.5, 1.0],
+      "flow_confirmations": [-0.25, 0.0, 0.25],
+      "minimum_volume_score": 0.0,
+      "exit_score": 0.0,
+      "annual_volatility_target": 0.4,
+      "maximum_target": 1.0
+    },
+    "breakout": {
+      "lookbacks": [24, 72, 168],
+      "flow_confirmations": [-0.1, 0.1],
+      "annual_volatility_target": 0.4,
+      "maximum_target": 1.0
+    },
+    "price_breakout": {
+      "lookbacks": [24, 72, 168],
+      "annual_volatility_target": 0.4,
+      "maximum_target": 1.0
+    },
+    "mean_reversion": {
+      "lookbacks": [24, 72, 168],
+      "entry_scores": [1.0, 1.5],
+      "exit_score": -0.1,
+      "trend_limit": 0.75,
+      "annual_volatility_target": 0.25,
+      "maximum_target": 0.75
+    },
+    "grid_shadow": {
+      "lookbacks": [24, 72],
+      "entry_scores": [1.0, 1.5],
+      "maximum_target": 0.5
+    }
+  },
+  "walk_forward": {
+    "minimum_train_bars": 1024,
+    "test_bars": 256,
+    "step_bars": 256,
+    "embargo_bars": 24
+  },
+  "validation": {
+    "minimum_oos_bars": 512,
+    "minimum_oos_sharpe": 0.0,
+    "maximum_drawdown": 0.45,
+    "maximum_fdr_q": 0.2,
+    "minimum_positive_fold_ratio": 0.5,
+    "maximum_probability_backtest_overfitting": 0.4,
+    "pbo_split_budget": 64,
+    "pbo_random_seed": 20260814,
+    "block_bootstrap_bars": 48,
+    "block_bootstrap_samples": 256,
+    "block_bootstrap_random_seed": 20260814,
+    "block_bootstrap_one_sided_alpha": 0.05,
+    "maximum_block_bootstrap_p_value": 0.05,
+    "minimum_deflated_sharpe_probability": 0.95,
+    "deflated_sharpe_gate_trial_count": "effective",
+    "minimum_parameter_neighbor_count": 1,
+    "minimum_positive_parameter_neighbor_ratio": 0.5,
+    "minimum_median_parameter_neighbor_sharpe_retention": 0.5,
+    "complexity_penalty": 0.02
+  },
+  "evolution": {
+    "maximum_candidates_per_family": 24,
+    "constraints": {
+      "trend": {
+        "lookback": {"minimum": 12, "maximum": 336},
+        "entry_score": {"minimum": 0.25, "maximum": 2.0}
+      },
+      "flow_trend": {
+        "lookback": {"minimum": 12, "maximum": 336},
+        "entry_score": {"minimum": 0.25, "maximum": 2.0},
+        "flow_confirmation": {"minimum": -1.0, "maximum": 1.0}
+      },
+      "breakout": {
+        "lookback": {"minimum": 12, "maximum": 336},
+        "flow_confirmation": {"minimum": -1.0, "maximum": 1.0}
+      },
+      "price_breakout": {
+        "lookback": {"minimum": 12, "maximum": 336}
+      },
+      "mean_reversion": {
+        "lookback": {"minimum": 12, "maximum": 336},
+        "entry_score": {"minimum": 0.5, "maximum": 3.0}
+      },
+      "grid_shadow": {
+        "lookback": {"minimum": 12, "maximum": 168},
+        "entry_score": {"minimum": 0.5, "maximum": 3.0}
+      }
+    }
+  }
+}

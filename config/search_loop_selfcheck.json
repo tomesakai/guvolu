@@ -1,0 +1,90 @@
+{
+  "schema_version": 1,
+  "purpose": "搜索循环合成自检配置：小网格、小 bootstrap，供 run_search_loop.py --synthetic",
+  "research_config": "config/strategy_research_selfcheck.json",
+  "output_root": "reports/strategy-search-selfcheck",
+  "panel_to_time": "2026-08-23T09:00:00+00:00",
+  "family_scope": [
+    "trend",
+    "flow_trend",
+    "breakout",
+    "price_breakout",
+    "mean_reversion",
+    "grid_shadow"
+  ],
+  "candidate_budget_per_family": 256,
+  "neighborhood": {
+    "trend": {
+      "lookback": [24, 48, 72, 96, 168],
+      "entry_score": [0.25, 0.5, 0.75, 1.0, 1.5],
+      "exit_score": [0.0],
+      "annual_volatility_target": [0.2, 0.4, 0.8],
+      "maximum_target": [1.0]
+    },
+    "flow_trend": {
+      "lookback": [72, 168],
+      "entry_score": [0.5, 1.0],
+      "flow_confirmation": [-0.25, 0.0, 0.25],
+      "annual_volatility_target": [0.2, 0.4, 0.8]
+    },
+    "breakout": {
+      "lookback": [24, 72, 168],
+      "flow_confirmation": [-0.25, -0.1, 0.1, 0.25],
+      "annual_volatility_target": [0.2, 0.4, 0.8]
+    },
+    "price_breakout": {
+      "lookback": [24, 48, 72, 168],
+      "annual_volatility_target": [0.2, 0.4, 0.8]
+    },
+    "mean_reversion": {
+      "lookback": [24, 72, 168],
+      "entry_score": [1.0, 1.5, 2.0],
+      "annual_volatility_target": [0.25, 0.4]
+    },
+    "grid_shadow": {
+      "lookback": [24, 72],
+      "entry_score": [1.0, 1.5, 2.0]
+    }
+  },
+  "structural_challengers": {
+    "limit_per_family": 2,
+    "projected_budget_per_family": 64,
+    "operators": ["comparison_strictness", "drop_conjunct", "numeric_bound_swap"],
+    "donors": {"trend": ["flow_trend"]}
+  },
+  "gpu": {
+    "device": "auto",
+    "candidate_chunk": 256,
+    "scan_method": "parallel"
+  },
+  "seed": 20260824,
+  "screen": {
+    "minimum_sharpe": 0.0,
+    "maximum_drawdown": 1.0,
+    "minimum_turnover": 0.0
+  },
+  "resample_screen": {
+    "minimum_oos_sharpe": 0.0,
+    "minimum_positive_fold_ratio": 0.5,
+    "maximum_bootstrap_p": 0.5,
+    "maximum_pbo": 1.0
+  },
+  "parity_tolerance": {
+    "target_abs": 1e-5,
+    "sharpe_abs": 1e-3,
+    "turnover_abs": 1e-5
+  },
+  "parity_candidate_limit": 64,
+  "proposal": {
+    "minimum_neighbor_count": 1,
+    "minimum_positive_neighbor_ratio": 0.5,
+    "minimum_neighbor_sharpe_retention": 0.5,
+    "maximum_axis_values": 3,
+    "score_metric": "oos_sharpe"
+  },
+  "write_reference_panel": false,
+  "synthetic": {
+    "bars": 4096,
+    "seed": 20260823
+  }
+}
