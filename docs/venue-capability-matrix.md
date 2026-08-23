@@ -15,15 +15,26 @@
 | GMO Coin | 执行加行情 | [能力报告](2026-08-05-gmo-api-capability-report.md)、[勘误](2026-08-05-gmo-order-id-erratum.md)、[量级实测](2026-08-06-gmo-data-scope-survey.md)、[打印口径实测](2026-08-07-gmo-trade-print-semantics.md) | 实测 |
 | bitFlyer | 日元行情加衍生品信号 | [实测快照](2026-08-07-bitflyer-api-verification.md) | 实测 |
 | bitbank | 日元行情 | [多所调查](2026-08-07-multi-venue-api-survey.md)、[实测快照](2026-08-08-bitbank-api-verification.md)、[闭环验证](2026-08-11-multi-source-closure-validation.md) | 实测 |
-| Coincheck | 日元行情备用 | [闭环验证](2026-08-11-multi-source-closure-validation.md) | 文档加实录 |
+| Coincheck | 日元行情备用 | [闭环验证](2026-08-11-multi-source-closure-validation.md)、[2026-08-24 文档核实](2026-08-24-japan-api-survey.md) | 文档加实录 |
 | Binance | 全球参考加长历史 | [闭环验证](2026-08-11-multi-source-closure-validation.md) | 文档加实测 |
-| Kraken | 全球参考加逐笔全历史 | 同上 | 文档 |
+| Kraken | 全球参考加逐笔全历史 | 同上；L3 变化见 [2026-08-24 文档核实](2026-08-24-japan-api-survey.md) | 文档 |
 | OKX | 全球参考加历史 L2 | [单日闭环验证](2026-08-11-okx-l2-sample-validation.md)、[最新质量验收](2026-08-13-l2-quality-and-l3-readiness.md) | 文档加实测 |
 | Bybit | 全球参考备用 | [OKX 验证中的目录复核](2026-08-11-okx-l2-sample-validation.md) | 文档；历史 L2 未核 |
-| Coinbase Exchange | 全球参考备用 | 同上 | 文档 |
-| Bitfinex | 截断 MBO 候选 | [官方 Raw Books](https://docs.bitfinex.com/reference/ws-public-raw-books)、[L3 工作簿证据](evidence/crypto_api_l3_registry_2026-08-12.json) | 文档；本地未实测 |
-| Bitstamp | L3/MBO 待核候选 | [官方 API](https://www.bitstamp.net/api/)、[L3 工作簿证据](evidence/crypto_api_l3_registry_2026-08-12.json) | 工作簿登记；待小样本验证 |
+| Coinbase Exchange | 全球参考备用 | 同上；L3 变化见 [2026-08-24 文档核实](2026-08-24-japan-api-survey.md) | 文档 |
+| Bitfinex | 截断 MBO 候选 | [官方 Raw Books](https://docs.bitfinex.com/reference/ws-public-raw-books)、[L3 工作簿证据](evidence/crypto_api_l3_registry_2026-08-12.json)、[2026-08-24 文档核实](2026-08-24-japan-api-survey.md) | 文档；本地未实测 |
+| Bitstamp | L3/MBO 小样本候选 | [官方 API](https://www.bitstamp.net/api/)、[L3 工作簿证据](evidence/crypto_api_l3_registry_2026-08-12.json)、[2026-08-24 文档核实](2026-08-24-japan-api-survey.md) | 文档（2026-08-24 文档核实）；待小样本验证 |
 | Hyperliquid | 链上永续补充 | 同上 | 未核为主 |
+| Zaif | 日元行情候选，未接入 | [2026-08-24 文档核实](2026-08-24-japan-api-survey.md) | 文档（2026-08-24 文档核实） |
+| BTCBOX | 日元行情候选，仅 REST，未接入 | 同上 | 文档（2026-08-24 文档核实） |
+| OKJ | 第二执行所候选，未接入 | 同上 | 文档（2026-08-24 文档核实） |
+| BitTrade | 第二执行所候选，未接入 | 同上 | 文档（2026-08-24 文档核实） |
+| Binance Japan | 日元参考候选，共用 Binance 接口族，未接入 | 同上 | 文档（2026-08-24 文档核实） |
+| 楽天ウォレット | 杠杆行情候选，现物无 API，未接入 | 同上 | 文档（2026-08-24 文档核实） |
+| 其余金融庁登録业者 | 无公开交易 API，不列能力 | 同上 | 文档（2026-08-24 文档核实） |
+
+2026-08-24 文档核实只补充公开 API 存在性、费率、委托号与规约等文档层事实，
+GMO、bitFlyer、bitbank 三行的实测结论不变；新补六行均未接入、未实测，能力各节
+暂不展开，接入前按第 8 节规则补证。
 
 ## 2. 准入与密钥模型
 
@@ -93,7 +104,7 @@
 | Coincheck | 差分 | `none` | 明示不重发 | 文档 |
 | Binance | 差分加 REST 快照引导 | `sequence`（U/u 连续性规则） | 靠序号自查 | 文档 |
 | Kraken | 快照加差分 | `checksum`（前 10 档 CRC32） | 靠校验和自查 | 文档 |
-| OKX | 分级频道 | `sequence`（`seqId/prevSeqId`；checksum 已弃用且固定 0） | 靠序号自查 | 文档 |
+| OKX | 分级频道 | `sequence`（`seqId/prevSeqId`；checksum 2026-06-23 起弃用且固定 0） | 靠序号自查 | 文档 |
 | Bybit | 快照加差分 | `sequence` | 靠序号自查 | 文档 |
 | Coinbase Exchange | `level2` 快照加更新；`full` L3 另表 | `sequence` | 靠序号自查 | 文档 |
 
@@ -124,13 +135,16 @@ bitbank 只有在 REST 与 WS 原生序列相等且比较深度一致时才可�
 
 | 次序 | 来源与官方能力 | 保真度 | 重放与有限度 | 本地状态 |
 |---|---|---|---|---|
-| 1 | Coinbase [`full` WS](https://docs.cdp.coinbase.com/exchange/websocket-feed/channels#full-channel) 加 [REST Level 3](https://docs.cdp.coinbase.com/api-reference/exchange-api/rest-api/products/get-product-book) | A：完整非聚合订单簿与订单生命周期 | 先缓冲 WS，再取 snapshot，丢弃小于等于 snapshot sequence 的消息后重放；`match` 带 maker/taker order ID，`side` 是 maker 侧 | `documented`；首接候选，未实现 |
-| 2 | Kraken 认证 [`level3`](https://docs.kraken.com/exchange/api-reference/spot-websocket-v2/level3) | A：深度受限 L3/MBO | 10/100/1000 价位，order ID 加 `add/modify/delete`；官方称无需 sequence，以前十价位 CRC32 校验；出界价位无 delete | `documented`；第二候选，令牌与裁剪待小样本 |
-| 3 | Bitfinex [`prec=R0` Raw Books](https://docs.bitfinex.com/reference/ws-public-raw-books) | B：截断 MBO | `order_id/price/amount`，`price=0` 删除，可选 checksum；`len` 最大 250 且是订单数而非价位数 | `documented`；未实现，先验 250 单边界 |
-| 4 | Bitstamp 工作簿登记的 `group=2` 加 live-orders | B 候选；尚未核实 | [官方 API](https://www.bitstamp.net/api/) 与公开示例不足以证明 order ID 稳定性、snapshot/update 顺序和缺口恢复 | `unverified`；仅进入小样本队列 |
+| 1 | Coinbase [`full` WS](https://docs.cdp.coinbase.com/exchange/websocket-feed/channels#full-channel) 加 [REST Level 3](https://docs.cdp.coinbase.com/api-reference/exchange-api/rest-api/products/get-product-book) | A：完整非聚合订单簿与订单生命周期 | 先缓冲 WS，再取 snapshot，丢弃小于等于 snapshot sequence 的消息后重放；`match` 带 maker/taker order ID，`side` 是 maker 侧。2026-08-24 文档核实：`full` 需认证，每 product 每 channel 订阅上限 10，WS 8 次每秒每 IP；[Market Data Terms](https://www.coinbase.com/legal/market_data) 2026-08-07 版限 personal 与 research 用途，禁止组织外再分发与 AI 或 ML 训练 | `documented`；首接候选，未实现；前置为账户、API key、条款合规与订阅配额 |
+| 2 | Kraken 认证 [`level3`](https://docs.kraken.com/api/docs/websocket-v2/level3/) 加 [REST Level 3](https://docs.kraken.com/api/docs/rest-api/get-level-3-order-book/) | A：深度受限 L3/MBO | 10/100/1000 价位，order ID 加 `add/modify/delete`；官方称无需 sequence，以前十价位 CRC32 校验；出界价位无 delete。2026-08-24 文档核实：WS 端点 `wss://ws-l3.kraken.com/v2`，消息增 `timestamp`；REST `/0/private/Level3` depth 0、10、25、100、250、1000，含 order_id 与纳秒 timestamp | `documented`；第二候选，令牌与裁剪待小样本 |
+| 3 | Bitfinex [`prec=R0` Raw Books](https://docs.bitfinex.com/reference/ws-public-raw-books) | B：截断 MBO | `order_id/price/amount`，`price=0` 删除，可选 checksum；`len` 最大 250 且是订单数而非价位数。2026-08-24 文档核实：`SEQ_ALL` 提供序号，R0 checksum 基于 order ID 与数量 | `documented`；未实现，先验 250 单边界 |
+| 4 | Bitstamp [`live_orders`](https://www.bitstamp.net/api/) 加 `POST /api/v2/order_data/` | B 候选 | 2026-08-24 文档核实：`live_orders` 含 `id` 与 `event_id`（MarketEventID），`order_data` 按 `since_id` 与 `until_id` 回放公共订单事件；order ID 稳定性、snapshot/update 顺序和缺口恢复仍待真实样本 | `documented`；进入小样本队列，未实现 |
 
 Coinbase 的完整序列引导使它优先于深度受限且认证的 Kraken；Bitfinex 只能研究
-可见的截断队列；Bitstamp 在真实响应、重连和缺口样本通过前不得升格。任何候选
+可见的截断队列；Bitstamp 在真实响应、重连和缺口样本通过前不得升格。Binance
+`trade` 流 2024-06-18 起不含买卖方订单 ID，OKX `books` checksum 2026-06-23 起弃用，
+两者均不进入候选；日本加密所全部不可 L3 重建，判定见
+[2026-08-24 文档核实](2026-08-24-japan-api-survey.md) 第 4 节。任何候选
 接入后仍须按 [L3 四表合同](order-flow-data-contract.md#11-l3-升级兼容与派生边界)
 分别保存逻辑事件、原件证据、可证明撮合关联与状态 checkpoint，再派生 L2；不能
 直接写入现有原生 L2 事实。
@@ -157,16 +171,16 @@ Coinbase 的完整序列引导使它优先于深度受限且认证的 Kraken；B
 | 来源 | 自定义委托号 | 全撤端点 | 私有推送 | 对账含义 | 证据 |
 |---|---|---|---|---|---|
 | GMO Coin | **无** | `cancelBulkOrder` | 私有 WS 四频道 | intent 与 orderId 映射（T-05），事后关联 | 实测 |
-| bitFlyer | 有 | `cancelallchildorders` | `child_order_events` 等两频道（认证实测通过） | 自定义号可直接承载 intent_id | 实测 |
-| bitbank | 未载 | 批量撤单端点 | PubNub 私有流 | 待接入时核实 | 文档 |
-| Coincheck | 未载 | 无批量端点载明 | order-events 等，明示不重发 | 待接入时核实 | 文档 |
+| bitFlyer | 无（2026-08-24 文档核实，修正 2026-08-07 调查的「有」；下单只返回 `child_order_acceptance_id`） | `cancelallchildorders` | `child_order_events` 等两频道（认证实测通过） | 受理号映射，待接入时核实 | 私有推送实测；委托号文档 |
+| bitbank | 无（2026-08-24 文档核实） | 批量撤单端点 | PubNub 私有流 | 待接入时核实 | 文档 |
+| Coincheck | 无（2026-08-24 文档核实） | 无批量端点载明 | order-events 等，明示不重发 | 待接入时核实 | 文档 |
 | Binance | 有 | 有 | 用户数据流 | 自定义号承载 | 文档 |
 | Kraken | 有 | 有 | WS v2 私有频道 | 自定义号承载 | 文档 |
 | OKX | 有 | 有 | 私有频道 | 自定义号承载 | 文档 |
 | Bybit | 有 | 有 | 私有频道 | 自定义号承载 | 文档 |
 | Coinbase Exchange | 有 | 有 | 私有频道 | 自定义号承载 | 文档 |
 
-GMO 是唯一无自定义委托号的来源；T-05 的映射法是 GMO 特例，不得推广为公共设计（multi-source 设计第 2 节不变量）。
+自定义委托号在日元所并不普遍，日本十家有 API 业者中仅 OKJ、BitTrade 与 Binance Japan 提供（见 [2026-08-24 文档核实](2026-08-24-japan-api-survey.md) 第 3.4 节）；T-05 的映射法按来源能力逐所决定，既不得假定全部来源都有自定义委托号，也不得把 GMO 的限制强加于有自定义委托号的来源（multi-source 设计第 2 节不变量）。
 
 ## 8. 更新规则
 
@@ -252,9 +266,9 @@ head，不做隐式 FX，也不等于回测级持久化聚合制品。
 | Kraken | BTC/USD 等全球逐笔全历史候选、CRC32 L2；深度受限 L3 第二候选 | Binance/Coinbase 全球参考降级 | 原生 OHLC 仅近 720 根；L3 认证、无 sequence 且出界无 delete；本地尚无闭环原件 |
 | OKX | 全球现货与衍生品、官方历史 L2 主候选 | Binance/Coinbase 参考降级 | 400 档历史已有有界闭环；live books 隔离小样本已验，生产持续运行、其他品种和 5000 档未核 |
 | Bybit | 全球衍生品实时备用 | OKX/Binance 参考降级 | 当前公开目录无历史 L2 文件证据；不得列为盘口冷启动来源 |
-| Coinbase | BTC/USD 第三参考票；Full 加 REST L3 首接候选 | Kraken/Binance 参考降级 | 必须完成 buffer/snapshot/discard/replay；`match.side` 是 maker 侧；本地尚未接入 |
+| Coinbase | BTC/USD 第三参考票；Full 加 REST L3 首接候选 | Kraken/Binance 参考降级 | 必须完成 buffer/snapshot/discard/replay；`match.side` 是 maker 侧；`full` 需认证与订阅配额，Market Data Terms 限个人与研究用途且禁止 AI 或 ML 训练；本地尚未接入 |
 | Bitfinex | 最多 250 单的截断 MBO 研究候选 | 不作完整 L3 fallback | `len` 是订单数，不是价位数；看不到完整队列；本地尚未接入 |
-| Bitstamp | `group=2`/live-orders 小样本候选 | 不作任何 L3 fallback | 稳定订单身份、顺序与缺口恢复均待实测；本地尚未接入 |
+| Bitstamp | `live_orders` 加 `order_data` 回放小样本候选 | 不作任何 L3 fallback | 官方已载 `event_id` 与按 id 回放，但稳定订单身份、顺序与缺口恢复均待实测；本地尚未接入 |
 | Hyperliquid | 链上永续 L2、资金费率候选 | 不作为日元现货 fallback | K 线仅近 5,000 根、L2 快照单侧 20 档；成交映射未核 |
 
 本册不固化本地行数、活动市场数、热层天数或审计时刻；这些动态值只见
