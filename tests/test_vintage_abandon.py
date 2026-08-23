@@ -378,3 +378,52 @@ def test_abandoned_vintage_rejects_plan_prediction_and_evaluation(
         _register_plan(tmp_path, registry, vintage.vintage_id)
     assert get_holdout_vintage(registry, vintage.vintage_id).status == "abandoned"
 
+
+def test_preflight_reports_abandoned_vintage(tmp_path: Path) -> None:
+    """预检对显式指定的已废弃 vintage 直接报告终态。"""
+    preflight = _load_script("preflight_holdout")
+    registry = tmp_path / "governance.sqlite3"
+    vintage = seal_holdout_vintage(
+        registry, "market-one",
+        _time("2026-02-01T00:00:00"), _time("2026-03-01T00:00:00"),
+    )
+    _register_plan(tmp_path, registry, vintage.vintage_id)
+    _set_now(_time("2026-02-10T00:00:00"))
+    abandon_holdout_vintage(registry, vintage.vintage_id, "预测永久中断")
+    report = preflight.run_preflight(
+        tmp_path, registry, vintage.vintage_id, verify_artifacts=False,
+    )
+    assert report["status"] == "abandoned"
+    assert report["vintage_status"] == "abandoned"
+    assert report["abandoned_at"] == "2026-02-10T00:00:00Z"
+    assert report["abandon_reason"] == "预测永久中断"
+    assert report["blockers"] == [] and report["read_only"] is True
+    with pytest.raises(LookupError, match="没有匹配的 sealed vintage"):
+        preflight.run_preflight(tmp_path, registry, None, verify_artifacts=False)
+
+
+def test_cli_abandon_and_list(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """命令行可废弃 vintage 并在列表中输出状态与理由。"""
+    cli = _load_script("manage_holdout_vintage")
+    registry = tmp_path / "governance.sqlite3"
+    vintage = seal_holdout_vintage(
+        registry, "market-one",
+        _time("2026-02-01T00:00:00"), _time("2026-03-01T00:00:00"),
+    )
+    _set_now(_time("2026-01-20T00:00:00"))
+    assert cli.main([
+        "--registry", str(registry), "abandon", vintage.vintage_id,
+        "--reason", "冻结前向运行根失效",
+    ]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "abandoned"
+    assert payload["abandon_reason"] == "冻结前向运行根失效"
+    assert payload["abandoned_at"] == "2026-01-20T00:00:00+00:00"
+    assert cli.main(["--registry", str(registry), "list"]) == 0
+    listed = json.loads(capsys.readouterr().out)
+    assert [item["status"] for item in listed] == ["abandoned"]
+    assert listed[0]["abandon_reason"] == "冻结前向运行根失效"
+    with pytest.raises(SystemExit):
+        cli.main(["--registry", str(registry), "abandon", vintage.vintage_id])

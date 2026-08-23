@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Sequence
 
 from guvolu.research.governance import (
+    abandon_holdout_vintage,
     finalize_holdout_evaluation,
     list_holdout_vintages,
     seal_holdout_vintage,
@@ -27,7 +28,7 @@ def _payload(value: object) -> object:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """执行封存、原子终结或只读列表。"""
+    """执行封存、废弃、原子终结或只读列表。"""
     parser = argparse.ArgumentParser(description="管理 G-08 一次性封存段")
     parser.add_argument(
         "--registry",
@@ -54,7 +55,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     finalize.add_argument("verdict")
     finalize.add_argument("result_manifest_path")
     finalize.add_argument("result_manifest_sha256")
-    subparsers.add_parser("list", help="列出封存与已消费历史")
+    abandon = subparsers.add_parser(
+        "abandon",
+        help="显式废弃从未开始评估的 sealed vintage 并留痕",
+    )
+    abandon.add_argument("vintage_id")
+    abandon.add_argument("--reason", required=True, help="可审计的废弃理由")
+    subparsers.add_parser("list", help="列出封存、已消费与已废弃历史")
     arguments = parser.parse_args(argv)
     registry = arguments.registry.resolve()
     repository = arguments.root.resolve()
@@ -64,6 +71,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             arguments.market_id,
             parse_time(arguments.start_time, "start_time"),
             parse_time(arguments.end_time, "end_time"),
+        )
+    elif arguments.action == "abandon":
+        result = abandon_holdout_vintage(
+            registry,
+            arguments.vintage_id,
+            arguments.reason,
         )
     elif arguments.action == "finalize":
         result = finalize_holdout_evaluation(

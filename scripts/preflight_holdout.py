@@ -127,6 +127,25 @@ def run_preflight(
         item for item in list_holdout_vintages(registry)
         if vintage_id is None or item.vintage_id == vintage_id
     ]
+    # 显式指定的废弃段直接报终态
+    abandoned = [
+        item for item in vintages
+        if vintage_id is not None and item.status == "abandoned"
+    ]
+    if abandoned:
+        dead = abandoned[0]
+        return {
+            "generated_at": _iso(now),
+            "read_only": True,
+            "vintage_id": dead.vintage_id,
+            "vintage_window": [_iso(dead.start_time), _iso(dead.end_time)],
+            "vintage_status": dead.status,
+            "abandoned_at": _iso(dead.abandoned_at),
+            "abandon_reason": dead.abandon_reason,
+            "warnings": [],
+            "blockers": [],
+            "status": "abandoned",
+        }
     sealed = [item for item in vintages if item.status == "sealed"]
     if not sealed:
         raise LookupError("注册表中没有匹配的 sealed vintage")
