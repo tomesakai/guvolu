@@ -53,10 +53,53 @@ from guvolu.strategy.expression import (
     strategy_expression,
 )
 
-GOVERNANCE_SCHEMA_VERSION = 8
+GOVERNANCE_SCHEMA_VERSION = 9
 SCHEMA_WRITE_CEILING_KEY = "schema_write_ceiling"
 GOVERNANCE_METHOD_VERSION = "research-data-governance-v2"
-_VINTAGE_STATUSES = ("sealed", "consumed")
+_VINTAGE_STATUSES = ("sealed", "consumed", "abandoned")
+# v9 封存段表定义，含废弃状态
+_HOLDOUT_VINTAGE_DDL = """
+CREATE TABLE IF NOT EXISTS holdout_vintage (
+  vintage_id TEXT PRIMARY KEY,
+  market_id TEXT NOT NULL,
+  start_time TEXT NOT NULL,
+  end_time TEXT NOT NULL,
+  sealed_at TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('sealed','consumed','abandoned')),
+  consumed_at TEXT,
+  candidate_set_hash TEXT,
+  evaluation_id TEXT,
+  verdict TEXT,
+  verdict_recorded_at TEXT,
+  abandoned_at TEXT,
+  abandon_reason TEXT,
+  CHECK(
+    (status='sealed' AND consumed_at IS NULL
+     AND candidate_set_hash IS NULL AND evaluation_id IS NULL
+     AND abandoned_at IS NULL AND abandon_reason IS NULL)
+    OR
+    (status='consumed' AND consumed_at IS NOT NULL
+     AND candidate_set_hash IS NOT NULL AND evaluation_id IS NOT NULL
+     AND abandoned_at IS NULL AND abandon_reason IS NULL)
+    OR
+    (status='abandoned' AND consumed_at IS NULL
+     AND candidate_set_hash IS NULL AND evaluation_id IS NULL
+     AND verdict IS NULL AND verdict_recorded_at IS NULL
+     AND abandoned_at IS NOT NULL AND abandon_reason IS NOT NULL
+     AND length(abandon_reason)>0)
+  )
+)
+"""
+_HOLDOUT_VINTAGE_RANGE_INDEX_DDL = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS holdout_vintage_range "
+    "ON holdout_vintage(market_id,start_time,end_time)"
+)
+# 升级前的 v8 封存段列
+_HOLDOUT_VINTAGE_V8_COLUMNS = (
+    "vintage_id", "market_id", "start_time", "end_time", "sealed_at",
+    "status", "consumed_at", "candidate_set_hash", "evaluation_id",
+    "verdict", "verdict_recorded_at",
+)
 # 缺预测处置政策取值
 MISSING_POLICIES = ("burn", "zero_exposure")
 DEFAULT_MISSING_POLICY = "burn"
@@ -76,7 +119,7 @@ class ResearchExposure:
 
 @dataclass(frozen=True)
 class HoldoutVintage:
-    """一个封存或已消费的数据区间。"""
+    """一个封存、已消费或已废弃的数据区间。"""
 
     vintage_id: str
     market_id: str
@@ -89,6 +132,8 @@ class HoldoutVintage:
     evaluation_id: str | None
     verdict: str | None
     verdict_recorded_at: datetime | None
+    abandoned_at: datetime | None = None
+    abandon_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1790,6 +1835,17 @@ def _terminal_invariant_violation(
     connection: sqlite3.Connection,
 ) -> sqlite3.Row | None:
     """查找 vintage 与 evaluation attempt 的跨表非法终态。"""
+    # v9 前物理表无废弃列，不查废弃终态
+    abandon_clause = """
+          OR
+          (v.status='abandoned' AND (
+            a.evaluation_id IS NOT NULL
+            OR v.abandoned_at IS NULL
+            OR v.abandon_reason IS NULL
+            OR v.consumed_at IS NOT NULL
+            OR v.verdict IS NOT NULL
+          ))
+    """ if _holdout_vintage_supports_abandon(connection) else ""
     row: sqlite3.Row | None = connection.execute(
         """
         SELECT v.vintage_id
@@ -1807,6 +1863,7 @@ def _terminal_invariant_violation(
             OR (v.verdict IS NOT NULL AND a.status<>'completed')
             OR ((v.verdict IS NULL)<>(v.verdict_recorded_at IS NULL))
           ))
+        """ + abandon_clause + """
         LIMIT 1
         """
     ).fetchone()
@@ -1821,13 +1878,82 @@ def _has_missing_policy_column(connection: sqlite3.Connection) -> bool:
     return any(str(row[1]) == "missing_policy" for row in rows)
 
 
+def _holdout_vintage_supports_abandon(
+    connection: sqlite3.Connection,
+) -> bool:
+    """检查封存段表是否已有废弃列与废弃状态约束。"""
+    columns = {
+        str(row[1]) for row in connection.execute(
+            "PRAGMA table_info(holdout_vintage)"
+        ).fetchall()
+    }
+    if not {"abandoned_at", "abandon_reason"}.issubset(columns):
+        return False
+    schema_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' "
+        "AND name='holdout_vintage'"
+    ).fetchone()
+    normalized = "" if schema_row is None else "".join(
+        str(schema_row[0]).lower().split()
+    )
+    return "'abandoned'" in normalized
+
+
+def _rebuild_holdout_vintage_for_abandon(
+    connection: sqlite3.Connection,
+) -> None:
+    """在写事务内按 v9 定义重建封存段表并保留全部旧行。"""
+    if not connection.in_transaction:
+        raise ValueError("封存段表重建必须在写事务内执行")
+    # CHECK 不可改，只能重建
+    existing_columns = {
+        str(row[1]) for row in connection.execute(
+            "PRAGMA table_info(holdout_vintage)"
+        ).fetchall()
+    }
+    if not set(_HOLDOUT_VINTAGE_V8_COLUMNS).issubset(existing_columns):
+        raise ValueError("治理库 holdout_vintage 表结构不兼容")
+    copied = list(_HOLDOUT_VINTAGE_V8_COLUMNS)
+    for name in ("abandoned_at", "abandon_reason"):
+        if name in existing_columns:
+            copied.append(name)
+    column_list = ",".join(copied)
+    # 子表外键延迟到提交时校验
+    connection.execute("PRAGMA defer_foreign_keys=ON")
+    connection.execute("DROP TABLE IF EXISTS holdout_vintage_legacy_copy")
+    connection.execute(
+        "CREATE TABLE holdout_vintage_legacy_copy AS "
+        "SELECT " + column_list + " FROM holdout_vintage"
+    )
+    before = int(connection.execute(
+        "SELECT COUNT(*) FROM holdout_vintage_legacy_copy"
+    ).fetchone()[0])
+    connection.execute("DROP TABLE holdout_vintage")
+    connection.execute(_HOLDOUT_VINTAGE_DDL)
+    connection.execute(
+        "INSERT INTO holdout_vintage(" + column_list + ") "
+        "SELECT " + column_list + " FROM holdout_vintage_legacy_copy"
+    )
+    connection.execute("DROP TABLE holdout_vintage_legacy_copy")
+    connection.execute(_HOLDOUT_VINTAGE_RANGE_INDEX_DDL)
+    after = int(connection.execute(
+        "SELECT COUNT(*) FROM holdout_vintage"
+    ).fetchone()[0])
+    if before != after:
+        raise ValueError("封存段表重建后行数不一致")
+    if connection.execute("PRAGMA foreign_key_check").fetchall():
+        raise ValueError("封存段表重建后外键不一致")
+    if not _holdout_vintage_supports_abandon(connection):
+        raise ValueError("封存段表重建后仍不支持废弃状态")
+
+
 def _upgrade_governance_state(
     connection: sqlite3.Connection,
     existing_version: str | None,
 ) -> None:
     """原子升级治理库，并把旧 consumed 记录变成可解释 incomplete 尝试。"""
     supported = {
-        None, "1", "2", "3", "4", "5", "6", "7",
+        None, "1", "2", "3", "4", "5", "6", "7", "8",
         str(GOVERNANCE_SCHEMA_VERSION),
     }
     if existing_version not in supported:
@@ -1843,11 +1969,21 @@ def _upgrade_governance_state(
     ).fetchone()[0])
     needs_upgrade = existing_version != str(GOVERNANCE_SCHEMA_VERSION)
     policy_column_missing = not _has_missing_policy_column(connection)
-    if needs_upgrade or orphan_count or policy_column_missing:
+    abandon_missing = not _holdout_vintage_supports_abandon(connection)
+    if (
+        needs_upgrade or orphan_count or policy_column_missing
+        or abandon_missing
+    ):
         owns_transaction = not connection.in_transaction
         if owns_transaction:
             connection.execute("BEGIN IMMEDIATE")
         try:
+            # 获写锁后复查，避免并发重复重建
+            if abandon_missing and not _holdout_vintage_supports_abandon(
+                connection,
+            ):
+                # v9 重建封存段表，旧行不变
+                _rebuild_holdout_vintage_for_abandon(connection)
             # 获写锁后复查，避免并发重复加列
             if policy_column_missing and not _has_missing_policy_column(
                 connection,
@@ -2349,9 +2485,13 @@ def _validate_pinned_read_schema(
     policy_probes = (
         "SELECT missing_policy FROM frozen_forward_plan LIMIT 0",
     ) if ceiling >= 8 else ()
+    abandon_probes = (
+        "SELECT abandoned_at,abandon_reason FROM holdout_vintage LIMIT 0",
+    ) if ceiling >= 9 else ()
     try:
         for statement in (
             *probes, *suite_probes, *suite_prediction_probes, *policy_probes,
+            *abandon_probes,
         ):
             connection.execute(statement)
         violation = _terminal_invariant_violation(connection)
@@ -2402,6 +2542,9 @@ def _connect(
         raise
     connection.execute("PRAGMA journal_mode=WAL")
     connection.execute("PRAGMA synchronous=FULL")
+    # 封存段表定义单独维护，旧库由升级重建
+    connection.execute(_HOLDOUT_VINTAGE_DDL)
+    connection.execute(_HOLDOUT_VINTAGE_RANGE_INDEX_DDL)
     connection.executescript(
         """
         CREATE TABLE IF NOT EXISTS governance_meta (
@@ -2416,28 +2559,6 @@ def _connect(
           end_time TEXT NOT NULL,
           recorded_at TEXT NOT NULL
         );
-        CREATE TABLE IF NOT EXISTS holdout_vintage (
-          vintage_id TEXT PRIMARY KEY,
-          market_id TEXT NOT NULL,
-          start_time TEXT NOT NULL,
-          end_time TEXT NOT NULL,
-          sealed_at TEXT NOT NULL,
-          status TEXT NOT NULL CHECK(status IN ('sealed','consumed')),
-          consumed_at TEXT,
-          candidate_set_hash TEXT,
-          evaluation_id TEXT,
-          verdict TEXT,
-          verdict_recorded_at TEXT,
-          CHECK(
-            (status='sealed' AND consumed_at IS NULL
-             AND candidate_set_hash IS NULL AND evaluation_id IS NULL)
-            OR
-            (status='consumed' AND consumed_at IS NOT NULL
-             AND candidate_set_hash IS NOT NULL AND evaluation_id IS NOT NULL)
-          )
-        );
-        CREATE UNIQUE INDEX IF NOT EXISTS holdout_vintage_range
-          ON holdout_vintage(market_id,start_time,end_time);
         CREATE TABLE IF NOT EXISTS frozen_forward_plan (
           plan_id TEXT PRIMARY KEY,
           vintage_id TEXT NOT NULL UNIQUE,
@@ -2859,8 +2980,10 @@ def seal_holdout_vintage(
             raise ValueError(
                 "封存段已被自适应研究读取: " + str(exposed["exposure_id"])
             )
+        # 已废弃 vintage 不再阻挡新封存
         overlap = connection.execute(
             "SELECT vintage_id FROM holdout_vintage WHERE "
+            "status<>'abandoned' AND "
             + _overlap_clause() + " LIMIT 1",
             (market_id, _timestamp(end), _timestamp(start)),
         ).fetchone()
@@ -2873,6 +2996,28 @@ def seal_holdout_vintage(
                 connection.execute("COMMIT")
                 return _vintage_from_row(existing)
             raise ValueError("封存段与既有 vintage 重叠: " + str(overlap["vintage_id"]))
+        # 新段起点不得早于重叠废弃段的废弃时刻
+        abandoned_rows = connection.execute(
+            "SELECT vintage_id,abandoned_at FROM holdout_vintage WHERE "
+            "status='abandoned' AND "
+            + _overlap_clause() + " ORDER BY abandoned_at,vintage_id",
+            (market_id, _timestamp(end), _timestamp(start)),
+        ).fetchall()
+        for abandoned in abandoned_rows:
+            abandoned_at = _parse_timestamp(str(abandoned["abandoned_at"]))
+            if start < abandoned_at:
+                raise ValueError(
+                    "封存段起点早于重叠废弃 vintage 的废弃时刻: "
+                    + str(abandoned["vintage_id"])
+                )
+        same_identity = connection.execute(
+            "SELECT vintage_id FROM holdout_vintage WHERE vintage_id=?",
+            (vintage_id,),
+        ).fetchone()
+        if same_identity is not None:
+            raise ValueError(
+                "同一区间的 vintage 已废弃，不得重新封存: " + vintage_id
+            )
         connection.execute(
             "INSERT INTO holdout_vintage("
             "vintage_id,market_id,start_time,end_time,sealed_at,status"
@@ -2901,6 +3046,60 @@ def seal_holdout_vintage(
     return _vintage_from_row(row)
 
 
+def abandon_holdout_vintage(
+    registry_path: Path,
+    vintage_id: str,
+    reason: str,
+) -> HoldoutVintage:
+    """显式废弃从未开始评估的 sealed vintage 并留痕。"""
+    normalized = reason.strip()
+    if not normalized:
+        raise ValueError("废弃 vintage 必须写明理由")
+    abandoned = clock.utc_now()
+    connection = _connect(registry_path, write=True)
+    try:
+        _begin(connection)
+        vintage = connection.execute(
+            "SELECT * FROM holdout_vintage WHERE vintage_id=?", (vintage_id,),
+        ).fetchone()
+        if vintage is None:
+            raise LookupError(f"封存段不存在: {vintage_id}")
+        status = str(vintage["status"])
+        if status == "abandoned":
+            # 同理由重复调用幂等
+            if str(vintage["abandon_reason"]) != normalized:
+                raise ValueError(f"vintage 已以不同理由废弃: {vintage_id}")
+            connection.execute("COMMIT")
+            return _vintage_from_row(vintage)
+        if status != "sealed":
+            raise ValueError(f"只有 sealed vintage 可以废弃: {vintage_id}")
+        attempt = connection.execute(
+            "SELECT evaluation_id FROM holdout_evaluation_attempt "
+            "WHERE vintage_id=? LIMIT 1",
+            (vintage_id,),
+        ).fetchone()
+        if attempt is not None:
+            raise ValueError(f"vintage 已开始评估，不得废弃: {vintage_id}")
+        connection.execute(
+            "UPDATE holdout_vintage SET status='abandoned',abandoned_at=?,"
+            "abandon_reason=? WHERE vintage_id=? AND status='sealed'",
+            (_timestamp(abandoned), normalized, vintage_id),
+        )
+        row = connection.execute(
+            "SELECT * FROM holdout_vintage WHERE vintage_id=?", (vintage_id,),
+        ).fetchone()
+        connection.execute("COMMIT")
+    except BaseException:
+        if connection.in_transaction:
+            connection.execute("ROLLBACK")
+        raise
+    finally:
+        connection.close()
+    if row is None:
+        raise RuntimeError("封存段废弃写入后不可见")
+    return _vintage_from_row(row)
+
+
 def start_holdout_evaluation_attempt(
     registry_path: Path,
     vintage_id: str,
@@ -2919,6 +3118,8 @@ def start_holdout_evaluation_attempt(
         ).fetchone()
         if vintage is None:
             raise LookupError(f"封存段不存在: {vintage_id}")
+        if vintage["status"] == "abandoned":
+            raise ValueError(f"vintage 已废弃，不得评估: {vintage_id}")
         if vintage["status"] != "sealed":
             raise ValueError(f"封存段已经消费: {vintage_id}")
         try:
@@ -3300,6 +3501,8 @@ def register_frozen_forward_plan(
         ).fetchone()
         if vintage is None:
             raise LookupError(f"封存段不存在: {vintage_id}")
+        if vintage["status"] == "abandoned":
+            raise ValueError("vintage 已废弃，不得绑定冻结前向计划")
         if vintage["status"] != "sealed":
             raise ValueError("冻结前向计划只能绑定未消费 vintage")
         if frozen >= _parse_timestamp(str(vintage["start_time"])):
@@ -3422,6 +3625,8 @@ def register_interval_suite_forward_plan(
         ).fetchone()
         if vintage is None:
             raise LookupError(f"封存段不存在: {vintage_id}")
+        if vintage["status"] == "abandoned":
+            raise ValueError("vintage 已废弃，不得绑定套件冻结前向计划")
         if vintage["status"] != "sealed":
             raise ValueError("套件冻结前向计划只能绑定未消费 vintage")
         if frozen >= _parse_timestamp(str(vintage["start_time"])):
@@ -3520,6 +3725,8 @@ def register_interval_suite_forward_prediction(
         vintage = connection.execute(
             "SELECT * FROM holdout_vintage WHERE vintage_id=?", (vintage_id,),
         ).fetchone()
+        if vintage is not None and vintage["status"] == "abandoned":
+            raise ValueError("vintage 已废弃，不得追加套件冻结预测")
         if vintage is None or vintage["status"] != "sealed":
             raise ValueError("套件冻结预测只能写入未消费 vintage")
         start = _parse_timestamp(str(vintage["start_time"]))
@@ -3709,6 +3916,8 @@ def register_frozen_forward_prediction(
         vintage = connection.execute(
             "SELECT * FROM holdout_vintage WHERE vintage_id=?", (vintage_id,),
         ).fetchone()
+        if vintage is not None and vintage["status"] == "abandoned":
+            raise ValueError("vintage 已废弃，不得追加冻结前向预测")
         if vintage is None or vintage["status"] != "sealed":
             raise ValueError("冻结前向预测只能写入未消费 vintage")
         start = _parse_timestamp(str(vintage["start_time"]))
@@ -3983,6 +4192,16 @@ def _vintage_from_row(row: sqlite3.Row) -> HoldoutVintage:
     status = str(row["status"])
     if status not in _VINTAGE_STATUSES:
         raise ValueError(f"未知 holdout vintage 状态: {status}")
+    # 冻结在 v9 前的旧库没有废弃列
+    columns = set(row.keys())
+    abandoned_at = (
+        _optional_time(row["abandoned_at"])
+        if "abandoned_at" in columns else None
+    )
+    abandon_reason = (
+        _optional_text(row["abandon_reason"])
+        if "abandon_reason" in columns else None
+    )
     return HoldoutVintage(
         vintage_id=str(row["vintage_id"]),
         market_id=str(row["market_id"]),
@@ -3995,6 +4214,8 @@ def _vintage_from_row(row: sqlite3.Row) -> HoldoutVintage:
         evaluation_id=_optional_text(row["evaluation_id"]),
         verdict=_optional_text(row["verdict"]),
         verdict_recorded_at=_optional_time(row["verdict_recorded_at"]),
+        abandoned_at=abandoned_at,
+        abandon_reason=abandon_reason,
     )
 
 

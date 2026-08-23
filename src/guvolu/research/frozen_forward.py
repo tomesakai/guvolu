@@ -295,6 +295,8 @@ def freeze_forward_plan(
     vintage = get_holdout_vintage(registry_path, vintage_id)
     if vintage.market_id != _text(config.get("market_id"), "market_id"):
         raise ValueError("vintage 与配置市场不一致")
+    if vintage.status == "abandoned":
+        raise ValueError("vintage 已废弃，不得绑定冻结前向计划")
     if vintage.status != "sealed":
         raise ValueError("冻结前向计划只能绑定未消费 vintage")
     timestamp = clock.utc_now()
@@ -748,6 +750,8 @@ def run_frozen_forward_prediction(
     if not identity.decision_grade or identity.tree_digest != plan.code_tree_digest:
         raise ValueError("预测执行器必须是冻结计划的 clean code tree")
     vintage = get_holdout_vintage(registry_path, plan.vintage_id)
+    if vintage.status == "abandoned":
+        raise ValueError("vintage 已废弃，不得追加前向预测")
     if vintage.status != "sealed":
         raise ValueError("已消费 vintage 不得追加前向预测")
     market_id = _text(config.get("market_id"), "market_id")

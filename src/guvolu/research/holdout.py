@@ -713,6 +713,8 @@ def run_holdout_validation(
     vintage = get_holdout_vintage(registry_path, vintage_id)
     if vintage.market_id != market_id:
         raise ValueError("vintage 与配置市场不一致")
+    if vintage.status == "abandoned":
+        raise ValueError("vintage 已废弃，禁止 holdout 评估")
     if vintage.status != "sealed":
         raise ValueError("vintage 已经消费，禁止重跑 holdout")
     inputs = capture_trade_input_receipt(
