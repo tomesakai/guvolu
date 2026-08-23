@@ -117,6 +117,38 @@ def _node_value(
     raise ValueError(f"SearchPlan 操作不受支持: {op}")
 
 
+def _reachable_nodes(
+    plan: Mapping[str, object],
+    roots: Mapping[str, object],
+) -> set[str]:
+    """返回所选流派根节点可达的节点集合。"""
+    arguments_by_id: dict[str, list[str]] = {}
+    for raw_node in _array(plan.get("nodes"), "nodes"):
+        node = _object(raw_node, "node")
+        arguments_by_id[_text(node.get("node_id"), "node.node_id")] = [
+            _text(value, "node.arg")
+            for value in _array(node.get("args"), "node.args")
+        ]
+    stack = [
+        _text(value, "roots.required")
+        for value in _array(roots.get("required"), "roots.required")
+    ]
+    for name in ("entry", "exit", "target"):
+        value = roots.get(name)
+        if value is not None:
+            stack.append(_text(value, f"roots.{name}"))
+    reachable: set[str] = set()
+    while stack:
+        node_id = stack.pop()
+        if node_id in reachable:
+            continue
+        reachable.add(node_id)
+        if node_id not in arguments_by_id:
+            raise ValueError(f"SearchPlan 根节点未登记: {node_id}")
+        stack.extend(arguments_by_id[node_id])
+    return reachable
+
+
 def evaluate_search_plan_candidate(
     plan: Mapping[str, object],
     candidate_id: str,
@@ -156,12 +188,18 @@ def evaluate_search_plan_candidate(
     if len(parameter_names) != len(parameter_values):
         raise ValueError("SearchPlan 参数列与数值数量不一致")
     parameters = dict(zip(parameter_names, parameter_values, strict=True))
+    roots = _object(selected_family.get("roots"), "roots")
+    reachable = _reachable_nodes(plan, roots)
     computed: dict[str, float | bool | None] = {}
+    seen: set[str] = set()
     for raw_node in _array(plan.get("nodes"), "nodes"):
         node = _object(raw_node, "node")
         node_id = _text(node.get("node_id"), "node.node_id")
-        if node_id in computed:
+        if node_id in seen:
             raise ValueError("SearchPlan node_id 重复")
+        seen.add(node_id)
+        if node_id not in reachable:
+            continue
         argument_ids = [
             _text(value, "node.arg")
             for value in _array(node.get("args"), "node.args")
@@ -173,7 +211,6 @@ def evaluate_search_plan_candidate(
         computed[node_id] = _node_value(
             node, arguments, parameters, bar, feature,
         )
-    roots = _object(selected_family.get("roots"), "roots")
 
     def root_value(name: str) -> float | bool | None:
         value = roots.get(name)
