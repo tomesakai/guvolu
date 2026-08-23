@@ -5,7 +5,6 @@
 """
 from __future__ import annotations
 
-import sqlite3
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -19,6 +18,7 @@ from guvolu.research.panel import (
     panel_inputs_payload,
     parse_time,
 )
+from guvolu.research.panel_limit import sealed_vintages_overlapping
 from guvolu.strategy.contracts import FeatureRow, ResearchBar
 
 PANEL_SOURCE_METHOD_VERSION = "search-loop-panel-source-v1"
@@ -90,42 +90,6 @@ def enforce_to_time(
                 + bar.latest_available_time.isoformat()
             )
     return tuple(bars)
-
-
-def sealed_vintages_overlapping(
-    registry_path: Path,
-    market_id: str,
-    start_time: datetime,
-    end_time: datetime,
-) -> tuple[str, ...]:
-    """以只读连接列出与区间重叠的未消费封存段。"""
-    if not registry_path.exists():
-        return ()
-    uri = f"file:{registry_path.resolve().as_posix()}?mode=ro"
-    connection = sqlite3.connect(uri, uri=True)
-    try:
-        present = connection.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' "
-            "AND name='holdout_vintage'"
-        ).fetchone()
-        if present is None:
-            return ()
-        rows = connection.execute(
-            "SELECT vintage_id,start_time,end_time FROM holdout_vintage "
-            "WHERE market_id=? AND status='sealed' ORDER BY start_time,vintage_id",
-            (market_id,),
-        ).fetchall()
-    finally:
-        connection.close()
-    start = _utc(start_time)
-    end = _utc(end_time)
-    overlapping: list[str] = []
-    for vintage_id, raw_start, raw_end in rows:
-        vintage_start = _utc(datetime.fromisoformat(str(raw_start)))
-        vintage_end = _utc(datetime.fromisoformat(str(raw_end)))
-        if vintage_start < end and start < vintage_end:
-            overlapping.append(str(vintage_id))
-    return tuple(overlapping)
 
 
 def resolve_panel_to_time(

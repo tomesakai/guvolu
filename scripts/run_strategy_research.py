@@ -6,12 +6,21 @@ import json
 from pathlib import Path
 from typing import Sequence
 
+from guvolu.research.panel import parse_time
 from guvolu.research.pipeline import run_research
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     """执行 CPU 研究并打印制品位置。"""
     parser = argparse.ArgumentParser(description="运行策略研究管线")
+    parser.add_argument(
+        "--to-time",
+        dest="to_time",
+        help=(
+            "面板截止上限（ISO8601 UTC）；覆盖配置 "
+            "data_governance.panel_to_time 且只能更早"
+        ),
+    )
     parser.add_argument("--root", type=Path, default=Path.cwd())
     parser.add_argument(
         "--config",
@@ -41,8 +50,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     data_root = arguments.data_root
     if data_root is not None and not data_root.is_absolute():
         data_root = root / data_root
+    to_time = (
+        None if arguments.to_time is None
+        else parse_time(arguments.to_time, "--to-time")
+    )
     result = run_research(
-        root, config, output, arguments.families, data_root=data_root,
+        root,
+        config,
+        output,
+        arguments.families,
+        data_root=data_root,
+        panel_to_time=to_time,
     )
     print(json.dumps({
         "run_id": result.run_id,
