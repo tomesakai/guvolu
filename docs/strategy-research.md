@@ -346,7 +346,12 @@ Windows 计划任务 `guvolu-frozen-forward-61c0c4cab6c5` 已登记为从 2026-0
 和 dry-run 执行器。调度层结果追加到
 `logs/research/frozen-forward/shadow-scheduler.jsonl`；逐周期 shadow 结果追加到独立执行仓
 `data/execution/shadow/frozen-forward/task.jsonl`，意图状态另记内容寻址报告与 append-only
-ledger。相同 `prediction_id` 重跑必须复用既有报告，不得重复追加意图。
+ledger。相同 `prediction_id` 重跑必须复用既有报告，不得重复追加意图。dry-run 报告校验
+通过后，任务再以 `--mode paper` 生成独立的 paper 目标快照并运行执行仓 paper 执行器，paper
+意图账本、持仓账、差异账、认领账与报告固定在执行仓 `data/execution/paper/`，与 shadow 账本
+分离；paper 报告必须为 `paper` 模式且 `write_touched=[]`，其终态、模型成交与成本摘要记入
+`task.jsonl` 的 `paper` 字段。paper 步骤失败只记 `paper.status=failed`，不改变当期预测与
+dry-run 登记结果及退出码；`--no-paper`（任务包装器 `-NoPaper`）可关闭该步骤。
 
 当前 Windows 权限策略拒绝无密码 `S4U` 注册，任务只能在用户登录期间运行；关机或注销
 超过两小时会造成不可补算的预测缺口，必须由每日健康巡检报警。任何 E 盘身份/哨兵失败、
