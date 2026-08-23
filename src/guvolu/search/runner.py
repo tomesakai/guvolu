@@ -35,17 +35,28 @@ from guvolu.search.ledger import (
     ledger_header,
     read_ledger,
 )
-from guvolu.search.metrics import METRICS_METHOD_VERSION, chunk_metrics
+from guvolu.search.metrics import (
+    METRICS_METHOD_VERSION,
+    chunk_metrics,
+    strategy_returns_tensor,
+)
 from guvolu.search.parity import (
     ParityTolerance,
     compare_parity,
     exact_reference,
 )
+from guvolu.search.resample import (
+    ResampleMetrics,
+    ResampleScreen,
+    ResampleSpec,
+    fold_payload,
+    resample_chunk,
+)
 from guvolu.search.scan import SCAN_METHOD_VERSION, scan_targets
 from guvolu.search.tensorize import array_bytes, array_from_bytes
 from guvolu.search.torch_runtime import runtime_identity, torch_module
 from guvolu.strategy.contracts import CandidateSpec, FeatureRow, ResearchBar
-from guvolu.strategy.expression import Unit, strategy_expression
+from guvolu.strategy.expression import StrategyExpression, Unit, strategy_expression
 
 RUNNER_METHOD_VERSION = "searchfast-runner-v1"
 SEARCH_RESULT_SCHEMA_VERSION = 1
@@ -111,6 +122,8 @@ class EvaluationOptions:
     scan_method: str = "parallel"
     seed: int = 0
     screen: ScreenConfig = ScreenConfig()
+    resample: ResampleSpec | None = None
+    resample_screen: ResampleScreen = ResampleScreen()
 
     def payload(self) -> Mapping[str, object]:
         """导出运行参数。"""
@@ -123,6 +136,12 @@ class EvaluationOptions:
             "seed": self.seed,
             "precision": PRECISION,
             "screen": self.screen.payload(),
+            "resample": (
+                None if self.resample is None else self.resample.payload()
+            ),
+            "resample_screen": (
+                None if self.resample is None else self.resample_screen.payload()
+            ),
         }
 
 
@@ -172,9 +191,11 @@ def candidate_from_plan(
     family: FamilyPlan,
     row_index: int,
     expression_id: str | None = None,
+    template: StrategyExpression | None = None,
 ) -> CandidateSpec:
     """由 SearchPlan 参数行重建候选规格，供精确复算。"""
-    template = strategy_expression(family.family)
+    if template is None:
+        template = strategy_expression(family.family)
     parameters: dict[str, int | float] = {}
     for name, value in zip(family.parameter_names, family.parameter_rows[row_index], strict=True):
         expected = template.parameter_types.get(name)
@@ -184,7 +205,7 @@ def candidate_from_plan(
             parameters[name] = float(value)
     return CandidateSpec(
         candidate_id=family.candidate_ids[row_index],
-        family=family.family,
+        family=template.family,
         mode=family.mode,
         parameters=parameters,
         complexity=len(parameters),
@@ -232,6 +253,7 @@ def evaluate_bundle(
     rejected = 0
     screened = 0
     bar_count = bundle.panel.bar_count
+    folds_record: list[Mapping[str, object]] | None = None
     for family in session.families:
         family_started = time.perf_counter()
         accepted_rows: list[int] = []
@@ -269,12 +291,31 @@ def evaluate_bundle(
             )
             metrics = chunk_metrics(session, targets, bundle.cost_model)
             metric_rows = metrics.rows()
+            resample_rows: tuple[Mapping[str, object], ...] | None = None
+            if options.resample is not None:
+                returns, _turnover, _held = strategy_returns_tensor(
+                    session, targets, bundle.cost_model,
+                )
+                resampled: ResampleMetrics = resample_chunk(
+                    session,
+                    family.family,
+                    returns,
+                    options.resample,
+                    _periods_per_year(bundle),
+                )
+                resample_rows = resampled.rows()
+                if folds_record is None:
+                    folds_record = fold_payload(resampled.folds)
             targets_store.frombytes(_tensor_f32_bytes(targets))
             chunk_rows: list[LedgerRow] = []
             for offset, row_index in enumerate(subset):
                 candidate_id = family.candidate_ids[row_index]
                 row_metrics = metric_rows[offset]
                 passed = options.screen.passes(row_metrics)
+                row_resample: Mapping[str, object] | None = None
+                if resample_rows is not None:
+                    row_resample = resample_rows[offset]
+                    passed = passed and options.resample_screen.passes(row_resample)
                 screened += 1
                 accepted_ids.append(candidate_id)
                 evaluation_id = evaluation_identifier(candidate_id, bundle.identity)
@@ -290,14 +331,18 @@ def evaluate_bundle(
                     parity=None,
                     screen_passed=passed,
                     promotable=False,
+                    resample=row_resample,
                 ))
-                evaluations.append({
+                evaluation: dict[str, object] = {
                     "evaluation_id": evaluation_id,
                     "candidate_id": candidate_id,
                     "family": family.family,
                     "screen_passed": passed,
                     "metrics": dict(row_metrics),
-                })
+                }
+                if row_resample is not None:
+                    evaluation["resample"] = dict(row_resample)
+                evaluations.append(evaluation)
             ledger.append_rows(chunk_rows)
         if options.device.startswith("cuda"):
             torch.cuda.synchronize()
@@ -331,6 +376,7 @@ def evaluate_bundle(
         "rejected_count": rejected,
         "screened_count": screened,
         "bar_count": bar_count,
+        "folds": folds_record,
         "families": families_payload,
         "evaluations": evaluations,
         "trial_ledger": {
@@ -409,6 +455,17 @@ def _write_targets(
     return {"file": name, "sha256": digest, "count": len(values), "typecode": "f"}
 
 
+def _row_sharpe(row: Mapping[str, object]) -> float:
+    """读取台账行的粗筛 Sharpe，缺失记为负无穷。"""
+    metrics = row.get("metrics")
+    if not isinstance(metrics, Mapping):
+        return -math.inf
+    value = metrics.get("sharpe")
+    if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        return -math.inf
+    return float(value)
+
+
 def search_result_identifier(body: Mapping[str, object]) -> str:
     """SearchResult 身份绑定评估内容与运行时，不含墙钟计时。"""
     identity_body = {
@@ -464,8 +521,14 @@ def run_parity(
     features: Sequence[FeatureRow],
     tolerance: ParityTolerance,
     only_screen_passed: bool = True,
+    templates: Mapping[str, StrategyExpression] | None = None,
+    candidate_limit: int | None = None,
 ) -> Path:
-    """对晋级候选做 CPU 精确复算并登记数值对照。"""
+    """对晋级候选做 CPU 精确复算并登记数值对照。
+
+    `templates` 按计划流派标签给出未注册 challenger 的表达式；
+    `candidate_limit` 为复算上限，按粗筛 Sharpe 降序截取。
+    """
     manifest = load_search_result(result_directory)
     if manifest.get("bundle_id") != bundle.bundle_id:
         raise ValueError("SearchResult 与搜索束身份不一致")
@@ -503,19 +566,26 @@ def run_parity(
     passed_count = 0
     worst = {"target": 0.0, "sharpe": 0.0, "turnover": 0.0}
     output_rows: list[LedgerRow] = []
-    for row in rows:
-        if row.get("stage") != STAGE_F1_SCREENED:
-            continue
-        if only_screen_passed and not bool(row.get("screen_passed")):
-            continue
+    selected_rows = [
+        row for row in rows
+        if row.get("stage") == STAGE_F1_SCREENED
+        and (not only_screen_passed or bool(row.get("screen_passed")))
+    ]
+    if candidate_limit is not None:
+        selected_rows.sort(key=lambda row: (
+            -_row_sharpe(row), str(row.get("candidate_id")),
+        ))
+        selected_rows = selected_rows[:max(candidate_limit, 0)]
+    for row in selected_rows:
         candidate_id = str(row.get("candidate_id"))
         family = families[str(row.get("family"))]
         row_index = family.candidate_ids.index(candidate_id)
+        template = None if templates is None else templates.get(family.family)
         candidate = candidate_from_plan(
-            family, row_index, expression_ids.get(family.family),
+            family, row_index, expression_ids.get(family.family), template,
         )
         reference_targets, reference = exact_reference(
-            candidate, bars, features, bundle.cost_model,
+            candidate, bars, features, bundle.cost_model, template,
         )
         metrics = row.get("metrics")
         if not isinstance(metrics, Mapping):
@@ -536,7 +606,7 @@ def run_parity(
         output_rows.append(LedgerRow(
             evaluation_id=str(row.get("evaluation_id")),
             candidate_id=candidate_id,
-            family=candidate.family,
+            family=family.family,
             bundle_id=bundle.bundle_id,
             stage=STAGE_F3_EXACT if result.passed else STAGE_F1_SCREENED,
             device="cpu",
@@ -553,6 +623,7 @@ def run_parity(
         "search_result_id": manifest.get("search_result_id"),
         "bundle_id": bundle.bundle_id,
         "tolerance": tolerance.payload(),
+        "candidate_limit": candidate_limit,
         "checked": checked,
         "passed": passed_count,
         "failed": checked - passed_count,
