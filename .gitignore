@@ -39,3 +39,4 @@ dist/
 Thumbs.db
 .idea/
 .vscode/
+.venv-gpu/
