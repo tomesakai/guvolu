@@ -7,7 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 REGISTRY = ROOT / "docs" / "00-rules-registry.md"
 
 # 扫描排除目录，含外部引入资料
-EXCLUDE = {".git", "__pycache__", ".venv", "venv", "node_modules",
+EXCLUDE = {".git", "__pycache__", ".venv", ".venv-gpu", "venv", "node_modules",
            ".pytest_cache", ".mypy_cache", ".ruff_cache",
            "gpu-factor-mining-v1.1", "outsides"}
 
