@@ -149,6 +149,20 @@ def test_build_proposal_constrained_grid_and_budget() -> None:
     assert trend["anchor"]["candidate_id"] == anchor.candidate_id
     assert set(trend["axis_evidence"]) == {"lookback", "entry_score"}
     assert "48" in trend["axis_evidence"]["lookback"] or "48.0" in trend["axis_evidence"]["lookback"]
+    out_of_bounds = {anchor.candidate_id, _candidate(240, 1.0).candidate_id}
+    sharpes[_candidate(240, 1.0).candidate_id] = 5.0
+    trial_b, parity_b = _rows(items, sharpes, out_of_bounds)
+    bounded = build_proposal(
+        "search-run-test",
+        {"research_config": {"path": "config/x.json", "sha256": "0" * 64}},
+        RESEARCH,
+        _Candidates(items),
+        trial_b,
+        parity_b,
+        thresholds,
+    )
+    assert bounded["families"]["trend"]["anchor"]["candidate_id"] == anchor.candidate_id
+    assert bounded["families"]["trend"]["summary"]["exact_within_constraints"] == 1
     no_exact = build_proposal(
         "search-run-test",
         {"research_config": {"path": "config/x.json", "sha256": "0" * 64}},

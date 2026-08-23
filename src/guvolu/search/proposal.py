@@ -315,6 +315,19 @@ def _constraint_bounds(
     )
 
 
+def _within_constraints(
+    research_config: Mapping[str, object],
+    family: str,
+    parameters: Mapping[str, int | float],
+) -> bool:
+    """候选各轴取值均在 evolution.constraints 之内。"""
+    for name, value in parameters.items():
+        bounds = _constraint_bounds(research_config, family, name)
+        if bounds is not None and (float(value) < bounds[0] or float(value) > bounds[1]):
+            return False
+    return True
+
+
 def _research_budget(research_config: Mapping[str, object], fallback: int) -> int:
     """读取研究配置的每流派候选预算。"""
     evolution = research_config.get("evolution")
@@ -391,17 +404,28 @@ def _family_proposal(
         for candidate_id, item in family_evidence.items()
     }
     exact = [item for item in family_evidence.values() if item.exact]
-    flat_exact = [item for item in exact if flat_by_id[item.candidate.candidate_id].flat]
+    within = [
+        item for item in exact
+        if _within_constraints(research_config, family, item.candidate.parameters)
+    ]
+    flat_exact = [item for item in within if flat_by_id[item.candidate.candidate_id].flat]
     summary = {
         "evaluated": len(family_evidence),
         "screen_passed": sum(item.screen_passed for item in family_evidence.values()),
         "exact": len(exact),
+        "exact_within_constraints": len(within),
         "flat_exact": len(flat_exact),
     }
     if not flat_exact:
+        if not exact:
+            reason = "no_exact_candidate"
+        elif not within:
+            reason = "no_exact_candidate_within_constraints"
+        else:
+            reason = "no_exact_flat_candidate"
         return {
             "status": STATUS_NO_PROPOSAL,
-            "reason": "no_exact_flat_candidate" if exact else "no_exact_candidate",
+            "reason": reason,
             "summary": summary,
             "current_strategy": dict(strategy),
         }

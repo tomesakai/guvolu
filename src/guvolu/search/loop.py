@@ -606,6 +606,7 @@ def run_search_loop(
         load_governed_strategy_config(root, loop.research_config_path)
     )
     candidates = generate_loop_candidates(research_config, config_hash, loop)
+    identity = code_identity(root, (loop.research_config_path, loop.path))
     run_root = loop.output_root / f"search-run.partial-{int(time.time())}"
     run_root.mkdir(parents=True, exist_ok=False)
     if synthetic:
@@ -621,7 +622,6 @@ def run_search_loop(
     panel_elapsed = time.perf_counter() - started
     spec: ResampleSpec = resample_spec_from_config(research_config)
     cost_model = loop_cost_model(research_config)
-    identity = code_identity(root, (loop.research_config_path, loop.path))
     tensor = tensorize_panel(panel.bars, panel.features, candidates.lookbacks)
     bundle: SearchBundle = build_search_bundle(
         tensor,
