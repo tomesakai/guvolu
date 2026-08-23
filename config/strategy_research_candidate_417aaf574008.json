@@ -1,0 +1,269 @@
+{
+  "schema_version": 1,
+  "pipeline_version": "strategy-research-cpu-v9",
+  "market_id": "mkt__gmo__btc__r0",
+  "bar_interval": "1hour",
+  "from_time": "2019-01-01T00:00:00+00:00",
+  "notional_scale": 100000000,
+  "strategy_decision_max_age_seconds": 3900,
+  "data_governance": {
+    "scope": "DEV_ADAPTIVE",
+    "registry": "data/research/governance.sqlite3",
+    "holdout_policy": {
+      "minimum_bars": 2160,
+      "minimum_sharpe": 0.0,
+      "maximum_drawdown": 0.45,
+      "maximum_fdr_q": 0.2,
+      "require_frozen_forward_predictions": true
+    }
+  },
+  "cost_model": {
+    "fee_bps_assumption": 5.0,
+    "half_spread_bps_assumption": 2.0,
+    "slippage_bps_assumption": 2.0,
+    "impact_bps_assumption": 1.0,
+    "capacity_notional_quote": 100000.0
+  },
+  "features": {
+    "lookbacks": [
+      24,
+      72,
+      168,
+      264,
+      288,
+      312
+    ],
+    "state_lookback": 72,
+    "volume_lookback": 168,
+    "maximum_structural_gap_bars_assumption": 4
+  },
+  "strategies": {
+    "trend": {
+      "annual_volatility_target": 0.2,
+      "entry_scores": [
+        1.0,
+        1.25,
+        1.5
+      ],
+      "exit_score": 0.0,
+      "lookbacks": [
+        264,
+        288,
+        312
+      ],
+      "maximum_target": 1.0
+    },
+    "flow_trend": {
+      "lookbacks": [
+        72,
+        168
+      ],
+      "entry_scores": [
+        0.5,
+        1.0
+      ],
+      "flow_confirmations": [
+        -0.25,
+        0.0,
+        0.25
+      ],
+      "minimum_volume_score": 0.0,
+      "exit_score": 0.0,
+      "annual_volatility_target": 0.4,
+      "maximum_target": 1.0
+    },
+    "breakout": {
+      "lookbacks": [
+        24,
+        72,
+        168
+      ],
+      "flow_confirmations": [
+        -0.1,
+        0.1
+      ],
+      "annual_volatility_target": 0.4,
+      "maximum_target": 1.0
+    },
+    "price_breakout": {
+      "lookbacks": [
+        24,
+        72,
+        168
+      ],
+      "annual_volatility_target": 0.4,
+      "maximum_target": 1.0
+    },
+    "mean_reversion": {
+      "lookbacks": [
+        24,
+        72,
+        168
+      ],
+      "entry_scores": [
+        1.0,
+        1.5
+      ],
+      "exit_score": -0.1,
+      "trend_limit": 0.75,
+      "annual_volatility_target": 0.25,
+      "maximum_target": 0.75
+    },
+    "grid_shadow": {
+      "lookbacks": [
+        24,
+        72
+      ],
+      "entry_scores": [
+        1.0,
+        1.5
+      ],
+      "maximum_target": 0.5
+    }
+  },
+  "walk_forward": {
+    "minimum_train_bars": 8760,
+    "test_bars": 2160,
+    "step_bars": 2160,
+    "embargo_bars": 24
+  },
+  "validation": {
+    "minimum_oos_bars": 8000,
+    "minimum_oos_sharpe": 0.0,
+    "maximum_drawdown": 0.45,
+    "maximum_fdr_q": 0.2,
+    "minimum_positive_fold_ratio": 0.5,
+    "maximum_probability_backtest_overfitting": 0.4,
+    "pbo_split_budget": 512,
+    "pbo_random_seed": 20260814,
+    "block_bootstrap_bars": 168,
+    "block_bootstrap_samples": 1024,
+    "block_bootstrap_random_seed": 20260814,
+    "block_bootstrap_one_sided_alpha": 0.05,
+    "maximum_block_bootstrap_p_value": 0.05,
+    "minimum_deflated_sharpe_probability": 0.95,
+    "deflated_sharpe_gate_trial_count": "effective",
+    "minimum_parameter_neighbor_count": 1,
+    "minimum_positive_parameter_neighbor_ratio": 0.5,
+    "minimum_median_parameter_neighbor_sharpe_retention": 0.5,
+    "complexity_penalty": 0.02
+  },
+  "evolution_monitor": {
+    "parameter_association_threshold": 0.35,
+    "minimum_history_runs": 3,
+    "sharpe_decay_threshold": 0.25,
+    "fdr_q_deterioration_threshold": 0.05
+  },
+  "evolution": {
+    "maximum_candidates_per_family": 24,
+    "constraints": {
+      "trend": {
+        "lookback": {
+          "minimum": 12,
+          "maximum": 336
+        },
+        "entry_score": {
+          "minimum": 0.25,
+          "maximum": 2.0
+        }
+      },
+      "flow_trend": {
+        "lookback": {
+          "minimum": 12,
+          "maximum": 336
+        },
+        "entry_score": {
+          "minimum": 0.25,
+          "maximum": 2.0
+        },
+        "flow_confirmation": {
+          "minimum": -1.0,
+          "maximum": 1.0
+        }
+      },
+      "breakout": {
+        "lookback": {
+          "minimum": 12,
+          "maximum": 336
+        },
+        "flow_confirmation": {
+          "minimum": -1.0,
+          "maximum": 1.0
+        }
+      },
+      "price_breakout": {
+        "lookback": {
+          "minimum": 12,
+          "maximum": 336
+        }
+      },
+      "mean_reversion": {
+        "lookback": {
+          "minimum": 12,
+          "maximum": 336
+        },
+        "entry_score": {
+          "minimum": 0.5,
+          "maximum": 3.0
+        }
+      },
+      "grid_shadow": {
+        "lookback": {
+          "minimum": 12,
+          "maximum": 168
+        },
+        "entry_score": {
+          "minimum": 0.5,
+          "maximum": 3.0
+        }
+      }
+    }
+  },
+  "allocation": {
+    "directional_families": [
+      "trend",
+      "flow_trend",
+      "breakout",
+      "price_breakout"
+    ],
+    "maximum_gross_weight": 0.85,
+    "trend_breakout_cap": 0.6,
+    "mean_reversion_cap": 0.25,
+    "minimum_risk_reserve": 0.15,
+    "l2_overlay_limit": 0.3,
+    "risk_aversion": 3.0,
+    "turnover_penalty": 0.02,
+    "uncertainty_penalty": 0.1,
+    "no_trade_band": 0.01,
+    "solver_iterations": 300,
+    "solver_step": 0.05
+  },
+  "cross_venue_shadow": {
+    "market_ids": [
+      "mkt__gmo__btc__r0",
+      "mkt__bitbank__btc_jpy__r0",
+      "mkt__bitflyer__btc_jpy__r0"
+    ],
+    "minimum_quorum": 2,
+    "maximum_age_seconds": 5,
+    "taker_fee_bps_assumptions": {
+      "gmo": 5.0,
+      "bitbank": 12.0,
+      "bitflyer": 15.0
+    }
+  },
+  "search_loop_source": {
+    "promote_method_version": "search-loop-promote-v1",
+    "proposal_path": "C:/Users/wu_zh/dev/guvolu-loop/reports/strategy-search/search-run-3e88ec842cad6444a89e5938eebd4bac82ba11621e723dabe3bc5f0275dca3c5/proposal.json",
+    "proposal_sha256": "c2e7336cdca5a6ffbd4495c5879011bc1646e56bd5089e8879a272558d8ae657",
+    "search_run_id": "search-run-3e88ec842cad6444a89e5938eebd4bac82ba11621e723dabe3bc5f0275dca3c5",
+    "bundle_id": "search-bundle-5f12654248d1a66ceebe5631ba57216d90d6c62cb21f4f9c243a0bab3e83b649",
+    "search_result_id": "search-result-d45a0e44235e6b2205d440151a6754d8b1af3143ef2b54e3193d987d4c32f24b",
+    "parent_config_path": "config/strategy_research.json",
+    "parent_config_sha256": "66590f5bb2788a4ddd70e3127a3dce13aa0707402309b0c187adc06f30763336",
+    "applied_families": [
+      "trend"
+    ],
+    "holdout_consumed": false
+  }
+}
