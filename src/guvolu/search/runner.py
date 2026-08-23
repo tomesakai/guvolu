@@ -269,8 +269,7 @@ def evaluate_bundle(
             )
             metrics = chunk_metrics(session, targets, bundle.cost_model)
             metric_rows = metrics.rows()
-            flat = targets.cpu().reshape(-1).tolist()
-            targets_store.extend(flat)
+            targets_store.frombytes(_tensor_f32_bytes(targets))
             chunk_rows: list[LedgerRow] = []
             for offset, row_index in enumerate(subset):
                 candidate_id = family.candidate_ids[row_index]
@@ -349,7 +348,7 @@ def evaluate_bundle(
             ),
         },
     }
-    result_id = "search-result-" + sha256_text(canonical_json(body))
+    result_id = search_result_identifier(body)
     manifest = {**body, "search_result_id": result_id}
     atomic_write_text(
         work_directory / "manifest.json", canonical_json(manifest) + "\n",
@@ -359,6 +358,16 @@ def evaluate_bundle(
         raise FileExistsError(f"SearchResult 已存在: {final_directory}")
     work_directory.replace(final_directory)
     return final_directory
+
+
+def _tensor_f32_bytes(tensor: object) -> bytes:
+    """把 f32 张量搬回主机并导出小端字节。"""
+    host = getattr(tensor, "cpu")().contiguous().reshape(-1)
+    try:
+        body = bytes(host.numpy().astype("<f4", copy=False).tobytes())
+    except (RuntimeError, ModuleNotFoundError):
+        body = array_bytes(array("f", host.tolist()))
+    return body
 
 
 def _periods_per_year(bundle: SearchBundle) -> float:
@@ -400,13 +409,21 @@ def _write_targets(
     return {"file": name, "sha256": digest, "count": len(values), "typecode": "f"}
 
 
+def search_result_identifier(body: Mapping[str, object]) -> str:
+    """SearchResult 身份绑定评估内容与运行时，不含墙钟计时。"""
+    identity_body = {
+        key: value for key, value in body.items()
+        if key not in ("search_result_id", "timings")
+    }
+    return "search-result-" + sha256_text(canonical_json(identity_body))
+
+
 def load_search_result(directory: Path) -> Mapping[str, object]:
     """读取并校验 SearchResult manifest 身份。"""
     manifest = json.loads((directory / "manifest.json").read_text(encoding="utf-8"))
     if not isinstance(manifest, Mapping):
         raise ValueError("SearchResult manifest 必须为对象")
-    body = {key: value for key, value in manifest.items() if key != "search_result_id"}
-    expected = "search-result-" + sha256_text(canonical_json(body))
+    expected = search_result_identifier(manifest)
     if manifest.get("search_result_id") != expected or directory.name != expected:
         raise ValueError("SearchResult 身份与内容不一致")
     return {str(key): value for key, value in manifest.items()}
