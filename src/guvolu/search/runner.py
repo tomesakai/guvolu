@@ -486,32 +486,49 @@ def load_search_result(directory: Path) -> Mapping[str, object]:
     return {str(key): value for key, value in manifest.items()}
 
 
-def _family_targets(
-    directory: Path,
-    record: Mapping[str, object],
-    bar_count: int,
-) -> Mapping[str, tuple[float, ...]]:
-    """读取一个流派的目标矩阵并按候选拆行。"""
-    targets = record.get("targets")
-    if not isinstance(targets, Mapping):
-        raise ValueError("SearchResult 流派缺少 targets")
-    path = directory / str(targets.get("file"))
-    body = path.read_bytes()
-    if sha256_bytes(body) != targets.get("sha256"):
-        raise ValueError(f"目标矩阵散列不匹配: {path.name}")
-    values = array_from_bytes("f", body)
-    ids = record.get("evaluated_candidate_ids")
-    if not isinstance(ids, list):
-        raise ValueError("SearchResult 流派缺少候选列表")
-    if len(values) != len(ids) * bar_count:
-        raise ValueError("目标矩阵长度与候选数不一致")
-    result: dict[str, tuple[float, ...]] = {}
-    for index, candidate_id in enumerate(ids):
-        start = index * bar_count
-        result[str(candidate_id)] = tuple(
-            float(item) for item in values[start:start + bar_count]
-        )
-    return result
+class _FamilyTargets:
+    """按流派惰性读取目标矩阵，同一时刻只驻留一个流派。"""
+
+    def __init__(self, directory: Path, records: Sequence[object], bar_count: int) -> None:
+        self.directory = directory
+        self.bar_count = bar_count
+        self.records: dict[str, Mapping[str, object]] = {}
+        for record in records:
+            if isinstance(record, Mapping):
+                self.records[str(record.get("family"))] = record
+        self._loaded_family: str | None = None
+        self._values: array[float] | array[int] | None = None
+        self._ids: list[str] = []
+
+    def _load(self, family: str) -> None:
+        """读取并校验一个流派的目标矩阵。"""
+        record = self.records.get(family)
+        if record is None:
+            raise ValueError(f"SearchResult 缺少流派: {family}")
+        targets = record.get("targets")
+        if not isinstance(targets, Mapping):
+            raise ValueError("SearchResult 流派缺少 targets")
+        path = self.directory / str(targets.get("file"))
+        body = path.read_bytes()
+        if sha256_bytes(body) != targets.get("sha256"):
+            raise ValueError(f"目标矩阵散列不匹配: {path.name}")
+        values = array_from_bytes("f", body)
+        ids = record.get("evaluated_candidate_ids")
+        if not isinstance(ids, list):
+            raise ValueError("SearchResult 流派缺少候选列表")
+        if len(values) != len(ids) * self.bar_count:
+            raise ValueError("目标矩阵长度与候选数不一致")
+        self._loaded_family = family
+        self._values = values
+        self._ids = [str(item) for item in ids]
+
+    def row(self, family: str, candidate_id: str) -> tuple[float, ...]:
+        """返回一个候选的目标序列。"""
+        if self._loaded_family != family or self._values is None:
+            self._load(family)
+        assert self._values is not None
+        start = self._ids.index(candidate_id) * self.bar_count
+        return tuple(float(item) for item in self._values[start:start + self.bar_count])
 
 
 def run_parity(
@@ -543,12 +560,9 @@ def run_parity(
     family_records = manifest.get("families")
     if not isinstance(family_records, list):
         raise ValueError("SearchResult 缺少 families")
-    targets_by_candidate: dict[str, tuple[float, ...]] = {}
-    for record in family_records:
-        if isinstance(record, Mapping):
-            targets_by_candidate.update(
-                _family_targets(result_directory, record, bundle.panel.bar_count),
-            )
+    family_targets = _FamilyTargets(
+        result_directory, family_records, bundle.panel.bar_count,
+    )
     parity_directory = result_directory / "parity"
     parity_directory.mkdir(exist_ok=True)
     writer = TrialLedgerWriter(parity_directory)
@@ -576,6 +590,8 @@ def run_parity(
             -_row_sharpe(row), str(row.get("candidate_id")),
         ))
         selected_rows = selected_rows[:max(candidate_limit, 0)]
+    # 按流派分组，目标矩阵只读一次
+    selected_rows.sort(key=lambda row: (str(row.get("family")), str(row.get("candidate_id"))))
     for row in selected_rows:
         candidate_id = str(row.get("candidate_id"))
         family = families[str(row.get("family"))]
@@ -592,7 +608,7 @@ def run_parity(
             raise ValueError("台账行缺少指标")
         fast_metrics = {str(key): float(value) for key, value in metrics.items()}
         result = compare_parity(
-            targets_by_candidate[candidate_id],
+            family_targets.row(family.family, candidate_id),
             fast_metrics,
             reference_targets,
             reference,
