@@ -919,6 +919,11 @@ CPU 阶段应先于 GPU 完成以下收敛：
 | [Deflated Sharpe Ratio](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=2460551) | 选择偏差、非正态与试验次数会抬高 Sharpe | 已加入 family-scoped raw/effective trial DSR；effective count 准入，raw count 作保守敏感性 |
 | [Ledoit-Wolf Sharpe 检验](https://www.ledoit.net/Robust_Sharpe_2008.pdf) | 肥尾或序列相关下应使用 studentized time-series bootstrap | 已加入固定 block-LRV 的一侧 bootstrap-t；QS 预白化与块长校准保持显式未实现 |
 
+以上收敛项之上的「策略生成迭代循环 v1」（GPU 宽筛、P3-2 重采样粗筛、受约束配置提案、CPU
+完整研究运行）的实现边界、运行方式与实测见
+[2026-08-24 策略生成迭代循环快照](2026-08-24-strategy-search-loop-v1.md)；GPU 只产提案，
+研究准入与封存段规则不变。
+
 ## 10. GPU 策略生成方式
 
 GPU 接入遵循 [GPU 因子挖掘规格](../gpu-factor-mining-v1.1/README.md)，并复用本管线已形成的
