@@ -47,6 +47,10 @@ from guvolu.research.panel import (
     panel_inputs_payload,
     parse_time,
 )
+from guvolu.research.panel_limit import (
+    reject_sealed_conflict,
+    resolve_panel_to_time,
+)
 from guvolu.data.trade_economics import TRADE_FLOW_INPUT_METHOD_VERSION
 from guvolu.research.provenance import (
     artifact_record,
@@ -151,10 +155,12 @@ def _text(value: object, name: str) -> str:
 def _governance_registry_path(
     root: Path,
     config: Mapping[str, object],
-) -> tuple[Path, str]:
+) -> tuple[Path, str, Mapping[str, object]]:
     """解析并限制研究治理注册表位于项目目录。"""
     raw = config.get("data_governance")
-    governance = {} if raw is None else _mapping(raw, "data_governance")
+    governance: Mapping[str, object] = (
+        {} if raw is None else _mapping(raw, "data_governance")
+    )
     scope = _text(governance.get("scope", "DEV_ADAPTIVE"), "data_governance.scope")
     if scope != "DEV_ADAPTIVE":
         raise ValueError("普通研究管线只允许 DEV_ADAPTIVE 数据范围")
@@ -168,7 +174,7 @@ def _governance_registry_path(
         path.relative_to(root)
     except ValueError as error:
         raise ValueError("研究治理注册表必须位于项目目录内") from error
-    return path, scope
+    return path, scope, governance
 
 
 def _write_content_text(
@@ -357,8 +363,12 @@ def run_research(
     output_root: Path | None = None,
     family_scope: Sequence[str] | None = None,
     data_root: Path | None = None,
+    panel_to_time: datetime | None = None,
 ) -> ResearchRunResult:
-    """运行完整 CPU 策略研究闭环。"""
+    """运行完整 CPU 策略研究闭环。
+
+    `panel_to_time` 为命令行面板截止覆盖，只能早于配置上限。
+    """
     root = repository_root.resolve()
     config_file = config_path.resolve()
     (
@@ -390,7 +400,20 @@ def run_research(
     input_event = inputs.maximum_event_time
     execution_evaluated_at = datetime.now(UTC)
     exposure_start = parse_time(config.get("from_time"), "from_time")
-    governance_path, data_scope = _governance_registry_path(root, config)
+    governance_path, data_scope, governance_config = (
+        _governance_registry_path(root, config)
+    )
+    panel_limit = resolve_panel_to_time(
+        governance_config, panel_to_time, exposure_start,
+    )
+    panel_to_time_effective = panel_limit.effective_to_time(input_event)
+    reject_sealed_conflict(
+        governance_path,
+        market_id,
+        exposure_start,
+        panel_to_time_effective,
+        panel_limit,
+    )
     research_identity = stable_identifier("research-identity", {
         "pipeline_method_version": PIPELINE_METHOD_VERSION,
         "p_value_method_version": P_VALUE_METHOD_VERSION,
@@ -430,6 +453,7 @@ def run_research(
         "candidate_ids": tuple(candidate.candidate_id for candidate in candidates),
         "governance_method_version": GOVERNANCE_METHOD_VERSION,
         "data_scope": data_scope,
+        **panel_limit.identity_payload(),
     })
     run_id, run_directory, artifact_directory = _research_output_paths(
         output_base,
@@ -439,12 +463,26 @@ def run_research(
     config_snapshot = snapshot_verified_config_lineage(
         root, config_file, artifact_directory,
     )
+    panel = build_panel_snapshot(
+        inputs,
+        research_data_root / "research" / "physical" / market_id,
+        _text(config.get("bar_interval"), "bar_interval"),
+        exposure_start,
+        panel_to_time_effective,
+        _integer(config.get("notional_scale"), "notional_scale"),
+    )
+    panel_last_decision_time = panel.bars[-1].decision_time
+    if panel_last_decision_time > panel_to_time_effective:
+        raise ValueError("研究面板末柱晚于截止上限")
+    panel_to_time_record = panel_limit.payload(
+        panel_to_time_effective, panel_last_decision_time,
+    )
     exposure = register_research_exposure(
         governance_path,
         research_identity,
         market_id,
         exposure_start,
-        input_event,
+        panel_last_decision_time,
     )
     receipt_registration = register_active_head_receipt(
         governance_path,
@@ -456,14 +494,6 @@ def run_research(
         inputs.receipt_sha256,
         repository_root=root,
         data_root=source_data_root,
-    )
-    panel = build_panel_snapshot(
-        inputs,
-        research_data_root / "research" / "physical" / market_id,
-        _text(config.get("bar_interval"), "bar_interval"),
-        exposure_start,
-        input_event,
-        _integer(config.get("notional_scale"), "notional_scale"),
     )
     feature_config = _mapping(config.get("features"), "features")
     lookbacks_value = feature_config.get("lookbacks")
@@ -814,6 +844,7 @@ def run_research(
                 receipt_registration.receipt_artifact_sha256
             ),
         },
+        "panel_to_time": panel_to_time_record,
         "input": panel_inputs_payload(inputs),
         "panel": {
             "bars": len(panel.bars),
@@ -895,6 +926,7 @@ def run_research(
         "config_lineage_depth": config_lineage_depth,
         "data_scope": data_scope,
         "research_exposure_id": exposure.exposure_id,
+        "panel_to_time": panel_to_time_record,
         "input_head_generation": panel.head_generation,
         "input_receipt_sha256": inputs.receipt_sha256,
         "input_attempt_ids": list(panel.attempt_ids),

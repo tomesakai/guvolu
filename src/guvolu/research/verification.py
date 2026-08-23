@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -88,6 +89,7 @@ _RUN_IDENTITY_FIELDS = (
     "config_hash",
     "config_lineage_root_hash",
     "config_lineage_depth",
+    "panel_to_time",
 )
 
 
@@ -182,6 +184,39 @@ def _resolve_manifest(root: Path, manifest_path: Path | None) -> tuple[Path, str
     relative = _text(latest.get("manifest"), "latest.manifest")
     expected = _text(latest.get("manifest_sha256"), "latest.manifest_sha256")
     return (root / relative).resolve(), expected
+
+
+def _recorded_panel_to_time(
+    manifest: Mapping[str, object],
+    maximum_event_time: datetime,
+) -> datetime:
+    """按 manifest 记录的截止上限重建面板 to_time。"""
+    raw = manifest.get("panel_to_time")
+    if raw is None:
+        return maximum_event_time
+    record = _object(raw, "manifest.panel_to_time")
+    limit = record.get("limit")
+    to_time = (
+        maximum_event_time if limit is None
+        else min(parse_time(limit, "panel_to_time.limit"), maximum_event_time)
+    )
+    if record.get("effective_to_time") != to_time.isoformat():
+        raise ValueError("panel_to_time.effective_to_time 不能由上限与输入重建")
+    return to_time
+
+
+def _panel_to_time_override(manifest: Mapping[str, object]) -> str | None:
+    """读取进入研究身份的命令行截止覆盖。"""
+    raw = manifest.get("panel_to_time")
+    if raw is None:
+        return None
+    record = _object(raw, "manifest.panel_to_time")
+    override = record.get("cli_override")
+    if override is None:
+        return None
+    if record.get("source") != "cli":
+        raise ValueError("panel_to_time.cli_override 与来源标记不一致")
+    return parse_time(override, "panel_to_time.cli_override").isoformat()
 
 
 def _artifact_path(root: Path, record: Mapping[str, object], name: str) -> Path:
@@ -679,7 +714,9 @@ def _verify_run_identity(
                     Path(temporary),
                     _text(config.get("bar_interval"), "bar_interval"),
                     parse_time(config.get("from_time"), "from_time"),
-                    registered.maximum_event_time,
+                    _recorded_panel_to_time(
+                        manifest, registered.maximum_event_time,
+                    ),
                     _integer(config.get("notional_scale"), "notional_scale"),
                 )
             if rebuilt.panel_sha256 != sha256_file(panel_path):
@@ -812,6 +849,9 @@ def _verify_run_identity(
             identity_payload["source_data_snapshot"] = manifest.get(
                 "source_data_snapshot"
             )
+    override = _panel_to_time_override(manifest)
+    if override is not None:
+        identity_payload["panel_to_time_override"] = override
     research_identity = stable_identifier("research-identity", identity_payload)
     if manifest.get("research_identity") != research_identity:
         raise ValueError("manifest.research_identity 无法由受保护证据重建")

@@ -232,8 +232,9 @@ holdout 只能在区间完整结束后消费并验证，不能以单成员预测
 派生配置是新制品，不覆盖基准配置。使用派生配置再次运行时仍属于开发回放；只有明确登记的
 一次性封存段才允许形成最终 promotion 证据（G-08）。
 
-治理 schema v2 把这条纪律落实为 SQLite 原子状态机。普通管线在打开面板前登记
-`DEV_ADAPTIVE` 暴露区间；封存段必须在区间开始前创建，且不得与任何历史暴露或其他 vintage
+治理 schema v2 把这条纪律落实为 SQLite 原子状态机。普通管线在打开面板前只读预检面板区间
+与 sealed vintage 不重叠，面板构建后以实际末柱决策时点登记 `DEV_ADAPTIVE` 暴露区间（截止
+上限见第 6.3 节）；封存段必须在区间开始前创建，且不得与任何历史暴露或其他 vintage
 重叠。区间开始前还必须建立唯一 `FROZEN_FORWARD` 计划，冻结来源 manifest、候选公式、参数、
 资金权重、风险余量、配置和代码树。区间内每根新决策柱只允许按该计划追加一个内容寻址预测；
 预测必须在配置的 3,900 秒窗口内产生，同一时点不能改写，质量或代码身份失败时目标必须为零。
@@ -452,6 +453,33 @@ blocker 降为 warning，状态最多为 `degraded`。
 
 与 G-08 的关系：废弃不是统计失败，从未开标评估的封存段不泄露任何标签信息；新段起点晚于废弃时刻
 且与研究暴露零重叠，不构成同段复用；理由与时刻写入账本可审计，账本仍只增不删。
+
+### 6.3 面板截止上限
+
+普通 CPU 研究管线的面板缺省延伸到活动 head 的最大事件时点；当治理库已封存未来 vintage
+时，这样的面板会与封存段重叠并被暴露登记拒绝。显式截止上限让研究暴露在封存段之前结束
+（G-06、G-08；实现于分支 `research/panel-to-time`，复用循环侧 `search_loop.panel_to_time`
+语义）：
+
+| 项目 | 规则 |
+|---|---|
+| 配置键 | `data_governance.panel_to_time`，可选，ISO8601 UTC 文本；自然进入 `config_hash` 与研究身份 |
+| 命令行 | `run_strategy_research.py --to-time <ISO8601 UTC>`，覆盖配置值且只能更早；晚于配置值即拒绝 |
+| 有效截止 | `to_time = min(上限, 活动 head 最大事件时点)`；二者皆无则保持原行为 |
+| 面板 | 末柱 `decision_time` 与 `latest_available_time` 均不晚于有效截止；特征、标签与收据随面板一致 |
+| 前置检查 | 打开面板前以只读连接查 sealed vintage：面板区间触及任一 sealed 起点即以中文错误提前拒绝，不写面板、不登记暴露 |
+| 暴露 | `register_research_exposure(start=from_time, end=实际面板末柱 decision_time)`，写锁内仍原子复查重叠 |
+| 留痕 | `summary.json` 与 `manifest.json` 的 `panel_to_time` 记录 `source`（`config`、`cli`、`none`）、`limit`、`config_limit`、`cli_override`、`effective_to_time` 与 `last_decision_time` |
+| 身份 | 命令行覆盖值以 `panel_to_time_override` 进入 `research_identity` 身份载荷；无覆盖时不进入，既有身份不变 |
+| 复核 | verifier 按 manifest 记录的上限与注册输入重建面板 `to_time`，并在重建研究身份时带入同一覆盖值 |
+
+`config/strategy_research.json` 仍是正在运行 vintage 的配置散列来源，不在此处改写；需要上限时
+使用派生配置或命令行覆盖：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\run_strategy_research.py `
+  --data-root <authoritative-data-root> --to-time 2026-08-23T09:00:00Z
+```
 
 ## 7. 当前策略生成方式
 
