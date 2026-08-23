@@ -34,12 +34,13 @@ class LedgerRow:
     screen_passed: bool | None
     promotable: bool
     reason: str | None = None
+    resample: Mapping[str, object] | None = None
 
     def payload(self) -> Mapping[str, object]:
         """生成台账行。"""
         if self.stage not in STAGES:
             raise ValueError(f"台账阶段不受支持: {self.stage}")
-        return {
+        row: dict[str, object] = {
             "record_type": "search_trial",
             "evaluation_id": self.evaluation_id,
             "candidate_id": self.candidate_id,
@@ -54,6 +55,9 @@ class LedgerRow:
             "promotable": self.promotable,
             "reason": self.reason,
         }
+        if self.resample is not None:
+            row["resample"] = dict(self.resample)
+        return row
 
 
 def ledger_header(

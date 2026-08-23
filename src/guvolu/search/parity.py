@@ -9,8 +9,9 @@ import statistics
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
-from guvolu.strategy.baselines import generate_targets
+from guvolu.strategy.baselines import generate_expression_targets, generate_targets
 from guvolu.strategy.contracts import CandidateSpec, FeatureRow, ResearchBar
+from guvolu.strategy.expression import StrategyExpression
 
 PARITY_TOLERANCE_VERSION = "searchfast-parity-tolerance-v1"
 REFERENCE_METHOD_VERSION = "searchfast-cpu-exact-reference-v1"
@@ -170,8 +171,12 @@ def exact_reference(
     bars: Sequence[ResearchBar],
     features: Sequence[FeatureRow],
     cost_model: Mapping[str, object],
+    template: StrategyExpression | None = None,
 ) -> tuple[tuple[float, ...], ReferenceMetrics]:
-    """对一个候选执行 CPU 精确复算：目标序列与指标。"""
+    """对一个候选执行 CPU 精确复算：目标序列与指标。
+
+    `template` 给出时按该表达式复算，供未注册结构 challenger 使用。
+    """
     rate = cost_model.get("one_way_cost_rate")
     gap = cost_model.get("maximum_gap_seconds")
     periods = cost_model.get("periods_per_year")
@@ -179,7 +184,12 @@ def exact_reference(
         raise ValueError("成本模型缺少成本率或年化周期")
     if gap is not None and not isinstance(gap, (int, float)):
         raise ValueError("maximum_gap_seconds 必须为数值或空")
-    targets = generate_targets(candidate, bars, features, float(periods))
+    if template is None:
+        targets = generate_targets(candidate, bars, features, float(periods))
+    else:
+        targets = generate_expression_targets(
+            template, candidate, bars, features, float(periods),
+        )
     metrics = reference_metrics(
         bars,
         targets,

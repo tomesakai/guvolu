@@ -1,0 +1,110 @@
+{
+  "schema_version": 1,
+  "purpose": "策略生成迭代循环 v1 配置初值（G-06）：面板上限、预算、邻域网格、阈值与容差",
+  "research_config": "config/strategy_research.json",
+  "output_root": "reports/strategy-search",
+  "panel_to_time": "2026-08-23T09:00:00+00:00",
+  "family_scope": [
+    "trend",
+    "flow_trend",
+    "breakout",
+    "price_breakout",
+    "mean_reversion",
+    "grid_shadow"
+  ],
+  "candidate_budget_per_family": 4096,
+  "neighborhood": {
+    "trend": {
+      "lookback": {"minimum": 24, "maximum": 720, "step": 24},
+      "entry_score": [0.25, 0.5, 0.75, 1.0, 1.25, 1.5],
+      "exit_score": [-0.25, 0.0, 0.25],
+      "annual_volatility_target": [0.2, 0.4, 0.6, 0.8],
+      "maximum_target": [1.0]
+    },
+    "flow_trend": {
+      "lookback": {"minimum": 48, "maximum": 720, "step": 48},
+      "entry_score": [0.5, 1.0, 1.5],
+      "flow_confirmation": [-0.5, -0.25, 0.0, 0.25, 0.5],
+      "minimum_volume_score": [0.0],
+      "exit_score": [0.0],
+      "annual_volatility_target": [0.2, 0.4, 0.6, 0.8],
+      "maximum_target": [1.0]
+    },
+    "breakout": {
+      "lookback": {"minimum": 24, "maximum": 720, "step": 24},
+      "flow_confirmation": [-0.5, -0.25, -0.1, 0.0, 0.1, 0.25, 0.5],
+      "annual_volatility_target": [0.2, 0.4, 0.6, 0.8],
+      "maximum_target": [1.0]
+    },
+    "price_breakout": {
+      "lookback": {"minimum": 24, "maximum": 720, "step": 24},
+      "annual_volatility_target": [0.2, 0.4, 0.6, 0.8],
+      "maximum_target": [0.5, 1.0]
+    },
+    "mean_reversion": {
+      "lookback": {"minimum": 24, "maximum": 720, "step": 24},
+      "entry_score": [0.5, 1.0, 1.5, 2.0, 2.5],
+      "exit_score": [-0.25, -0.1, 0.0],
+      "trend_limit": [0.5, 0.75, 1.0],
+      "annual_volatility_target": [0.2, 0.25, 0.4],
+      "maximum_target": [0.75]
+    },
+    "grid_shadow": {
+      "lookback": {"minimum": 24, "maximum": 168, "step": 24},
+      "entry_score": [0.5, 1.0, 1.5, 2.0, 2.5, 3.0],
+      "maximum_target": [0.25, 0.5, 0.75]
+    }
+  },
+  "structural_challengers": {
+    "limit_per_family": 4,
+    "projected_budget_per_family": 256,
+    "operators": ["comparison_strictness", "drop_conjunct", "numeric_bound_swap"],
+    "donors": {
+      "trend": ["flow_trend"],
+      "breakout": ["price_breakout"]
+    }
+  },
+  "gpu": {
+    "device": "auto",
+    "candidate_chunk": 512,
+    "scan_method": "parallel"
+  },
+  "seed": 20260824,
+  "screen": {
+    "minimum_sharpe": 0.0,
+    "maximum_drawdown": 0.45,
+    "minimum_turnover": 0.0
+  },
+  "resample_screen": {
+    "minimum_oos_sharpe": 0.0,
+    "minimum_positive_fold_ratio": 0.5,
+    "maximum_bootstrap_p": 0.1,
+    "maximum_pbo": 0.5
+  },
+  "parity_tolerance": {
+    "target_abs": 1e-5,
+    "sharpe_abs": 1e-3,
+    "turnover_abs": 1e-5
+  },
+  "resample_tolerance": {
+    "fold_sharpe_abs": 1e-3,
+    "oos_sharpe_abs": 1e-3,
+    "bootstrap_lower_abs": 1e-3,
+    "bootstrap_p_abs": 2e-3,
+    "cscv_rank_abs": 1e-6,
+    "pbo_abs": 1e-6
+  },
+  "parity_candidate_limit": 256,
+  "proposal": {
+    "minimum_neighbor_count": 1,
+    "minimum_positive_neighbor_ratio": 0.5,
+    "minimum_neighbor_sharpe_retention": 0.5,
+    "maximum_axis_values": 3,
+    "score_metric": "oos_sharpe"
+  },
+  "write_reference_panel": false,
+  "synthetic": {
+    "bars": 4096,
+    "seed": 20260823
+  }
+}

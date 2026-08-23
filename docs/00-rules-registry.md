@@ -55,6 +55,7 @@
 | docs/2026-08-22-theory-system-and-fastest-live-path.md | 时效快照 | v7 栈切换后现场、分层理论体系与最快实盘路径 |
 | docs/2026-08-23-gpu-searchfast-p1.md | 时效快照 | GPU SearchFast P3-1 实现快照：阈值网格、状态机扫描与数值对照 |
 | docs/2026-08-23-research-milestone-and-runtime-switch.md | 时效快照 | 数据前提恢复、旧封存段废弃、main 干净树研究结果、新 vintage 与冻结运行根落 D 盘 |
+| docs/2026-08-24-strategy-search-loop-v1.md | 时效快照 | 策略生成迭代循环 v1：GPU 宽筛、P3-2 重采样、受约束提案与 promote 的实现与实测 |
 | docs/2026-08-11-account-assets-capability.md | 时效快照 | GMO Coin 与 bitFlyer 私有资产接口复核 |
 | docs/2026-08-10-persistence-audit.md | 时效快照 | 持久化完整性、恢复探针与历史损坏边界审计 |
 | docs/ui-design.md | 长期维护 | 控制面与可视化设计（TBD-12 至 17 提案载体） |

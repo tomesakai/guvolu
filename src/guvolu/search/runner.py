@@ -35,17 +35,28 @@ from guvolu.search.ledger import (
     ledger_header,
     read_ledger,
 )
-from guvolu.search.metrics import METRICS_METHOD_VERSION, chunk_metrics
+from guvolu.search.metrics import (
+    METRICS_METHOD_VERSION,
+    chunk_metrics,
+    strategy_returns_tensor,
+)
 from guvolu.search.parity import (
     ParityTolerance,
     compare_parity,
     exact_reference,
 )
+from guvolu.search.resample import (
+    ResampleMetrics,
+    ResampleScreen,
+    ResampleSpec,
+    fold_payload,
+    resample_chunk,
+)
 from guvolu.search.scan import SCAN_METHOD_VERSION, scan_targets
 from guvolu.search.tensorize import array_bytes, array_from_bytes
 from guvolu.search.torch_runtime import runtime_identity, torch_module
 from guvolu.strategy.contracts import CandidateSpec, FeatureRow, ResearchBar
-from guvolu.strategy.expression import Unit, strategy_expression
+from guvolu.strategy.expression import StrategyExpression, Unit, strategy_expression
 
 RUNNER_METHOD_VERSION = "searchfast-runner-v1"
 SEARCH_RESULT_SCHEMA_VERSION = 1
@@ -111,6 +122,8 @@ class EvaluationOptions:
     scan_method: str = "parallel"
     seed: int = 0
     screen: ScreenConfig = ScreenConfig()
+    resample: ResampleSpec | None = None
+    resample_screen: ResampleScreen = ResampleScreen()
 
     def payload(self) -> Mapping[str, object]:
         """导出运行参数。"""
@@ -123,6 +136,12 @@ class EvaluationOptions:
             "seed": self.seed,
             "precision": PRECISION,
             "screen": self.screen.payload(),
+            "resample": (
+                None if self.resample is None else self.resample.payload()
+            ),
+            "resample_screen": (
+                None if self.resample is None else self.resample_screen.payload()
+            ),
         }
 
 
@@ -172,9 +191,11 @@ def candidate_from_plan(
     family: FamilyPlan,
     row_index: int,
     expression_id: str | None = None,
+    template: StrategyExpression | None = None,
 ) -> CandidateSpec:
     """由 SearchPlan 参数行重建候选规格，供精确复算。"""
-    template = strategy_expression(family.family)
+    if template is None:
+        template = strategy_expression(family.family)
     parameters: dict[str, int | float] = {}
     for name, value in zip(family.parameter_names, family.parameter_rows[row_index], strict=True):
         expected = template.parameter_types.get(name)
@@ -184,7 +205,7 @@ def candidate_from_plan(
             parameters[name] = float(value)
     return CandidateSpec(
         candidate_id=family.candidate_ids[row_index],
-        family=family.family,
+        family=template.family,
         mode=family.mode,
         parameters=parameters,
         complexity=len(parameters),
@@ -232,6 +253,7 @@ def evaluate_bundle(
     rejected = 0
     screened = 0
     bar_count = bundle.panel.bar_count
+    folds_record: list[Mapping[str, object]] | None = None
     for family in session.families:
         family_started = time.perf_counter()
         accepted_rows: list[int] = []
@@ -269,12 +291,31 @@ def evaluate_bundle(
             )
             metrics = chunk_metrics(session, targets, bundle.cost_model)
             metric_rows = metrics.rows()
+            resample_rows: tuple[Mapping[str, object], ...] | None = None
+            if options.resample is not None:
+                returns, _turnover, _held = strategy_returns_tensor(
+                    session, targets, bundle.cost_model,
+                )
+                resampled: ResampleMetrics = resample_chunk(
+                    session,
+                    family.family,
+                    returns,
+                    options.resample,
+                    _periods_per_year(bundle),
+                )
+                resample_rows = resampled.rows()
+                if folds_record is None:
+                    folds_record = fold_payload(resampled.folds)
             targets_store.frombytes(_tensor_f32_bytes(targets))
             chunk_rows: list[LedgerRow] = []
             for offset, row_index in enumerate(subset):
                 candidate_id = family.candidate_ids[row_index]
                 row_metrics = metric_rows[offset]
                 passed = options.screen.passes(row_metrics)
+                row_resample: Mapping[str, object] | None = None
+                if resample_rows is not None:
+                    row_resample = resample_rows[offset]
+                    passed = passed and options.resample_screen.passes(row_resample)
                 screened += 1
                 accepted_ids.append(candidate_id)
                 evaluation_id = evaluation_identifier(candidate_id, bundle.identity)
@@ -290,14 +331,18 @@ def evaluate_bundle(
                     parity=None,
                     screen_passed=passed,
                     promotable=False,
+                    resample=row_resample,
                 ))
-                evaluations.append({
+                evaluation: dict[str, object] = {
                     "evaluation_id": evaluation_id,
                     "candidate_id": candidate_id,
                     "family": family.family,
                     "screen_passed": passed,
                     "metrics": dict(row_metrics),
-                })
+                }
+                if row_resample is not None:
+                    evaluation["resample"] = dict(row_resample)
+                evaluations.append(evaluation)
             ledger.append_rows(chunk_rows)
         if options.device.startswith("cuda"):
             torch.cuda.synchronize()
@@ -331,6 +376,7 @@ def evaluate_bundle(
         "rejected_count": rejected,
         "screened_count": screened,
         "bar_count": bar_count,
+        "folds": folds_record,
         "families": families_payload,
         "evaluations": evaluations,
         "trial_ledger": {
@@ -409,6 +455,17 @@ def _write_targets(
     return {"file": name, "sha256": digest, "count": len(values), "typecode": "f"}
 
 
+def _row_sharpe(row: Mapping[str, object]) -> float:
+    """读取台账行的粗筛 Sharpe，缺失记为负无穷。"""
+    metrics = row.get("metrics")
+    if not isinstance(metrics, Mapping):
+        return -math.inf
+    value = metrics.get("sharpe")
+    if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+        return -math.inf
+    return float(value)
+
+
 def search_result_identifier(body: Mapping[str, object]) -> str:
     """SearchResult 身份绑定评估内容与运行时，不含墙钟计时。"""
     identity_body = {
@@ -429,32 +486,49 @@ def load_search_result(directory: Path) -> Mapping[str, object]:
     return {str(key): value for key, value in manifest.items()}
 
 
-def _family_targets(
-    directory: Path,
-    record: Mapping[str, object],
-    bar_count: int,
-) -> Mapping[str, tuple[float, ...]]:
-    """读取一个流派的目标矩阵并按候选拆行。"""
-    targets = record.get("targets")
-    if not isinstance(targets, Mapping):
-        raise ValueError("SearchResult 流派缺少 targets")
-    path = directory / str(targets.get("file"))
-    body = path.read_bytes()
-    if sha256_bytes(body) != targets.get("sha256"):
-        raise ValueError(f"目标矩阵散列不匹配: {path.name}")
-    values = array_from_bytes("f", body)
-    ids = record.get("evaluated_candidate_ids")
-    if not isinstance(ids, list):
-        raise ValueError("SearchResult 流派缺少候选列表")
-    if len(values) != len(ids) * bar_count:
-        raise ValueError("目标矩阵长度与候选数不一致")
-    result: dict[str, tuple[float, ...]] = {}
-    for index, candidate_id in enumerate(ids):
-        start = index * bar_count
-        result[str(candidate_id)] = tuple(
-            float(item) for item in values[start:start + bar_count]
-        )
-    return result
+class _FamilyTargets:
+    """按流派惰性读取目标矩阵，同一时刻只驻留一个流派。"""
+
+    def __init__(self, directory: Path, records: Sequence[object], bar_count: int) -> None:
+        self.directory = directory
+        self.bar_count = bar_count
+        self.records: dict[str, Mapping[str, object]] = {}
+        for record in records:
+            if isinstance(record, Mapping):
+                self.records[str(record.get("family"))] = record
+        self._loaded_family: str | None = None
+        self._values: array[float] | array[int] | None = None
+        self._ids: list[str] = []
+
+    def _load(self, family: str) -> None:
+        """读取并校验一个流派的目标矩阵。"""
+        record = self.records.get(family)
+        if record is None:
+            raise ValueError(f"SearchResult 缺少流派: {family}")
+        targets = record.get("targets")
+        if not isinstance(targets, Mapping):
+            raise ValueError("SearchResult 流派缺少 targets")
+        path = self.directory / str(targets.get("file"))
+        body = path.read_bytes()
+        if sha256_bytes(body) != targets.get("sha256"):
+            raise ValueError(f"目标矩阵散列不匹配: {path.name}")
+        values = array_from_bytes("f", body)
+        ids = record.get("evaluated_candidate_ids")
+        if not isinstance(ids, list):
+            raise ValueError("SearchResult 流派缺少候选列表")
+        if len(values) != len(ids) * self.bar_count:
+            raise ValueError("目标矩阵长度与候选数不一致")
+        self._loaded_family = family
+        self._values = values
+        self._ids = [str(item) for item in ids]
+
+    def row(self, family: str, candidate_id: str) -> tuple[float, ...]:
+        """返回一个候选的目标序列。"""
+        if self._loaded_family != family or self._values is None:
+            self._load(family)
+        assert self._values is not None
+        start = self._ids.index(candidate_id) * self.bar_count
+        return tuple(float(item) for item in self._values[start:start + self.bar_count])
 
 
 def run_parity(
@@ -464,8 +538,14 @@ def run_parity(
     features: Sequence[FeatureRow],
     tolerance: ParityTolerance,
     only_screen_passed: bool = True,
+    templates: Mapping[str, StrategyExpression] | None = None,
+    candidate_limit: int | None = None,
 ) -> Path:
-    """对晋级候选做 CPU 精确复算并登记数值对照。"""
+    """对晋级候选做 CPU 精确复算并登记数值对照。
+
+    `templates` 按计划流派标签给出未注册 challenger 的表达式；
+    `candidate_limit` 为复算上限，按粗筛 Sharpe 降序截取。
+    """
     manifest = load_search_result(result_directory)
     if manifest.get("bundle_id") != bundle.bundle_id:
         raise ValueError("SearchResult 与搜索束身份不一致")
@@ -480,12 +560,9 @@ def run_parity(
     family_records = manifest.get("families")
     if not isinstance(family_records, list):
         raise ValueError("SearchResult 缺少 families")
-    targets_by_candidate: dict[str, tuple[float, ...]] = {}
-    for record in family_records:
-        if isinstance(record, Mapping):
-            targets_by_candidate.update(
-                _family_targets(result_directory, record, bundle.panel.bar_count),
-            )
+    family_targets = _FamilyTargets(
+        result_directory, family_records, bundle.panel.bar_count,
+    )
     parity_directory = result_directory / "parity"
     parity_directory.mkdir(exist_ok=True)
     writer = TrialLedgerWriter(parity_directory)
@@ -503,26 +580,35 @@ def run_parity(
     passed_count = 0
     worst = {"target": 0.0, "sharpe": 0.0, "turnover": 0.0}
     output_rows: list[LedgerRow] = []
-    for row in rows:
-        if row.get("stage") != STAGE_F1_SCREENED:
-            continue
-        if only_screen_passed and not bool(row.get("screen_passed")):
-            continue
+    selected_rows = [
+        row for row in rows
+        if row.get("stage") == STAGE_F1_SCREENED
+        and (not only_screen_passed or bool(row.get("screen_passed")))
+    ]
+    if candidate_limit is not None:
+        selected_rows.sort(key=lambda row: (
+            -_row_sharpe(row), str(row.get("candidate_id")),
+        ))
+        selected_rows = selected_rows[:max(candidate_limit, 0)]
+    # 按流派分组，目标矩阵只读一次
+    selected_rows.sort(key=lambda row: (str(row.get("family")), str(row.get("candidate_id"))))
+    for row in selected_rows:
         candidate_id = str(row.get("candidate_id"))
         family = families[str(row.get("family"))]
         row_index = family.candidate_ids.index(candidate_id)
+        template = None if templates is None else templates.get(family.family)
         candidate = candidate_from_plan(
-            family, row_index, expression_ids.get(family.family),
+            family, row_index, expression_ids.get(family.family), template,
         )
         reference_targets, reference = exact_reference(
-            candidate, bars, features, bundle.cost_model,
+            candidate, bars, features, bundle.cost_model, template,
         )
         metrics = row.get("metrics")
         if not isinstance(metrics, Mapping):
             raise ValueError("台账行缺少指标")
         fast_metrics = {str(key): float(value) for key, value in metrics.items()}
         result = compare_parity(
-            targets_by_candidate[candidate_id],
+            family_targets.row(family.family, candidate_id),
             fast_metrics,
             reference_targets,
             reference,
@@ -536,7 +622,7 @@ def run_parity(
         output_rows.append(LedgerRow(
             evaluation_id=str(row.get("evaluation_id")),
             candidate_id=candidate_id,
-            family=candidate.family,
+            family=family.family,
             bundle_id=bundle.bundle_id,
             stage=STAGE_F3_EXACT if result.passed else STAGE_F1_SCREENED,
             device="cpu",
@@ -553,6 +639,7 @@ def run_parity(
         "search_result_id": manifest.get("search_result_id"),
         "bundle_id": bundle.bundle_id,
         "tolerance": tolerance.payload(),
+        "candidate_limit": candidate_limit,
         "checked": checked,
         "passed": passed_count,
         "failed": checked - passed_count,
