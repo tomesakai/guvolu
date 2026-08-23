@@ -426,6 +426,28 @@ missing_decision_count == score_bars`。预测存在但 `quality.eligible=false`
 [preflight_holdout.py](../scripts/preflight_holdout.py) 在 `zero_exposure` 下把覆盖缺口从
 blocker 降为 warning，状态最多为 `degraded`。
 
+### 6.2 废弃 vintage
+
+`abandoned` 是 sealed vintage 的显式终态，用于冻结前向运行根失效、预测永久中断等从未开始
+评估的封存段（实现于分支 `research/vintage-abandon`）。治理库 schema v9 为 `holdout_vintage`
+增加状态 `abandoned` 与列 `abandoned_at`、`abandon_reason`；SQLite 不能修改 CHECK 约束，
+旧库在首次以当前代码打开或经 `upgrade_governance_write_ceiling` 显式升级时，于同一写事务内
+按 v9 定义重建该表并回填全部旧行，子表外键、区间唯一索引与 `schema_write_ceiling` 语义不变。
+入口为 `manage_holdout_vintage.py abandon <vintage_id> --reason "..."`，`list` 输出新状态与理由。
+
+| 项目 | 规则 |
+|---|---|
+| 前置条件 | `status='sealed'`；该 vintage 没有任何 `holdout_evaluation_attempt`；理由非空 |
+| 幂等 | 同 vintage 同理由重复调用返回既有行；不同理由拒绝；非 sealed 拒绝 |
+| 留痕 | 状态改为 `abandoned`，写入 `abandoned_at` 与 `abandon_reason`；不删除任何行 |
+| 计划与预测 | 绑定的冻结前向计划与套件计划保留但退役；新预测、新计划与 holdout 评估均以「vintage 已废弃」拒绝 |
+| 预检与就绪度 | `preflight_holdout.py --vintage-id` 对废弃段直接报告 `status=abandoned`，不计 `would_burn`；就绪度只统计 sealed |
+| 研究暴露 | 废弃段不再阻挡研究暴露登记，其余段可进入开发研究 |
+| 新 vintage 起点 | 封存新段时忽略与废弃段的重叠，但 `start_time` 不得早于每条重叠废弃段的 `abandoned_at`；与 sealed、consumed 段重叠仍拒绝；与任何研究暴露重叠仍拒绝；与废弃段完全相同的区间身份不可重新封存 |
+
+与 G-08 的关系：废弃不是统计失败，从未开标评估的封存段不泄露任何标签信息；新段起点晚于废弃时刻
+且与研究暴露零重叠，不构成同段复用；理由与时刻写入账本可审计，账本仍只增不删。
+
 ## 7. 当前策略生成方式
 
 当前版本是可解释的 CPU 小网格，不是自动发现系统。版本化 JSON 展开趋势、量价确认趋势、
