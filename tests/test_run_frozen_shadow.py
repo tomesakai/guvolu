@@ -5,7 +5,7 @@ import json
 import subprocess
 import sys
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -59,6 +59,7 @@ class FakeChain:
         self.calls: list[list[str]] = []
         self.paper_report: dict[str, object] | None = _paper_filled_report()
         self.paper_returncode = 0
+        self.prediction_decision_time: datetime | None = None
 
     def refresh(self, source: Path, runtime: Path, market_id: str) -> dict[str, object]:
         return {"status": "refreshed", "market_id": market_id}
@@ -87,7 +88,9 @@ class FakeChain:
         payload = {
             "prediction_id": PREDICTION_ID,
             "prediction_path": str(path),
-            "decision_time": datetime.now(UTC).isoformat(),
+            "decision_time": (
+                self.prediction_decision_time or datetime.now(UTC)
+            ).isoformat(),
             "aggregate_target": 0.4,
         }
         return subprocess.CompletedProcess(parts, 0, json.dumps(payload) + "\n", "")
@@ -208,7 +211,7 @@ def test_paper_failure_keeps_prediction_and_dry_run_result(
     summary = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     paper = summary["paper"]
 
-    assert code == 0
+    assert code == 1
     assert summary["status"] == "completed"
     assert summary["prediction_id"] == PREDICTION_ID
     assert summary["intent_state"] == "DRY_RUN_REJECTED"
@@ -222,6 +225,17 @@ def test_paper_failure_keeps_prediction_and_dry_run_result(
     assert isinstance(recorded_paper, dict)
     assert record["status"] == "completed"
     assert recorded_paper["status"] == "failed"
+
+
+def test_stale_prediction_fails_before_target_adaptation(chain: FakeChain) -> None:
+    """超过保守年龄上限的冻结预测不得进入任何执行适配。"""
+    chain.prediction_decision_time = datetime.now(UTC) - timedelta(minutes=46)
+
+    with pytest.raises(ValueError, match="冻结预测过期"):
+        _run_chain(chain)
+
+    assert chain.scripts("adapt_frozen_target.py") == []
+    assert _task_records(chain)[-1]["status"] == "failed"
 
 
 @pytest.mark.parametrize(
@@ -263,6 +277,50 @@ def test_duplicate_paper_report_without_mode_is_accepted(chain: FakeChain) -> No
     assert paper["outcome"] == "duplicate_prediction"
     assert paper["intent_state"] is None
     assert paper["fill"] is None
+
+
+def test_nonzero_paper_report_is_failed_even_when_report_is_valid(
+    chain: FakeChain,
+) -> None:
+    """执行器非零码不能被已落盘的合法待对账报告掩盖。"""
+    chain.paper_report = {
+        "prediction_id": PREDICTION_ID,
+        "status": "needs_reconciliation",
+        "endpoints": {
+            "read_touched": [], "write_planned": [], "write_touched": [],
+        },
+    }
+    chain.paper_returncode = 1
+
+    paper = _run_chain(chain)["paper"]
+    assert isinstance(paper, dict)
+    assert paper["status"] == "failed"
+    assert paper["outcome"] == "needs_reconciliation"
+    assert paper["returncode"] == 1
+    assert "非零码" in str(paper["error"])
+
+
+def test_reused_reconciliation_report_remains_failed(chain: FakeChain) -> None:
+    """待对账报告复用时仍须非零，不得伪装为健康周期。"""
+    report = chain.execution / (
+        "data/execution/paper/reports/" + PREDICTION_ID + ".json"
+    )
+    report.parent.mkdir(parents=True, exist_ok=True)
+    report.write_text(json.dumps({
+        "prediction_id": PREDICTION_ID,
+        "status": "needs_reconciliation",
+        "endpoints": {
+            "read_touched": [], "write_planned": [], "write_touched": [],
+        },
+    }), encoding="utf-8")
+
+    paper = _run_chain(chain)["paper"]
+    assert isinstance(paper, dict)
+    assert paper["status"] == "failed"
+    assert paper["outcome"] == "needs_reconciliation"
+    assert paper["returncode"] is None
+    assert "人工处置" in str(paper["error"])
+    assert chain.scripts("run_paper_executor.py") == []
 
 
 def test_no_paper_skips_paper_step(chain: FakeChain) -> None:

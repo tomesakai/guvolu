@@ -19,10 +19,12 @@ PAPER_ROOT = "data/execution/paper"
 TARGET_DIRECTORY = "data/execution/targets"
 PAPER_MODE = "paper"
 DRY_RUN_MODE = "dry-run"
+DEFAULT_MAX_PREDICTION_AGE_MINUTES = 45
 # 去重与待对账报告不含 mode
 PAPER_STATUSES_WITHOUT_ROW = frozenset({
     "duplicate_prediction", "needs_reconciliation",
 })
+PAPER_FAILURE_OUTCOMES = frozenset({"needs_reconciliation"})
 
 
 def _object(value: object, name: str) -> dict[str, object]:
@@ -207,6 +209,12 @@ def run_paper_step(
             report, status="reused" if reused else "completed",
             target_path=target_path, report_path=report_path, returncode=returncode,
         ))
+        if returncode not in (None, 0):
+            paper["status"] = "failed"
+            paper["error"] = f"paper 执行器返回非零码: {returncode}"
+        elif paper.get("outcome") in PAPER_FAILURE_OUTCOMES:
+            paper["status"] = "failed"
+            paper["error"] = f"paper 终态需要人工处置: {paper['outcome']}"
     except Exception as exc:
         paper["status"] = "failed"
         paper["error"] = f"{type(exc).__name__}: {exc}"
@@ -222,13 +230,13 @@ def run_shadow(
     *,
     symbol: str = "BTC",
     budget_jpy: str = "500",
-    max_prediction_age_minutes: int = 90,
+    max_prediction_age_minutes: int = DEFAULT_MAX_PREDICTION_AGE_MINUTES,
     paper_enabled: bool = True,
 ) -> dict[str, object]:
     """串联快照、冻结预测、目标适配、零写彩排与 paper 执行。
 
     paper 步骤在 dry-run 报告校验通过后运行，结果记入 paper 字段；
-    其失败不改变预测与 dry-run 的登记结果，也不改变退出码。
+    其失败不改变预测与 dry-run 的登记结果，但 CLI 必须返回非零码。
     """
     started = datetime.now(UTC)
     source_root = repository.resolve()
@@ -338,7 +346,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--market-id", default="mkt__gmo__btc__r0")
     parser.add_argument("--symbol", default="BTC")
     parser.add_argument("--budget-jpy", default="500")
-    parser.add_argument("--max-prediction-age-minutes", type=int, default=90)
+    parser.add_argument(
+        "--max-prediction-age-minutes", type=int,
+        default=DEFAULT_MAX_PREDICTION_AGE_MINUTES,
+        help="进入执行适配前允许的最大预测年龄；缺省 45 分钟，预留过期缓冲",
+    )
     parser.add_argument(
         "--no-paper", action="store_true", help="跳过 paper 执行步骤",
     )
@@ -351,6 +363,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         paper_enabled=not bool(args.no_paper),
     )
     print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
+    paper = summary.get("paper")
+    if isinstance(paper, dict) and paper.get("status") == "failed":
+        return 1
     return 0
 
 

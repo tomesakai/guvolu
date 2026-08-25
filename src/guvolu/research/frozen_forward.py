@@ -785,6 +785,13 @@ def run_frozen_forward_prediction(
     decision_time = panel.bars[-1].decision_time
     if not vintage.start_time <= decision_time < vintage.end_time:
         raise ValueError("最新完整研究柱不在计划绑定的 vintage 内")
+    maximum_age = _integer(
+        config.get("strategy_decision_max_age_seconds"),
+        "strategy_decision_max_age_seconds",
+    )
+    lag = (now - decision_time).total_seconds()
+    if lag < 0 or lag > maximum_age:
+        raise ValueError("最新研究柱不在冻结预测登记时效窗口内")
     existing = {
         item.decision_time: item
         for item in list_frozen_forward_predictions(registry_path, plan_id)
@@ -803,13 +810,6 @@ def run_frozen_forward_prediction(
             existing.decision_time,
             _number(content.get("aggregate_target"), "aggregate_target"),
         )
-    maximum_age = _integer(
-        config.get("strategy_decision_max_age_seconds"),
-        "strategy_decision_max_age_seconds",
-    )
-    lag = (now - decision_time).total_seconds()
-    if lag < 0 or lag > maximum_age:
-        raise ValueError("最新研究柱不在冻结预测登记时效窗口内")
     feature_config = _object(config.get("features"), "features")
     raw_lookbacks = feature_config.get("lookbacks")
     if not isinstance(raw_lookbacks, list):

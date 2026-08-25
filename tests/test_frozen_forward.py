@@ -293,6 +293,9 @@ def test_frozen_forward_uses_fixed_weight_and_is_idempotent(
     assert content["families"][0]["frozen_allocation_weight"] == 0.4
     _set_now(decision + timedelta(minutes=2))
     assert run_frozen_forward_prediction(tmp_path, plan.plan_id) == result
+    _set_now(decision + timedelta(seconds=3901))
+    with pytest.raises(ValueError, match="登记时效窗口"):
+        run_frozen_forward_prediction(tmp_path, plan.plan_id)
     verification = verify_frozen_forward(tmp_path, plan.plan_id)
     assert verification.prediction_count == 1
 

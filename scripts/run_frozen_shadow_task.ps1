@@ -64,5 +64,6 @@ $Record = [ordered]@{
     exit_code = $ExitCode
     output = ($Output -join "`n")
 }
-Add-Content -LiteralPath $LogPath -Value ($Record | ConvertTo-Json -Compress)
+Add-Content -LiteralPath $LogPath -Encoding UTF8 `
+    -Value ($Record | ConvertTo-Json -Compress)
 exit $ExitCode

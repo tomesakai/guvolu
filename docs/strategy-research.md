@@ -274,6 +274,13 @@ UTC 壁钟，公共 Python API 不接受调用方时间覆盖；治理层还会�
 .\scripts\register_frozen_forward_task.ps1 -PlanId <plan_id> `
   -StartUtc 2026-08-21T00:00:00Z -EndUtc 2026-11-29T00:00:00Z
 
+# 需要同时刷新冻结运行根并串联零写 shadow 时，直接注册项目内包装器；
+# 不得再经未受版本控制的短启动器间接调用。
+.\scripts\register_frozen_shadow_task.ps1 -PlanId <plan_id> `
+  -StartUtc 2026-08-24T00:00:00Z -EndUtc 2026-12-02T00:00:00Z `
+  -RuntimeRoot <frozen-runtime> -ExecutionRepository <execution-repository> `
+  -NoPaper
+
 # 区间完整到达后只消费一次，并评价已登记预测。
 .\.venv\Scripts\python.exe scripts\run_holdout_validation.py <vintage_id> `
   --source-summary <clean-combined-summary.json>
@@ -351,18 +358,20 @@ ledger。相同 `prediction_id` 重跑必须复用既有报告，不得重复追
 通过后，任务再以 `--mode paper` 生成独立的 paper 目标快照并运行执行仓 paper 执行器，paper
 意图账本、持仓账、差异账、认领账与报告固定在执行仓 `data/execution/paper/`，与 shadow 账本
 分离；paper 报告必须为 `paper` 模式且 `write_touched=[]`，其终态、模型成交与成本摘要记入
-`task.jsonl` 的 `paper` 字段。paper 步骤失败只记 `paper.status=failed`，不改变当期预测与
-dry-run 登记结果及退出码；`--no-paper`（任务包装器 `-NoPaper`）可关闭该步骤。
+`task.jsonl` 的 `paper` 字段。paper 步骤失败不改变当期预测与 dry-run 登记结果，但命令返回
+非零码，让调度器重试并暴露告警；`--no-paper`（任务包装器 `-NoPaper`）可关闭该步骤。注册器
+默认在每小时第 25 分钟启动（`-MinuteOffset` 可在 1--59 分钟内调整），以给实时成交到达和
+冻结快照刷新留出窗口；进入执行适配前的预测年龄硬限为 45 分钟，晚到周期失败关闭。
 
 当前 Windows 权限策略拒绝无密码 `S4U` 注册，任务只能在用户登录期间运行；关机或注销
 超过两小时会造成不可补算的预测缺口，必须由每日健康巡检报警。任何 E 盘身份/哨兵失败、
-冻结树非 clean、输入散列不符、预测年龄超过九十分钟、dry-run 模式不符或
+冻结树非 clean、输入散列不符、预测年龄超过四十五分钟、dry-run 模式不符或
 `write_touched` 非空都会使当期失败。promotion 当前只等待封存段与预测历史完整到达；
 区间结束前不得运行新的重叠 `DEV_ADAPTIVE` 研究。
 
 从 shadow 到最小实盘不是同一开关。最快门禁为连续二十四小时、推荐七十二小时均满足：
 
-1. 每小时任务退出码为零，决策时点连续推进，预测年龄不超过九十分钟；
+1. 每小时任务退出码为零，决策时点连续推进，进入执行适配时预测年龄不超过四十五分钟；
 2. 每个预测只有一个内容寻址报告，重复运行不增加 intent ledger，全部
    `write_touched=[]`；
 3. 三所 BTC/JPY L2 与三所 BTC 逐笔 checkpoint 新鲜，物化无新增 reject，质量窗与活动
@@ -431,6 +440,25 @@ missing_decision_count == score_bars`。预测存在但 `quality.eligible=false`
 与政策无关。预测生成侧不因政策改变：窗口内仍只登记真实预测，不补写缺失柱。
 [preflight_holdout.py](../scripts/preflight_holdout.py) 在 `zero_exposure` 下把覆盖缺口从
 blocker 降为 warning，状态最多为 `degraded`。
+
+每日预检任务固定名为 `guvolu-holdout-preflight`，直接绑定受版本控制的
+`scripts/run_holdout_preflight_task.ps1`。先用描述模式复核本地时区、动作与参数，再去掉
+`-DescribeOnly` 注册；`Repository`、`RuntimeRoot` 与 `VintageId` 均可省略，运行根缺省为仓库，
+执行时间缺省为本地 `09:35`：
+
+```powershell
+.\scripts\register_holdout_preflight_task.ps1 `
+  -Repository C:\Users\wu_zh\dev\guvolu `
+  -RuntimeRoot D:\dev\guvolu-frozen-runtime-356b45e `
+  -VintageId holdout-vintage-690a9c9b4643f29a6ba8b8012b557568bd568904f8907d4ad751ffdb36b50618 `
+  -DailyAt 09:35 `
+  -DescribeOnly
+```
+
+注册后的任务采用 `IgnoreNew`、错过后启动、允许电池运行且不因切换电池停止、唤醒运行及
+三十分钟执行上限。任务不自动重试：`degraded` 是需要保留的非零健康证据，盲目重跑既不会
+补回冻结前向缺口，也会重复占用完整复核资源。预检仍只读取治理身份、计数、散列与制品状态，
+不消费封存段。
 
 ### 6.2 废弃 vintage
 

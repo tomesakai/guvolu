@@ -21,18 +21,18 @@ $Runtime = $null
 [System.Management.Automation.ActionPreference]$PreviousErrorActionPreference =
     [System.Management.Automation.ActionPreference]$ErrorActionPreference
 try {
-    # 运行根不可达也必须留下调度记录。
+    # Always record scheduler evidence when the runtime is unavailable.
     $Runtime = (Resolve-Path -LiteralPath $RuntimeRoot -ErrorAction Stop).Path
     if (-not $Runtime) {
-        throw "运行根不可达: $RuntimeRoot"
+        throw "runtime root unavailable: $RuntimeRoot"
     }
-    # 预检以运行根代码树为准
+    # The preflight must import the frozen runtime code tree.
     $env:PYTHONPATH = Join-Path $Runtime "src"
     $Arguments = @("--root", $Runtime, "--json-output", $JsonOutput)
     if ($VintageId -ne "") {
         $Arguments += @("--vintage-id", $VintageId)
     }
-    # 完整保留原生进程输出。
+    # Preserve native process output in the scheduler record.
     $ErrorActionPreference =
         [System.Management.Automation.ActionPreference]::Continue
     $Output = & $Python $Runner @Arguments 2>&1
@@ -52,5 +52,6 @@ $Record = [ordered]@{
     exit_code = $ExitCode
     output = ($Output -join "`n")
 }
-Add-Content -LiteralPath $LogPath -Value ($Record | ConvertTo-Json -Compress)
+Add-Content -LiteralPath $LogPath -Encoding UTF8 `
+    -Value ($Record | ConvertTo-Json -Compress)
 exit $ExitCode
