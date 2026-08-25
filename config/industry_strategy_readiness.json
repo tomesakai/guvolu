@@ -1,11 +1,54 @@
 {
   "schema_version": 1,
-  "policy_id": "guvolu-industry-strategy-admission-v1",
+  "policy_id": "guvolu-industry-strategy-admission-v4",
   "policy_scope": "project_admission_policy_not_universal_truth",
   "description": "本文件仅定义 guvolu 项目的策略准入政策，不代表量化行业的普遍真理。",
   "research": {
     "accepted_cpu_pipeline_versions": [
       "strategy-research-pipeline-v14"
+    ],
+    "accepted_industry_evidence_method_versions": [
+      "industry-evidence-v2"
+    ],
+    "industry_evidence_generator_status": "not_implemented",
+    "scenario_source_replay_status": "not_implemented",
+    "accepted_generator_attestation_method_versions": [],
+    "allowed_industry_evidence_generators": [],
+    "accepted_tail_scenario_method_versions": [
+      "walk-forward-tail-v1"
+    ],
+    "accepted_stress_scenario_method_versions": [
+      "walk-forward-stress-v1"
+    ],
+    "accepted_cost_scenario_method_versions": [
+      "fixed-target-cost-sensitivity-v1"
+    ],
+    "accepted_capacity_scenario_method_versions": [
+      "l2-depth-capacity-v1"
+    ],
+    "allowed_tail_source_artifacts": [
+      {
+        "name": "tail_risk_evidence",
+        "kind": "tail_risk_evidence"
+      }
+    ],
+    "allowed_stress_source_artifacts": [
+      {
+        "name": "stress_scenario_evidence",
+        "kind": "stress_scenario_evidence"
+      }
+    ],
+    "allowed_cost_source_artifacts": [
+      {
+        "name": "fixed_target_cost_replay",
+        "kind": "fixed_target_cost_replay"
+      }
+    ],
+    "allowed_capacity_source_artifacts": [
+      {
+        "name": "l2_depth_capacity_evidence",
+        "kind": "l2_depth_capacity_evidence"
+      }
     ],
     "minimum_oos_sharpe": 0.75,
     "maximum_oos_drawdown": 0.45,
@@ -19,9 +62,45 @@
     "minimum_parameter_neighbor_count": 2,
     "minimum_positive_parameter_neighbor_ratio": 0.6,
     "minimum_parameter_neighbor_sharpe_retention": 0.7,
-    "minimum_capacity_score": 0.5,
+    "minimum_scenario_bars": 10000,
+    "minimum_scenario_folds": 2,
+    "minimum_scenario_coverage_ratio": 1.0,
+    "required_tail_probabilities": [
+      0.01,
+      0.025,
+      0.05
+    ],
+    "required_stress_definitions": [
+      "cross_venue_dislocation",
+      "liquidity_gap",
+      "volatility_spike"
+    ],
+    "required_cost_tiers": [
+      "policy_baseline",
+      "adverse",
+      "severe"
+    ],
+    "policy_baseline_total_cost_bps": 10.0,
+    "minimum_cost_grid_step_bps": 5.0,
+    "minimum_capacity_scenarios": 3,
     "minimum_capacity_notional_quote": 100000.0,
+    "maximum_capacity_participation_rate": 0.05,
+    "maximum_capacity_impact_bps": 10.0,
     "minimum_benchmark_sharpe_excess": 0.05,
+    "minimum_tail_scenario_sharpe": 0.0,
+    "minimum_tail_scenario_net_return": 0.0,
+    "maximum_tail_scenario_drawdown": 0.45,
+    "maximum_tail_scenario_turnover": 250.0,
+    "minimum_tail_expected_shortfall": -0.2,
+    "minimum_stress_scenario_sharpe": 0.0,
+    "minimum_stress_scenario_net_return": 0.0,
+    "maximum_stress_scenario_drawdown": 0.45,
+    "maximum_stress_scenario_turnover": 250.0,
+    "minimum_cost_scenario_sharpe": 0.0,
+    "minimum_cost_scenario_net_return": 0.0,
+    "maximum_cost_scenario_drawdown": 0.45,
+    "maximum_cost_scenario_turnover": 250.0,
+    "minimum_cost_scenario_benchmark_sharpe_excess": 0.05,
     "minimum_tail_scenarios": 3,
     "minimum_stress_scenarios": 3,
     "minimum_cost_scenarios": 3

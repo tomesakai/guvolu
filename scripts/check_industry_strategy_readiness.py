@@ -22,7 +22,7 @@ def _failure_report(code: str, detail: str) -> dict[str, object]:
     """配置或输入合同异常时生成失败关闭结果。"""
     return {
         "schema_version": 1,
-        "method_version": "industry-strategy-readiness-v1",
+        "method_version": "industry-strategy-readiness-v4",
         "verdict": "NOT_READY",
         "technically_ready_for_external_live_approval": False,
         "live_authorized": False,
