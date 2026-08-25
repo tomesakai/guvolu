@@ -267,7 +267,14 @@ SQLite、manifest、拒绝证据和 quarantine 不在本阶段删除范围。释
 散列复核后原子替换，幂等），路由状态不变；`restore-hot --from-raw` 不读冷盘，由热层
 raw 归档按 `materialization_output` 反查的完成态尝试与 `partition_input` 输入重算
 Parquet，并以登记 SHA-256 与字节数相等为门禁恢复，不等项只列为 `mismatched` 绝不
-写入，输入缺失或散列不符的项计入 `failures` 后跳过；恢复后 `rollback` 重新可用。研究面板或
+写入，输入缺失或散列不符的项计入 `failures` 后跳过。OKX 历史 L2 只接受计划内
+`book_l2_frame` 与 `book_l2_level` 成对输出，按日复用原封口输入、映射和能力修订在
+临时目录重放；双输出的散列与字节数全部相等后才计为可恢复并逐文件原子落盘。该路径不下载、不登记
+物化尝试或活动 head，也不改路由；缺省 dry-run 同样完成重放和散列证明。恢复后
+有不等或输入失败时 dry-run 返回 `blocked`。应用阶段同时持有日内全部目标锁并重验缺失；
+逐文件落盘遇到可恢复错误时尽力回移本次已落盘文件，并分别报告 landing 与 rollback
+失败。该补偿只覆盖进程仍运行时的可恢复失败，不提供掉电时的跨文件原子性。恢复后
+`rollback` 重新可用。研究面板或
 冻结前向仍在读取的逻辑前缀（如历史 `trade-normalization-v1`）不得长期只存冷层：冷盘
 离线即中断研究，须保留或恢复热副本后再释放。
 
