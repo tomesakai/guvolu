@@ -22,12 +22,12 @@ from typing import Mapping, Sequence
 from guvolu.domain.config import MAX_ORDER_JPY_CEILING
 from guvolu.domain.errors import ConfigError
 from guvolu.domain.symbols import SpotSymbol
-from guvolu.execution.dry_run_executor import TARGET_UNIT
 from guvolu.execution.paper_config import (
     TARGET_MODES,
     bar_interval_duration,
     load_paper_config,
 )
+from guvolu.execution.target_contract import TARGET_UNIT
 
 
 ADAPTER_SCHEMA_VERSION = 2
@@ -108,25 +108,27 @@ def _validate_semantics(prediction: Mapping[str, object]) -> None:
     semantics = prediction.get("target_semantics")
     if semantics is None:
         return
-    if not isinstance(semantics, Mapping) or any(
-        semantics.get(key) != value for key, value in TARGET_SEMANTICS.items()
+    if not isinstance(semantics, Mapping) or dict(semantics) != dict(
+        TARGET_SEMANTICS
     ):
         raise FrozenTargetError("冻结预测 target_semantics 与目标域不一致")
 
 
-def load_frozen_prediction(path: Path) -> tuple[dict[str, object], str]:
-    """读取并验证冻结预测与质量合同。"""
+def validate_frozen_prediction_bytes(
+    source_bytes: bytes,
+) -> tuple[dict[str, object], str]:
+    """从一次捕获的原始字节验证冻结预测及其质量合同。"""
     try:
-        source_bytes = path.read_bytes()
         raw: object = json.loads(source_bytes)
-    except FileNotFoundError as exc:
-        raise FrozenTargetError(f"冻结预测不存在: {path}") from exc
-    except json.JSONDecodeError as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise FrozenTargetError("冻结预测不是合法 JSON") from exc
     if not isinstance(raw, dict):
         raise FrozenTargetError("冻结预测根必须为对象")
+    schema_version = raw.get("schema_version")
     if (
-        raw.get("schema_version") not in SUPPORTED_PREDICTION_SCHEMA_VERSIONS
+        isinstance(schema_version, bool)
+        or not isinstance(schema_version, int)
+        or schema_version not in SUPPORTED_PREDICTION_SCHEMA_VERSIONS
         or raw.get("scope") != "FROZEN_FORWARD"
     ):
         raise FrozenTargetError("冻结预测结构或范围不受支持")
@@ -160,6 +162,17 @@ def load_frozen_prediction(path: Path) -> tuple[dict[str, object], str]:
     if not isinstance(families, list):
         raise FrozenTargetError("冻结预测缺少 family 贡献")
     return raw, hashlib.sha256(source_bytes).hexdigest()
+
+
+def load_frozen_prediction(path: Path) -> tuple[dict[str, object], str]:
+    """稳定读取并验证冻结预测与质量合同。"""
+    try:
+        source_bytes = path.read_bytes()
+    except FileNotFoundError as exc:
+        raise FrozenTargetError(f"冻结预测不存在: {path}") from exc
+    except OSError as exc:
+        raise FrozenTargetError(f"冻结预测不可读取: {path}") from exc
+    return validate_frozen_prediction_bytes(source_bytes)
 
 
 def derive_correlation_id(prediction_id: str) -> str:
@@ -210,7 +223,11 @@ def build_operational_target(
         raise FrozenTargetError("market_id 不能为空")
     if mode not in TARGET_MODES:
         raise FrozenTargetError(f"mode 不受支持: {mode!r}")
-    if risk_budget_jpy <= 0 or risk_budget_jpy > MAX_ORDER_JPY_CEILING:
+    if (
+        not risk_budget_jpy.is_finite()
+        or risk_budget_jpy <= 0
+        or risk_budget_jpy > MAX_ORDER_JPY_CEILING
+    ):
         raise FrozenTargetError(
             f"risk_budget_jpy 必须在 (0, {MAX_ORDER_JPY_CEILING}] 内"
         )
@@ -315,9 +332,12 @@ def persist_operational_target(
 def _decimal_argument(raw: str, name: str) -> Decimal:
     """命令行金额直接进 Decimal，绝不经 float（T-08）。"""
     try:
-        return Decimal(raw)
+        value = Decimal(raw)
     except InvalidOperation as exc:
         raise FrozenTargetError(f"参数 {name} 不是合法数值: {raw!r}") from exc
+    if not value.is_finite():
+        raise FrozenTargetError(f"参数 {name} 必须是有限数值: {raw!r}")
+    return value
 
 
 def main(argv: Sequence[str] | None = None) -> int:

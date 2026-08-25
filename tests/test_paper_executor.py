@@ -1,6 +1,7 @@
 """paper 执行器端到端单测：全程离线，零写端点（C-13、C-14、T-04）。"""
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
@@ -13,6 +14,7 @@ import pytest
 from guvolu.data.intent_ledger import IntentLedger
 from guvolu.domain.config import Limits
 from guvolu.domain.enums import ExecutionType, ServiceStatus, Side
+from guvolu.domain.errors import ConfigError
 from guvolu.domain.intent import IntentState, OrderIntent
 from guvolu.domain.models import SymbolRule
 from guvolu.domain.symbols import SpotSymbol
@@ -95,6 +97,11 @@ BOOK_PAYLOAD = {
 }
 
 
+def as_mapping(value: object) -> Mapping[str, Any]:
+    assert isinstance(value, dict)
+    return value
+
+
 def write_config(tmp_path: Path, **overrides: object) -> Path:
     payload: dict[str, Any] = {
         "schema_version": 1,
@@ -117,6 +124,14 @@ def write_config(tmp_path: Path, **overrides: object) -> Path:
     path = tmp_path / "paper_executor.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
     return path
+
+
+@pytest.mark.parametrize("value", ["NaN", "Infinity", "-Infinity"])
+def test_paper_config_rejects_non_finite_decimals(
+    tmp_path: Path, value: str,
+) -> None:
+    with pytest.raises(ConfigError, match="有限数值"):
+        load_paper_config(write_config(tmp_path, risk_budget_jpy=value))
 
 
 def write_prediction(
@@ -161,6 +176,30 @@ def write_target(
         prediction, tmp_path / "targets", market_id=market_id, symbol=symbol,
         risk_budget_jpy=budget, mode=mode,
     )
+    return path
+
+
+def source_prediction_arguments(target: Path) -> list[str]:
+    payload = json.loads(target.read_text(encoding="utf-8"))
+    source = Path(payload["lineage"]["source_prediction_path"])
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    return [
+        "--source-prediction", str(source),
+        "--source-prediction-sha256", digest,
+    ]
+
+
+def rewrite_content_addressed_target(
+    original: Path, payload: Mapping[str, object],
+) -> Path:
+    raw = (
+        json.dumps(
+            dict(payload), ensure_ascii=False, separators=(",", ":"), sort_keys=True,
+        ) + "\n"
+    ).encode("utf-8")
+    digest = hashlib.sha256(raw).hexdigest()
+    path = original.parent / f"target-{digest}.json"
+    path.write_bytes(raw)
     return path
 
 
@@ -274,14 +313,16 @@ def test_full_exposure_buys_from_zero_and_records_everything(
     assert row["correlation_id"] == target.correlation_id
     assert row["exposure_target"] == 1.0
     assert row["target_notional_jpy"] == "500.0000"
-    assert row["delta"]["proposal"]["side"] == "BUY"
-    assert row["fill"]["model_fill_price"] == "1000700"
-    assert Decimal(row["cost"]["total_cost_bps"]) == Decimal("12")
-    assert row["overlay"]["applied"] is False
-    assert row["overlay"]["would_apply"] is True
-    assert row["overlay"]["limit"] == "0.3"
-    assert row["endpoints"]["write_touched"] == []
-    assert row["endpoints"]["write_planned"] == []
+    assert as_mapping(as_mapping(row["delta"])["proposal"])["side"] == "BUY"
+    assert as_mapping(row["fill"])["model_fill_price"] == "1000700"
+    assert Decimal(as_mapping(row["cost"])["total_cost_bps"]) == Decimal("12")
+    overlay = as_mapping(row["overlay"])
+    assert overlay["applied"] is False
+    assert overlay["would_apply"] is True
+    assert overlay["limit"] == "0.3"
+    endpoints = as_mapping(row["endpoints"])
+    assert endpoints["write_touched"] == []
+    assert endpoints["write_planned"] == []
 
 
 def test_reduced_exposure_sells_down_never_below_position(
@@ -399,28 +440,28 @@ def test_target_loader_rejects_out_of_range_exposure_and_v1(
     path = write_target(tmp_path, target=0.5)
     payload = json.loads(path.read_text(encoding="utf-8"))
 
-    bad = tmp_path / "bad.json"
-    bad.write_text(json.dumps({**payload, "exposure_target": 1.2}), encoding="utf-8")
+    bad = rewrite_content_addressed_target(
+        path, {**payload, "exposure_target": 1.2},
+    )
     with pytest.raises(PaperExecutorError, match="exposure_target"):
         load_execution_target(bad)
 
-    negative = tmp_path / "negative.json"
-    negative.write_text(
-        json.dumps({**payload, "exposure_target": -0.1}), encoding="utf-8"
+    negative = rewrite_content_addressed_target(
+        path, {**payload, "exposure_target": -0.1},
     )
     with pytest.raises(PaperExecutorError, match="exposure_target"):
         load_execution_target(negative)
 
-    legacy = tmp_path / "legacy.json"
-    legacy.write_text(json.dumps({**payload, "schema_version": 1}), encoding="utf-8")
-    with pytest.raises(PaperExecutorError, match="schema_version"):
+    legacy = rewrite_content_addressed_target(
+        path, {**payload, "schema_version": 1},
+    )
+    with pytest.raises(PaperExecutorError, match="结构"):
         load_execution_target(legacy)
 
-    semantics = tmp_path / "semantics.json"
-    semantics.write_text(json.dumps({
+    semantics = rewrite_content_addressed_target(path, {
         **payload,
         "target_semantics": {**payload["target_semantics"], "short_allowed": True},
-    }), encoding="utf-8")
+    })
     with pytest.raises(PaperExecutorError, match="target_semantics"):
         load_execution_target(semantics)
 
@@ -440,8 +481,9 @@ def test_fee_fetch_failure_degrades_to_config_and_is_labelled(
     row = read_difference_rows(
         runtime.ledger_directory / DIFFERENCE_LEDGER_NAME
     )[0]
-    assert row["fee"]["source"] == FEE_SOURCE_FALLBACK
-    assert "offline" in row["fee"]["detail"]
+    fee = as_mapping(row["fee"])
+    assert fee["source"] == FEE_SOURCE_FALLBACK
+    assert "offline" in fee["detail"]
 
 
 def test_overlay_records_gates_and_marks_unavailable_inputs(
@@ -475,20 +517,29 @@ def test_overlay_records_gates_and_marks_unavailable_inputs(
     assert complete["would_apply"] is True
     assert Decimal(str(complete["multiplier"])) == Decimal("0")
     assert Decimal(str(complete["top_imbalance"])) == Decimal("0")
-    names = [gate["name"] for gate in complete["gates"]]
+    complete_gates_raw = complete["gates"]
+    assert isinstance(complete_gates_raw, list)
+    complete_gates = [as_mapping(gate) for gate in complete_gates_raw]
+    names = [gate["name"] for gate in complete_gates]
     assert names == [
         "quality_eligible", "service_status", "rest_anchor_age_seconds",
         "best_spread_bps", "top5_depth_base",
     ]
     assert partial["would_apply"] is False
     assert partial["complete"] is False
-    anchor = partial["gates"][2]
+    partial_gates_raw = partial["gates"]
+    assert isinstance(partial_gates_raw, list)
+    partial_gates = [as_mapping(gate) for gate in partial_gates_raw]
+    anchor = partial_gates[2]
     assert anchor["status"] == "unavailable" and anchor["passed"] is None
     assert no_book["would_apply"] is False
     assert no_book["multiplier"] is None
-    assert no_book["gates"][0]["passed"] is False
-    assert no_book["gates"][1]["passed"] is False
-    assert no_book["gates"][3]["status"] == "unavailable"
+    no_book_gates_raw = no_book["gates"]
+    assert isinstance(no_book_gates_raw, list)
+    no_book_gates = [as_mapping(gate) for gate in no_book_gates_raw]
+    assert no_book_gates[0]["passed"] is False
+    assert no_book_gates[1]["passed"] is False
+    assert no_book_gates[3]["status"] == "unavailable"
 
 
 def test_maintenance_status_gate_rejects_without_touching_endpoints(
@@ -527,6 +578,7 @@ def test_cli_end_to_end_offline_and_summary(tmp_path: Path) -> None:
 
     code = main([
         "--target", str(target),
+        *source_prediction_arguments(target),
         "--config", str(config_path),
         "--rules", str(rules_path),
         "--book", str(book_path),
@@ -549,6 +601,7 @@ def test_cli_end_to_end_offline_and_summary(tmp_path: Path) -> None:
 
     again = main([
         "--target", str(target),
+        *source_prediction_arguments(target),
         "--config", str(config_path),
         "--rules", str(rules_path),
         "--book", str(book_path),
@@ -565,7 +618,7 @@ def test_cli_end_to_end_offline_and_summary(tmp_path: Path) -> None:
     summary = summarize_ledger(
         root / "execution" / "paper" / DIFFERENCE_LEDGER_NAME
     )
-    day = summary["days"]["2026-08-22"]
+    day = as_mapping(as_mapping(summary["days"])["2026-08-22"])
     assert summary["rows"] == 1
     assert day["paper_filled"] == 1
     assert Decimal(day["buy_notional_jpy"]) == Decimal("500.35")
@@ -610,6 +663,7 @@ def cli_args(
     env = env_file if env_file is not None else tmp_path / "absent.env"
     return [
         "--target", str(target),
+        *source_prediction_arguments(target),
         "--config", str(config_path),
         "--rules", str(rules_path),
         "--book", str(book_path),
@@ -619,6 +673,65 @@ def cli_args(
         "--now", MOMENT.isoformat(),
         "--report", str(tmp_path / report),
     ]
+
+
+@pytest.mark.parametrize("attack", ["source_flip", "coherent_run_tamper"])
+def test_cli_rebuilds_target_identity_before_any_paper_side_effect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    attack: str,
+) -> None:
+    monkeypatch.delenv("GUVOLU_MODE", raising=False)
+    target = write_target(tmp_path, target=0.5)
+    payload = json.loads(target.read_text(encoding="utf-8"))
+    if attack == "source_flip":
+        payload["correlation_id_source"] = "prediction"
+        payload["correlation_id"] = "coffffffffffffffff"
+        message = "correlation 血缘"
+    else:
+        forged_id = "prediction-forged"
+        payload["run_id"] = forged_id
+        payload["lineage"]["prediction_id"] = forged_id
+        digest = hashlib.sha256(
+            f"guvolu-prediction:{forged_id}".encode("utf-8")
+        ).hexdigest()
+        payload["correlation_id"] = f"co{digest[:16]}"
+        message = "身份/时点"
+    tampered = rewrite_content_addressed_target(target, payload)
+
+    with pytest.raises(PaperExecutorError, match=message):
+        main(cli_args(tmp_path, tampered, report="tampered.json"))
+    assert not (tmp_path / "root").exists()
+    assert not (tmp_path / "tampered.json").exists()
+
+
+def test_cli_rejects_unknown_target_semantics_before_paper_side_effect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GUVOLU_MODE", raising=False)
+    target = write_target(tmp_path, target=0.5)
+    payload = json.loads(target.read_text(encoding="utf-8"))
+    payload["target_semantics"]["future_short_override"] = True
+    tampered = rewrite_content_addressed_target(target, payload)
+
+    with pytest.raises(PaperExecutorError, match="target_semantics"):
+        main(cli_args(tmp_path, tampered, report="unknown-semantics.json"))
+    assert not (tmp_path / "root").exists()
+    assert not (tmp_path / "unknown-semantics.json").exists()
+
+
+def test_cli_rejects_live_process_environment_before_paper_side_effect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GUVOLU_MODE", "live")
+    target = write_target(tmp_path, target=0.5)
+
+    with pytest.raises(PaperExecutorError, match="拒绝非 dry-run"):
+        main(cli_args(tmp_path, target, report="live.json"))
+    assert not (tmp_path / "root").exists()
+    assert not (tmp_path / "live.json").exists()
 
 
 def test_interrupt_after_settlement_before_difference_row_is_not_replayed(
@@ -682,7 +795,9 @@ def test_interrupt_after_claim_before_intent_reports_reconciliation(
     assert again.status == NEEDS_RECONCILIATION
     assert again.reconciliation is not None
     assert again.reconciliation["intents"] == []
-    assert again.reconciliation["claim"]["prediction_id"] == "prediction-one"
+    assert as_mapping(again.reconciliation["claim"])["prediction_id"] == (
+        "prediction-one"
+    )
     assert not (runtime.ledger_directory / INTENT_LEDGER_NAME).exists()
 
 
@@ -833,9 +948,8 @@ def test_target_loader_rejects_non_finite_and_non_numeric_exposure(
 ) -> None:
     path = write_target(tmp_path, target=0.5)
     payload = json.loads(path.read_text(encoding="utf-8"))
-    broken = tmp_path / "broken.json"
-    broken.write_text(
-        json.dumps({**payload, "exposure_target": bad}), encoding="utf-8",
+    broken = rewrite_content_addressed_target(
+        path, {**payload, "exposure_target": bad},
     )
 
     with pytest.raises(PaperExecutorError, match="exposure_target"):

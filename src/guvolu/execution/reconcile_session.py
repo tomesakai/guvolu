@@ -41,13 +41,8 @@ from guvolu.execution.conversion import (
 )
 from guvolu.execution.dispatch import DispatchResult, dispatch_order_intent
 from guvolu.execution.dry_run_executor import (
-    EXPECTED_END_STATES,
     ORDER_ENDPOINT,
     ExecutorError,
-    TargetArtifact,
-    fetch_market_rule,
-    load_market_rule,
-    load_target_artifact,
 )
 from guvolu.execution.dual_reconcile import (
     ORDER_LOOKUP_ENDPOINT,
@@ -634,13 +629,12 @@ def _emit(report: dict[str, object], destination: str) -> None:
         Path(destination).write_text(text + "\n", encoding="utf-8")
 
 
-def _resolve_market_inputs(
+def _resolve_service_status(
     args: argparse.Namespace,
     config: Config,
-    symbol: SpotSymbol,
     session: ReconcileSession,
-) -> tuple[MarketRule | None, Decimal | None, ServiceStatus]:
-    """取取引ルール、参考价与服务状态，缺省经公开端点。"""
+) -> ServiceStatus:
+    """取服务状态；无显式注入时只触碰公开端点。"""
     public: PublicClient | None = None
 
     def get_public() -> PublicClient:
@@ -649,42 +643,25 @@ def _resolve_market_inputs(
             public = PublicClient.from_config(config)
         return public
 
-    rule: MarketRule | None = None
-    reference_price: Decimal | None = None
-    rules_arg: Path | None = args.rules
-    price_arg: str | None = args.reference_price
-    if args.target is not None:
-        if rules_arg is not None:
-            rule = load_market_rule(rules_arg, symbol)
-        else:
-            rule = fetch_market_rule(get_public(), symbol)
-            session._touch("GET /v1/symbols")
-        if price_arg is not None:
-            reference_price = decimal_argument(
-                price_arg, "--reference-price"
-            )
-            if reference_price <= 0:
-                raise ExecutorError("参考价必须为正")
-        else:
-            tickers = get_public().ticker(str(symbol))
-            session._touch("GET /v1/ticker")
-            if not tickers:
-                raise ExecutorError(f"公开端点无品种 {symbol} 的最新レート")
-            reference_price = tickers[0].last
     status_arg: str | None = args.service_status
     if status_arg is not None:
-        service_status = ServiceStatus(status_arg)
-    else:
-        service_status = get_public().status()
-        session._touch("GET /v1/status")
-    return rule, reference_price, service_status
+        return ServiceStatus(status_arg)
+    service_status = get_public().status()
+    session._touch("GET /v1/status")
+    return service_status
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """命令行入口。缺省模拟运行，实盘须显式配置（T-04、A-01）。"""
+    """命令行入口；当前只允许无目标的 dry-run 对账会话。"""
     args = build_parser().parse_args(argv)
+    if args.target is not None:
+        raise ExecutorError(
+            "对账会话的目标驱动发送尚未获准；请使用独立 dry-run/paper 入口"
+        )
     env_file: Path | None = args.env_file
     config = load_config(env_file)
+    if config.mode is not RunMode.DRY_RUN:
+        raise ExecutorError("对账会话当前只允许 dry-run 模式")
     settings = load_session_settings(args.session_config)
     ledger_arg: Path | None = args.ledger
     ledger_path = (
@@ -711,9 +688,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         symbol=symbol,
         policy=policy,
     )
-    rule, reference_price, service_status = _resolve_market_inputs(
-        args, config, symbol, session
-    )
+    service_status = _resolve_service_status(args, config, session)
     now = datetime.now(UTC)
     ws_events_arg: Path | None = args.ws_events
     ws_outcomes: tuple[WsApplyOutcome, ...] = ()
@@ -738,31 +713,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     delta: DeltaDecision | None = None
     target_value: float | None = None
     outcome: tuple[OrderIntent, DispatchResult] | None = None
-    target_arg: Path | None = args.target
-    if target_arg is not None:
-        artifact: TargetArtifact = load_target_artifact(target_arg)
-        target_value = artifact.aggregate_target
-        if rule is None or reference_price is None:
-            raise ExecutorError("差分决策缺少取引ルール或参考价")
-        delta = session.decide_delta(
-            target_value,
-            rule=rule,
-            reference_price=reference_price,
-            budget_jpy=decimal_argument(
-                str(args.budget_jpy), "--budget-jpy"
-            ),
-            no_trade_band=no_trade_band,
-        )
-        outcome = execute_delta(
-            delta,
-            ledger=ledger,
-            limit_gate=LimitGate(config.limits),
-            breaker=breaker,
-            service_status=service_status,
-            whitelist=config.spot_whitelist,
-            sender=TradeClientSender(trade),
-            moment=now,
-        )
     report = render_session_report(
         mode=config.mode,
         service_status=service_status,
@@ -786,8 +736,5 @@ def main(argv: Sequence[str] | None = None) -> int:
     pending = any(
         item.disposition in ("ambiguous", "query_error") for item in timeouts
     )
-    unexpected_end = (
-        outcome is not None and outcome[1].state not in EXPECTED_END_STATES
-    )
     tripped = breaker.state is BreakerState.TRIPPED
-    return 1 if pending or unexpected_end or tripped else 0
+    return 1 if pending or tripped else 0

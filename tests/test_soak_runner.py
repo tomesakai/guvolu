@@ -238,6 +238,34 @@ def test_cli_live_config_refused(
     assert code == 2
 
 
+def test_cli_dynamic_target_refused_before_config_or_clients(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """动态目标在任何账本、客户端、WS token 或报告副作用前失败。"""
+    forbid_network(monkeypatch)
+    target = write_artifact(tmp_path, 0.6)
+
+    def poison(*args: object, **kwargs: object) -> object:
+        raise AssertionError("动态目标拒绝前不得构造运行资源")
+
+    monkeypatch.setattr(soak_runner, "load_config", poison)
+    monkeypatch.setattr(soak_runner, "IntentLedger", poison)
+    monkeypatch.setattr(soak_runner, "create_ws_token", poison)
+    monkeypatch.setattr(soak_runner, "atomic_write_text", poison)
+
+    code = main(
+        [
+            "--target", str(target),
+            "--ledger", str(tmp_path / "intent_ledger.jsonl"),
+            "--report", str(tmp_path / "soak_report.jsonl"),
+        ]
+    )
+    assert code == 2
+    assert not (tmp_path / "intent_ledger.jsonl").exists()
+    assert not (tmp_path / "soak_report.jsonl").exists()
+
+
 def test_rounds_progress_with_zero_target(tmp_path: Path) -> None:
     """多轮推进：首轮基线、次轮稳态，零目标不生成委托。"""
     runner, paths, _breaker, _reader = make_runner(tmp_path)
@@ -329,38 +357,11 @@ def test_reconnect_forces_realign_round(tmp_path: Path) -> None:
     assert snapshot_third["mode"] == "audit"
 
 
-def test_target_hot_reload_between_rounds(tmp_path: Path) -> None:
-    """目标制品每轮重读，更新即生效，损坏即跳过差分。"""
-    target = write_artifact(tmp_path, 0.0)
-    runner, paths, _breaker, _reader = make_runner(
-        tmp_path, target_path=target
-    )
-    first = runner.run_round(MOMENT)
-    delta_first = first["delta"]
-    assert isinstance(delta_first, dict)
-    assert delta_first["proposal"] is None
-    write_artifact(tmp_path, 0.6)
-    second = runner.run_round(ROUND2)
-    delta_second = second["delta"]
-    assert isinstance(delta_second, dict)
-    proposal = delta_second["proposal"]
-    assert isinstance(proposal, dict)
-    assert proposal["side"] == "BUY"
-    assert proposal["size"] == "0.0003"
-    intent = second["intent"]
-    assert isinstance(intent, dict)
-    assert intent["state"] == "DRY_RUN_BLOCKED"
-    endpoints = second["endpoints"]
-    assert isinstance(endpoints, dict)
-    assert endpoints["write_planned"] == ["POST /v1/order"]
-    assert endpoints["write_touched"] == []
-    target.write_text("不是 JSON", encoding="utf-8")
-    third = runner.run_round(ROUND3)
-    target_body = third["target"]
-    assert isinstance(target_body, dict)
-    assert target_body["value"] is None
-    assert target_body["error"] is not None
-    assert third["delta"] is None
+def test_dynamic_target_soak_is_disabled(tmp_path: Path) -> None:
+    """没有版本化目标头与逐轮血缘前，动态目标不得成为浸泡证据。"""
+    target = write_artifact(tmp_path, 0.6)
+    with pytest.raises(SoakError, match="暂不接受动态目标"):
+        make_runner(tmp_path, target_path=target)
 
 
 def test_race_observation_classifies_channels(tmp_path: Path) -> None:
@@ -557,7 +558,6 @@ def test_cli_offline_max_rounds(
     paths = make_paths(tmp_path)
     code = main(
         [
-            "--target", str(write_artifact(tmp_path, 0.6)),
             "--rules", str(write_rules(tmp_path)),
             "--reference-price", "1000000",
             "--service-status", "OPEN",
@@ -576,12 +576,10 @@ def test_cli_offline_max_rounds(
     assert code == 0
     report = read_report(paths)
     assert len(report) == 2
-    intent = report[0]["intent"]
-    assert isinstance(intent, dict)
-    assert intent["state"] == "DRY_RUN_BLOCKED"
+    assert report[0]["intent"] is None
     endpoints = report[1]["endpoints"]
     assert isinstance(endpoints, dict)
-    assert endpoints["write_planned"] == ["POST /v1/order"]
+    assert endpoints["write_planned"] == []
     assert endpoints["write_touched"] == []
     assert endpoints["auth_lifecycle"] == [
         "POST /v1/ws-auth",
