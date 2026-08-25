@@ -80,9 +80,12 @@ def _decimal(payload: Mapping[str, object], key: str) -> Decimal:
     if not isinstance(raw, str):
         raise ConfigError(f"paper 配置字段 {key} 必须为字符串数值")
     try:
-        return Decimal(raw)
+        value = Decimal(raw)
     except InvalidOperation as exc:
         raise ConfigError(f"paper 配置字段 {key} 不是合法数值") from exc
+    if not value.is_finite():
+        raise ConfigError(f"paper 配置字段 {key} 必须为有限数值")
+    return value
 
 
 def _integer(payload: Mapping[str, object], key: str) -> int:
@@ -109,6 +112,8 @@ def load_paper_config(path: Path) -> PaperExecutorConfig:
         raw: object = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError as exc:
         raise ConfigError(f"paper 配置不存在: {path}") from exc
+    except OSError as exc:
+        raise ConfigError(f"paper 配置不可读取: {path}") from exc
     except json.JSONDecodeError as exc:
         raise ConfigError(f"paper 配置不是合法 JSON: {path}") from exc
     if not isinstance(raw, dict):

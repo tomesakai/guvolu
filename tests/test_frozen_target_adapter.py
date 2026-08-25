@@ -29,7 +29,7 @@ def _prediction(
     path: Path,
     *,
     eligible: bool = True,
-    target: float = 0.25,
+    target: object = 0.25,
     extra: dict[str, object] | None = None,
 ) -> None:
     payload: dict[str, object] = {
@@ -177,6 +177,9 @@ def test_adapter_rejects_budget_over_ceiling_and_bad_mode(tmp_path: Path) -> Non
         _build(source, risk_budget_jpy=Decimal("1001"))
     with pytest.raises(FrozenTargetError, match="risk_budget_jpy"):
         _build(source, risk_budget_jpy=Decimal("0"))
+    for value in ("NaN", "Infinity", "-Infinity"):
+        with pytest.raises(FrozenTargetError, match="risk_budget_jpy"):
+            _build(source, risk_budget_jpy=Decimal(value))
     with pytest.raises(FrozenTargetError, match="mode"):
         _build(source, mode="real")
 

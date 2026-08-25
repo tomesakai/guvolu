@@ -12,7 +12,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -24,8 +23,8 @@ from guvolu.api.public_client import PublicClient
 from guvolu.data.durable_io import durable_append_bytes
 from guvolu.data.intent_ledger import IntentLedger
 from guvolu.data.paths import data_root
-from guvolu.domain.config import MAX_ORDER_JPY_CEILING, load_config
-from guvolu.domain.enums import ExecutionType, ServiceStatus, Side
+from guvolu.domain.config import load_config
+from guvolu.domain.enums import ExecutionType, RunMode, ServiceStatus, Side
 from guvolu.domain.errors import GuvoluError, PaperRejected, PaperSettled
 from guvolu.domain.ids import new_intent_id
 from guvolu.domain.intent import (
@@ -41,8 +40,14 @@ from guvolu.execution.conversion import (
     convert_target_to_delta_order,
 )
 from guvolu.execution.dispatch import DispatchResult, dispatch_order_intent
-from guvolu.execution.dry_run_executor import ORDER_ENDPOINT, load_market_rule
-from guvolu.execution.frozen_target_adapter import TARGET_SEMANTICS
+from guvolu.execution.dry_run_executor import (
+    ORDER_ENDPOINT,
+    ExecutorError,
+    TargetArtifact,
+    load_market_rule,
+    load_target_artifact,
+    verify_v2_source_prediction,
+)
 from guvolu.execution.paper_config import (
     DEFAULT_PAPER_CONFIG_PATH,
     OverlayThresholds,
@@ -69,8 +74,6 @@ from guvolu.risk.circuit_breaker import (
 from guvolu.risk.limits import LimitGate, trading_day
 from guvolu.risk.service_gate import allows_new_intent
 
-# 执行目标快照的最低可消费版本
-MIN_TARGET_SCHEMA_VERSION = 2
 # 执行器只消费 paper 模式目标
 PAPER_MODE = "paper"
 # 差异账、持仓账与认领账的版本
@@ -129,97 +132,55 @@ class ExecutionTarget:
     mode: str
     quality_eligible: bool
     lineage: Mapping[str, object]
-
-
-def _text(payload: Mapping[str, object], key: str) -> str:
-    value = payload.get(key)
-    if not isinstance(value, str) or not value:
-        raise PaperExecutorError(f"执行目标字段 {key} 缺失或非文本")
-    return value
-
-
-def _aware(payload: Mapping[str, object], key: str) -> datetime:
-    try:
-        parsed = datetime.fromisoformat(_text(payload, key))
-    except ValueError as exc:
-        raise PaperExecutorError(f"执行目标字段 {key} 非法时刻") from exc
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise PaperExecutorError(f"执行目标字段 {key} 缺少时区")
-    return parsed
+    operational: TargetArtifact
 
 
 def load_execution_target(path: Path) -> ExecutionTarget:
-    """装载第 2 版执行目标快照并校验结构与目标域。"""
+    """经共用严格合同装载第 2 版执行目标。"""
     try:
-        raw_bytes = path.read_bytes()
-    except FileNotFoundError as exc:
-        raise PaperExecutorError(f"执行目标不存在: {path}") from exc
-    try:
-        payload: object = json.loads(raw_bytes.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise PaperExecutorError(f"执行目标不是合法 JSON: {path}") from exc
-    if not isinstance(payload, dict):
-        raise PaperExecutorError("执行目标根必须为对象")
-    version = payload.get("schema_version")
+        artifact = load_target_artifact(path)
+    except ExecutorError as exc:
+        raise PaperExecutorError(str(exc)) from exc
     if (
-        isinstance(version, bool)
-        or not isinstance(version, int)
-        or version < MIN_TARGET_SCHEMA_VERSION
+        artifact.mode is None
+        or artifact.symbol is None
+        or artifact.risk_budget_jpy is None
+        or artifact.valid_from is None
+        or artifact.valid_until is None
     ):
-        raise PaperExecutorError(
-            f"执行目标 schema_version 须不低于 {MIN_TARGET_SCHEMA_VERSION}"
-        )
-    semantics = payload.get("target_semantics")
-    if not isinstance(semantics, Mapping) or any(
-        semantics.get(key) != value for key, value in TARGET_SEMANTICS.items()
-    ):
-        raise PaperExecutorError("执行目标 target_semantics 与目标域不一致")
-    exposure = payload.get("exposure_target")
-    if isinstance(exposure, bool) or not isinstance(exposure, (int, float)):
-        raise PaperExecutorError("执行目标 exposure_target 非数值")
-    exposure_value = float(exposure)
-    if not (0.0 <= exposure_value <= 1.0):
-        raise PaperExecutorError(
-            f"执行目标 exposure_target {exposure_value!r} 不在 [0, 1]"
-        )
-    try:
-        budget = Decimal(_text(payload, "risk_budget_jpy"))
-    except InvalidOperation as exc:
-        raise PaperExecutorError("执行目标 risk_budget_jpy 非法") from exc
-    if budget <= 0 or budget > MAX_ORDER_JPY_CEILING:
-        raise PaperExecutorError(
-            f"执行目标 risk_budget_jpy 必须在 (0, {MAX_ORDER_JPY_CEILING}] 内"
-        )
+        raise PaperExecutorError("paper 只接受 adapter v2 执行目标")
+    payload = artifact.payload
     quality = payload.get("quality")
-    if not isinstance(quality, Mapping) or not isinstance(
-        quality.get("eligible"), bool
-    ):
-        raise PaperExecutorError("执行目标缺少质量合同 eligible 位")
     lineage = payload.get("lineage")
-    if not isinstance(lineage, Mapping):
-        raise PaperExecutorError("执行目标缺少 lineage")
-    decision_time = _aware(payload, "decision_time")
-    valid_from = _aware(payload, "valid_from")
-    valid_until = _aware(payload, "valid_until")
-    if valid_until <= valid_from:
-        raise PaperExecutorError("执行目标 valid_until 不晚于 valid_from")
+    version = payload.get("schema_version")
+    valid_until_source = payload.get("valid_until_source")
+    if (
+        not isinstance(quality, Mapping)
+        or not isinstance(lineage, Mapping)
+        or not isinstance(version, int)
+        or isinstance(version, bool)
+        or not isinstance(valid_until_source, str)
+        or not valid_until_source
+    ):
+        raise PaperExecutorError("paper v2 目标字段不完整")
     return ExecutionTarget(
         path=path,
-        sha256=hashlib.sha256(raw_bytes).hexdigest(),
+        sha256=artifact.sha256,
         schema_version=version,
-        prediction_id=_text(payload, "run_id"),
-        correlation_id=_text(payload, "correlation_id"),
-        decision_time=decision_time,
-        valid_from=valid_from,
-        valid_until=valid_until,
-        valid_until_source=_text(payload, "valid_until_source"),
-        market_id=_text(payload, "market_id"),
-        symbol=SpotSymbol(_text(payload, "symbol")),
-        exposure_target=exposure_value,
-        risk_budget_jpy=budget,
-        mode=_text(payload, "mode"),
+        prediction_id=artifact.run_id,
+        correlation_id=artifact.correlation_id,
+        decision_time=artifact.decision_time,
+        valid_from=artifact.valid_from,
+        valid_until=artifact.valid_until,
+        valid_until_source=valid_until_source,
+        market_id=artifact.market_id,
+        symbol=artifact.symbol,
+        exposure_target=artifact.aggregate_target,
+        risk_budget_jpy=artifact.risk_budget_jpy,
+        mode=artifact.mode,
         quality_eligible=bool(quality["eligible"]),
         lineage={str(key): value for key, value in lineage.items()},
+        operational=artifact,
     )
 
 
@@ -243,6 +204,8 @@ def validate_execution_target(
         raise PaperExecutorError(
             f"执行目标 symbol {target.symbol} 与配置 {config.symbol} 不一致"
         )
+    if target.operational.payload.get("bar_interval") != config.bar_interval:
+        raise PaperExecutorError("执行目标 bar_interval 与配置不一致")
     if now >= target.valid_until:
         raise PaperExecutorError(
             f"执行目标已越期: valid_until {target.valid_until.isoformat()}"
@@ -250,9 +213,9 @@ def validate_execution_target(
         )
     if now < target.valid_from:
         raise PaperExecutorError("执行目标尚未生效")
-    if target.risk_budget_jpy > config.risk_budget_jpy:
+    if target.risk_budget_jpy != config.risk_budget_jpy:
         raise PaperExecutorError(
-            f"执行目标 risk_budget_jpy {target.risk_budget_jpy} 超过配置 "
+            f"执行目标 risk_budget_jpy {target.risk_budget_jpy} 与配置 "
             f"{config.risk_budget_jpy}"
         )
 
@@ -1050,6 +1013,8 @@ def render_report(
     """生成运行报告：目标、差分、成交、成本与触碰端点（A-03）。"""
     report: dict[str, object] = dict(outcome.difference_row)
     report["generated_at"] = datetime.now(UTC).isoformat()
+    report["target_path"] = str(outcome.target.path)
+    report["target_sha256"] = outcome.target.sha256
     report["ledger_paths"] = {
         "intent_ledger": str(runtime.intent_ledger_path),
         "position_ledger": str(runtime.position_ledger_path),
@@ -1132,6 +1097,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="paper 执行器配置（G-06）",
     )
     parser.add_argument(
+        "--source-prediction", type=Path, required=True,
+        help="由编排侧绑定的来源冻结预测路径",
+    )
+    parser.add_argument(
+        "--source-prediction-sha256", required=True,
+        help="编排侧在适配前固定的来源预测 SHA-256",
+    )
+    parser.add_argument(
         "--rules", type=Path, default=None,
         help="取引ルール快照 JSON；缺省经公开端点拉取",
     )
@@ -1170,17 +1143,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     env_file: Path | None = args.env_file
     process_config = load_config(env_file)
+    if process_config.mode is not RunMode.DRY_RUN:
+        raise PaperExecutorError("paper 执行器拒绝非 dry-run 进程环境")
     config_path: Path = args.config
     config = load_paper_config(config_path)
     target_path: Path = args.target
     target = load_execution_target(target_path)
     now_text: str | None = args.now
-    moment = (
-        datetime.now(UTC) if now_text is None
-        else datetime.fromisoformat(now_text)
-    )
+    try:
+        moment = (
+            datetime.now(UTC) if now_text is None
+            else datetime.fromisoformat(now_text)
+        )
+    except ValueError as exc:
+        raise PaperExecutorError("--now 不是合法时刻") from exc
     if moment.tzinfo is None:
         raise PaperExecutorError("--now 必须带时区")
+    try:
+        verify_v2_source_prediction(
+            target.operational,
+            source_prediction_path=Path(args.source_prediction),
+            expected_source_sha256=str(args.source_prediction_sha256),
+        )
+    except ExecutorError as exc:
+        raise PaperExecutorError(str(exc)) from exc
+    validate_execution_target(target, config, now=moment)
     root_arg: Path | None = args.ledger_root
     root = root_arg if root_arg is not None else data_root()
     ledger_directory = root / config.ledger_directory

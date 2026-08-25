@@ -15,6 +15,7 @@ from guvolu.domain.enums import ExecutionType, OrderStatus, Side
 from guvolu.domain.intent import IntentState, OrderIntent
 from guvolu.domain.models import Asset, Execution, Order
 from guvolu.domain.symbols import SpotSymbol
+from guvolu.execution.dry_run_executor import ExecutorError
 from guvolu.execution.dual_reconcile import SnapshotMode
 from guvolu.execution.reconcile_session import (
     ReconcileSession,
@@ -28,7 +29,7 @@ from guvolu.risk.circuit_breaker import (
     BreakerThresholds,
     CircuitBreaker,
 )
-from test_dry_run_executor import write_artifact, write_rules
+from test_dry_run_executor import write_artifact, write_v2_target
 from test_order_state import order_event, rest_execution, rest_order
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -343,9 +344,6 @@ def test_cli_full_round_offline(
     code = main(
         [
             "--ws-events", str(write_ws_events(tmp_path)),
-            "--target", str(write_artifact(tmp_path, 0.6)),
-            "--rules", str(write_rules(tmp_path)),
-            "--reference-price", "1000000",
             "--service-status", "OPEN",
             "--ledger", str(ledger_path),
             "--breaker-config", str(BREAKER_CONFIG),
@@ -364,10 +362,8 @@ def test_cli_full_round_offline(
     assert report["snapshot"]["counted_into_breaker"] == 1
     assert report["timeouts"] == []
     assert report["position"]["size"] == "0"
-    assert report["delta"]["proposal"]["side"] == "BUY"
-    assert report["delta"]["proposal"]["size"] == "0.0003"
-    assert report["delta"]["no_trade_band"] == "0.01"
-    assert report["intent"]["state"] == "DRY_RUN_BLOCKED"
+    assert report["delta"] is None
+    assert report["intent"] is None
     reads = report["endpoints"]["read_touched"]
     for endpoint in (
         "GET /v1/activeOrders",
@@ -376,7 +372,7 @@ def test_cli_full_round_offline(
         "GET /v1/orders",
     ):
         assert endpoint in reads
-    assert report["endpoints"]["write_planned"] == ["POST /v1/order"]
+    assert report["endpoints"]["write_planned"] == []
     assert report["endpoints"]["write_touched"] == []
     assert report["breaker"]["state"] == "NORMAL"
     assert report["breaker"]["emergency_stop"] == []
@@ -397,9 +393,6 @@ def test_cli_resolves_timeout_and_band_skips(
     report_path = tmp_path / "report.json"
     code = main(
         [
-            "--target", str(write_artifact(tmp_path, 0.6)),
-            "--rules", str(write_rules(tmp_path)),
-            "--reference-price", "1000000",
             "--service-status", "OPEN",
             "--no-trade-band", "0.99",
             "--ledger", str(ledger_path),
@@ -415,12 +408,69 @@ def test_cli_resolves_timeout_and_band_skips(
     assert report["snapshot"]["counted_into_breaker"] == 0
     assert report["timeouts"][0]["disposition"] == "resolved"
     assert report["timeouts"][0]["state"] == "FAILED"
-    assert report["delta"]["proposal"] is None
-    assert "不交易带" in report["delta"]["skip_reason"]
+    assert report["delta"] is None
     assert report["intent"] is None
     assert report["endpoints"]["write_planned"] == []
     reloaded = IntentLedger(ledger_path)
     assert reloaded.state("it01") is IntentState.FAILED
+
+
+@pytest.mark.parametrize("target_version", ["legacy", "v2"])
+@pytest.mark.parametrize("runtime_mode", ["dry-run", "live"])
+def test_cli_target_send_is_disabled_before_any_side_effect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target_version: str,
+    runtime_mode: str,
+) -> None:
+    """未获批准期间，任何目标版本/运行模式都不能进入对账发送链。"""
+    forbid_network(monkeypatch)
+    monkeypatch.setenv("GUVOLU_MODE", runtime_mode)
+    target = (
+        write_v2_target(tmp_path)
+        if target_version == "v2"
+        else write_artifact(tmp_path, 0.6)
+    )
+    ledger_path = tmp_path / "new" / "intent_ledger.jsonl"
+    report_path = tmp_path / "report.json"
+
+    def poison(*args: object, **kwargs: object) -> object:
+        raise AssertionError("目标拒绝前不得构造客户端、账本或报告")
+
+    class PoisonClient:
+        @classmethod
+        def from_config(cls, config: object) -> object:
+            return poison(config)
+
+    monkeypatch.setattr(
+        "guvolu.execution.reconcile_session.IntentLedger", poison,
+    )
+    monkeypatch.setattr(
+        "guvolu.execution.reconcile_session.PublicClient", PoisonClient,
+    )
+    monkeypatch.setattr(
+        "guvolu.execution.reconcile_session.ReadClient", PoisonClient,
+    )
+    monkeypatch.setattr(
+        "guvolu.execution.reconcile_session.TradeClient", PoisonClient,
+    )
+    monkeypatch.setattr(
+        "guvolu.execution.reconcile_session.arm_emergency_stop", poison,
+    )
+    monkeypatch.setattr("guvolu.execution.reconcile_session._emit", poison)
+
+    with pytest.raises(ExecutorError, match="目标驱动发送尚未获准"):
+        main(
+            [
+                "--target", str(target),
+                "--ledger", str(ledger_path),
+                "--env-file", str(tmp_path / "absent.env"),
+                "--report", str(report_path),
+            ]
+        )
+    assert not ledger_path.exists()
+    assert not report_path.exists()
+    assert not (tmp_path / "logs").exists()
 
 
 def test_cli_ambiguous_timeout_returns_one(

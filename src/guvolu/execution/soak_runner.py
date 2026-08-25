@@ -63,10 +63,8 @@ from guvolu.execution.conversion import DeltaDecision, MarketRule
 from guvolu.execution.dispatch import DispatchResult
 from guvolu.execution.dry_run_executor import (
     ORDER_ENDPOINT,
-    ExecutorError,
     fetch_market_rule,
     load_market_rule,
-    load_target_artifact,
 )
 from guvolu.execution.dual_reconcile import (
     PrivateEvent,
@@ -394,6 +392,10 @@ class SoakRunner:
         started_at: datetime | None = None,
     ) -> None:
         ensure_dry_run(mode)
+        if target_path is not None:
+            raise SoakError(
+                "浸泡证据暂不接受动态目标；须先实现版本化目标头与逐轮血缘校验"
+            )
         self._mode = mode
         self._session = session
         self._reader = reader
@@ -638,14 +640,8 @@ class SoakRunner:
         self.heartbeat(moment, force=True)
 
     def _read_target(self) -> tuple[float | None, str | None]:
-        """每轮重读目标制品；未给制品按零目标。"""
-        if self._target_path is None:
-            return 0.0, None
-        try:
-            artifact = load_target_artifact(self._target_path)
-        except ExecutorError as exc:
-            return None, str(exc)
-        return artifact.aggregate_target, None
+        """当前浸泡只运行零目标基础设施路径。"""
+        return 0.0, None
 
     def _plan_write(self, endpoint: str) -> None:
         if endpoint not in self._write_planned:
@@ -841,7 +837,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--symbol", default="BTC", help="现物品种，缺省 BTC")
     parser.add_argument(
         "--target", type=Path, default=None,
-        help="target-position 制品路径，每轮重读；缺省目标为零",
+        help="保留参数；动态目标浸泡尚未获准，传入即失败关闭",
     )
     parser.add_argument(
         "--budget-jpy", default="500", help="名义预算 JPY，缺省 500"
@@ -935,6 +931,12 @@ def _resolve_paths(args: argparse.Namespace) -> SoakPaths:
 def main(argv: Sequence[str] | None = None) -> int:
     """命令行入口。仅限模拟运行，live 配置拒绝启动（T-04）。"""
     args = build_parser().parse_args(argv)
+    if args.target is not None:
+        print(
+            "浸泡证据暂不接受动态目标；须先实现版本化目标头与逐轮血缘校验",
+            file=sys.stderr,
+        )
+        return 2
     env_file: Path | None = args.env_file
     config = load_config(env_file)
     if config.mode is not RunMode.DRY_RUN:
