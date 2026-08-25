@@ -5,16 +5,22 @@
 """
 from __future__ import annotations
 
+import ctypes
+import importlib
 import json
 import math
 import os
 import re
-from collections.abc import Mapping, Sequence
+import secrets
+import stat
+import sys
+from collections.abc import Callable, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any, Iterator, Protocol, cast
 
-from guvolu.data.durable_io import atomic_write_text, exclusive_path_lock
 from guvolu.research import clock
 from guvolu.research.provenance import (
     canonical_json,
@@ -25,10 +31,10 @@ from guvolu.research.provenance import (
 ECONOMIC_OBSERVATION_SCHEMA_VERSION = 1
 ECONOMIC_CONTEXT_SCHEMA_VERSION = 1
 ECONOMIC_PROPOSAL_SCHEMA_VERSION = 1
-ECONOMIC_AGENT_LEDGER_SCHEMA_VERSION = 1
+ECONOMIC_AGENT_LEDGER_SCHEMA_VERSION = 2
 ECONOMIC_CONTEXT_METHOD_VERSION = "economic-context-v1"
 ECONOMIC_PROPOSAL_METHOD_VERSION = "economic-search-plan-proposal-v1"
-ECONOMIC_AGENT_METHOD_VERSION = "economic-research-agent-v1"
+ECONOMIC_AGENT_METHOD_VERSION = "economic-research-agent-v1-embedded-ledger"
 
 DIMENSIONS = ("growth", "inflation", "rates", "liquidity", "fx", "risk")
 _REGIME_LABELS: Mapping[str, tuple[str, str, str]] = {
@@ -43,6 +49,345 @@ _IDENTIFIER = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_.:-]{0,127}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _ZERO_HASH = "0" * 64
 _SOURCE_RECEIPT_KEYS = frozenset({"source_id", "receipt_sha256", "locator"})
+
+
+@dataclass(frozen=True)
+class _DirectoryIdentity:
+    """A lexical directory component bound to its resolved path and file ID."""
+
+    lexical: str
+    resolved: str
+    device: int
+    inode: int
+    mode: int
+    file_attributes: int
+    reparse_tag: int
+
+
+def _path_race_hook(_phase: str, _path: Path) -> None:
+    """Internal no-op seam used to exercise check/use races deterministically."""
+
+
+def _absolute_lexical_path(path: Path, name: str) -> Path:
+    if not path.is_absolute():
+        raise ValueError(f"{name} 必须使用绝对规范路径")
+    normalized_text = os.path.normpath(str(path))
+    if os.path.normcase(str(path)) != os.path.normcase(normalized_text):
+        raise ValueError(f"{name} 不得使用含 . 或 .. 的路径别名")
+    return Path(os.path.abspath(path))
+
+
+def _directory_components(directory: Path) -> tuple[Path, ...]:
+    lexical = _absolute_lexical_path(directory, "目录")
+    parents = list(lexical.parents)
+    parents.reverse()
+    return tuple((*parents, lexical))
+
+
+def _directory_identity(path: Path, name: str) -> _DirectoryIdentity:
+    lexical = _absolute_lexical_path(path, name)
+    try:
+        metadata = lexical.lstat()
+        resolved = lexical.resolve(strict=True)
+    except OSError as error:
+        raise ValueError(f"{name} 不存在或无法读取身份: {lexical}") from error
+    attributes = int(getattr(metadata, "st_file_attributes", 0))
+    reparse_tag = int(getattr(metadata, "st_reparse_tag", 0))
+    reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or attributes & reparse_flag
+        or reparse_tag
+    ):
+        raise ValueError(f"{name} 不得是 symlink、junction 或其他 reparse point")
+    if os.path.normcase(str(lexical)) != os.path.normcase(str(resolved)):
+        raise ValueError(f"{name} 不得使用非规范路径或目录别名")
+    return _DirectoryIdentity(
+        lexical=str(lexical),
+        resolved=str(resolved),
+        device=int(metadata.st_dev),
+        inode=int(metadata.st_ino),
+        mode=int(metadata.st_mode),
+        file_attributes=attributes,
+        reparse_tag=reparse_tag,
+    )
+
+
+def _capture_directory_chain(
+    directory: Path,
+    name: str,
+) -> tuple[_DirectoryIdentity, ...]:
+    """Bind every existing lexical component, including Windows reparse metadata."""
+    return tuple(
+        _directory_identity(component, f"{name} 目录层级")
+        for component in _directory_components(directory)
+    )
+
+
+def _revalidate_directory_chain(
+    directory: Path,
+    expected: tuple[_DirectoryIdentity, ...],
+    name: str,
+) -> None:
+    if _capture_directory_chain(directory, name) != expected:
+        raise ValueError(f"{name} 目录身份在持锁操作期间发生变化")
+
+
+class _FcntlModule(Protocol):
+    LOCK_EX: int
+    LOCK_UN: int
+
+    def flock(self, fd: int, operation: int) -> None: ...
+
+
+class _WindowsFileTime(ctypes.Structure):
+    _fields_ = (
+        ("low", ctypes.c_uint32),
+        ("high", ctypes.c_uint32),
+    )
+
+
+class _WindowsFileInformation(ctypes.Structure):
+    _fields_ = (
+        ("file_attributes", ctypes.c_uint32),
+        ("creation_time", _WindowsFileTime),
+        ("last_access_time", _WindowsFileTime),
+        ("last_write_time", _WindowsFileTime),
+        ("volume_serial_number", ctypes.c_uint32),
+        ("file_size_high", ctypes.c_uint32),
+        ("file_size_low", ctypes.c_uint32),
+        ("number_of_links", ctypes.c_uint32),
+        ("file_index_high", ctypes.c_uint32),
+        ("file_index_low", ctypes.c_uint32),
+    )
+
+    @property
+    def file_index(self) -> int:
+        return (int(self.file_index_high) << 32) | int(self.file_index_low)
+
+
+@dataclass(frozen=True)
+class _PinnedDirectory:
+    """An opened direct parent plus every no-delete Windows ancestor handle."""
+
+    path: Path
+    identity: tuple[_DirectoryIdentity, ...]
+    descriptor: int | None
+    windows_handles: tuple[int, ...]
+
+
+@dataclass
+class _LedgerTransactionState:
+    """Share the durable commit point with every enclosing cleanup layer."""
+
+    committed: bool = False
+
+
+def _cleanup_transaction_resource(
+    action: Callable[[], None],
+    *,
+    state: _LedgerTransactionState | None,
+    body_failed: bool,
+    phase: str,
+    path: Path,
+) -> None:
+    """Run cleanup without turning a durable commit into a retry signal."""
+    try:
+        action()
+        _path_race_hook(phase, path)
+    except OSError:
+        if not body_failed and not (state is not None and state.committed):
+            raise
+
+
+def _windows_kernel32() -> Any:
+    loader = cast(Any, getattr(ctypes, "WinDLL"))
+    return loader("kernel32", use_last_error=True)
+
+
+def _windows_open_directory_handle(
+    path: Path,
+    expected: _DirectoryIdentity,
+) -> int:
+    """Open a directory without FILE_SHARE_DELETE and bind its file index."""
+    kernel = _windows_kernel32()
+    create_file = kernel.CreateFileW
+    create_file.argtypes = (
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    )
+    create_file.restype = ctypes.c_void_p
+    # 只共享读写，不共享删除。
+    handle_value = create_file(
+        str(path),
+        0x80,
+        0x1 | 0x2,
+        None,
+        3,
+        0x02000000 | 0x00200000,
+        None,
+    )
+    invalid = ctypes.c_void_p(-1).value
+    if handle_value is None or int(handle_value) == invalid:
+        error = ctypes.get_last_error()
+        raise OSError(error, f"无法固定目录句柄: {path}")
+    handle = int(handle_value)
+    get_information = kernel.GetFileInformationByHandle
+    get_information.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(_WindowsFileInformation),
+    )
+    get_information.restype = ctypes.c_int
+    information = _WindowsFileInformation()
+    if not get_information(ctypes.c_void_p(handle), ctypes.byref(information)):
+        error = ctypes.get_last_error()
+        _windows_discard_handle_after_failure(handle)
+        raise OSError(error, f"无法读取目录句柄身份: {path}")
+    reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    directory_flag = int(getattr(stat, "FILE_ATTRIBUTE_DIRECTORY", 0x10))
+    if (
+        information.file_index != expected.inode
+        or not int(information.file_attributes) & directory_flag
+        or int(information.file_attributes) & reparse_flag
+    ):
+        _windows_discard_handle_after_failure(handle)
+        raise ValueError(f"目录句柄与已验证路径身份不一致: {path}")
+    return handle
+
+
+def _windows_close_handle(handle: int) -> None:
+    kernel = _windows_kernel32()
+    close_handle = kernel.CloseHandle
+    close_handle.argtypes = (ctypes.c_void_p,)
+    close_handle.restype = ctypes.c_int
+    if not close_handle(ctypes.c_void_p(handle)):
+        error = ctypes.get_last_error()
+        raise OSError(error, "Windows 句柄关闭失败")
+
+
+def _windows_discard_handle_after_failure(handle: int) -> None:
+    try:
+        _windows_close_handle(handle)
+    except OSError:
+        pass
+
+
+@contextmanager
+def _pin_directory_chain(
+    directory: Path,
+    name: str,
+    *,
+    transaction_state: _LedgerTransactionState | None = None,
+) -> Iterator[_PinnedDirectory]:
+    """Open and identity-bind a directory chain before any path-based mutation."""
+    lexical = _absolute_lexical_path(directory, name)
+    identity = _capture_directory_chain(lexical, name)
+    descriptor: int | None = None
+    handles: list[int] = []
+    try:
+        if os.name == "nt":
+            for item in identity:
+                handles.append(
+                    _windows_open_directory_handle(Path(item.lexical), item),
+                )
+        else:
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(lexical, flags)
+            metadata = os.fstat(descriptor)
+            expected = identity[-1]
+            if (
+                int(metadata.st_dev) != expected.device
+                or int(metadata.st_ino) != expected.inode
+                or not stat.S_ISDIR(metadata.st_mode)
+            ):
+                raise ValueError(f"{name} 固定句柄与路径身份不一致")
+        _revalidate_directory_chain(lexical, identity, name)
+        yield _PinnedDirectory(
+            lexical,
+            identity,
+            descriptor,
+            tuple(handles),
+        )
+    finally:
+        body_failed = sys.exc_info()[0] is not None
+        cleanup_error: OSError | None = None
+        if descriptor is not None:
+            try:
+                _cleanup_transaction_resource(
+                    lambda: os.close(descriptor),
+                    state=transaction_state,
+                    body_failed=body_failed,
+                    phase="ledger-parent-close-after-effect",
+                    path=lexical,
+                )
+            except OSError as error:
+                cleanup_error = error
+        for handle in reversed(handles):
+            try:
+                _cleanup_transaction_resource(
+                    lambda: _windows_close_handle(handle),
+                    state=transaction_state,
+                    body_failed=body_failed or cleanup_error is not None,
+                    phase="ledger-parent-close-after-effect",
+                    path=lexical,
+                )
+            except OSError as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+        if cleanup_error is not None:
+            raise cleanup_error
+
+
+def _ensure_canonical_directory_tree(
+    directory: Path,
+    name: str,
+) -> Path:
+    """Create missing ancestors one at a time without trusting recursive mkdir."""
+    lexical = _absolute_lexical_path(directory, name)
+    missing: list[Path] = []
+    current = lexical
+    while True:
+        try:
+            current.lstat()
+        except FileNotFoundError:
+            missing.append(current)
+            parent = current.parent
+            if parent == current:
+                raise ValueError(f"{name} 无法定位既有父目录")
+            current = parent
+            continue
+        break
+    _capture_directory_chain(current, name)
+    for candidate in reversed(missing):
+        expected = current / candidate.name
+        if os.path.normcase(str(expected)) != os.path.normcase(str(candidate)):
+            raise ValueError(f"{name} 包含非规范目录层级")
+        with _pin_directory_chain(current, name) as pinned:
+            _path_race_hook("directory-before-mkdir", candidate)
+            _revalidate_directory_chain(current, pinned.identity, name)
+            try:
+                if pinned.descriptor is None:
+                    candidate.mkdir()
+                else:
+                    os.mkdir(candidate.name, dir_fd=pinned.descriptor)
+            except FileExistsError:
+                pass
+            if pinned.descriptor is None:
+                _fsync_directory(current)
+            else:
+                os.fsync(pinned.descriptor)
+            _path_race_hook("directory-after-mkdir", candidate)
+            _revalidate_directory_chain(current, pinned.identity, name)
+            _capture_directory_chain(candidate, name)
+        current = candidate
+    return Path(_directory_identity(lexical, name).lexical)
 
 
 def _object(value: object, name: str) -> Mapping[str, object]:
@@ -260,12 +605,585 @@ def parse_economic_observation(value: Mapping[str, object]) -> EconomicObservati
     )
 
 
-def _read_chain(path: Path, record_type: str) -> tuple[Mapping[str, object], ...]:
-    if not path.exists():
-        return ()
+def _canonical_ledger_path(
+    path: Path,
+    name: str,
+    *,
+    require_file: bool,
+) -> Path:
+    """拒绝相对、符号链接、``..`` 与硬链接台账别名。"""
+    lexical = _absolute_lexical_path(path, name)
+    if not require_file:
+        _ensure_canonical_directory_tree(lexical.parent, f"{name} 父目录")
+    else:
+        _capture_directory_chain(lexical.parent, f"{name} 父目录")
+    resolved = path.resolve(strict=False)
+    if os.path.normcase(str(lexical)) != os.path.normcase(str(resolved)):
+        raise ValueError(f"{name} 不得使用非规范路径或符号链接别名")
+    if resolved.exists():
+        if not resolved.is_file():
+            raise ValueError(f"{name} 不是普通文件")
+        try:
+            link_count = resolved.stat().st_nlink
+        except OSError as error:
+            raise ValueError(f"{name} 无法读取文件身份") from error
+        if link_count != 1:
+            raise ValueError(f"{name} 不得使用硬链接台账")
+    elif require_file:
+        raise ValueError(f"{name} 不存在: {resolved}")
+    return resolved
+
+
+@dataclass
+class _PendingLedgerAppend:
+    """One inode-bound append that remains reversible until lock exit."""
+
+    descriptor: int
+    created: bool
+    device: int
+    inode: int
+    original_body: bytes
+    committed_body: bytes
+    record_type: str
+
+
+@dataclass
+class _LockedLedger:
+    path: Path
+    parent: _PinnedDirectory
+    pending_append: _PendingLedgerAppend | None = None
+
+
+def _windows_final_path(handle: int, name: str) -> Path:
+    kernel = _windows_kernel32()
+    get_final_path = kernel.GetFinalPathNameByHandleW
+    get_final_path.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+    )
+    get_final_path.restype = ctypes.c_uint32
+    buffer = ctypes.create_unicode_buffer(32768)
+    length = int(
+        get_final_path(
+            ctypes.c_void_p(handle),
+            buffer,
+            len(buffer),
+            0,
+        ),
+    )
+    if length == 0 or length >= len(buffer):
+        error = ctypes.get_last_error()
+        raise OSError(error, f"无法读取{name}最终路径")
+    value = buffer.value
+    if value.startswith("\\\\?\\UNC\\"):
+        value = "\\\\" + value[8:]
+    elif value.startswith("\\\\?\\"):
+        value = value[4:]
+    return Path(value)
+
+
+def _windows_open_parent_anchor(parent: Path, ledger_name: str) -> int:
+    """Create a delete-on-close child that pins the verified parent subtree."""
+    kernel = _windows_kernel32()
+    create_file = kernel.CreateFileW
+    create_file.argtypes = (
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    )
+    create_file.restype = ctypes.c_void_p
+    invalid = ctypes.c_void_p(-1).value
+    for _attempt in range(128):
+        anchor_path = (
+            parent
+            / f".{ledger_name}.anchor-{secrets.token_hex(16)}"
+        )
+        handle_value = create_file(
+            str(anchor_path),
+            0x80000000 | 0x40000000 | 0x00010000,
+            0x1 | 0x2,
+            None,
+            1,
+            0x100 | 0x04000000 | 0x00200000,
+            None,
+        )
+        if handle_value is not None and int(handle_value) != invalid:
+            return int(handle_value)
+        error = ctypes.get_last_error()
+        if error not in {80, 183}:
+            raise OSError(error, f"无法建立台账父目录锚点: {parent}")
+    raise FileExistsError("无法分配唯一台账父目录锚点")
+
+
+def _validate_windows_parent_anchor(
+    handle: int,
+    parent: _PinnedDirectory,
+    name: str,
+) -> None:
+    anchor_parent = _windows_final_path(handle, f"{name}父目录锚点").parent
+    expected = os.path.normcase(os.path.abspath(parent.path))
+    actual = os.path.normcase(os.path.abspath(anchor_parent))
+    if actual != expected:
+        raise ValueError(f"{name}父目录锚点越出已验证目录")
+
+
+@contextmanager
+def _windows_named_ledger_mutex(
+    path: Path,
+    transaction_state: _LedgerTransactionState | None = None,
+) -> Iterator[None]:
+    """Serialize one canonical ledger without creating a path-based lock file."""
+    kernel = _windows_kernel32()
+    create_mutex = kernel.CreateMutexW
+    create_mutex.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_wchar_p,
+    )
+    create_mutex.restype = ctypes.c_void_p
+    mutex_name = (
+        "Global\\guvolu-economic-ledger-"
+        + sha256_text(os.path.normcase(str(path)))
+    )
+    handle_value = create_mutex(None, 0, mutex_name)
+    if handle_value is None:
+        error = ctypes.get_last_error()
+        raise OSError(error, "无法建立经济台账命名 mutex")
+    handle = int(handle_value)
+    wait = kernel.WaitForSingleObject
+    wait.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+    wait.restype = ctypes.c_uint32
+    result = int(wait(ctypes.c_void_p(handle), 0xFFFFFFFF))
+    if result not in {0, 0x80}:
+        error = ctypes.get_last_error()
+        _windows_discard_handle_after_failure(handle)
+        raise OSError(error, f"经济台账 mutex 等待失败: {result}")
     try:
-        body = path.read_bytes()
+        yield
+    finally:
+        body_failed = sys.exc_info()[0] is not None
+        release = kernel.ReleaseMutex
+        release.argtypes = (ctypes.c_void_p,)
+        release.restype = ctypes.c_int
+
+        def release_mutex() -> None:
+            if not release(ctypes.c_void_p(handle)):
+                error = ctypes.get_last_error()
+                raise OSError(error, "经济台账 mutex 释放失败")
+
+        release_error: OSError | None = None
+        try:
+            _cleanup_transaction_resource(
+                release_mutex,
+                state=transaction_state,
+                body_failed=body_failed,
+                phase="ledger-lock-release-after-effect",
+                path=path.parent,
+            )
+        except OSError as error:
+            release_error = error
+        _cleanup_transaction_resource(
+            lambda: _windows_close_handle(handle),
+            state=transaction_state,
+            body_failed=body_failed or release_error is not None,
+            phase="ledger-lock-close-after-effect",
+            path=path.parent,
+        )
+        if release_error is not None:
+            raise release_error
+
+
+
+def _windows_open_regular_file(path: Path, name: str) -> int:
+    """Open one existing regular file without following or sharing deletion."""
+    kernel = _windows_kernel32()
+    create_file = kernel.CreateFileW
+    create_file.argtypes = (
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    )
+    create_file.restype = ctypes.c_void_p
+    handle_value = create_file(
+        str(path),
+        0x80000000,
+        0x1,
+        None,
+        3,
+        0x80 | 0x00200000,
+        None,
+    )
+    invalid = ctypes.c_void_p(-1).value
+    if handle_value is None or int(handle_value) == invalid:
+        error = ctypes.get_last_error()
+        raise OSError(error, f"无法安全打开{name}: {path}")
+    handle = int(handle_value)
+    get_information = kernel.GetFileInformationByHandle
+    get_information.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(_WindowsFileInformation),
+    )
+    get_information.restype = ctypes.c_int
+    information = _WindowsFileInformation()
+    if not get_information(ctypes.c_void_p(handle), ctypes.byref(information)):
+        error = ctypes.get_last_error()
+        _windows_discard_handle_after_failure(handle)
+        raise OSError(error, f"无法读取{name}身份: {path}")
+    reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    directory_flag = int(getattr(stat, "FILE_ATTRIBUTE_DIRECTORY", 0x10))
+    if (
+        int(information.file_attributes) & (reparse_flag | directory_flag)
+        or int(information.number_of_links) != 1
+    ):
+        _windows_discard_handle_after_failure(handle)
+        raise ValueError(f"{name}必须是普通单链接文件")
+    import msvcrt
+
+    try:
+        return msvcrt.open_osfhandle(
+            handle,
+            os.O_RDONLY | getattr(os, "O_BINARY", 0),
+        )
+    except BaseException:
+        _windows_discard_handle_after_failure(handle)
+        raise
+
+
+def _windows_open_regular_file_for_update(
+    path: Path,
+    name: str,
+    *,
+    create: bool,
+) -> int:
+    """Open or create one inode-bound ledger without sharing writes/deletion."""
+    kernel = _windows_kernel32()
+    create_file = kernel.CreateFileW
+    create_file.argtypes = (
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    )
+    create_file.restype = ctypes.c_void_p
+    handle_value = create_file(
+        str(path),
+        0x80000000 | 0x40000000,
+        0,
+        None,
+        1 if create else 3,
+        0x80 | 0x00200000,
+        None,
+    )
+    invalid = ctypes.c_void_p(-1).value
+    if handle_value is None or int(handle_value) == invalid:
+        error = ctypes.get_last_error()
+        action = "建立" if create else "打开"
+        raise OSError(error, f"无法安全{action}{name}: {path}")
+    handle = int(handle_value)
+    get_information = kernel.GetFileInformationByHandle
+    get_information.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(_WindowsFileInformation),
+    )
+    get_information.restype = ctypes.c_int
+    information = _WindowsFileInformation()
+    if not get_information(ctypes.c_void_p(handle), ctypes.byref(information)):
+        error = ctypes.get_last_error()
+        _windows_discard_handle_after_failure(handle)
+        raise OSError(error, f"无法读取{name}身份: {path}")
+    reparse_flag = int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    directory_flag = int(getattr(stat, "FILE_ATTRIBUTE_DIRECTORY", 0x10))
+    if (
+        int(information.file_attributes) & (reparse_flag | directory_flag)
+        or int(information.number_of_links) != 1
+    ):
+        _windows_discard_handle_after_failure(handle)
+        raise ValueError(f"{name}必须是普通单链接文件")
+    import msvcrt
+
+    try:
+        return msvcrt.open_osfhandle(
+            handle,
+            os.O_RDWR | getattr(os, "O_BINARY", 0),
+        )
+    except BaseException:
+        _windows_discard_handle_after_failure(handle)
+        raise
+
+
+@contextmanager
+def _exclusive_pinned_lock(
+    ledger_path: Path,
+    parent: _PinnedDirectory,
+    name: str,
+    *,
+    transaction_state: _LedgerTransactionState | None = None,
+    create_lock: bool,
+) -> Iterator[None]:
+    """Lock a ledger without resolving the lock through a mutable parent."""
+    if parent.descriptor is None:
+        with _windows_named_ledger_mutex(ledger_path, transaction_state):
+            _path_race_hook("ledger-lock-before-open", parent.path)
+            _revalidate_directory_chain(
+                parent.path,
+                parent.identity,
+                f"{name} 父目录",
+            )
+            _path_race_hook("ledger-lock-after-final-check", parent.path)
+            anchor = _windows_open_parent_anchor(
+                parent.path,
+                ledger_path.name,
+            )
+            try:
+                identity_error: BaseException | None = None
+                try:
+                    _validate_windows_parent_anchor(anchor, parent, name)
+                    _revalidate_directory_chain(
+                        parent.path,
+                        parent.identity,
+                        f"{name} 父目录",
+                    )
+                except BaseException as error:
+                    identity_error = error
+                _path_race_hook("ledger-lock-after-open", parent.path)
+                if identity_error is not None:
+                    raise identity_error
+                _validate_windows_parent_anchor(anchor, parent, name)
+                _revalidate_directory_chain(
+                    parent.path,
+                    parent.identity,
+                    f"{name} 父目录",
+                )
+                yield
+            finally:
+                _cleanup_transaction_resource(
+                    lambda: _windows_close_handle(anchor),
+                    state=transaction_state,
+                    body_failed=sys.exc_info()[0] is not None,
+                    phase="ledger-anchor-close-after-effect",
+                    path=parent.path,
+                )
+        return
+
+    lock_name = ledger_path.name + ".lock"
+    descriptor = -1
+    _path_race_hook("ledger-lock-before-open", parent.path)
+    _revalidate_directory_chain(
+        parent.path,
+        parent.identity,
+        f"{name} 父目录",
+    )
+    _path_race_hook("ledger-lock-after-final-check", parent.path)
+    try:
+        flags = (
+            os.O_RDWR | os.O_CREAT
+            if create_lock
+            else os.O_RDONLY
+        )
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(
+            lock_name,
+            flags,
+            0o600,
+            dir_fd=parent.descriptor,
+        )
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or int(metadata.st_nlink) != 1:
+            raise ValueError("台账锁必须是普通单链接文件")
+        if metadata.st_size == 0 and create_lock:
+            os.write(descriptor, b"\0")
+            os.fsync(descriptor)
+        elif metadata.st_size != 1:
+            raise ValueError("台账锁文件长度非法")
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        identity_error = None
+        try:
+            _revalidate_directory_chain(
+                parent.path,
+                parent.identity,
+                f"{name} 父目录",
+            )
+        except BaseException as error:
+            identity_error = error
+        _path_race_hook("ledger-lock-after-open", parent.path)
+        if identity_error is not None:
+            raise identity_error
+        _revalidate_directory_chain(
+            parent.path,
+            parent.identity,
+            f"{name} 父目录",
+        )
+        fcntl = cast(_FcntlModule, importlib.import_module("fcntl"))
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            _cleanup_transaction_resource(
+                lambda: fcntl.flock(descriptor, fcntl.LOCK_UN),
+                state=transaction_state,
+                body_failed=sys.exc_info()[0] is not None,
+                phase="ledger-lock-release-after-effect",
+                path=parent.path,
+            )
+    finally:
+        if descriptor >= 0:
+            _cleanup_transaction_resource(
+                lambda: os.close(descriptor),
+                state=transaction_state,
+                body_failed=sys.exc_info()[0] is not None,
+                phase="ledger-lock-close-after-effect",
+                path=parent.path,
+            )
+
+
+
+@contextmanager
+def _exclusive_ledger_lock(
+    path: Path,
+    name: str,
+    *,
+    require_file: bool,
+    transaction_state: _LedgerTransactionState | None = None,
+    precommit_validator: Callable[[], None] | None = None,
+) -> Iterator[_LockedLedger]:
+    """固定父目录链后持锁，避免锁和数据路径双换位。"""
+    lexical = _absolute_lexical_path(path, name)
+    if not require_file:
+        _ensure_canonical_directory_tree(lexical.parent, f"{name} 父目录")
+    canonical = _canonical_ledger_path(path, name, require_file=require_file)
+    if transaction_state is None:
+        transaction_state = _LedgerTransactionState()
+    with _pin_directory_chain(
+        canonical.parent,
+        f"{name} 父目录",
+        transaction_state=transaction_state,
+    ) as parent:
+        with _exclusive_pinned_lock(
+            canonical,
+            parent,
+            name,
+            transaction_state=transaction_state,
+            create_lock=not require_file,
+        ):
+            canonical = _canonical_ledger_path(
+                canonical,
+                name,
+                require_file=require_file,
+            )
+            locked = _LockedLedger(canonical, parent)
+            try:
+                yield locked
+            except BaseException:
+                try:
+                    _rollback_pending_append(locked)
+                except BaseException as rollback_error:
+                    raise OSError(
+                        f"{name} 失败后无法恢复原台账 inode",
+                    ) from rollback_error
+                raise
+            else:
+                if (
+                    transaction_state.committed
+                    and locked.pending_append is None
+                ):
+                    # 包围已提交写事务的只读锁不再反转结果。
+                    return
+                try:
+                    _canonical_ledger_path(canonical, name, require_file=True)
+                    _revalidate_directory_chain(
+                        canonical.parent,
+                        parent.identity,
+                        f"{name} 父目录",
+                    )
+                    had_pending_append = locked.pending_append is not None
+                    _finish_pending_append(
+                        locked,
+                        precommit_validator=precommit_validator,
+                    )
+                    if had_pending_append:
+                        transaction_state.committed = True
+                except BaseException:
+                    try:
+                        _rollback_pending_append(locked)
+                    except BaseException as rollback_error:
+                        raise OSError(
+                            f"{name} 提交检查失败后无法恢复原台账 inode",
+                        ) from rollback_error
+                    raise
+
+
+def _pinned_lstat(ledger: _LockedLedger) -> os.stat_result | None:
+    try:
+        if ledger.parent.descriptor is None:
+            return ledger.path.lstat()
+        return os.stat(
+            ledger.path.name,
+            dir_fd=ledger.parent.descriptor,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        return None
+
+
+def _read_pinned_bytes(ledger: _LockedLedger, name: str) -> bytes:
+    metadata = _pinned_lstat(ledger)
+    if metadata is None:
+        raise FileNotFoundError(ledger.path)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or int(metadata.st_nlink) != 1
+    ):
+        raise ValueError(f"{name} 必须是普通单链接文件")
+    if ledger.parent.descriptor is None:
+        descriptor = _windows_open_regular_file(ledger.path, name)
+    else:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(
+            ledger.path.name,
+            flags,
+            dir_fd=ledger.parent.descriptor,
+        )
+    try:
+        opened = os.fstat(descriptor)
+        if (
+            int(opened.st_dev) != int(metadata.st_dev)
+            or int(opened.st_ino) != int(metadata.st_ino)
+            or not stat.S_ISREG(opened.st_mode)
+            or int(opened.st_nlink) != 1
+        ):
+            raise ValueError(f"{name} 文件身份在打开时发生变化")
+        with os.fdopen(descriptor, "rb") as handle:
+            descriptor = -1
+            return handle.read()
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _read_chain(
+    ledger: _LockedLedger,
+    record_type: str,
+) -> tuple[Mapping[str, object], ...]:
+    path = ledger.path
+    try:
+        body = _read_pinned_bytes(ledger, f"{record_type} 台账")
         text = body.decode("utf-8")
+    except FileNotFoundError:
+        return ()
     except (OSError, UnicodeDecodeError) as error:
         raise ValueError(f"{record_type} 台账无法读取") from error
     if body and not body.endswith(b"\n"):
@@ -283,6 +1201,8 @@ def _read_chain(path: Path, record_type: str) -> tuple[Mapping[str, object], ...
             raise ValueError(f"{record_type} 台账第 {sequence} 行不是 canonical JSON")
         if row.get("record_type") != record_type or row.get("sequence") != sequence:
             raise ValueError(f"{record_type} 台账顺序或类型非法")
+        if row.get("ledger_canonical_path") != path.as_posix():
+            raise ValueError(f"{record_type} 台账登记路径与当前路径不一致")
         if row.get("previous_record_sha256") != previous:
             raise ValueError(f"{record_type} 台账哈希链断裂")
         supplied_hash = _sha256(row.get("record_sha256"), "record_sha256")
@@ -298,6 +1218,7 @@ def _read_chain(path: Path, record_type: str) -> tuple[Mapping[str, object], ...
 
 def _chain_rows(
     record_type: str,
+    ledger_path: Path,
     existing: Sequence[Mapping[str, object]],
     payloads: Sequence[Mapping[str, object]],
 ) -> tuple[Mapping[str, object], ...]:
@@ -313,6 +1234,7 @@ def _chain_rows(
             "sequence": len(existing) + offset,
             "previous_record_sha256": previous,
             **dict(payload),
+            "ledger_canonical_path": ledger_path.as_posix(),
         }
         digest = sha256_text(canonical_json(body))
         row = {**body, "record_sha256": digest}
@@ -321,21 +1243,440 @@ def _chain_rows(
     return tuple(rows)
 
 
+def _fsync_directory(directory: Path) -> None:
+    """尽力持久化目录项；不支持目录 fsync 的平台安全降级。"""
+    try:
+        descriptor = os.open(directory, os.O_RDONLY)
+    except OSError:
+        if os.name == "nt":
+            return
+        raise
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        if os.name != "nt":
+            raise
+    finally:
+        os.close(descriptor)
+
+
+def _create_pinned_temp(
+    parent: _PinnedDirectory,
+    prefix: str,
+    mode: int,
+) -> tuple[int, str, Path]:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    for _attempt in range(128):
+        name = f"{prefix}{secrets.token_hex(16)}"
+        path = parent.path / name
+        try:
+            if parent.descriptor is None:
+                descriptor = os.open(path, flags, mode)
+            else:
+                descriptor = os.open(
+                    name,
+                    flags,
+                    mode,
+                    dir_fd=parent.descriptor,
+                )
+            return descriptor, name, path
+        except FileExistsError:
+            continue
+    raise FileExistsError("无法分配唯一台账临时文件")
+
+
+def _unlink_pinned(parent: _PinnedDirectory, name: str) -> None:
+    if parent.descriptor is None:
+        (parent.path / name).unlink()
+    else:
+        os.unlink(name, dir_fd=parent.descriptor)
+
+
+def _link_pinned(parent: _PinnedDirectory, source: str, target: str) -> None:
+    if parent.descriptor is None:
+        os.link(
+            parent.path / source,
+            parent.path / target,
+            follow_symlinks=False,
+        )
+    else:
+        os.link(
+            source,
+            target,
+            src_dir_fd=parent.descriptor,
+            dst_dir_fd=parent.descriptor,
+            follow_symlinks=False,
+        )
+
+
+def _sync_pinned_directory(parent: _PinnedDirectory) -> None:
+    if parent.descriptor is None:
+        _fsync_directory(parent.path)
+    else:
+        os.fsync(parent.descriptor)
+
+
+def _same_file_identity(
+    metadata: os.stat_result,
+    device: int,
+    inode: int,
+) -> bool:
+    return (
+        int(metadata.st_dev) == device
+        and int(metadata.st_ino) == inode
+        and stat.S_ISREG(metadata.st_mode)
+        and not stat.S_ISLNK(metadata.st_mode)
+    )
+
+
+def _read_descriptor_bytes(descriptor: int) -> bytes:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+
+
+def _write_descriptor_all(descriptor: int, body: bytes) -> None:
+    offset = 0
+    while offset < len(body):
+        written = os.write(descriptor, body[offset:])
+        if written <= 0:
+            raise OSError("台账写入未取得进展")
+        offset += written
+
+
+def _open_pinned_ledger_for_update(
+    ledger: _LockedLedger,
+    name: str,
+) -> tuple[int, bool, os.stat_result]:
+    """Open the canonical inode once; never write through a replaceable temp."""
+    prior = _pinned_lstat(ledger)
+    if prior is not None and (
+        not stat.S_ISREG(prior.st_mode)
+        or stat.S_ISLNK(prior.st_mode)
+        or int(prior.st_nlink) != 1
+    ):
+        raise ValueError(f"{name}必须是普通单链接文件")
+    created = prior is None
+    descriptor = -1
+    opened: os.stat_result | None = None
+    try:
+        if ledger.parent.descriptor is None:
+            descriptor = _windows_open_regular_file_for_update(
+                ledger.path,
+                name,
+                create=created,
+            )
+        else:
+            flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+            if created:
+                flags |= os.O_CREAT | os.O_EXCL
+            descriptor = os.open(
+                ledger.path.name,
+                flags,
+                0o644,
+                dir_fd=ledger.parent.descriptor,
+            )
+        opened = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or int(opened.st_nlink) != 1
+            or (
+                prior is not None
+                and not _same_file_identity(
+                    opened,
+                    int(prior.st_dev),
+                    int(prior.st_ino),
+                )
+            )
+        ):
+            raise ValueError(f"{name} 文件身份在更新打开时发生变化")
+        current = _pinned_lstat(ledger)
+        if current is None or not _same_file_identity(
+            current,
+            int(opened.st_dev),
+            int(opened.st_ino),
+        ):
+            raise ValueError(f"{name} 规范路径未绑定打开的 inode")
+        return descriptor, created, opened
+    except BaseException:
+        truncate_error: BaseException | None = None
+        cleanup_error: BaseException | None = None
+        if descriptor >= 0:
+            try:
+                if created:
+                    os.ftruncate(descriptor, 0)
+                    os.fsync(descriptor)
+            except BaseException as error:
+                truncate_error = error
+            try:
+                os.close(descriptor)
+            except OSError:
+                # close 后效不阻断清理。
+                pass
+        if created and opened is None:
+            cleanup_error = OSError(f"{name} 新台账身份不可得")
+        elif created:
+            assert opened is not None
+            try:
+                current = _pinned_lstat(ledger)
+                if current is not None:
+                    if not _same_file_identity(
+                        current,
+                        int(opened.st_dev),
+                        int(opened.st_ino),
+                    ):
+                        raise OSError("新台账路径被其他 inode 占用")
+                    if int(current.st_nlink) != 1 and truncate_error is not None:
+                        raise OSError("新台账外链无法恢复为空") from truncate_error
+                    _unlink_pinned(ledger.parent, ledger.path.name)
+                _sync_pinned_directory(ledger.parent)
+            except BaseException as error:
+                cleanup_error = error
+        if cleanup_error is not None:
+            raise OSError(f"{name} 更新打开失败后无法清理") from cleanup_error
+        raise
+
+
+def _validate_pending_append(
+    ledger: _LockedLedger,
+    *,
+    require_single_link: bool,
+) -> _PendingLedgerAppend:
+    pending = ledger.pending_append
+    if pending is None:
+        raise RuntimeError("台账没有待提交追加")
+    metadata = os.fstat(pending.descriptor)
+    if not _same_file_identity(metadata, pending.device, pending.inode):
+        raise ValueError(f"{pending.record_type} 台账 inode 身份发生变化")
+    if require_single_link and int(metadata.st_nlink) != 1:
+        raise ValueError(f"{pending.record_type} 台账更新期间出现硬链接")
+    return pending
+
+
+def _rollback_pending_append(ledger: _LockedLedger) -> None:
+    pending = ledger.pending_append
+    if pending is None:
+        return
+    failure: BaseException | None = None
+    remove_created = False
+    try:
+        _validate_pending_append(ledger, require_single_link=False)
+        os.lseek(pending.descriptor, 0, os.SEEK_SET)
+        _write_descriptor_all(pending.descriptor, pending.original_body)
+        os.ftruncate(pending.descriptor, len(pending.original_body))
+        os.fsync(pending.descriptor)
+        current = _pinned_lstat(ledger)
+        if pending.created:
+            if current is not None:
+                if not _same_file_identity(current, pending.device, pending.inode):
+                    raise OSError("新台账规范路径已被其他 inode 占用")
+                remove_created = True
+        elif current is None or not _same_file_identity(
+            current,
+            pending.device,
+            pending.inode,
+        ):
+            raise OSError("既有台账规范路径不再指向原 inode")
+    except BaseException as error:
+        failure = error
+    finally:
+        try:
+            os.close(pending.descriptor)
+        except OSError:
+            # 内容已经持久化。
+            # close 后效不遮蔽主异常。
+            # 仍须继续 unlink 和目录同步。
+            pass
+        ledger.pending_append = None
+    if remove_created:
+        try:
+            current = _pinned_lstat(ledger)
+            if current is None or not _same_file_identity(
+                current,
+                pending.device,
+                pending.inode,
+            ):
+                raise OSError("新台账关闭后规范路径身份发生变化")
+            _unlink_pinned(ledger.parent, ledger.path.name)
+        except BaseException as error:
+            failure = failure or error
+    try:
+        _sync_pinned_directory(ledger.parent)
+    except BaseException as error:
+        failure = failure or error
+    if failure is not None:
+        raise OSError("inode-bound 台账追加无法回滚") from failure
+
+
+def _finish_pending_append(
+    ledger: _LockedLedger,
+    *,
+    precommit_validator: Callable[[], None] | None = None,
+) -> None:
+    pending = ledger.pending_append
+    if pending is None:
+        return
+    _validate_pending_append(ledger, require_single_link=True)
+    if _read_descriptor_bytes(pending.descriptor) != pending.committed_body:
+        raise ValueError(f"{pending.record_type} 台账提交内容发生变化")
+    current = _pinned_lstat(ledger)
+    if (
+        current is None
+        or not _same_file_identity(current, pending.device, pending.inode)
+        or int(current.st_nlink) != 1
+    ):
+        raise ValueError(f"{pending.record_type} 台账规范路径身份发生变化")
+    os.fsync(pending.descriptor)
+    _sync_pinned_directory(ledger.parent)
+    _path_race_hook("ledger-before-commit", ledger.path.parent)
+    _revalidate_directory_chain(
+        ledger.path.parent,
+        ledger.parent.identity,
+        f"{pending.record_type} 台账父目录",
+    )
+    _validate_pending_append(ledger, require_single_link=True)
+    current = _pinned_lstat(ledger)
+    if (
+        current is None
+        or not _same_file_identity(current, pending.device, pending.inode)
+        or int(current.st_nlink) != 1
+    ):
+        raise ValueError(f"{pending.record_type} 台账提交前路径身份发生变化")
+    if precommit_validator is not None:
+        precommit_validator()
+    descriptor = pending.descriptor
+    ledger.pending_append = None
+    try:
+        os.close(descriptor)
+    except OSError:
+        # 已提交。
+        # close 状态不明时不得诱导重试。
+        pass
+
+
 def _append_chain_unlocked(
-    path: Path,
+    ledger: _LockedLedger,
     record_type: str,
     existing: Sequence[Mapping[str, object]],
     payloads: Sequence[Mapping[str, object]],
 ) -> tuple[Mapping[str, object], ...]:
-    rows = _chain_rows(record_type, existing, payloads)
+    path = ledger.path
+    rows = _chain_rows(record_type, path, existing, payloads)
     if not rows:
         return ()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    encoded = "".join(canonical_json(row) + "\n" for row in rows).encode("utf-8")
-    with path.open("ab") as handle:
-        handle.write(encoded)
-        handle.flush()
-        os.fsync(handle.fileno())
+    if ledger.pending_append is not None:
+        raise RuntimeError("同一台账锁内只允许一次待提交追加")
+    old_body = "".join(
+        canonical_json(row) + "\n" for row in existing
+    ).encode("utf-8")
+    appended_body = "".join(
+        canonical_json(row) + "\n" for row in rows
+    ).encode("utf-8")
+    new_body = old_body + appended_body
+    _path_race_hook("ledger-before-temp", path.parent)
+    _revalidate_directory_chain(
+        path.parent,
+        ledger.parent.identity,
+        f"{record_type} 台账父目录",
+    )
+    descriptor, created, metadata = _open_pinned_ledger_for_update(
+        ledger,
+        f"{record_type} 台账",
+    )
+    try:
+        current_body = _read_descriptor_bytes(descriptor)
+        if current_body != old_body:
+            raise ValueError(f"{record_type} 台账在持锁期间发生变化")
+        ledger.pending_append = _PendingLedgerAppend(
+            descriptor=descriptor,
+            created=created,
+            device=int(metadata.st_dev),
+            inode=int(metadata.st_ino),
+            original_body=old_body,
+            committed_body=new_body,
+            record_type=record_type,
+        )
+        descriptor = -1
+        pending = _validate_pending_append(ledger, require_single_link=True)
+        os.lseek(pending.descriptor, len(old_body), os.SEEK_SET)
+        _write_descriptor_all(pending.descriptor, appended_body)
+        if os.lseek(pending.descriptor, 0, os.SEEK_END) != len(new_body):
+            raise OSError(f"{record_type} 台账出现短写或并发改写")
+        os.fsync(pending.descriptor)
+        _path_race_hook("ledger-after-write", path.parent)
+        _validate_pending_append(ledger, require_single_link=True)
+        _revalidate_directory_chain(
+            path.parent,
+            ledger.parent.identity,
+            f"{record_type} 台账父目录",
+        )
+        _path_race_hook("ledger-before-replace", path.parent)
+        _revalidate_directory_chain(
+            path.parent,
+            ledger.parent.identity,
+            f"{record_type} 台账父目录",
+        )
+        _path_race_hook("ledger-after-final-check", path.parent)
+        identity_error: BaseException | None = None
+        try:
+            _revalidate_directory_chain(
+                path.parent,
+                ledger.parent.identity,
+                f"{record_type} 台账父目录",
+            )
+        except BaseException as error:
+            identity_error = error
+        _path_race_hook("ledger-after-install", path.parent)
+        if identity_error is not None:
+            raise identity_error
+        _path_race_hook("ledger-after-replace", path.parent)
+        _revalidate_directory_chain(
+            path.parent,
+            ledger.parent.identity,
+            f"{record_type} 台账父目录",
+        )
+        _sync_pinned_directory(ledger.parent)
+        _validate_pending_append(ledger, require_single_link=True)
+    finally:
+        if descriptor >= 0:
+            truncate_error: BaseException | None = None
+            cleanup_error: BaseException | None = None
+            if created:
+                try:
+                    os.ftruncate(descriptor, 0)
+                    os.fsync(descriptor)
+                except BaseException as error:
+                    truncate_error = error
+            try:
+                os.close(descriptor)
+            except OSError:
+                # close 后效错误不中断新文件的删除。
+                pass
+            if created:
+                try:
+                    current = _pinned_lstat(ledger)
+                    if current is not None:
+                        if not _same_file_identity(
+                            current,
+                            int(metadata.st_dev),
+                            int(metadata.st_ino),
+                        ):
+                            raise OSError("新台账路径被其他 inode 占用")
+                        if int(current.st_nlink) != 1 and truncate_error is not None:
+                            raise OSError("新台账外链无法恢复为空") from truncate_error
+                        _unlink_pinned(ledger.parent, path.name)
+                    _sync_pinned_directory(ledger.parent)
+                except BaseException as error:
+                    cleanup_error = error
+            if cleanup_error is not None:
+                raise OSError(
+                    f"{record_type} 台账待追加建立失败后无法清理",
+                ) from cleanup_error
     return rows
 
 
@@ -363,9 +1704,19 @@ def _validate_revision_chain(observations: Sequence[EconomicObservation]) -> Non
         latest[key] = observation
 
 
+_OBSERVATION_ROW_KEYS = frozenset({
+    "record_type", "sequence", "previous_record_sha256", "record_sha256",
+    "ledger_canonical_path", "schema_version", "observation_id", "series_id",
+    "value", "unit", "event_time", "available_time", "ingest_time",
+    "revision_id", "supersedes_revision_id", "source_receipt",
+})
+
+
 def _observation_snapshot(
     rows: Sequence[Mapping[str, object]],
 ) -> EconomicObservationSnapshot:
+    for row in rows:
+        _validate_exact_keys(row, _OBSERVATION_ROW_KEYS, "economic observation row")
     observations = tuple(parse_economic_observation(row) for row in rows)
     _validate_revision_chain(observations)
     head = (
@@ -378,10 +1729,12 @@ def _observation_snapshot(
 
 def load_economic_observation_snapshot(path: Path) -> EconomicObservationSnapshot:
     """在共享路径锁内读取并校验完整观测台账。"""
-    with exclusive_path_lock(path):
-        if not path.is_file():
-            raise ValueError(f"经济观测台账不存在: {path}")
-        rows = _read_chain(path, "economic_observation")
+    with _exclusive_ledger_lock(
+        path,
+        "经济观测台账",
+        require_file=True,
+    ) as ledger:
+        rows = _read_chain(ledger, "economic_observation")
     return _observation_snapshot(rows)
 
 
@@ -398,12 +1751,16 @@ def append_economic_observations(
     parsed = tuple(parse_economic_observation(value) for value in values)
     if not parsed:
         raise ValueError("观测批次不得为空")
-    with exclusive_path_lock(path):
-        rows = _read_chain(path, "economic_observation")
-        existing = tuple(parse_economic_observation(row) for row in rows)
+    with _exclusive_ledger_lock(
+        path,
+        "经济观测台账",
+        require_file=False,
+    ) as ledger:
+        rows = _read_chain(ledger, "economic_observation")
+        existing = _observation_snapshot(rows).observations
         _validate_revision_chain((*existing, *parsed))
         _append_chain_unlocked(
-            path,
+            ledger,
             "economic_observation",
             rows,
             tuple(observation.payload() for observation in parsed),
@@ -651,19 +2008,98 @@ def write_content_addressed_artifact(
     kind: str,
 ) -> Path:
     """以制品标识命名并且绝不改写既有不同内容。"""
+    if kind in {"economic-search-plan-proposal", "economic-agent-run"}:
+        raise ValueError("v1 禁止写入 standalone proposal/run 制品")
     artifact_id = _verify_artifact(value, kind)
-    content = canonical_json(value) + "\n"
-    path = output / f"{artifact_id}.json"
-    if path.exists():
-        if path.read_text(encoding="utf-8") != content:
-            raise ValueError(f"已有同名制品内容不同: {path}")
-        return path
-    atomic_write_text(path, content)
-    return path
+    content = (canonical_json(value) + "\n").encode("utf-8")
+    parent = _ensure_canonical_directory_tree(output, f"{kind} 制品目录")
+    path = parent / f"{artifact_id}.json"
+    transaction_state = _LedgerTransactionState()
+    with _pin_directory_chain(
+        parent,
+        f"{kind} 制品目录",
+        transaction_state=transaction_state,
+    ) as pinned:
+        with _exclusive_pinned_lock(
+            path,
+            pinned,
+            f"{kind} 制品",
+            transaction_state=transaction_state,
+            create_lock=True,
+        ):
+            artifact = _LockedLedger(path, pinned)
+            if _pinned_lstat(artifact) is not None:
+                if _read_pinned_bytes(artifact, kind) != content:
+                    raise ValueError(f"已有同名制品内容不同: {path}")
+                transaction_state.committed = True
+                return path
+            descriptor, temp_name, _temp = _create_pinned_temp(
+                pinned,
+                f".{path.name}.artifact-",
+                0o644,
+            )
+            installed = False
+            try:
+                with os.fdopen(descriptor, "wb") as handle:
+                    descriptor = -1
+                    handle.write(content)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                _path_race_hook("artifact-before-install", parent)
+                _revalidate_directory_chain(
+                    parent,
+                    pinned.identity,
+                    f"{kind} 制品目录",
+                )
+                _link_pinned(pinned, temp_name, path.name)
+                installed = True
+                identity_error: BaseException | None = None
+                try:
+                    _revalidate_directory_chain(
+                        parent,
+                        pinned.identity,
+                        f"{kind} 制品目录",
+                    )
+                except BaseException as error:
+                    identity_error = error
+                _path_race_hook("artifact-after-install", parent)
+                if identity_error is not None:
+                    raise identity_error
+                _revalidate_directory_chain(
+                    parent,
+                    pinned.identity,
+                    f"{kind} 制品目录",
+                )
+                _unlink_pinned(pinned, temp_name)
+                _sync_pinned_directory(pinned)
+                if _read_pinned_bytes(artifact, kind) != content:
+                    raise OSError("已提交制品内容发生变化")
+                transaction_state.committed = True
+            except BaseException as error:
+                if installed:
+                    try:
+                        if _read_pinned_bytes(artifact, kind) != content:
+                            raise OSError("已安装制品内容发生变化")
+                        _unlink_pinned(pinned, path.name)
+                        _sync_pinned_directory(pinned)
+                    except BaseException as rollback_error:
+                        raise OSError("制品安装失败后无法回滚") from rollback_error
+                raise
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+                try:
+                    _unlink_pinned(pinned, temp_name)
+                except FileNotFoundError:
+                    pass
+            return path
 
 
-def load_content_addressed_artifact(path: Path, kind: str) -> Mapping[str, object]:
-    """读取并校验内容寻址制品。"""
+def _load_content_addressed_artifact_untyped(
+    path: Path,
+    kind: str,
+) -> Mapping[str, object]:
+    """只验证 canonical 内容身份；调用方还必须做合同语义验证。"""
     value = _load_json(path, kind)
     artifact_id = _verify_artifact(value, kind)
     if path.stem != artifact_id:
@@ -671,6 +2107,13 @@ def load_content_addressed_artifact(path: Path, kind: str) -> Mapping[str, objec
     if path.read_text(encoding="utf-8") != canonical_json(value) + "\n":
         raise ValueError(f"{kind} 制品不是 canonical JSON")
     return value
+
+
+def load_content_addressed_artifact(path: Path, kind: str) -> Mapping[str, object]:
+    """读取普通内容制品；proposal/run 必须使用带 commitment 的专用入口。"""
+    if kind in {"economic-search-plan-proposal", "economic-agent-run"}:
+        raise ValueError(f"{kind} 必须使用专用语义与台账 commitment 验证入口")
+    return _load_content_addressed_artifact_untyped(path, kind)
 
 
 def build_economic_context(
@@ -858,12 +2301,14 @@ def build_economic_context(
     return _artifact("economic-context", body)
 
 
-def verify_economic_context(
+def _verify_economic_context_rows(
     context: Mapping[str, object],
-    observation_ledger_path: Path,
+    rows: Sequence[Mapping[str, object]],
     policy: EconomicAgentPolicy,
+    *,
+    reject_eligible_tail: bool,
 ) -> str:
-    """由台账已绑定前缀重建 context，并逐字节比对规范制品。"""
+    """从已锁定台账行重建 context，并可要求 as-of 输入完整。"""
     context_id = _verify_artifact(context, "economic-context")
     ledger_identity = _object(
         context.get("observation_ledger"), "context.observation_ledger",
@@ -879,10 +2324,6 @@ def verify_economic_context(
         ledger_identity.get("head_sha256"),
         "context.observation_ledger.head_sha256",
     )
-    with exclusive_path_lock(observation_ledger_path):
-        if not observation_ledger_path.is_file():
-            raise ValueError(f"经济观测台账不存在: {observation_ledger_path}")
-        rows = _read_chain(observation_ledger_path, "economic_observation")
     if len(rows) < raw_sequence:
         raise ValueError("context 绑定的观测台账前缀已缺失")
     prefix = rows[:raw_sequence]
@@ -893,7 +2334,39 @@ def verify_economic_context(
     expected = build_economic_context(snapshot, decision, policy)
     if canonical_json(expected) != canonical_json(context):
         raise ValueError("economic-context 不能由已绑定观测台账重建")
+    if reject_eligible_tail:
+        full_snapshot = _observation_snapshot(rows)
+        eligible_tail = tuple(
+            observation.observation_id
+            for observation in full_snapshot.observations[raw_sequence:]
+            if observation.available_time <= decision
+        )
+        if eligible_tail:
+            raise ValueError(
+                "economic-context 前缀之后存在 decision_time 已可知的观测: "
+                f"{list(eligible_tail)}",
+            )
     return context_id
+
+
+def verify_economic_context(
+    context: Mapping[str, object],
+    observation_ledger_path: Path,
+    policy: EconomicAgentPolicy,
+) -> str:
+    """由台账已绑定前缀重建历史 context；不把它声明为当前完整输入。"""
+    with _exclusive_ledger_lock(
+        observation_ledger_path,
+        "经济观测台账",
+        require_file=True,
+    ) as ledger:
+        rows = _read_chain(ledger, "economic_observation")
+        return _verify_economic_context_rows(
+            context,
+            rows,
+            policy,
+            reject_eligible_tail=False,
+        )
 
 
 def _normalize_bounds(value: object, name: str) -> Mapping[str, object]:
@@ -990,65 +2463,53 @@ def _normalize_proposal(
     return {**dict(body), "proposal_id": proposal_id}
 
 
-def _inference_identity(value: Mapping[str, object] | None) -> Mapping[str, object]:
-    if value is None:
-        empty = sha256_text("")
-        return {
-            "provider": "none",
-            "model_id": "deterministic-rules-v1",
-            "model_parameters_sha256": sha256_text(canonical_json({})),
-            "prompt_template_id": "none",
-            "prompt_sha256": empty,
-            "model_input_sha256": empty,
-            "model_output_sha256": empty,
-        }
-    expected = frozenset({
-        "provider", "model_id", "model_parameters_sha256", "prompt_template_id",
-        "prompt_sha256", "model_input_sha256", "model_output_sha256",
+def _normalize_persisted_proposal(
+    value: Mapping[str, object],
+    policy: ProposalGatePolicy,
+) -> Mapping[str, object]:
+    """重读已规范提案，同时严格校验持久化 schema。"""
+    required = frozenset({
+        "schema_version", "hypothesis", "evidence_ids", "family", "template",
+        "parameter_bounds", "regimes", "horizon", "falsification",
+        "trial_budget", "proposal_id",
     })
-    _validate_exact_keys(value, expected, "inference_identity")
+    _validate_exact_keys(value, required, "persisted ResearchProposal")
+    if value.get("schema_version") != ECONOMIC_PROPOSAL_SCHEMA_VERSION:
+        raise ValueError("persisted ResearchProposal schema_version 非法")
+    source = dict(value)
+    del source["schema_version"]
+    normalized = _normalize_proposal(source, policy)
+    if canonical_json(normalized) != canonical_json(value):
+        raise ValueError("persisted ResearchProposal 不是规范提案")
+    return normalized
+
+
+def _inference_identity(value: Mapping[str, object] | None) -> Mapping[str, object]:
+    if value is not None:
+        raise ValueError(
+            "v1 不接受无法从本地封存制品重建的外部 inference_identity",
+        )
+    empty = sha256_text("")
     return {
-        "provider": _identifier(value.get("provider"), "provider"),
-        "model_id": _identifier(value.get("model_id"), "model_id"),
-        "model_parameters_sha256": _sha256(
-            value.get("model_parameters_sha256"), "model_parameters_sha256",
-        ),
-        "prompt_template_id": _identifier(
-            value.get("prompt_template_id"), "prompt_template_id",
-        ),
-        "prompt_sha256": _sha256(value.get("prompt_sha256"), "prompt_sha256"),
-        "model_input_sha256": _sha256(
-            value.get("model_input_sha256"), "model_input_sha256",
-        ),
-        "model_output_sha256": _sha256(
-            value.get("model_output_sha256"), "model_output_sha256",
-        ),
+        "provider": "none",
+        "model_id": "deterministic-rules-v1",
+        "model_parameters_sha256": sha256_text(canonical_json({})),
+        "prompt_template_id": "none",
+        "prompt_sha256": empty,
+        "model_input_sha256": empty,
+        "model_output_sha256": empty,
     }
 
 
 @dataclass(frozen=True)
 class EconomicAgentRunResult:
-    """一次提案门禁的内容寻址输出。"""
+    """一次提案门禁的内嵌台账回执。"""
 
     run_id: str
-    receipt_path: Path
+    ledger_path: Path
     proposal_paths: tuple[Path, ...]
     accepted_proposal_ids: tuple[str, ...]
     rejected_count: int
-
-
-def _accepted_proposal_ids(rows: Sequence[Mapping[str, object]]) -> set[str]:
-    accepted: set[str] = set()
-    for row in rows:
-        attempts = row.get("attempts")
-        if not isinstance(attempts, list):
-            raise ValueError("economic_agent_run 台账缺少 attempts")
-        for raw_attempt in attempts:
-            attempt = _object(raw_attempt, "attempt")
-            proposal_id = attempt.get("proposal_id")
-            if attempt.get("status") == "accepted" and isinstance(proposal_id, str):
-                accepted.add(proposal_id)
-    return accepted
 
 
 def _proposal_context_reasons(
@@ -1079,8 +2540,11 @@ def _proposal_context_reasons(
     context_time = _utc_time(context.get("decision_time"), "context.decision_time")
     if evaluated_at < context_time:
         reasons.append("evaluation_precedes_context")
+    # v1 治理尚未绑定。
+    # market/vintage 未绑定。
+    # 所有提案失败关闭。
+    reasons.append("holdout_governance_unbound")
     if boundary is not None:
-        reasons.append("holdout_governance_unbound")
         if context_time >= boundary or evaluated_at >= boundary:
             reasons.append("holdout_boundary_reached")
         for evidence_id in evidence_ids:
@@ -1100,6 +2564,477 @@ def _attempt_index(value: Mapping[str, object]) -> int:
     return raw
 
 
+def _proposal_artifact(
+    context_id: str,
+    policy: EconomicAgentPolicy,
+    proposal: Mapping[str, object],
+) -> Mapping[str, object]:
+    """由规范提案重建固定为 research-only 的 proposal 制品。"""
+    body: Mapping[str, object] = {
+        "schema_version": ECONOMIC_PROPOSAL_SCHEMA_VERSION,
+        "artifact_type": "economic_search_plan_proposal",
+        "method_version": ECONOMIC_PROPOSAL_METHOD_VERSION,
+        "source_context_artifact_id": context_id,
+        "policy_id": policy.policy_id,
+        "proposal": proposal,
+        "search_plan_interface": {
+            "contract": "proposal_only",
+            "consumer": "SearchPlan",
+            "family": proposal["family"],
+            "template": proposal["template"],
+            "parameter_bounds": proposal["parameter_bounds"],
+            "trial_budget": proposal["trial_budget"],
+            "requires_explicit_review": True,
+            "requires_candidate_registration": True,
+            "holdout_governance_bound": False,
+            "may_write_config": False,
+            "may_write_registry": False,
+            "may_promote": False,
+        },
+        "authority": {
+            "research_only": True,
+            "network": False,
+            "secrets": False,
+            "trade": False,
+            "execution": False,
+            "config_mutation": False,
+            "registry_mutation": False,
+            "promotion": False,
+            "holdout_governance_bound": False,
+        },
+    }
+    return _artifact("economic-search-plan-proposal", body)
+
+
+@dataclass(frozen=True)
+class _ProposalEvaluation:
+    attempts: tuple[Mapping[str, object], ...]
+    accepted_artifacts: tuple[Mapping[str, object], ...]
+    accepted_proposal_ids: tuple[str, ...]
+    total_trial_budget: int
+
+
+def _context_evidence(
+    context: Mapping[str, object],
+) -> Mapping[str, Mapping[str, object]]:
+    evidence_rows = context.get("evidence")
+    if not isinstance(evidence_rows, list):
+        raise ValueError("经济语境缺少 evidence")
+    evidence: dict[str, Mapping[str, object]] = {}
+    for raw in evidence_rows:
+        item = _object(raw, "context.evidence[]")
+        observation = parse_economic_observation(item)
+        evidence[observation.observation_id] = observation.payload()
+    return evidence
+
+
+def _normalize_proposal_batch(
+    proposals: Sequence[Mapping[str, object]],
+    gate: ProposalGatePolicy,
+) -> tuple[tuple[int, Mapping[str, object]], ...]:
+    """在取锁或生成任何运行文件前完整验证提案合同。"""
+    if len(proposals) > gate.max_proposals_per_run:
+        raise ValueError(
+            "ResearchProposal 批次数量超出 max_proposals_per_run；"
+            "本批次不生成回执",
+        )
+    normalized: list[tuple[int, Mapping[str, object]]] = []
+    for index, proposal in enumerate(proposals):
+        try:
+            normalized.append((index, _normalize_proposal(proposal, gate)))
+        except ValueError as error:
+            raise ValueError(
+                f"ResearchProposal[{index}] 合同非法；本批次不生成回执",
+            ) from error
+    return tuple(normalized)
+
+
+def _evaluate_proposals(
+    normalized: Sequence[tuple[int, Mapping[str, object]]],
+    *,
+    context: Mapping[str, object],
+    policy: EconomicAgentPolicy,
+    evaluated_at: datetime,
+) -> _ProposalEvaluation:
+    """按确定性顺序门禁提案；v1 因治理未绑定而不会接受。"""
+    evidence = _context_evidence(context)
+    attempts: list[Mapping[str, object]] = []
+    for index, proposal in sorted(
+        normalized,
+        key=lambda item: (str(item[1]["proposal_id"]), item[0]),
+    ):
+        proposal_id = str(proposal["proposal_id"])
+        reasons = _proposal_context_reasons(
+            proposal,
+            context,
+            evidence,
+            policy.proposal_gate,
+            evaluated_at,
+        )
+        reasons.append("holdout_governance_unbound")
+        reasons = sorted(set(reasons))
+        attempts.append({
+            "input_index": index,
+            "input_sha256": sha256_text(canonical_json(proposal)),
+            "proposal_id": proposal_id,
+            "proposal": proposal,
+            "status": "rejected",
+            "reasons": reasons,
+        })
+    attempts.sort(key=_attempt_index)
+    return _ProposalEvaluation(
+        tuple(attempts),
+        (),
+        (),
+        0,
+    )
+
+
+def _run_authority() -> Mapping[str, object]:
+    return {
+        "research_only": True,
+        "network": False,
+        "secrets": False,
+        "trade": False,
+        "execution": False,
+        "config_mutation": False,
+        "registry_mutation": False,
+        "promotion": False,
+        "holdout_governance_bound": False,
+    }
+
+
+def _run_receipt(
+    *,
+    context: Mapping[str, object],
+    context_id: str,
+    policy: EconomicAgentPolicy,
+    evaluated_at: datetime,
+    inference: Mapping[str, object],
+    evaluation: _ProposalEvaluation,
+    verified_observation_ledger: Mapping[str, object],
+) -> Mapping[str, object]:
+    attempts = list(evaluation.attempts)
+    input_hashes = [str(item["input_sha256"]) for item in attempts]
+    input_identity = {
+        "context_artifact_id": context_id,
+        "policy_id": policy.policy_id,
+        "proposal_input_sha256s": input_hashes,
+        "proposal_batch_sha256": sha256_text(canonical_json(input_hashes)),
+        "proposal_count": len(attempts),
+        "observation_ledger": context["observation_ledger"],
+        "verified_observation_ledger": verified_observation_ledger,
+        "holdout_governance": {
+            "bound": False,
+            "binding": None,
+            "reason": "holdout_governance_unbound",
+        },
+    }
+    output_identity = {
+        "accepted_artifact_ids": sorted(
+            str(item["artifact_id"])
+            for item in evaluation.accepted_artifacts
+        ),
+        "accepted_proposal_ids": list(evaluation.accepted_proposal_ids),
+        "attempts_sha256": sha256_text(canonical_json(attempts)),
+        "total_trial_budget": evaluation.total_trial_budget,
+    }
+    body: Mapping[str, object] = {
+        "schema_version": ECONOMIC_AGENT_LEDGER_SCHEMA_VERSION,
+        "artifact_type": "economic_agent_run_receipt",
+        "method_version": ECONOMIC_AGENT_METHOD_VERSION,
+        "evaluated_at": _time_text(evaluated_at),
+        "model_identity": inference,
+        "prompt_identity": {
+            "prompt_template_id": inference["prompt_template_id"],
+            "prompt_sha256": inference["prompt_sha256"],
+        },
+        "input_identity": input_identity,
+        "output_identity": output_identity,
+        "attempts": attempts,
+        "context": context,
+        "policy": policy.payload(),
+        "authority": _run_authority(),
+    }
+    return _artifact("economic-agent-run", body)
+
+
+def _ledger_payload(
+    receipt: Mapping[str, object],
+    artifacts: Sequence[Mapping[str, object]],
+) -> Mapping[str, object]:
+    if artifacts:
+        raise ValueError("v1 不允许外部 accepted proposal 制品")
+    run_id = str(receipt["artifact_id"])
+    return {
+        "schema_version": ECONOMIC_AGENT_LEDGER_SCHEMA_VERSION,
+        "method_version": ECONOMIC_AGENT_METHOD_VERSION,
+        "run_id": run_id,
+        "evaluated_at": receipt["evaluated_at"],
+        "receipt_artifact_id": run_id,
+        "receipt_sha256": sha256_text(canonical_json(receipt) + "\n"),
+        "receipt_storage": "embedded_in_ledger",
+        "receipt": receipt,
+        "artifact_commitments": [],
+        "research_only": True,
+    }
+
+
+def _canonical_artifact_root(path: Path, *, require_dir: bool) -> Path:
+    if not path.is_absolute():
+        raise ValueError("经济代理输出根必须使用绝对规范路径")
+    normalized_text = os.path.normpath(str(path))
+    if os.path.normcase(str(path)) != os.path.normcase(normalized_text):
+        raise ValueError("经济代理输出根不得使用含 . 或 .. 的路径别名")
+    lexical = Path(os.path.abspath(path))
+    resolved = path.resolve(strict=False)
+    if os.path.normcase(str(lexical)) != os.path.normcase(str(resolved)):
+        raise ValueError("经济代理输出根不得使用路径别名")
+    if resolved.exists() and not resolved.is_dir():
+        raise ValueError("经济代理输出根不是目录")
+    if require_dir and not resolved.is_dir():
+        raise ValueError(f"经济代理输出根不存在: {resolved}")
+    return resolved
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def _verify_proposal_artifact_value(
+    value: Mapping[str, object],
+    *,
+    context: Mapping[str, object],
+    policy: EconomicAgentPolicy,
+) -> str:
+    _validate_exact_keys(
+        value,
+        frozenset({
+            "schema_version", "artifact_type", "method_version",
+            "source_context_artifact_id", "policy_id", "proposal",
+            "search_plan_interface", "authority", "artifact_id",
+        }),
+        "economic proposal artifact",
+    )
+    context_id = _verify_artifact(context, "economic-context")
+    normalized = _normalize_persisted_proposal(
+        _object(value.get("proposal"), "proposal"),
+        policy.proposal_gate,
+    )
+    expected = _proposal_artifact(context_id, policy, normalized)
+    if canonical_json(expected) != canonical_json(value):
+        raise ValueError("economic proposal artifact 不能由 context/policy/proposal 重建")
+    return str(expected["artifact_id"])
+
+
+def _verify_attempts(
+    value: object,
+    *,
+    context: Mapping[str, object],
+    policy: EconomicAgentPolicy,
+    evaluated_at: datetime,
+) -> tuple[Mapping[str, object], ...]:
+    if not isinstance(value, list) or not value:
+        raise ValueError("economic agent receipt attempts 必须为非空列表")
+    evidence = _context_evidence(context)
+    attempts = tuple(_object(item, "attempt") for item in value)
+    if [_attempt_index(item) for item in attempts] != list(range(len(attempts))):
+        raise ValueError("economic agent receipt attempts input_index 不连续")
+    for attempt in attempts:
+        proposal_value = attempt.get("proposal")
+        if proposal_value is None:
+            raise ValueError("v1 运行台账不得封存 contract-invalid 原始输入")
+        _validate_exact_keys(
+            attempt,
+            frozenset({
+                "input_index", "input_sha256", "proposal_id", "proposal", "status", "reasons",
+            }),
+            "normalized proposal attempt",
+        )
+        proposal = _normalize_persisted_proposal(
+            _object(proposal_value, "attempt.proposal"),
+            policy.proposal_gate,
+        )
+        if attempt.get("proposal_id") != proposal["proposal_id"]:
+            raise ValueError("attempt proposal_id 与规范提案不一致")
+        if attempt.get("input_sha256") != sha256_text(canonical_json(proposal)):
+            raise ValueError("attempt input_sha256 与规范提案不一致")
+        expected_reasons = _proposal_context_reasons(
+            proposal,
+            context,
+            evidence,
+            policy.proposal_gate,
+            evaluated_at,
+        )
+        if attempt.get("status") != "rejected" or attempt.get("reasons") != expected_reasons:
+            raise ValueError("v1 规范提案必须按治理未绑定原因失败关闭")
+    return attempts
+
+
+def _verify_run_receipt_value(
+    value: Mapping[str, object],
+    *,
+    observation_rows: Sequence[Mapping[str, object]],
+    expected_policy: EconomicAgentPolicy,
+) -> tuple[str, EconomicAgentPolicy, Mapping[str, object]]:
+    _validate_exact_keys(
+        value,
+        frozenset({
+            "schema_version", "artifact_type", "method_version", "evaluated_at",
+            "model_identity", "prompt_identity", "input_identity", "output_identity",
+            "attempts", "context", "policy", "authority", "artifact_id",
+        }),
+        "economic agent run receipt",
+    )
+    if (
+        value.get("schema_version") != ECONOMIC_AGENT_LEDGER_SCHEMA_VERSION
+        or value.get("artifact_type") != "economic_agent_run_receipt"
+        or value.get("method_version") != ECONOMIC_AGENT_METHOD_VERSION
+    ):
+        raise ValueError("economic agent run receipt 版本或类型非法")
+    evaluated = _utc_time(value.get("evaluated_at"), "receipt.evaluated_at")
+    inference = _inference_identity(None)
+    if canonical_json(value.get("model_identity")) != canonical_json(inference):
+        raise ValueError("v1 run receipt 仅允许本地 deterministic inference identity")
+    expected_prompt = {
+        "prompt_template_id": inference["prompt_template_id"],
+        "prompt_sha256": inference["prompt_sha256"],
+    }
+    if value.get("prompt_identity") != expected_prompt:
+        raise ValueError("run receipt prompt_identity 不能由 model_identity 重建")
+    policy_payload = _object(value.get("policy"), "receipt.policy")
+    policy = parse_economic_policy(policy_payload)
+    if canonical_json(policy.payload()) != canonical_json(policy_payload):
+        raise ValueError("run receipt policy 不是规范政策")
+    if policy.policy_id != expected_policy.policy_id:
+        raise ValueError("run receipt policy 未绑定当前受信政策")
+    input_identity = _object(value.get("input_identity"), "receipt.input_identity")
+    verified_identity = _object(
+        input_identity.get("verified_observation_ledger"),
+        "receipt.input_identity.verified_observation_ledger",
+    )
+    verified_sequence = verified_identity.get("sequence")
+    if (
+        isinstance(verified_sequence, bool)
+        or not isinstance(verified_sequence, int)
+        or verified_sequence < 0
+        or verified_sequence > len(observation_rows)
+    ):
+        raise ValueError("run receipt 绑定的观测验证前缀非法")
+    verified_rows = observation_rows[:verified_sequence]
+    verified_snapshot = _observation_snapshot(verified_rows)
+    verified_head = _sha256(
+        verified_identity.get("head_sha256"),
+        "verified_observation_ledger.head_sha256",
+    )
+    if verified_snapshot.ledger_head_sha256 != verified_head:
+        raise ValueError("run receipt 绑定的观测验证链头不匹配")
+    normalized_verified_identity = {
+        "sequence": verified_snapshot.ledger_sequence,
+        "head_sha256": verified_snapshot.ledger_head_sha256,
+    }
+    context = _object(value.get("context"), "receipt.context")
+    context_id = _verify_economic_context_rows(
+        context,
+        verified_rows,
+        policy,
+        reject_eligible_tail=True,
+    )
+    attempts = _verify_attempts(
+        value.get("attempts"),
+        context=context,
+        policy=policy,
+        evaluated_at=evaluated,
+    )
+    evaluation = _ProposalEvaluation(attempts, (), (), 0)
+    expected = _run_receipt(
+        context=context,
+        context_id=context_id,
+        policy=policy,
+        evaluated_at=evaluated,
+        inference=inference,
+        evaluation=evaluation,
+        verified_observation_ledger=normalized_verified_identity,
+    )
+    if canonical_json(expected) != canonical_json(value):
+        raise ValueError("economic agent run receipt 不能由输入与失败关闭结果重建")
+    if value.get("authority") != _run_authority():
+        raise ValueError("economic agent run receipt authority 非法")
+    return str(expected["artifact_id"]), policy, context
+
+
+_LEDGER_ROW_KEYS = frozenset({
+    "record_type", "sequence", "previous_record_sha256", "record_sha256",
+    "ledger_canonical_path",
+    "schema_version", "method_version", "run_id", "evaluated_at",
+    "receipt_artifact_id", "receipt_sha256", "receipt_storage", "receipt",
+    "artifact_commitments", "research_only",
+})
+
+
+def _verify_agent_rows(
+    rows: Sequence[Mapping[str, object]],
+    *,
+    observation_rows: Sequence[Mapping[str, object]],
+    expected_policy: EconomicAgentPolicy,
+) -> None:
+    seen_runs: set[str] = set()
+    for row in rows:
+        _validate_exact_keys(row, _LEDGER_ROW_KEYS, "economic agent ledger row")
+        if (
+            row.get("record_type") != "economic_agent_run"
+            or row.get("schema_version") != ECONOMIC_AGENT_LEDGER_SCHEMA_VERSION
+            or row.get("method_version") != ECONOMIC_AGENT_METHOD_VERSION
+            or row.get("research_only") is not True
+        ):
+            raise ValueError("economic agent ledger row 合同非法")
+        receipt = _object(row.get("receipt"), "ledger.receipt")
+        run_id, policy, context = _verify_run_receipt_value(
+            receipt,
+            observation_rows=observation_rows,
+            expected_policy=expected_policy,
+        )
+        if run_id in seen_runs:
+            raise ValueError("economic agent ledger 重复 run_id")
+        seen_runs.add(run_id)
+        expected_payload = _ledger_payload(receipt, ())
+        payload = {
+            key: item for key, item in row.items()
+            if key not in {
+                "record_type", "sequence", "previous_record_sha256", "record_sha256",
+                "ledger_canonical_path",
+            }
+        }
+        if canonical_json(payload) != canonical_json(expected_payload):
+            raise ValueError("economic agent ledger row 不能由 run receipt 重建")
+        if row.get("receipt_storage") != "embedded_in_ledger":
+            raise ValueError("run receipt 必须内嵌于已验证运行台账")
+        if row.get("receipt_sha256") != sha256_text(canonical_json(receipt) + "\n"):
+            raise ValueError("运行台账 receipt_sha256 不一致")
+        if policy.policy_id != _object(receipt["input_identity"], "input_identity").get(
+            "policy_id",
+        ):
+            raise ValueError("run receipt policy_id 不一致")
+        if _verify_artifact(context, "economic-context") != _object(
+            receipt["input_identity"], "input_identity",
+        ).get("context_artifact_id"):
+            raise ValueError("run receipt context_artifact_id 不一致")
+
+
 def run_economic_research_agent(
     *,
     context: Mapping[str, object],
@@ -1110,221 +3045,188 @@ def run_economic_research_agent(
     ledger_path: Path,
     inference_identity: Mapping[str, object] | None = None,
 ) -> EconomicAgentRunResult:
-    """审计全部提案尝试，仅写 proposal-only 制品和追加台账。"""
+    """审计全部提案；v1 在治理绑定完成前只写全拒绝回执。"""
     if not proposals:
         raise ValueError("ResearchProposal 批次不得为空")
-    context_id = verify_economic_context(
-        context, observation_ledger_path, policy,
+    normalized_proposals = _normalize_proposal_batch(
+        proposals,
+        policy.proposal_gate,
     )
     evaluated = _utc_time(_time_text(clock.utc_now()), "evaluated_at")
-    holdout_bound = False
-    holdout_reason = (
-        "holdout_governance_unbound"
-        if policy.proposal_gate.holdout_start_time is not None
-        else None
-    )
-    evidence_rows = context.get("evidence")
-    if not isinstance(evidence_rows, list):
-        raise ValueError("经济语境缺少 evidence")
-    evidence: dict[str, Mapping[str, object]] = {}
-    for raw in evidence_rows:
-        item = _object(raw, "context.evidence[]")
-        observation = parse_economic_observation(item)
-        evidence[observation.observation_id] = observation.payload()
-    batch_sha256 = sha256_text(canonical_json(list(proposals)))
     inference = _inference_identity(inference_identity)
-    with exclusive_path_lock(ledger_path):
-        ledger_rows = _read_chain(ledger_path, "economic_agent_run")
-        historical = _accepted_proposal_ids(ledger_rows)
-        normalized: list[tuple[int, Mapping[str, object]]] = []
-        attempts: list[Mapping[str, object]] = []
-        for index, proposal in enumerate(proposals):
-            try:
-                normalized.append((index, _normalize_proposal(proposal, policy.proposal_gate)))
-            except ValueError as error:
-                raw_hash = sha256_text(canonical_json(proposal))
-                attempts.append({
-                    "input_index": index,
-                    "input_sha256": raw_hash,
-                    "proposal_id": None,
-                    "status": "rejected",
-                    "reasons": [f"contract_invalid:{error}"],
-                })
-        accepted_artifacts: list[Mapping[str, object]] = []
-        accepted_ids: set[str] = set()
-        total_budget = 0
-        for index, proposal in sorted(
-            normalized, key=lambda item: (str(item[1]["proposal_id"]), item[0]),
-        ):
-            proposal_id = str(proposal["proposal_id"])
-            reasons = _proposal_context_reasons(
-                proposal,
-                context,
-                evidence,
-                policy.proposal_gate,
-                evaluated,
-            )
-            if proposal_id in historical or proposal_id in accepted_ids:
-                reasons.append("duplicate_proposal")
-            if len(accepted_artifacts) >= policy.proposal_gate.max_proposals_per_run:
-                reasons.append("proposal_quota_exceeded")
-            budget = _positive_integer(proposal.get("trial_budget"), "trial_budget")
-            if total_budget + budget > policy.proposal_gate.max_total_trial_budget:
-                reasons.append("total_trial_budget_exceeded")
-            reasons = sorted(set(reasons))
-            if reasons:
-                attempts.append({
-                    "input_index": index,
-                    "input_sha256": sha256_text(canonical_json(proposal)),
-                    "proposal_id": proposal_id,
-                    "status": "rejected",
-                    "reasons": reasons,
-                })
-                continue
-            artifact_body: Mapping[str, object] = {
-                "schema_version": ECONOMIC_PROPOSAL_SCHEMA_VERSION,
-                "artifact_type": "economic_search_plan_proposal",
-                "method_version": ECONOMIC_PROPOSAL_METHOD_VERSION,
-                "source_context_artifact_id": context_id,
-                "policy_id": policy.policy_id,
-                "proposal": proposal,
-                "search_plan_interface": {
-                    "contract": "proposal_only",
-                    "consumer": "SearchPlan",
-                    "family": proposal["family"],
-                    "template": proposal["template"],
-                    "parameter_bounds": proposal["parameter_bounds"],
-                    "trial_budget": proposal["trial_budget"],
-                    "requires_explicit_review": True,
-                    "requires_candidate_registration": True,
-                    "holdout_governance_bound": holdout_bound,
-                    "may_write_config": False,
-                    "may_write_registry": False,
-                    "may_promote": False,
-                },
-                "authority": {
-                    "research_only": True,
-                    "network": False,
-                    "secrets": False,
-                    "trade": False,
-                    "execution": False,
-                    "holdout_governance_bound": holdout_bound,
-                },
-            }
-            proposal_artifact = _artifact(
-                "economic-search-plan-proposal", artifact_body,
-            )
-            accepted_artifacts.append(proposal_artifact)
-            accepted_ids.add(proposal_id)
-            total_budget += budget
-            attempts.append({
-                "input_index": index,
-                "input_sha256": sha256_text(canonical_json(proposal)),
-                "proposal_id": proposal_id,
-                "status": "accepted",
-                "reasons": [],
-                "output_artifact_id": proposal_artifact["artifact_id"],
-            })
-        attempts.sort(key=_attempt_index)
-        output_identity = {
-            "accepted_artifact_ids": sorted(
-                str(item["artifact_id"]) for item in accepted_artifacts
-            ),
-            "accepted_proposal_ids": sorted(accepted_ids),
-            "attempts_sha256": sha256_text(canonical_json(attempts)),
-            "total_trial_budget": total_budget,
-        }
-        input_identity = {
-            "context_artifact_id": context_id,
-            "policy_id": policy.policy_id,
-            "proposal_batch_sha256": batch_sha256,
-            "proposal_count": len(proposals),
-            "observation_ledger": context["observation_ledger"],
-            "holdout_governance": {
-                "bound": holdout_bound,
-                "binding": None,
-                "reason": holdout_reason,
-            },
-        }
-        receipt_body: Mapping[str, object] = {
-            "schema_version": ECONOMIC_AGENT_LEDGER_SCHEMA_VERSION,
-            "artifact_type": "economic_agent_run_receipt",
-            "method_version": ECONOMIC_AGENT_METHOD_VERSION,
-            "evaluated_at": _time_text(evaluated),
-            "model_identity": inference,
-            "prompt_identity": {
-                "prompt_template_id": inference["prompt_template_id"],
-                "prompt_sha256": inference["prompt_sha256"],
-            },
-            "input_identity": input_identity,
-            "output_identity": output_identity,
-            "attempts": attempts,
-            "authority": {
-                "research_only": True,
-                "network": False,
-                "secrets": False,
-                "trade": False,
-                "execution": False,
-                "config_mutation": False,
-                "registry_mutation": False,
-                "promotion": False,
-                "holdout_governance_bound": holdout_bound,
-            },
-        }
-        receipt = _artifact("economic-agent-run", receipt_body)
-        run_id = str(receipt["artifact_id"])
-        if any(row.get("run_id") == run_id for row in ledger_rows):
-            raise ValueError("相同 economic agent run 已入账")
-        proposal_paths = tuple(
-            write_content_addressed_artifact(
-                output / "proposals", item, "economic-search-plan-proposal",
-            )
-            for item in accepted_artifacts
+    _canonical_artifact_root(output, require_dir=False)
+    operation_state = _LedgerTransactionState()
+    with _exclusive_ledger_lock(
+        observation_ledger_path,
+        "经济观测台账",
+        require_file=True,
+        transaction_state=operation_state,
+    ) as observation_ledger:
+        observation_rows = _read_chain(observation_ledger, "economic_observation")
+        context_id = _verify_economic_context_rows(
+            context,
+            observation_rows,
+            policy,
+            reject_eligible_tail=True,
         )
-        receipt_path = write_content_addressed_artifact(
-            output / "runs", receipt, "economic-agent-run",
-        )
-        ledger_payload: Mapping[str, object] = {
-            "schema_version": ECONOMIC_AGENT_LEDGER_SCHEMA_VERSION,
-            "method_version": ECONOMIC_AGENT_METHOD_VERSION,
-            "run_id": run_id,
-            "evaluated_at": _time_text(evaluated),
-            "receipt_artifact_id": run_id,
-            "receipt_sha256": sha256_text(canonical_json(receipt) + "\n"),
-            "model_identity": inference,
-            "prompt_identity": receipt["prompt_identity"],
-            "input_identity": input_identity,
-            "output_identity": output_identity,
-            "attempts": attempts,
-            "research_only": True,
-        }
-        _append_chain_unlocked(
+        canonical_agent = _canonical_ledger_path(
             ledger_path,
-            "economic_agent_run",
-            ledger_rows,
-            (ledger_payload,),
+            "经济代理运行台账",
+            require_file=False,
         )
+        if canonical_agent == observation_ledger.path:
+            raise ValueError("经济观测台账与代理运行台账不得共用路径")
+
+        def validate_observation_dependency() -> None:
+            """在运行台账提交点重验观测前缀。"""
+            current_rows = _read_chain(
+                observation_ledger,
+                "economic_observation",
+            )
+            if current_rows != observation_rows:
+                raise ValueError("经济观测台账在运行提交前变化")
+
+        with _exclusive_ledger_lock(
+            canonical_agent,
+            "经济代理运行台账",
+            require_file=False,
+            transaction_state=operation_state,
+            precommit_validator=validate_observation_dependency,
+        ) as agent_ledger:
+            # 保持观测锁。
+            # 直至台账 fsync。
+            _canonical_ledger_path(
+                observation_ledger.path,
+                "经济观测台账",
+                require_file=True,
+            )
+            ledger_rows = _read_chain(agent_ledger, "economic_agent_run")
+            _verify_agent_rows(
+                ledger_rows,
+                observation_rows=observation_rows,
+                expected_policy=policy,
+            )
+            evaluation = _evaluate_proposals(
+                normalized_proposals,
+                context=context,
+                policy=policy,
+                evaluated_at=evaluated,
+            )
+            receipt = _run_receipt(
+                context=context,
+                context_id=context_id,
+                policy=policy,
+                evaluated_at=evaluated,
+                inference=inference,
+                evaluation=evaluation,
+                verified_observation_ledger={
+                    "sequence": len(observation_rows),
+                    "head_sha256": _observation_snapshot(
+                        observation_rows,
+                    ).ledger_head_sha256,
+                },
+            )
+            run_id = str(receipt["artifact_id"])
+            verified_run_id, _verified_policy, _verified_context = (
+                _verify_run_receipt_value(
+                    receipt,
+                    observation_rows=observation_rows,
+                    expected_policy=policy,
+                )
+            )
+            if verified_run_id != run_id:
+                raise ValueError("经济代理新 run receipt 预提交语义校验失败")
+            if any(row.get("run_id") == run_id for row in ledger_rows):
+                raise ValueError("相同 economic agent run 已入账")
+            _append_chain_unlocked(
+                agent_ledger,
+                "economic_agent_run",
+                ledger_rows,
+                (_ledger_payload(receipt, evaluation.accepted_artifacts),),
+            )
     return EconomicAgentRunResult(
         run_id=run_id,
-        receipt_path=receipt_path,
-        proposal_paths=proposal_paths,
-        accepted_proposal_ids=tuple(sorted(accepted_ids)),
-        rejected_count=sum(item["status"] == "rejected" for item in attempts),
+        ledger_path=agent_ledger.path,
+        proposal_paths=(),
+        accepted_proposal_ids=evaluation.accepted_proposal_ids,
+        rejected_count=sum(
+            item["status"] == "rejected" for item in evaluation.attempts
+        ),
     )
 
 
-def verify_economic_agent_ledger(path: Path) -> tuple[Mapping[str, object], ...]:
-    """校验运行台账哈希链与必需身份字段。"""
-    with exclusive_path_lock(path):
-        if not path.is_file():
-            raise ValueError(f"经济代理运行台账不存在: {path}")
-        rows = _read_chain(path, "economic_agent_run")
-    _accepted_proposal_ids(rows)
+def verify_economic_agent_ledger(
+    path: Path,
+    *,
+    observation_ledger_path: Path,
+    output: Path,
+    policy: EconomicAgentPolicy,
+) -> tuple[Mapping[str, object], ...]:
+    """锁定两本台账，逐行重建内嵌 receipt 的完整语义。"""
+    _canonical_artifact_root(output, require_dir=False)
+    with _exclusive_ledger_lock(
+        observation_ledger_path,
+        "经济观测台账",
+        require_file=True,
+    ) as observation_ledger:
+        observation_rows = _read_chain(observation_ledger, "economic_observation")
+        canonical_agent = _canonical_ledger_path(
+            path,
+            "经济代理运行台账",
+            require_file=True,
+        )
+        if canonical_agent == observation_ledger.path:
+            raise ValueError("经济观测台账与代理运行台账不得共用路径")
+        with _exclusive_ledger_lock(
+            canonical_agent,
+            "经济代理运行台账",
+            require_file=True,
+        ) as agent_ledger:
+            rows = _read_chain(agent_ledger, "economic_agent_run")
+            _verify_agent_rows(
+                rows,
+                observation_rows=observation_rows,
+                expected_policy=policy,
+            )
+            return rows
+
+
+def load_economic_run_receipt(
+    run_id: str,
+    *,
+    observation_ledger_path: Path,
+    agent_ledger_path: Path,
+    output: Path,
+    policy: EconomicAgentPolicy,
+) -> Mapping[str, object]:
+    """按 run_id 返回已由完整语义验证的台账内嵌 receipt。"""
+    requested_run_id = _identifier(run_id, "run_id")
+    rows = verify_economic_agent_ledger(
+        agent_ledger_path,
+        observation_ledger_path=observation_ledger_path,
+        output=output,
+        policy=policy,
+    )
     for row in rows:
-        if row.get("research_only") is not True:
-            raise ValueError("economic agent 台账不是 research_only")
-        for field in (
-            "model_identity", "prompt_identity", "input_identity", "output_identity",
-        ):
-            _object(row.get(field), field)
-    return rows
+        if row.get("run_id") == requested_run_id:
+            return _object(row.get("receipt"), "ledger.receipt")
+    raise ValueError("run_id 没有有效运行台账内嵌 receipt")
+
+
+def load_economic_proposal_artifact(
+    path: Path,
+    *,
+    context: Mapping[str, object],
+    policy: EconomicAgentPolicy,
+    observation_ledger_path: Path,
+    agent_ledger_path: Path,
+    output: Path,
+) -> Mapping[str, object]:
+    """v1 无 accepted proposal；仍先验证台账后失败关闭。"""
+    verify_economic_agent_ledger(
+        agent_ledger_path,
+        observation_ledger_path=observation_ledger_path,
+        output=output,
+        policy=policy,
+    )
+    raise ValueError("v1 没有 accepted proposal 台账 commitment")
