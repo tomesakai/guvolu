@@ -4,6 +4,8 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
+import time
 from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -85,14 +87,18 @@ def _write_segment(
     payloads: Sequence[tuple[str, str | None, str | None]],
     *,
     schema_version: int,
+    segment_sequence: int = 1,
+    sealed_at: datetime | None = None,
+    status: str = "sealed",
+    completion_claim: bool = True,
 ) -> None:
     descriptor = _DESCRIPTORS[venue]
     directory = (
         root / "raw/realtime/book_l2" / f"venue_id={venue}"
         / f"venue_symbol={symbol}" / f"run_id={run_id}"
     )
-    directory.mkdir(parents=True)
-    path = directory / "segment-000001.jsonl"
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"segment-{segment_sequence:06d}.jsonl"
     rows: list[dict[str, object]] = []
     for index, (payload, connection_id, channel_id) in enumerate(
         payloads, start=1
@@ -100,7 +106,7 @@ def _write_segment(
         received = (BASE + timedelta(seconds=10, milliseconds=index)).isoformat()
         row: dict[str, object] = {
             "schema_version": schema_version,
-            "run_id": run_id, "segment_sequence": 1,
+            "run_id": run_id, "segment_sequence": segment_sequence,
             "record_sequence": index, "venue_id": venue,
             "venue_symbol": symbol, "domain": "book_l2",
             "source": "websocket",
@@ -124,12 +130,14 @@ def _write_segment(
         "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
     )
     sha = hashlib.sha256(path.read_bytes()).hexdigest()
+    seal_time = sealed_at or BASE + timedelta(minutes=segment_sequence)
     manifest = {
-        "schema_version": schema_version, "status": "sealed",
-        "completion_claim": True, "artifact_id": f"sha256-{sha}",
+        "schema_version": schema_version, "status": status,
+        "completion_claim": completion_claim,
+        "artifact_id": f"sha256-{sha}",
         "sha256": sha, "byte_count": path.stat().st_size,
         "record_count": len(rows), "run_id": run_id,
-        "segment_sequence": 1, "venue_id": venue,
+        "segment_sequence": segment_sequence, "venue_id": venue,
         "venue_symbol": symbol, "domain": "book_l2",
         "endpoint_id": (
             descriptor.endpoint_id if schema_version in {2, 3} else None
@@ -138,10 +146,62 @@ def _write_segment(
             descriptor.endpoint_revision if schema_version == 3 else None
         ),
         "storage_path": path.relative_to(root).as_posix(),
+        "started_at": (seal_time - timedelta(seconds=2)).isoformat(),
+        "first_ingest_time": (seal_time - timedelta(seconds=2)).isoformat(),
+        "last_ingest_time": (seal_time - timedelta(seconds=1)).isoformat(),
+        "sealed_at": seal_time.isoformat(),
     }
-    path.with_name("segment-000001.manifest.json").write_text(
+    path.with_name(
+        f"segment-{segment_sequence:06d}.manifest.json"
+    ).write_text(
         json.dumps(manifest), encoding="utf-8"
     )
+
+
+def _write_run_checkpoint(
+    root: Path,
+    venue: str,
+    symbol: str,
+    run_id: str,
+    *,
+    started_at: datetime = BASE - timedelta(hours=1),
+) -> Path:
+    directory = (
+        root / "raw/realtime/book_l2" / f"venue_id={venue}"
+        / f"venue_symbol={symbol}" / f"run_id={run_id}"
+    )
+    manifests = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in sorted(directory.glob("segment-*.manifest.json"))
+    ]
+    latest_seal = max(
+        (
+            datetime.fromisoformat(str(body["sealed_at"]))
+            for body in manifests
+        ),
+        default=started_at,
+    )
+    checkpoint = {
+        "schema_version": 3,
+        "status": "open",
+        "run_id": run_id,
+        "venue_id": venue,
+        "venue_symbol": symbol,
+        "domain": "book_l2",
+        "endpoint_id": (
+            manifests[0].get("endpoint_id") if manifests else None
+        ),
+        "endpoint_revision": (
+            manifests[0].get("endpoint_revision") if manifests else None
+        ),
+        "started_at": started_at.isoformat(),
+        "checkpoint_at": (latest_seal + timedelta(seconds=1)).isoformat(),
+        "sealed_segments": len(manifests),
+        "records": sum(int(body["record_count"]) for body in manifests),
+    }
+    path = directory / "checkpoint.json"
+    path.write_text(json.dumps(checkpoint), encoding="utf-8")
+    return path
 
 
 def _materialize(root: Path) -> L2Result:
@@ -419,6 +479,561 @@ def test_latest_run_filter_prefers_open_run_over_newer_closed_run(
     selected = _sealed_inputs(tmp_path, latest_run_only=True)
 
     assert [item.run_id for item in selected] == ["run-open"]
+
+
+def test_legacy_latest_run_only_remains_one_run_per_venue(
+    tmp_path: Path,
+) -> None:
+    _write_segment(
+        tmp_path, "gmo", "BTC", "run-btc",
+        [(_gmo_payload(), None, None)], schema_version=1,
+    )
+    _write_segment(
+        tmp_path, "gmo", "ETH", "run-eth",
+        [(_gmo_payload(), None, None)], schema_version=1,
+    )
+    btc_run = (
+        tmp_path / "raw/realtime/book_l2/venue_id=gmo/venue_symbol=BTC"
+        / "run_id=run-btc"
+    )
+    eth_run = (
+        tmp_path / "raw/realtime/book_l2/venue_id=gmo/venue_symbol=ETH"
+        / "run_id=run-eth"
+    )
+    os.utime(btc_run, ns=(1_000_000_000, 1_000_000_000))
+    os.utime(eth_run, ns=(2_000_000_000, 2_000_000_000))
+
+    selected = _sealed_inputs(tmp_path, latest_run_only=True)
+
+    assert [item.run_id for item in selected] == ["run-eth"]
+    assert len(_sealed_inputs(tmp_path)) == 2
+
+
+def test_bounded_freshness_selects_latest_n_per_stream_repeatably(
+    tmp_path: Path,
+) -> None:
+    for venue, symbol, count in (
+        ("gmo", "BTC", 4),
+        ("gmo", "ETH", 3),
+        ("bitbank", "btc_jpy", 3),
+    ):
+        for sequence in range(1, count + 1):
+            _write_segment(
+                tmp_path,
+                venue,
+                symbol,
+                f"run-{venue}",
+                [(_gmo_payload(), None, None)],
+                schema_version=1,
+                segment_sequence=sequence,
+                sealed_at=BASE + timedelta(minutes=sequence),
+            )
+        _write_run_checkpoint(
+            tmp_path, venue, symbol, f"run-{venue}",
+        )
+
+    first = _sealed_inputs(
+        tmp_path, latest_sealed_segments_per_stream=2,
+    )
+    second = _sealed_inputs(
+        tmp_path, latest_sealed_segments_per_stream=2,
+    )
+
+    identity = [
+        (
+            next(
+                part.split("=", 1)[1]
+                for part in item.manifest_path.parts
+                if part.startswith("venue_id=")
+            ),
+            next(
+                part.split("=", 1)[1]
+                for part in item.manifest_path.parts
+                if part.startswith("venue_symbol=")
+            ),
+            item.segment_sequence,
+        )
+        for item in first
+    ]
+    assert identity == [
+        ("bitbank", "btc_jpy", 2),
+        ("bitbank", "btc_jpy", 3),
+        ("gmo", "BTC", 3),
+        ("gmo", "BTC", 4),
+        ("gmo", "ETH", 2),
+        ("gmo", "ETH", 3),
+    ]
+    assert [item.manifest_path for item in first] == [
+        item.manifest_path for item in second
+    ]
+    assert len(_sealed_inputs(tmp_path)) == 10
+
+
+def test_bounded_freshness_rejects_nonmonotonic_segment_seal_time(
+    tmp_path: Path,
+) -> None:
+    for sequence, minute in ((1, 30), (2, 10), (3, 20), (4, 20)):
+        _write_segment(
+            tmp_path,
+            "gmo",
+            "BTC",
+            "run-current",
+            [(_gmo_payload(), None, None)],
+            schema_version=1,
+            segment_sequence=sequence,
+            sealed_at=BASE + timedelta(minutes=minute),
+        )
+
+    _write_run_checkpoint(tmp_path, "gmo", "BTC", "run-current")
+
+    with pytest.raises(ValueError, match="时间非单调"):
+        _sealed_inputs(
+            tmp_path, latest_sealed_segments_per_stream=3,
+        )
+
+
+def test_bounded_freshness_rejects_incomplete_without_fallback(
+    tmp_path: Path,
+) -> None:
+    _write_segment(
+        tmp_path,
+        "gmo",
+        "BTC",
+        "run-current",
+        [(_gmo_payload(), None, None)],
+        schema_version=1,
+        segment_sequence=1,
+    )
+    _write_segment(
+        tmp_path,
+        "gmo",
+        "BTC",
+        "run-current",
+        [(_gmo_payload(), None, None)],
+        schema_version=1,
+        segment_sequence=2,
+        status="recovered_incomplete",
+        completion_claim=False,
+    )
+    run_directory = (
+        tmp_path / "raw/realtime/book_l2/venue_id=gmo/venue_symbol=BTC"
+        / "run_id=run-current"
+    )
+    (run_directory / "segment-000003.jsonl.open").write_text(
+        "{}\n", encoding="utf-8",
+    )
+    _write_run_checkpoint(tmp_path, "gmo", "BTC", "run-current")
+
+    with pytest.raises(ValueError, match="非完整 segment"):
+        _sealed_inputs(
+            tmp_path, latest_sealed_segments_per_stream=10,
+        )
+    only_unsealed = tmp_path / "only-unsealed"
+    _write_segment(
+        only_unsealed,
+        "gmo",
+        "BTC",
+        "run-open",
+        [(_gmo_payload(), None, None)],
+        schema_version=1,
+        status="open",
+        completion_claim=False,
+    )
+    _write_run_checkpoint(only_unsealed, "gmo", "BTC", "run-open")
+    with pytest.raises(ValueError, match="非完整 segment"):
+        _sealed_inputs(
+            only_unsealed, latest_sealed_segments_per_stream=1,
+        )
+
+    no_run_fallback = tmp_path / "no-run-fallback"
+    _write_segment(
+        no_run_fallback,
+        "gmo",
+        "BTC",
+        "run-old",
+        [(_gmo_payload(), None, None)],
+        schema_version=1,
+    )
+    _write_run_checkpoint(
+        no_run_fallback, "gmo", "BTC", "run-old",
+        started_at=BASE - timedelta(hours=2),
+    )
+    latest_directory = (
+        no_run_fallback
+        / "raw/realtime/book_l2/venue_id=gmo/venue_symbol=BTC"
+        / "run_id=run-current"
+    )
+    latest_directory.mkdir(parents=True)
+    (latest_directory / "checkpoint.json").write_text(json.dumps({
+        "schema_version": 3,
+        "status": "open",
+        "run_id": "run-current",
+        "venue_id": "gmo",
+        "venue_symbol": "BTC",
+        "domain": "book_l2",
+        "endpoint_id": None,
+        "endpoint_revision": None,
+        "started_at": BASE.isoformat(),
+        "checkpoint_at": (BASE + timedelta(minutes=1)).isoformat(),
+        "sealed_segments": 0,
+        "records": 0,
+    }), encoding="utf-8")
+    (latest_directory / "segment-000001.jsonl.open").write_text(
+        "{}\n", encoding="utf-8",
+    )
+    assert _sealed_inputs(
+        no_run_fallback, latest_sealed_segments_per_stream=1,
+    ) == []
+
+
+def test_bounded_freshness_fails_closed_on_invalid_selection_or_metadata(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="必须为正整数"):
+        _sealed_inputs(tmp_path, latest_sealed_segments_per_stream=0)
+    with pytest.raises(ValueError, match="互斥"):
+        _sealed_inputs(
+            tmp_path,
+            latest_run_only=True,
+            latest_sealed_segments_per_stream=1,
+        )
+
+    _write_segment(
+        tmp_path,
+        "gmo",
+        "BTC",
+        "run-current",
+        [(_gmo_payload(), None, None)],
+        schema_version=1,
+    )
+    _write_run_checkpoint(tmp_path, "gmo", "BTC", "run-current")
+    manifest = next(tmp_path.rglob("segment-000001.manifest.json"))
+    body = json.loads(manifest.read_text(encoding="utf-8"))
+    del body["sealed_at"]
+    manifest.write_text(json.dumps(body), encoding="utf-8")
+    with pytest.raises(ValueError, match="缺 sealed_at"):
+        _sealed_inputs(
+            tmp_path, latest_sealed_segments_per_stream=1,
+        )
+
+    invalid_shape = tmp_path / "invalid-shape"
+    _write_segment(
+        invalid_shape,
+        "gmo",
+        "BTC",
+        "run-current",
+        [(_gmo_payload(), None, None)],
+        schema_version=1,
+    )
+    _write_run_checkpoint(
+        invalid_shape, "gmo", "BTC", "run-current",
+    )
+    invalid_manifest = next(
+        invalid_shape.rglob("segment-000001.manifest.json")
+    )
+    invalid_manifest.write_text("[]", encoding="utf-8")
+    with pytest.raises(ValueError, match="结构非法"):
+        _sealed_inputs(
+            invalid_shape, latest_sealed_segments_per_stream=1,
+        )
+
+
+def test_bounded_freshness_rejects_string_encoded_counts(
+    tmp_path: Path,
+) -> None:
+    """Bounded 状态合同不得把字符串数字冒充规范整数。"""
+    _write_segment(
+        tmp_path,
+        "gmo",
+        "BTC",
+        "run-current",
+        [(_gmo_payload(), None, None)],
+        schema_version=1,
+    )
+    checkpoint = _write_run_checkpoint(
+        tmp_path, "gmo", "BTC", "run-current",
+    )
+    body = json.loads(checkpoint.read_text(encoding="utf-8"))
+    body["sealed_segments"] = str(body["sealed_segments"])
+    checkpoint.write_text(json.dumps(body), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="sealed_segments 必须为整数"):
+        _sealed_inputs(
+            tmp_path, latest_sealed_segments_per_stream=1,
+        )
+
+
+@pytest.mark.parametrize(
+    ("run_started", "segment_started", "first_ingest"),
+    (
+        (
+            BASE + timedelta(seconds=59),
+            BASE + timedelta(seconds=58),
+            BASE + timedelta(seconds=58),
+        ),
+        (
+            BASE + timedelta(seconds=58),
+            BASE + timedelta(seconds=59),
+            BASE + timedelta(seconds=57),
+        ),
+    ),
+)
+def test_bounded_freshness_rejects_events_before_run_start(
+    tmp_path: Path,
+    run_started: datetime,
+    segment_started: datetime,
+    first_ingest: datetime,
+) -> None:
+    _write_segment(
+        tmp_path, "gmo", "BTC", "run-current",
+        [(_gmo_payload(), None, None)], schema_version=1,
+    )
+    manifest = next(tmp_path.rglob("segment-000001.manifest.json"))
+    manifest_body = json.loads(manifest.read_text(encoding="utf-8"))
+    manifest_body["started_at"] = segment_started.isoformat()
+    manifest_body["first_ingest_time"] = first_ingest.isoformat()
+    manifest.write_text(json.dumps(manifest_body), encoding="utf-8")
+    _write_run_checkpoint(
+        tmp_path, "gmo", "BTC", "run-current",
+        started_at=run_started,
+    )
+
+    with pytest.raises(ValueError, match="时序倒置"):
+        _sealed_inputs(
+            tmp_path, latest_sealed_segments_per_stream=1,
+        )
+
+
+def test_bounded_freshness_rejects_checkpoint_before_included_seal(
+    tmp_path: Path,
+) -> None:
+    _write_segment(
+        tmp_path, "gmo", "BTC", "run-current",
+        [(_gmo_payload(), None, None)], schema_version=1,
+    )
+    checkpoint = _write_run_checkpoint(
+        tmp_path, "gmo", "BTC", "run-current",
+    )
+    body = json.loads(checkpoint.read_text(encoding="utf-8"))
+    body["checkpoint_at"] = (BASE + timedelta(seconds=59)).isoformat()
+    checkpoint.write_text(json.dumps(body), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="checkpoint 早于 segment seal"):
+        _sealed_inputs(
+            tmp_path, latest_sealed_segments_per_stream=1,
+        )
+
+
+@pytest.mark.parametrize(
+    ("target", "field"),
+    (
+        ("manifest", "segment_sequence"),
+        ("manifest", "byte_count"),
+        ("manifest", "schema_version"),
+        ("checkpoint", "schema_version"),
+    ),
+)
+def test_bounded_freshness_rejects_string_encoded_identity_integers(
+    tmp_path: Path,
+    target: str,
+    field: str,
+) -> None:
+    _write_segment(
+        tmp_path, "gmo", "BTC", "run-current",
+        [(_gmo_payload(), None, None)], schema_version=1,
+    )
+    checkpoint = _write_run_checkpoint(
+        tmp_path, "gmo", "BTC", "run-current",
+    )
+    path = (
+        next(tmp_path.rglob("segment-000001.manifest.json"))
+        if target == "manifest" else checkpoint
+    )
+    body = json.loads(path.read_text(encoding="utf-8"))
+    body[field] = str(body[field])
+    path.write_text(json.dumps(body), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="必须为整数"):
+        _sealed_inputs(
+            tmp_path, latest_sealed_segments_per_stream=1,
+        )
+
+
+def test_bounded_freshness_cli_rejects_zero_and_mutually_exclusive_modes(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(SystemExit) as zero:
+        l2_module.main([
+            "--data-root", str(tmp_path), "all",
+            "--latest-sealed-segments-per-stream", "0",
+        ])
+    assert zero.value.code == 2
+
+    with pytest.raises(SystemExit) as conflicting:
+        l2_module.main([
+            "--data-root", str(tmp_path), "all",
+            "--latest-run-only",
+            "--latest-sealed-segments-per-stream", "1",
+        ])
+    assert conflicting.value.code == 2
+
+
+def test_l2_cli_rejects_abbreviated_identity_and_selection_options(
+    tmp_path: Path,
+) -> None:
+    for argv in (
+        ["--data-ro", str(tmp_path), "audit"],
+        ["--data-root", str(tmp_path), "all", "--latest-run"],
+        [
+            "--data-root", str(tmp_path), "watch",
+            "--latest-sealed-segments-per-str", "1",
+        ],
+    ):
+        with pytest.raises(SystemExit) as rejected:
+            l2_module.main(argv)
+        assert rejected.value.code == 2
+
+
+def test_l2_watch_owner_record_is_fixed_and_removed(tmp_path: Path) -> None:
+    root = tmp_path / "data"
+    root.mkdir()
+
+    with l2_module._l2_watch_owner(root, selection="latest_run") as owner:
+        owner_path = root / ".locks/l2-materializer-owner.json"
+        recorded = json.loads(owner_path.read_text(encoding="utf-8"))
+        assert recorded == owner
+        assert recorded["schema_version"] == 1
+        assert recorded["pid"] == os.getpid()
+        assert recorded["selection"] == "latest_run"
+        assert Path(recorded["data_root"]) == root.resolve()
+        assert Path(recorded["executable_path"]) == Path(
+            getattr(sys, "_base_executable", sys.executable)
+        ).resolve()
+        assert len(recorded["nonce"]) == 32
+
+    assert not owner_path.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="验证 Windows byte lock")
+def test_direct_python_watch_rejects_concurrent_singleton_owner(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "data"
+    root.mkdir()
+    command = [
+        sys.executable,
+        "-m",
+        "guvolu.data.l2_materialize",
+        "--data-root",
+        str(root),
+        "watch",
+        "--interval-seconds",
+        "10",
+    ]
+    first = subprocess.Popen(
+        command,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    owner_path = root / ".locks/l2-materializer-owner.json"
+    owner_pid: int | None = None
+    try:
+        deadline = time.monotonic() + 15
+        while not owner_path.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        owner = json.loads(owner_path.read_text(encoding="utf-8"))
+        owner_pid = int(owner["pid"])
+        assert owner["selection"] == "all"
+
+        second = subprocess.run(
+            [*command, "--latest-run-only"],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=15,
+        )
+
+        assert second.returncode != 0
+        assert "singleton is already owned" in (
+            second.stdout + second.stderr
+        )
+        unchanged = json.loads(owner_path.read_text(encoding="utf-8"))
+        assert unchanged["pid"] == owner_pid
+        assert unchanged["selection"] == "all"
+    finally:
+        if owner_pid is not None:
+            subprocess.run(
+                ["taskkill.exe", "/PID", str(owner_pid), "/T", "/F"],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+        if first.poll() is None:
+            first.terminate()
+            first.wait(timeout=5)
+
+
+def test_bounded_freshness_cli_materializes_only_selected_receipt(
+    tmp_path: Path,
+) -> None:
+    for sequence in range(1, 4):
+        _write_segment(
+            tmp_path,
+            "gmo",
+            "BTC",
+            "run-current",
+            [(_gmo_payload(), None, None)],
+            schema_version=1,
+            segment_sequence=sequence,
+        )
+    _write_run_checkpoint(tmp_path, "gmo", "BTC", "run-current")
+    newest_manifest = json.loads((
+        tmp_path / "raw/realtime/book_l2/venue_id=gmo/venue_symbol=BTC"
+        / "run_id=run-current/segment-000003.manifest.json"
+    ).read_text(encoding="utf-8"))
+
+    assert l2_module.main([
+        "--data-root", str(tmp_path), "all",
+        "--latest-sealed-segments-per-stream", "1",
+    ]) == 0
+
+    conn = store.connect(tmp_path)
+    try:
+        rows = conn.execute(
+            "SELECT a.partition_key,a.input_set_hash,a.status,i.artifact_id "
+            "FROM partition_attempt a JOIN partition_input i "
+            "ON i.attempt_id=a.attempt_id WHERE a.domain='book_l2'"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert len(rows) == 1
+    assert rows[0][0] == "run-current/segment-000003"
+    assert len(str(rows[0][1])) == 64
+    int(str(rows[0][1]), 16)
+    assert rows[0][2] in {"complete", "complete_with_rejections"}
+    assert rows[0][3] == newest_manifest["artifact_id"]
+
+
+def test_bounded_freshness_rechecks_selected_content_receipt(
+    tmp_path: Path,
+) -> None:
+    _write_segment(
+        tmp_path,
+        "gmo",
+        "BTC",
+        "run-current",
+        [(_gmo_payload(), None, None)],
+        schema_version=1,
+    )
+    _write_run_checkpoint(tmp_path, "gmo", "BTC", "run-current")
+    segment = next(tmp_path.rglob("segment-000001.jsonl"))
+    segment.write_text("tampered\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="segment 散列不符"):
+        _sealed_inputs(
+            tmp_path, latest_sealed_segments_per_stream=1,
+        )
 
 
 def test_legacy_raw_v1_becomes_explicit_nullable_v3_fact(tmp_path: Path) -> None:

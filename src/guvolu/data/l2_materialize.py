@@ -4,17 +4,20 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import importlib
 import json
 import os
 import sqlite3
+import sys
 import time
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, BinaryIO, cast
 
 import duckdb
 
@@ -142,6 +145,18 @@ class SegmentInput:
     @property
     def partition_key(self) -> str:
         return f"{self.run_id}/segment-{self.segment_sequence:06d}"
+
+
+@dataclass(frozen=True)
+class _BoundedRunContract:
+    """用于 bounded 选择的稳定 run 身份快照。"""
+
+    directory: Path
+    state_path: Path
+    state_bytes: bytes
+    body: Mapping[str, object]
+    started_at: datetime
+    open_run: bool
 
 
 @dataclass(frozen=True)
@@ -336,52 +351,44 @@ _PARSERS = {
 
 def _sealed_inputs(
     root: Path, *, latest_run_only: bool = False,
+    latest_sealed_segments_per_stream: int | None = None,
 ) -> list[SegmentInput]:
+    _validate_input_selection(
+        latest_run_only=latest_run_only,
+        latest_sealed_segments_per_stream=(
+            latest_sealed_segments_per_stream
+        ),
+    )
     inputs: list[SegmentInput] = []
     base = _resolve_recorded_path(root, "raw/realtime/book_l2")
     if not base.is_dir():
         return []
-    if latest_run_only:
-        latest_directories: dict[str, tuple[int, int, str, Path]] = {}
-        for run_directory in base.rglob("run_id=*"):
-            if not run_directory.is_dir():
-                continue
-            venue_id = next(
-                (
-                    part.split("=", 1)[1] for part in run_directory.parts
-                    if part.startswith("venue_id=")
-                ),
-                "",
-            )
-            run_id = run_directory.name.split("=", 1)[1]
-            open_run = int(
-                (run_directory / "checkpoint.json").is_file()
-                and next(run_directory.glob("segment-*.open"), None)
-                is not None
-            )
-            candidate = (
-                open_run, run_directory.stat().st_mtime_ns,
-                run_id, run_directory,
-            )
-            if candidate[:3] > latest_directories.get(
-                venue_id, (-1, -1, "", run_directory),
-            )[:3]:
-                latest_directories[venue_id] = candidate
-        manifest_paths = sorted(
-            path
-            for _, _, _, directory in latest_directories.values()
-            for path in directory.glob("segment-*.manifest.json")
+    manifests: list[tuple[Path, Mapping[str, object]]]
+    if latest_sealed_segments_per_stream is not None:
+        manifests = _latest_sealed_manifest_entries(
+            base, latest_sealed_segments_per_stream,
         )
     else:
-        manifest_paths = sorted(base.rglob("segment-*.manifest.json"))
-    manifests: list[tuple[Path, Mapping[str, object]]] = []
-    for manifest_path in manifest_paths:
-        body = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if not isinstance(body, Mapping):
-            continue
-        if body.get("status") != "sealed" or body.get("completion_claim") is not True:
-            continue
-        manifests.append((manifest_path, body))
+        manifest_paths: list[Path]
+        if latest_run_only:
+            manifest_paths = sorted(
+                path
+                for directory in _latest_run_directories(base).values()
+                for path in directory.glob("segment-*.manifest.json")
+            )
+        else:
+            manifest_paths = sorted(base.rglob("segment-*.manifest.json"))
+        manifests = []
+        for manifest_path in manifest_paths:
+            body = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(body, Mapping):
+                continue
+            if (
+                body.get("status") != "sealed"
+                or body.get("completion_claim") is not True
+            ):
+                continue
+            manifests.append((manifest_path, body))
     for manifest_path, body in manifests:
         recorded = str(body["storage_path"])
         relative = PurePosixPath(recorded)
@@ -479,6 +486,601 @@ def _sealed_inputs(
             ),
         ))
     return inputs
+
+
+def _validate_input_selection(
+    *,
+    latest_run_only: bool,
+    latest_sealed_segments_per_stream: int | None,
+) -> None:
+    """拒绝含糊或无界的增量选择参数。"""
+    limit = latest_sealed_segments_per_stream
+    if limit is not None and (
+        isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0
+    ):
+        raise ValueError("latest-sealed-segments-per-stream 必须为正整数")
+    if latest_run_only and limit is not None:
+        raise ValueError(
+            "latest-run-only 与 latest-sealed-segments-per-stream 互斥"
+        )
+
+
+def _json_object_snapshot(
+    path: Path, label: str,
+) -> tuple[bytes, Mapping[str, object]]:
+    """单次读取 JSON 对象，供随后逐字节稳定性复核。"""
+    try:
+        raw = path.read_bytes()
+        loaded: object = json.loads(raw)
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{label} 无法读取: {path}") from exc
+    if not isinstance(loaded, Mapping):
+        raise ValueError(f"{label} 结构非法: {path}")
+    if any(not isinstance(key, str) for key in loaded):
+        raise ValueError(f"{label} 键类型非法: {path}")
+    return raw, cast(Mapping[str, object], loaded)
+
+
+def _bounded_integer(
+    value: object, label: str, *, minimum: int = 0,
+) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{label} 必须为整数")
+    if value < minimum:
+        raise ValueError(f"{label} 不得小于 {minimum}")
+    return value
+
+
+def _bounded_run_contract(
+    run_directory: Path,
+    *,
+    venue_id: str,
+    venue_symbol: str,
+) -> _BoundedRunContract:
+    """读取 checkpoint 或 terminal run manifest 的唯一身份合同。
+
+    checkpoint 是可变文件，run manifest 也尚无自身内容散列；因此这里不把
+    两者提升为不可伪造事实，只把逐字节稳定快照与严格身份/时序作为 bounded
+    模式的最低失败关闭边界。生产格式升级前仍不能据此声称 run liveness。
+    """
+    run_id = run_directory.name.split("=", 1)[1]
+    if not run_id:
+        raise ValueError(f"bounded freshness run 目录非法: {run_directory}")
+    checkpoint = run_directory / "checkpoint.json"
+    terminal = run_directory / "run.manifest.json"
+    states = [path for path in (checkpoint, terminal) if path.is_file()]
+    if len(states) != 1:
+        raise ValueError(
+            "bounded freshness run 状态合同不唯一: "
+            f"{run_directory}"
+        )
+    state_path = states[0]
+    state_bytes, body = _json_object_snapshot(
+        state_path, "bounded freshness run 状态合同",
+    )
+    if (
+        body.get("run_id") != run_id
+        or body.get("venue_id") != venue_id
+        or body.get("venue_symbol") != venue_symbol
+        or body.get("domain") != "book_l2"
+    ):
+        raise ValueError(
+            "bounded freshness run 状态身份与路径不一致: "
+            f"{state_path}"
+        )
+    run_schema_version = _bounded_integer(
+        body.get("schema_version"), "bounded run schema_version", minimum=1,
+    )
+    if run_schema_version != 3:
+        raise ValueError(
+            f"bounded freshness run schema_version 非法: {state_path}"
+        )
+    run_endpoint_revision = body.get("endpoint_revision")
+    if run_endpoint_revision is not None:
+        _bounded_integer(
+            run_endpoint_revision,
+            "bounded run endpoint_revision",
+        )
+    started_at = _time(
+        body.get("started_at"), "bounded run started_at",
+    )
+    if state_path == checkpoint:
+        if body.get("status") != "open":
+            raise ValueError(
+                f"bounded freshness checkpoint 状态非法: {state_path}"
+            )
+        checkpoint_at = _time(
+            body.get("checkpoint_at"), "bounded checkpoint_at",
+        )
+        if checkpoint_at < started_at:
+            raise ValueError(
+                f"bounded freshness checkpoint 时序倒置: {state_path}"
+            )
+        _bounded_integer(
+            body.get("sealed_segments"),
+            "bounded checkpoint sealed_segments",
+        )
+        _bounded_integer(body.get("records"), "bounded checkpoint records")
+        return _BoundedRunContract(
+            run_directory, state_path, state_bytes, body, started_at, True,
+        )
+    status = body.get("status")
+    if status not in {"complete", "interrupted", "failed"}:
+        raise ValueError(
+            f"bounded freshness run manifest 状态非法: {state_path}"
+        )
+    if body.get("completion_claim") is not (status == "complete"):
+        raise ValueError(
+            f"bounded freshness run completion_claim 非法: {state_path}"
+        )
+    finished_at = _time(body.get("finished_at"), "bounded run finished_at")
+    if finished_at < started_at:
+        raise ValueError(
+            f"bounded freshness run manifest 时序倒置: {state_path}"
+        )
+    _bounded_integer(body.get("segment_count"), "bounded run segment_count")
+    _bounded_integer(body.get("record_count"), "bounded run record_count")
+    if not isinstance(body.get("segments"), list):
+        raise ValueError(
+            f"bounded freshness run receipts 结构非法: {state_path}"
+        )
+    return _BoundedRunContract(
+        run_directory, state_path, state_bytes, body, started_at, False,
+    )
+
+
+def _run_rank(run_directory: Path) -> tuple[int, int, str]:
+    run_id = run_directory.name.split("=", 1)[1]
+    if not run_id:
+        raise ValueError(f"L2 run 目录非法: {run_directory}")
+    open_run = int(
+        (run_directory / "checkpoint.json").is_file()
+        and next(run_directory.glob("segment-*.open"), None) is not None
+    )
+    return open_run, run_directory.stat().st_mtime_ns, run_id
+
+
+def _latest_stream_run_directories(
+    base: Path,
+) -> dict[tuple[str, str], Path]:
+    """按规范目录深度定位每个 (venue,symbol) 流的最新运行。"""
+    latest: dict[tuple[str, str], tuple[int, int, str, Path]] = {}
+    for venue_directory in sorted(base.glob("venue_id=*")):
+        if not venue_directory.is_dir():
+            continue
+        venue_id = venue_directory.name.split("=", 1)[1]
+        if not venue_id:
+            raise ValueError(f"L2 venue 目录非法: {venue_directory}")
+        for symbol_directory in sorted(
+            venue_directory.glob("venue_symbol=*")
+        ):
+            if not symbol_directory.is_dir():
+                continue
+            venue_symbol = symbol_directory.name.split("=", 1)[1]
+            if not venue_symbol:
+                raise ValueError(
+                    f"L2 symbol 目录非法: {symbol_directory}"
+                )
+            stream = (venue_id, venue_symbol)
+            for run_directory in sorted(symbol_directory.glob("run_id=*")):
+                if not run_directory.is_dir():
+                    continue
+                candidate = (*_run_rank(run_directory), run_directory)
+                if candidate[:3] > latest.get(
+                    stream, (-1, -1, "", run_directory),
+                )[:3]:
+                    latest[stream] = candidate
+    return {stream: row[3] for stream, row in latest.items()}
+
+
+def _bounded_latest_stream_run_contracts(
+    base: Path,
+) -> dict[tuple[str, str], _BoundedRunContract]:
+    """按合同 started_at，而非目录 mtime，选择每个流的最新 run。"""
+    latest: dict[
+        tuple[str, str], tuple[datetime, str, _BoundedRunContract]
+    ] = {}
+    for venue_directory in sorted(base.glob("venue_id=*")):
+        if not venue_directory.is_dir():
+            continue
+        venue_id = venue_directory.name.split("=", 1)[1]
+        if not venue_id:
+            raise ValueError(f"L2 venue 目录非法: {venue_directory}")
+        for symbol_directory in sorted(
+            venue_directory.glob("venue_symbol=*")
+        ):
+            if not symbol_directory.is_dir():
+                continue
+            venue_symbol = symbol_directory.name.split("=", 1)[1]
+            if not venue_symbol:
+                raise ValueError(
+                    f"L2 symbol 目录非法: {symbol_directory}"
+                )
+            stream = (venue_id, venue_symbol)
+            for run_directory in sorted(symbol_directory.glob("run_id=*")):
+                if not run_directory.is_dir():
+                    continue
+                contract = _bounded_run_contract(
+                    run_directory,
+                    venue_id=venue_id,
+                    venue_symbol=venue_symbol,
+                )
+                run_id = run_directory.name.split("=", 1)[1]
+                candidate = (contract.started_at, run_id, contract)
+                prior = latest.get(stream)
+                if prior is None or candidate[:2] > prior[:2]:
+                    latest[stream] = candidate
+    return {stream: row[2] for stream, row in latest.items()}
+
+
+def _latest_run_directories(base: Path) -> dict[str, Path]:
+    """保留 legacy latest-run-only 的每所单运行语义。"""
+    latest: dict[str, tuple[int, int, str, Path]] = {}
+    for (venue_id, _), run_directory in (
+        _latest_stream_run_directories(base).items()
+    ):
+        candidate = (*_run_rank(run_directory), run_directory)
+        if candidate[:3] > latest.get(
+            venue_id, (-1, -1, "", run_directory),
+        )[:3]:
+            latest[venue_id] = candidate
+    return {venue_id: row[3] for venue_id, row in latest.items()}
+
+
+def _manifest_segment_sequence(manifest_path: Path) -> int:
+    name = manifest_path.name
+    prefix = "segment-"
+    suffix = ".manifest.json"
+    raw_sequence = name.removeprefix(prefix).removesuffix(suffix)
+    if (
+        not name.startswith(prefix)
+        or not name.endswith(suffix)
+        or not raw_sequence.isdigit()
+        or int(raw_sequence) <= 0
+    ):
+        raise ValueError(f"segment manifest 文件名非法: {manifest_path}")
+    return int(raw_sequence)
+
+
+def _terminal_run_receipts(
+    contract: _BoundedRunContract,
+    base: Path,
+) -> dict[int, Mapping[str, object]]:
+    raw_receipts = contract.body.get("segments")
+    if not isinstance(raw_receipts, list):
+        raise ValueError(
+            "bounded freshness terminal run receipts 结构非法: "
+            f"{contract.state_path}"
+        )
+    expected_count = _bounded_integer(
+        contract.body.get("segment_count"),
+        "bounded terminal segment_count",
+    )
+    if expected_count != len(raw_receipts):
+        raise ValueError(
+            "bounded freshness terminal run receipt 数量不闭合: "
+            f"{contract.state_path}"
+        )
+    run_relative = contract.directory.relative_to(base).as_posix()
+    receipts: dict[int, Mapping[str, object]] = {}
+    total_records = 0
+    for expected_sequence, loaded in enumerate(raw_receipts, start=1):
+        if not isinstance(loaded, Mapping) or any(
+            not isinstance(key, str) for key in loaded
+        ):
+            raise ValueError(
+                "bounded freshness terminal receipt 结构非法: "
+                f"{contract.state_path}"
+            )
+        receipt = cast(Mapping[str, object], loaded)
+        sequence = _bounded_integer(
+            receipt.get("segment_sequence"),
+            "bounded terminal receipt segment_sequence",
+            minimum=1,
+        )
+        if sequence != expected_sequence or sequence in receipts:
+            raise ValueError(
+                "bounded freshness terminal receipt 序列不连续: "
+                f"{contract.state_path}"
+            )
+        storage_path = (
+            "raw/realtime/book_l2/"
+            f"{run_relative}/segment-{sequence:06d}.jsonl"
+        )
+        manifest_path = (
+            "raw/realtime/book_l2/"
+            f"{run_relative}/segment-{sequence:06d}.manifest.json"
+        )
+        if (
+            receipt.get("storage_path") != storage_path
+            or receipt.get("manifest_path") != manifest_path
+        ):
+            raise ValueError(
+                "bounded freshness terminal receipt 路径非法: "
+                f"{contract.state_path}"
+            )
+        _bounded_integer(
+            receipt.get("byte_count"),
+            "bounded terminal receipt byte_count",
+            minimum=1,
+        )
+        records = _bounded_integer(
+            receipt.get("record_count"),
+            "bounded terminal receipt record_count",
+            minimum=1,
+        )
+        total_records += records
+        sha = receipt.get("sha256")
+        if (
+            not isinstance(sha, str)
+            or len(sha) != 64
+            or receipt.get("artifact_id") != f"sha256-{sha}"
+        ):
+            raise ValueError(
+                "bounded freshness terminal receipt 散列身份非法: "
+                f"{contract.state_path}"
+            )
+        try:
+            int(sha, 16)
+        except ValueError as exc:
+            raise ValueError(
+                "bounded freshness terminal receipt SHA-256 非法: "
+                f"{contract.state_path}"
+            ) from exc
+        for key in ("first_ingest_time", "last_ingest_time"):
+            if not isinstance(receipt.get(key), str):
+                raise ValueError(
+                    f"bounded freshness terminal receipt 缺 {key}: "
+                    f"{contract.state_path}"
+                )
+        receipts[sequence] = receipt
+    if total_records != _bounded_integer(
+        contract.body.get("record_count"),
+        "bounded terminal record_count",
+    ):
+        raise ValueError(
+            "bounded freshness terminal receipt 行数不闭合: "
+            f"{contract.state_path}"
+        )
+    return receipts
+
+
+def _latest_sealed_manifest_entries(
+    base: Path, limit: int,
+) -> list[tuple[Path, Mapping[str, object]]]:
+    """按 run 合同与单调 segment receipt 取每流最新 N 片。
+
+    当前 run/checkpoint 格式没有状态文件自身的内容寻址身份，也没有把
+    ``sealed_at`` 写入 terminal run receipt。因此本模式只能验证稳定字节快照、
+    数据散列绑定和可复核时序，不能把 checkpoint 新鲜度等同于 collector 存活。
+    任何状态身份、计数、时序或扫描期间稳定性含糊都会失败关闭。
+    """
+    selected: list[
+        tuple[str, str, int, str, Path, Mapping[str, object]]
+    ] = []
+    for (venue_id, venue_symbol), contract in sorted(
+        _bounded_latest_stream_run_contracts(base).items()
+    ):
+        run_directory = contract.directory
+        receipts = (
+            {} if contract.open_run
+            else _terminal_run_receipts(contract, base)
+        )
+        candidates: list[tuple[int, str, Path, Mapping[str, object]]] = []
+        manifest_snapshots: dict[Path, bytes] = {}
+        for manifest_path in sorted(
+            run_directory.glob("segment-*.manifest.json")
+        ):
+            raw, body = _json_object_snapshot(
+                manifest_path, "bounded freshness manifest",
+            )
+            manifest_snapshots[manifest_path] = raw
+            if (
+                body.get("status") != "sealed"
+                or body.get("completion_claim") is not True
+            ):
+                raise ValueError(
+                    "bounded freshness latest run 含非完整 segment: "
+                    f"{manifest_path}"
+                )
+            segment_sequence = _manifest_segment_sequence(manifest_path)
+            if body.get("sealed_at") is None:
+                raise ValueError(
+                    "bounded freshness manifest 缺 sealed_at: "
+                    f"{manifest_path}"
+                )
+            sealed_at = _time(body["sealed_at"], "sealed_at")
+            segment_started_at = _time(
+                body.get("started_at"), "segment started_at",
+            )
+            first_ingest = _time(
+                body.get("first_ingest_time"), "first_ingest_time",
+            )
+            last_ingest = _time(
+                body.get("last_ingest_time"), "last_ingest_time",
+            )
+            recorded_sequence = _bounded_integer(
+                body.get("segment_sequence"),
+                "bounded manifest segment_sequence",
+                minimum=1,
+            )
+            _bounded_integer(
+                body.get("byte_count"),
+                "bounded manifest byte_count",
+                minimum=1,
+            )
+            _bounded_integer(
+                body.get("record_count"),
+                "bounded manifest record_count",
+                minimum=1,
+            )
+            manifest_schema_version = _bounded_integer(
+                body.get("schema_version", 1),
+                "bounded manifest schema_version",
+                minimum=1,
+            )
+            if manifest_schema_version not in {1, 2, 3}:
+                raise ValueError(
+                    "bounded freshness manifest schema_version 非法: "
+                    f"{manifest_path}"
+                )
+            manifest_endpoint_revision = body.get("endpoint_revision")
+            if manifest_endpoint_revision is not None:
+                _bounded_integer(
+                    manifest_endpoint_revision,
+                    "bounded manifest endpoint_revision",
+                )
+            if (
+                body.get("venue_id") != venue_id
+                or body.get("venue_symbol") != venue_symbol
+                or str(body.get("run_id"))
+                != run_directory.name.split("=", 1)[1]
+                or recorded_sequence != segment_sequence
+            ):
+                raise ValueError(
+                    "bounded freshness manifest 身份与路径不一致: "
+                    f"{manifest_path}"
+                )
+            if body.get("domain") != "book_l2":
+                raise ValueError(
+                    "bounded freshness manifest domain 非法: "
+                    f"{manifest_path}"
+                )
+            if any(
+                body.get(key) != contract.body.get(key)
+                for key in ("endpoint_id", "endpoint_revision")
+            ):
+                raise ValueError(
+                    "bounded freshness manifest 与 run 端点身份不一致: "
+                    f"{manifest_path}"
+                )
+            if (
+                first_ingest > last_ingest
+                or segment_started_at < contract.started_at
+                or first_ingest < contract.started_at
+                or sealed_at < segment_started_at
+                or sealed_at < first_ingest
+                or sealed_at < last_ingest
+            ):
+                raise ValueError(
+                    "bounded freshness manifest 时序倒置: "
+                    f"{manifest_path}"
+                )
+            receipt = receipts.get(segment_sequence)
+            if not contract.open_run:
+                if receipt is None:
+                    raise ValueError(
+                        "bounded freshness manifest 缺 terminal receipt: "
+                        f"{manifest_path}"
+                    )
+                for key in (
+                    "artifact_id", "sha256", "byte_count", "record_count",
+                    "storage_path", "first_ingest_time", "last_ingest_time",
+                ):
+                    if body.get(key) != receipt.get(key):
+                        raise ValueError(
+                            "bounded freshness manifest 与 terminal receipt "
+                            f"不一致: {manifest_path}: {key}"
+                        )
+            stable_path = manifest_path.relative_to(base).as_posix()
+            candidates.append(
+                (segment_sequence, stable_path, manifest_path, body)
+            )
+
+        candidates.sort(key=lambda row: (row[0], row[1]))
+        sequences = [row[0] for row in candidates]
+        if sequences != list(range(1, len(candidates) + 1)):
+            raise ValueError(
+                "bounded freshness latest run segment 序列不连续: "
+                f"{run_directory}"
+            )
+        previous_sealed: datetime | None = None
+        previous_started: datetime | None = None
+        total_records = 0
+        for _, _, manifest_path, body in candidates:
+            sealed_at = _time(body.get("sealed_at"), "sealed_at")
+            segment_started_at = _time(
+                body.get("started_at"), "segment started_at",
+            )
+            if (
+                previous_sealed is not None
+                and sealed_at < previous_sealed
+            ) or (
+                previous_started is not None
+                and segment_started_at < previous_started
+            ):
+                raise ValueError(
+                    "bounded freshness latest run segment 时间非单调: "
+                    f"{manifest_path}"
+                )
+            previous_sealed = sealed_at
+            previous_started = segment_started_at
+            total_records += _bounded_integer(
+                body.get("record_count"),
+                "bounded manifest record_count",
+                minimum=1,
+            )
+        if contract.open_run:
+            checkpoint_segments = _bounded_integer(
+                contract.body.get("sealed_segments"),
+                "bounded checkpoint sealed_segments",
+            )
+            checkpoint_records = _bounded_integer(
+                contract.body.get("records"),
+                "bounded checkpoint records",
+            )
+            if (
+                checkpoint_segments != len(candidates)
+                or checkpoint_records < total_records
+            ):
+                raise ValueError(
+                    "bounded freshness checkpoint 与 segment 计数不闭合: "
+                    f"{contract.state_path}"
+                )
+            checkpoint_at = _time(
+                contract.body.get("checkpoint_at"),
+                "bounded checkpoint_at",
+            )
+            if previous_sealed is not None and checkpoint_at < previous_sealed:
+                raise ValueError(
+                    "bounded freshness checkpoint 早于 segment seal: "
+                    f"{contract.state_path}"
+                )
+        else:
+            if len(receipts) != len(candidates):
+                raise ValueError(
+                    "bounded freshness terminal receipt 未全部落盘: "
+                    f"{contract.state_path}"
+                )
+            finished_at = _time(
+                contract.body.get("finished_at"), "bounded run finished_at",
+            )
+            if previous_sealed is not None and finished_at < previous_sealed:
+                raise ValueError(
+                    "bounded freshness run finish 早于 segment seal: "
+                    f"{contract.state_path}"
+                )
+        for path, raw in manifest_snapshots.items():
+            if path.read_bytes() != raw:
+                raise ValueError(
+                    "bounded freshness manifest 在选择期间变化: "
+                    f"{path}"
+                )
+        if contract.state_path.read_bytes() != contract.state_bytes:
+            raise ValueError(
+                "bounded freshness run 状态在选择期间变化: "
+                f"{contract.state_path}"
+            )
+        newest = candidates[-limit:]
+        selected.extend(
+            (
+                venue_id, venue_symbol, segment_sequence,
+                stable_path, path, body,
+            )
+            for segment_sequence, stable_path, path, body in newest
+        )
+    selected.sort(key=lambda row: row[:4])
+    return [(path, body) for _, _, _, _, path, body in selected]
 
 
 def _latest_run_inputs(inputs: Sequence[SegmentInput]) -> list[SegmentInput]:
@@ -1187,9 +1789,16 @@ def materialize_all(
     *,
     report_reused: bool = True,
     latest_run_only: bool = False,
+    latest_sealed_segments_per_stream: int | None = None,
 ) -> list[L2Result]:
     """断点复用地物化全部已封口 L2 segment。"""
-    inputs = _sealed_inputs(root, latest_run_only=latest_run_only)
+    inputs = _sealed_inputs(
+        root,
+        latest_run_only=latest_run_only,
+        latest_sealed_segments_per_stream=(
+            latest_sealed_segments_per_stream
+        ),
+    )
     results: list[L2Result] = []
     for index, item in enumerate(inputs, start=1):
         result = materialize_segment(root, conn, item)
@@ -1345,7 +1954,158 @@ def _refresh_market_status_nonblocking(
         return None, exc
 
 
-def _watch(root: Path, interval: float, *, latest_run_only: bool) -> int:
+def _watch_selection(
+    *,
+    latest_run_only: bool,
+    latest_sealed_segments_per_stream: int | None,
+) -> str:
+    _validate_input_selection(
+        latest_run_only=latest_run_only,
+        latest_sealed_segments_per_stream=(
+            latest_sealed_segments_per_stream
+        ),
+    )
+    if latest_run_only:
+        return "latest_run"
+    if latest_sealed_segments_per_stream is not None:
+        return (
+            "latest_sealed_per_stream:"
+            f"{latest_sealed_segments_per_stream}"
+        )
+    return "all"
+
+
+def _try_l2_owner_lock(stream: BinaryIO) -> bool:
+    stream.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        try:
+            msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+        except OSError:
+            return False
+        return True
+    fcntl: Any = importlib.import_module("fcntl")
+    try:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    return True
+
+
+def _release_l2_owner_lock(stream: BinaryIO) -> None:
+    stream.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+    fcntl: Any = importlib.import_module("fcntl")
+    fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def _l2_owner_paths(root: Path) -> tuple[Path, Path]:
+    directory = root / ".locks"
+    return (
+        directory / "l2-materializer-owner.lock",
+        directory / "l2-materializer-owner.json",
+    )
+
+
+@contextmanager
+def _l2_watch_owner(
+    root: Path, *, selection: str,
+) -> Iterator[Mapping[str, object]]:
+    """Nonblocking singleton ownership with an atomic, fixed truth record."""
+    lock_path, owner_path = _l2_owner_paths(root)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("a+b") as stream:
+        stream.seek(0, os.SEEK_END)
+        if stream.tell() == 0:
+            stream.write(b"\0")
+            stream.flush()
+            os.fsync(stream.fileno())
+        if not _try_l2_owner_lock(stream):
+            raise RuntimeError(
+                "L2 watch singleton is already owned for data-root: "
+                f"{root.resolve()}"
+            )
+        try:
+            owner_path.unlink()
+        except FileNotFoundError:
+            pass
+        nonce = uuid.uuid4().hex
+        owner: Mapping[str, object] = {
+            "schema_version": 1,
+            "pid": os.getpid(),
+            "selection": selection,
+            "data_root": str(root.resolve(strict=True)),
+            "executable_path": str(
+                Path(
+                    getattr(sys, "_base_executable", sys.executable)
+                ).resolve(strict=True)
+            ),
+            "started_at": datetime.now(UTC).isoformat(),
+            "nonce": nonce,
+        }
+        try:
+            atomic_write_text(
+                owner_path,
+                json.dumps(
+                    owner,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ) + "\n",
+            )
+            yield owner
+        finally:
+            try:
+                loaded: object = json.loads(
+                    owner_path.read_text(encoding="utf-8")
+                )
+                if (
+                    isinstance(loaded, Mapping)
+                    and loaded.get("pid") == os.getpid()
+                    and loaded.get("nonce") == nonce
+                ):
+                    owner_path.unlink()
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                pass
+            _release_l2_owner_lock(stream)
+
+
+def _watch(
+    root: Path,
+    interval: float,
+    *,
+    latest_run_only: bool,
+    latest_sealed_segments_per_stream: int | None,
+) -> int:
+    selection = _watch_selection(
+        latest_run_only=latest_run_only,
+        latest_sealed_segments_per_stream=(
+            latest_sealed_segments_per_stream
+        ),
+    )
+    with _l2_watch_owner(root, selection=selection):
+        return _watch_as_owner(
+            root,
+            interval,
+            latest_run_only=latest_run_only,
+            latest_sealed_segments_per_stream=(
+                latest_sealed_segments_per_stream
+            ),
+        )
+
+
+def _watch_as_owner(
+    root: Path,
+    interval: float,
+    *,
+    latest_run_only: bool,
+    latest_sealed_segments_per_stream: int | None,
+) -> int:
     """持续追赶封口盘口；启动锁竞争只延后本轮。"""
     def report_connect_error(exc: Exception, elapsed: float) -> None:
         print(json.dumps({
@@ -1370,10 +2130,16 @@ def _watch(root: Path, interval: float, *, latest_run_only: bool) -> int:
                     cycle = materialize_all(
                         root, conn, report_reused=False,
                         latest_run_only=latest_run_only,
+                        latest_sealed_segments_per_stream=(
+                            latest_sealed_segments_per_stream
+                        ),
                     )
                     market_status_summary: dict[str, object] | None
                     market_status_error: Exception | None
-                    if latest_run_only:
+                    if (
+                        latest_run_only
+                        or latest_sealed_segments_per_stream is not None
+                    ):
                         market_status_summary = {
                             "candidate_segments": 0,
                             "materialized_now": 0,
@@ -1408,6 +2174,16 @@ def _watch(root: Path, interval: float, *, latest_run_only: bool) -> int:
                     }, ensure_ascii=False), flush=True)
                 print(json.dumps({
                     "event": "l2_materialization_cycle",
+                    "input_selection": (
+                        "latest_run"
+                        if latest_run_only
+                        else "latest_sealed_per_stream"
+                        if latest_sealed_segments_per_stream is not None
+                        else "all"
+                    ),
+                    "latest_sealed_segments_per_stream": (
+                        latest_sealed_segments_per_stream
+                    ),
                     "sealed_segments": len(cycle),
                     "materialized_now": len(created),
                     "frames_now": sum(
@@ -1438,17 +2214,50 @@ def _watch(root: Path, interval: float, *, latest_run_only: bool) -> int:
             conn.close()
 
 
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("必须为正整数") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("必须为正整数")
+    return parsed
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """命令行入口。"""
-    parser = argparse.ArgumentParser(description="三所 L2 segment 物化")
+    parser = argparse.ArgumentParser(
+        description="三所 L2 segment 物化",
+        allow_abbrev=False,
+    )
     parser.add_argument("--data-root", type=Path, default=None)
     sub = parser.add_subparsers(dest="command", required=True)
-    all_parser = sub.add_parser("all", help="物化全部封口 segment")
-    all_parser.add_argument("--latest-run-only", action="store_true")
-    sub.add_parser("audit", help="审计活动 L2 输出")
-    watch = sub.add_parser("watch", help="周期追赶新封口 segment")
+    all_parser = sub.add_parser(
+        "all", help="物化全部封口 segment", allow_abbrev=False,
+    )
+    all_selection = all_parser.add_mutually_exclusive_group()
+    all_selection.add_argument("--latest-run-only", action="store_true")
+    all_selection.add_argument(
+        "--latest-sealed-segments-per-stream",
+        type=_positive_int,
+        help=(
+            "每个 (venue,symbol) 最新 run 仅物化按 sealed_at 最新的 N 片"
+        ),
+    )
+    sub.add_parser("audit", help="审计活动 L2 输出", allow_abbrev=False)
+    watch = sub.add_parser(
+        "watch", help="周期追赶新封口 segment", allow_abbrev=False,
+    )
     watch.add_argument("--interval-seconds", type=float, default=300.0)
-    watch.add_argument("--latest-run-only", action="store_true")
+    watch_selection = watch.add_mutually_exclusive_group()
+    watch_selection.add_argument("--latest-run-only", action="store_true")
+    watch_selection.add_argument(
+        "--latest-sealed-segments-per-stream",
+        type=_positive_int,
+        help=(
+            "每个 (venue,symbol) 最新 run 仅追赶按 sealed_at 最新的 N 片"
+        ),
+    )
     args = parser.parse_args(argv)
     root = (args.data_root or configured_data_root()).resolve()
     if args.command == "watch":
@@ -1456,7 +2265,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         if interval < 10:
             raise ValueError("interval-seconds 不得小于 10")
         return _watch(
-            root, interval, latest_run_only=bool(args.latest_run_only),
+            root,
+            interval,
+            latest_run_only=bool(args.latest_run_only),
+            latest_sealed_segments_per_stream=(
+                args.latest_sealed_segments_per_stream
+            ),
         )
 
     conn = store.connect(root)
@@ -1466,6 +2280,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 completed = materialize_all(
                     root, conn,
                     latest_run_only=bool(args.latest_run_only),
+                    latest_sealed_segments_per_stream=(
+                        args.latest_sealed_segments_per_stream
+                    ),
                 )
             results: object = [asdict(result) for result in completed]
             code = 0
