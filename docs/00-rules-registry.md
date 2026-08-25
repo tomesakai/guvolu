@@ -57,6 +57,8 @@
 | docs/2026-08-23-research-milestone-and-runtime-switch.md | 时效快照 | 数据前提恢复、旧封存段废弃、main 干净树研究结果、新 vintage 与冻结运行根落 D 盘 |
 | docs/2026-08-24-strategy-search-loop-v1.md | 时效快照 | 策略生成迭代循环 v1：GPU 宽筛、P3-2 重采样、受约束提案与 promote 的实现与实测 |
 | docs/2026-08-24-japan-api-survey.md | 时效快照 | 金融庁登録 27 家 API 存在性与能力、L3 可重建性判定、日本法人订单级路径与全球 L3 候选变化 |
+| docs/2026-08-26-economic-research-agent-v1.md | 时效快照 | research-only 经济研究代理 v1：修订链观测、PIT 语境、提案门禁与内容寻址审计合同 |
+| docs/2026-08-26-project-data-strategy-audit.md | 时效快照 | Git/工作树、数据可用性、策略生成方法、前向与 paper、行业准入差距的有界审计 |
 | docs/2026-08-11-account-assets-capability.md | 时效快照 | GMO Coin 与 bitFlyer 私有资产接口复核 |
 | docs/2026-08-10-persistence-audit.md | 时效快照 | 持久化完整性、恢复探针与历史损坏边界审计 |
 | docs/ui-design.md | 长期维护 | 控制面与可视化设计（TBD-12 至 17 提案载体） |

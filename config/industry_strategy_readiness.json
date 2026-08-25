@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "policy_id": "guvolu-industry-strategy-admission-v1",
+  "policy_scope": "project_admission_policy_not_universal_truth",
+  "description": "本文件仅定义 guvolu 项目的策略准入政策，不代表量化行业的普遍真理。",
+  "research": {
+    "accepted_cpu_pipeline_versions": [
+      "strategy-research-pipeline-v14"
+    ],
+    "minimum_oos_sharpe": 0.75,
+    "maximum_oos_drawdown": 0.45,
+    "minimum_oos_bars": 10000,
+    "maximum_fdr_q": 0.05,
+    "maximum_pbo": 0.2,
+    "maximum_block_bootstrap_p_value": 0.05,
+    "minimum_block_bootstrap_sharpe_lower_bound": 0.0,
+    "minimum_block_bootstrap_samples": 1024,
+    "minimum_deflated_sharpe_probability": 0.95,
+    "minimum_parameter_neighbor_count": 2,
+    "minimum_positive_parameter_neighbor_ratio": 0.6,
+    "minimum_parameter_neighbor_sharpe_retention": 0.7,
+    "minimum_capacity_score": 0.5,
+    "minimum_capacity_notional_quote": 100000.0,
+    "minimum_benchmark_sharpe_excess": 0.05,
+    "minimum_tail_scenarios": 3,
+    "minimum_stress_scenarios": 3,
+    "minimum_cost_scenarios": 3
+  },
+  "forward": {
+    "decision_interval_seconds": 3600,
+    "minimum_prediction_coverage_ratio": 1.0,
+    "required_terminal_verdict": "passed"
+  },
+  "paper": {
+    "minimum_duration_hours": 720,
+    "minimum_decisions": 500,
+    "minimum_ledger_rows": 500,
+    "minimum_reconciled_decisions": 500,
+    "maximum_error_ratio": 0.01,
+    "accepted_reconciliation_statuses": [
+      "matched",
+      "no_difference",
+      "reconciled"
+    ]
+  },
+  "execution": {
+    "required_controls": [
+      "service_status_gate",
+      "hard_order_limits",
+      "circuit_breaker",
+      "timeout_reconciliation",
+      "dual_channel_reconciliation",
+      "independent_kill_switch"
+    ],
+    "required_permissions": [
+      "research_trade_credentials_absent",
+      "paper_write_endpoints_disabled",
+      "trade_read_permissions_absent"
+    ]
+  },
+  "evidence_paths": {
+    "paper_task_log": "data/execution/shadow/frozen-forward/task.jsonl",
+    "paper_difference_ledger": "data/execution/paper/difference_ledger.jsonl",
+    "paper_reconciliation_ledger": "data/execution/paper/reconciliation.jsonl",
+    "execution_safety_attestation": "data/execution/readiness/execution-safety-attestation.json"
+  }
+}
