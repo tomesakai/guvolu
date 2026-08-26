@@ -1,9 +1,18 @@
 param(
     [int]$IntervalSeconds = 300,
-    [string]$Repository = ''
+    [string]$Repository = '',
+    [switch]$LatestRunOnly,
+    [ValidateRange(1, 2147483647)]
+    [Nullable[int]]$LatestSealedSegmentsPerStream = $null,
+    [switch]$VerifyAllHashes
 )
 
 $ErrorActionPreference = 'Stop'
+if ($LatestRunOnly -and $null -ne $LatestSealedSegmentsPerStream) {
+    throw (
+        'LatestRunOnly and LatestSealedSegmentsPerStream are mutually exclusive.'
+    )
+}
 $RepoRoot = if ($Repository) {
     (Resolve-Path -LiteralPath $Repository).Path
 } else {
@@ -24,9 +33,21 @@ Set-Location -LiteralPath $RepoRoot
 Start-Transcript -Path $LogPath -Append | Out-Null
 try {
     Write-Host "guvolu trade-realtime-materializer started; interval=${IntervalSeconds}s."
+    $Arguments = @('watch', '--interval-seconds', [string]$IntervalSeconds)
+    if ($LatestRunOnly) {
+        $Arguments += '--latest-run-only'
+    }
+    if ($null -ne $LatestSealedSegmentsPerStream) {
+        $Arguments += @(
+            '--latest-sealed-segments-per-stream',
+            [string]$LatestSealedSegmentsPerStream
+        )
+    }
+    if ($VerifyAllHashes) {
+        $Arguments += '--verify-all-hashes'
+    }
     & $PythonPath -m guvolu.data.trade_realtime_materialize `
-        --data-root $DataRoot watch `
-        --interval-seconds $IntervalSeconds
+        --data-root $DataRoot @Arguments
 } finally {
     Write-Host 'guvolu trade-realtime-materializer exited.'
     Stop-Transcript | Out-Null
