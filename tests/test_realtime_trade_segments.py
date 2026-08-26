@@ -528,8 +528,10 @@ def test_latest_run_only_groups_by_venue_and_symbol(tmp_path: Path) -> None:
         ("BTC", "run-btc-old"), ("BTC", "run-btc-new"),
         ("ETH", "run-eth-old"), ("ETH", "run-eth-new"),
     ):
-        _write_segment(tmp_path, "gmo", symbol, [_gmo_payload("17000000")], run_id)
-    # ETH 两个 run 的 mtime 都晚于 BTC。
+        _write_segment(
+            tmp_path, "gmo", symbol, [_gmo_payload("17000000")], run_id,
+        )
+    # ETH 两个 run 均晚于 BTC。
     _touch_run(tmp_path, "gmo", "BTC", "run-btc-old", 1_780_000_000.0)
     _touch_run(tmp_path, "gmo", "BTC", "run-btc-new", 1_780_000_100.0)
     _touch_run(tmp_path, "gmo", "ETH", "run-eth-old", 1_780_000_200.0)

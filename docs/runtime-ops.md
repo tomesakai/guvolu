@@ -363,6 +363,50 @@ book-state checkpoint v3 与 OFL v8 物化器。
 只有原采集器正常封口的段可进入旧版兼容重投影，崩溃尾段继续按
 `recovered_incomplete` 隔离。守护任务在受控切换完成并确认单写者后再恢复启用。
 
+### 8.1 实时逐笔增量输入选择
+
+实时逐笔物化器每轮曾对 `raw/realtime/trade_realtime` 下全部
+`segment-*.manifest.json` 做一次全量重扫，并逐段重算 SHA-256。该成本随语料
+线性增长：语料到达 15,024 段、631 MB 时单轮扫描已超过 watcher 的 300 秒周期，
+watcher 退化为近乎连续的全量重扫，长期占用 `sqlite_writer_lock`，其他物化器
+以 `TimeoutError` 失败。
+
+`all` 与 `watch` 两个子命令因此提供一组互斥的输入选择开关：
+
+| 开关 | 语义 | 适用 |
+|---|---|---|
+| 缺省 | 扫描全部封口段 | 补历史与审计 |
+| `--latest-run-only` | 每个 `(venue_id, venue_symbol)` 只取最新 run 目录 | 单流回补 |
+| `--latest-sealed-segments-per-stream N` | 每个 `(venue_id, venue_symbol)` 最新 run 内按 `sealed_at` 取最新 N 片 | 常驻 watcher |
+
+最新 run 的判定顺序为 open-run 优先、其次目录 mtime、再次 run_id。分组必须按
+`(venue_id, venue_symbol)`：GMO 同时采集五个 symbol，按场所分组会让除一路以外
+的所有流从输入集消失。
+
+散列复用预筛独立于上述选择，缺省启用。它先从控制面读取已属于完成态
+`trade_realtime` attempt 的输入制品登记散列与字节数，再逐段比对磁盘字节数、
+manifest 记录的散列与字节数；三者一致才复用登记散列，跳过全量重算。任一不一致
+即抛出错误并中止本轮，不退化为静默重算。预筛的正确性以 raw 不可变为前提，
+因此它不能发现保持字节数不变的原地改写；`--verify-all-hashes` 关闭预筛、
+回到逐段重算，用于审计。
+
+每轮 `watch` 的 `trade_realtime_materialization_cycle` 事件附带
+`input_selection`、`latest_sealed_segments_per_stream`、`verify_all_hashes`、
+`scanned_manifests`、`hash_recomputed`、`hash_reused` 与 `elapsed_scan_seconds`。
+`scanned_manifests` 或 `elapsed_scan_seconds` 随日期上行即为退化信号；稳定运行时
+`hash_recomputed` 应只覆盖本轮新封口的段。
+
+运维缺省为：常驻 watcher 用 `--latest-sealed-segments-per-stream`，N 按封口周期
+与 watcher 周期之比留余量，取值随任务配置版本化（G-06），不在本文固化为事实；
+补历史与定期审计用缺省全量模式，并周期性加 `--verify-all-hashes` 做一次全量
+散列复核。
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run_trade_materializer.ps1 `
+  -IntervalSeconds 300 -LatestSealedSegmentsPerStream 4
+uv run python -m guvolu.data.trade_realtime_materialize --data-root data all --verify-all-hashes
+```
+
 ## 9. 未决项登记
 
 | 编号 | 问题 | 本文提案 |
