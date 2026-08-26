@@ -88,7 +88,7 @@ def venue_depth_facts(
                 domains=("book_l2",),
                 datasets=("book_l2_frame", "book_l2_level"),
             )
-        except (OSError, ValueError) as error:
+        except (LookupError, OSError, ValueError) as error:
             # 目录不可读按覆盖缺失
             facts.append({
                 "market_id": market_id,
