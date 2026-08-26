@@ -757,6 +757,11 @@ def build_stress_evidence(
     }
     candidates: list[Mapping[str, object]] = []
     for path in paths:
+        if (
+            len(volume_scores) != len(path.gross_returns)
+            or len(cross_venue_spreads) != len(path.gross_returns)
+        ):
+            raise ValueError("压力统计量与样本外区段长度不一致")
         window = evidence_window(path, identity.panel_available_through)
         volatility = _volatility_statistic(path.market_returns, lookback)
         definitions: list[Mapping[str, object]] = []
