@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "method_version": "industry-evidence-v2",
+  "scope": "project_evidence_generation_settings_not_universal_truth",
+  "description": "行业稳健性证据生成器的版本化阈值与网格；不代表普遍真理。",
+  "cost": {
+    "tier_multipliers": {
+      "policy_baseline": 1.0,
+      "adverse": 1.5,
+      "severe": 2.0
+    },
+    "minimum_step_bps": 5.0
+  },
+  "tail": {
+    "probabilities": [0.01, 0.025, 0.05],
+    "bootstrap_samples": 512
+  },
+  "stress": {
+    "volatility_lookback_bars": 24,
+    "volatility_quantile": 0.9,
+    "volume_quantile": 0.1,
+    "cross_venue_quantile": 0.9,
+    "minimum_subinterval_bars": 240,
+    "cross_venue_market_ids": [
+      "mkt__gmo__btc__r0",
+      "mkt__bitbank__btc_jpy__r0",
+      "mkt__bitflyer__btc_jpy__r0"
+    ]
+  },
+  "capacity": {
+    "notional_quote_grid": [100000.0, 200000.0, 400000.0],
+    "depth_quantile": 0.5,
+    "depth_horizon_seconds": 3600,
+    "depth_sample_count": 24,
+    "depth_levels": 200,
+    "minimum_depth_samples": 12,
+    "execution_market_id": "mkt__gmo__btc__r0",
+    "venue_market_ids": [
+      "mkt__gmo__btc__r0",
+      "mkt__bitbank__btc_jpy__r0",
+      "mkt__bitflyer__btc_jpy__r0"
+    ]
+  }
+}
