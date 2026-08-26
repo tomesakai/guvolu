@@ -39,6 +39,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         dest="families",
         help="仅运行指定策略家族；可重复传入",
     )
+    parser.add_argument(
+        "--no-industry-evidence",
+        dest="industry_evidence",
+        action="store_false",
+        help="跳过行业稳健性证据生成；仅供快速迭代，产出不可用于准入",
+    )
     arguments = parser.parse_args(argv)
     root = arguments.root.resolve()
     config = arguments.config
@@ -61,6 +67,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         arguments.families,
         data_root=data_root,
         panel_to_time=to_time,
+        generate_industry_evidence=arguments.industry_evidence,
     )
     print(json.dumps({
         "run_id": result.run_id,

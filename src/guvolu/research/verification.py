@@ -855,12 +855,21 @@ def _verify_run_identity(
     research_identity = stable_identifier("research-identity", identity_payload)
     if manifest.get("research_identity") != research_identity:
         raise ValueError("manifest.research_identity 无法由受保护证据重建")
-    run_id = stable_identifier("research-run", {
-        "research_identity": research_identity,
-        "execution_evaluated_at": manifest.get("execution_evaluated_at"),
-    })
-    if manifest.get("run_id") != run_id:
-        raise ValueError("manifest.run_id 无法由研究身份和执行时点重建")
+    run_started_at = manifest.get("run_started_at")
+    run_payload = (
+        {
+            "research_identity": research_identity,
+            "run_started_at": run_started_at,
+        }
+        if run_started_at is not None
+        # 早期运行没有起始时点
+        else {
+            "research_identity": research_identity,
+            "execution_evaluated_at": manifest.get("execution_evaluated_at"),
+        }
+    )
+    if manifest.get("run_id") != stable_identifier("research-run", run_payload):
+        raise ValueError("manifest.run_id 无法由研究身份和运行时点重建")
 
 
 def _verify_data_governance(root: Path, summary: Mapping[str, object]) -> None:

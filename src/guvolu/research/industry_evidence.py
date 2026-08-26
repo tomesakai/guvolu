@@ -201,7 +201,6 @@ class RunIdentity:
     config_hash: str
     input_receipt_sha256: str
     decision_time: datetime
-    execution_evaluated_at: datetime
     market_id: str
     panel_sha256: str
     panel_available_through: datetime
@@ -255,10 +254,6 @@ def read_run_identity(
         ),
         decision_time=_time(
             manifest.get("decision_time"), "manifest.decision_time",
-        ),
-        execution_evaluated_at=_time(
-            manifest.get("execution_evaluated_at"),
-            "manifest.execution_evaluated_at",
         ),
         market_id=_text(summary.get("market_id"), "summary.market_id"),
         panel_sha256=_text(panel.get("sha256"), "summary.panel.sha256"),
@@ -1051,9 +1046,7 @@ def build_capacity_evidence(
         candidates.append({
             "family": path.family,
             "candidate_id": path.candidate_id,
-            "coverage": dict(
-                _capacity_window(identity, venue_facts, execution).payload()
-            ) if execution is not None else None,
+            "coverage": _capacity_coverage(identity, venue_facts, execution),
             "scenarios": entries,
         })
     return _source_payload(
@@ -1081,15 +1074,24 @@ def build_capacity_evidence(
     )
 
 
-def _capacity_window(
+def _capacity_coverage(
     identity: RunIdentity,
     venue_facts: Sequence[Mapping[str, object]],
     execution: Mapping[str, object] | None,
+) -> Mapping[str, object] | None:
+    """覆盖不足时不给区间，绝不外推。"""
+    if execution is None or execution.get("sufficient") is not True:
+        return None
+    return dict(_capacity_window(identity, venue_facts, execution).payload())
+
+
+def _capacity_window(
+    identity: RunIdentity,
+    venue_facts: Sequence[Mapping[str, object]],
+    execution: Mapping[str, object],
 ) -> EvidenceWindow:
     """容量证据的 L2 覆盖区间。"""
     del venue_facts
-    if execution is None:
-        raise ValueError("容量证据缺少执行来源 L2 事实")
     return EvidenceWindow(
         from_time=_time(execution.get("from_time"), "l2.from_time"),
         to_time=_time(execution.get("to_time"), "l2.to_time"),

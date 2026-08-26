@@ -69,7 +69,6 @@ def _identity() -> RunIdentity:
         config_hash="3" * 64,
         input_receipt_sha256="4" * 64,
         decision_time=_DECISION_TIME,
-        execution_evaluated_at=_REGISTRATION_CUTOFF,
         market_id="mkt__gmo__btc__r0",
         panel_sha256="5" * 64,
         panel_available_through=_AVAILABLE_THROUGH,
@@ -327,9 +326,7 @@ def _checker_evidence(
                 "config_hash": identity.config_hash,
                 "input_receipt_sha256": identity.input_receipt_sha256,
                 "decision_time": identity.decision_time.isoformat(),
-                "execution_evaluated_at": (
-                    identity.execution_evaluated_at.isoformat()
-                ),
+                "execution_evaluated_at": _REGISTRATION_CUTOFF.isoformat(),
             },
             "summary": summary,
             "research_config": {
