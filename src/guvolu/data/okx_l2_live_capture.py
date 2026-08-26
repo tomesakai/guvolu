@@ -16,7 +16,11 @@ from websockets.exceptions import WebSocketException
 
 from guvolu.api.ws_common import reconnect_delay_seconds, to_text
 from guvolu.data.paths import data_root as configured_data_root
-from guvolu.data.segmented_raw import SegmentedRawWriter, recover_open_segments
+from guvolu.data.segmented_raw import (
+    SegmentedRawWriter,
+    recover_open_segments,
+    supervise_capture_tasks,
+)
 
 OKX_PUBLIC_WS_URL = "wss://ws.okx.com:8443/ws/v5/public"
 OKX_ENDPOINT = "books"
@@ -67,6 +71,10 @@ def _remaining(deadline: float | None) -> float:
     if deadline is None:
         return SILENCE_TIMEOUT_SECONDS
     return min(SILENCE_TIMEOUT_SECONDS, max(0.05, deadline - time.monotonic()))
+
+
+def _bounded_reconnect_delay(consecutive_failures: int) -> float:
+    return reconnect_delay_seconds(min(max(0, consecutive_failures), 63))
 
 
 def _json_mapping(text: str) -> Mapping[str, object] | None:
@@ -209,7 +217,7 @@ async def _record_loop(
                 stats.disconnects += 1
             stats.consecutive_failures += 1
             stats.reconnects += 1
-            await asyncio.sleep(reconnect_delay_seconds(stats.consecutive_failures))
+            await asyncio.sleep(_bounded_reconnect_delay(stats.consecutive_failures))
 
 
 async def record_books(
@@ -257,30 +265,40 @@ async def record_books(
     failure: str | None = None
 
     async def checkpoint_loop() -> None:
-        while _active(deadline):
+        while True:
+            if not _active(deadline):
+                await asyncio.Event().wait()
             await asyncio.sleep(min(CHECKPOINT_SECONDS, _remaining(deadline)))
             if _active(deadline):
                 writer.checkpoint(asdict(stats))
 
-    checkpoint_task = asyncio.create_task(checkpoint_loop())
+    primary: BaseException | None = None
+    manifest: Path | None = None
     try:
-        await _record_loop(writer, stats, deadline)
-    except asyncio.CancelledError:
-        status = "interrupted"
-        raise
-    except Exception as exc:
-        status = "failed"
-        failure = f"{type(exc).__name__}: {exc}"
-        raise
-    finally:
-        checkpoint_task.cancel()
-        try:
-            await checkpoint_task
-        except asyncio.CancelledError:
-            pass
+        await supervise_capture_tasks(
+            _record_loop(writer, stats, deadline), checkpoint_loop(),
+        )
+    except BaseException as exc:
+        primary = exc
+        if isinstance(exc, asyncio.CancelledError):
+            status = "interrupted"
+        else:
+            status = "failed"
+            failure = f"{type(exc).__name__}: {exc}"
+    try:
         manifest = writer.finish(
             {**asdict(stats), "failure_detail": failure}, status=status
         )
+    except BaseException as finish_error:
+        if primary is None:
+            raise
+        primary.add_note(
+            "writer.finish 未替换采集主异常: "
+            f"{type(finish_error).__name__}: {finish_error}"
+        )
+    if primary is not None:
+        raise primary
+    assert manifest is not None
     return stats, manifest
 
 

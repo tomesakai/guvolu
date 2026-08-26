@@ -2506,6 +2506,81 @@ def _validate_pinned_read_schema(
         )
 
 
+def _connect_read_only(path: Path) -> sqlite3.Connection:
+    """以 SQLite/OS 只读模式打开现有治理库，且绝不建库或迁移。"""
+    try:
+        resolved = path.resolve(strict=True)
+    except FileNotFoundError as error:
+        raise FileNotFoundError(f"治理库不存在: {path}") from error
+    if not resolved.is_file():
+        raise FileNotFoundError(f"治理库不是普通文件: {resolved}")
+
+    # mode=ro 让 VFS 以只读
+    # 标志打开主库；用
+    # cache=private 避免
+    # 进程内其它连接把可写
+    # shared-cache 状态带进
+    # 审计连接。不能使用
+    # immutable=1：活动 WAL
+    # 可能含尚未 checkpoint 的
+    # 已提交事务。
+    uri = resolved.as_uri() + "?mode=ro&cache=private"
+    connection = sqlite3.connect(
+        uri,
+        timeout=30.0,
+        isolation_level=None,
+        uri=True,
+    )
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("PRAGMA query_only=ON")
+        connection.execute("PRAGMA foreign_keys=ON")
+        query_only = connection.execute("PRAGMA query_only").fetchone()
+        if query_only is None or int(query_only[0]) != 1:
+            raise ValueError("治理库只读连接未进入 query_only 模式")
+
+        ceiling = _schema_write_ceiling(connection)
+        try:
+            existing = connection.execute(
+                "SELECT value FROM governance_meta WHERE key='schema_version'"
+            ).fetchone()
+        except sqlite3.DatabaseError as error:
+            raise ValueError("治理库缺少可验证的 schema 元数据") from error
+        existing_version = None if existing is None else str(existing["value"])
+
+        if ceiling is None:
+            if existing_version != str(GOVERNANCE_SCHEMA_VERSION):
+                raise ValueError(
+                    "治理库只读连接拒绝隐式 schema 迁移: "
+                    f"expected={GOVERNANCE_SCHEMA_VERSION}, "
+                    f"actual={existing_version}"
+                )
+            readable_schema = GOVERNANCE_SCHEMA_VERSION
+        else:
+            readable_schema = ceiling
+        _validate_pinned_read_schema(
+            connection, existing_version, readable_schema,
+        )
+
+        # 当前 schema 还要验证
+        # 只读安全的列、唯一性、
+        # 外键和 CHECK 文本；约束
+        # 写探针只属于显式写/升级路径，
+        # 不能在 reader 中运行。
+        if readable_schema == GOVERNANCE_SCHEMA_VERSION:
+            _validate_active_head_receipt_schema(connection)
+            _validate_interval_suite_forward_plan_schema(connection)
+            _validate_interval_suite_forward_prediction_schema(connection)
+            if not _has_missing_policy_column(connection):
+                raise ValueError("治理库 frozen_forward_plan 缺少 missing_policy")
+            if not _holdout_vintage_supports_abandon(connection):
+                raise ValueError("治理库 holdout_vintage 缺少废弃状态约束")
+        return connection
+    except BaseException:
+        connection.close()
+        raise
+
+
 def _connect(
     path: Path,
     *,
@@ -2515,6 +2590,8 @@ def _connect(
     """打开治理库；版本固定时只允许已证明的向下兼容操作。"""
     if compatible_schema is not None and not write:
         raise ValueError("compatible_schema 只适用于治理写入")
+    if not write:
+        return _connect_read_only(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path, timeout=30.0, isolation_level=None)
     connection.row_factory = sqlite3.Row

@@ -10,7 +10,7 @@ from pathlib import Path
 import duckdb
 import pytest
 
-from guvolu.data import store
+from guvolu.data import okx_l2_live_capture, store
 from guvolu.data.okx_l2_live_capture import (
     CaptureStats,
     OKX_ENDPOINT_ID,
@@ -466,7 +466,10 @@ def test_sequence_mismatch_is_rejected_and_audit_fails(tmp_path: Path) -> None:
     ) == (2, 1, 0, 1)
     assert result.status == "complete_with_rejections"
     assert audit["ok"] is False
-    assert any("rejected raw rows" in error for error in audit["errors"])
+    errors = audit["errors"]
+    assert isinstance(errors, list)
+    assert all(isinstance(error, str) for error in errors)
+    assert any("rejected raw rows" in error for error in errors)
 
 
 class _FakeConnection:
@@ -517,6 +520,49 @@ def test_capture_rejects_resident_or_long_run(
 ) -> None:
     with pytest.raises(ValueError, match="尚未开放常驻采集"):
         asyncio.run(record_books(tmp_path, minutes=minutes))
+
+
+def test_okx_checkpoint_failure_is_primary_and_cancels_recorder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder_cancelled = False
+
+    async def recorder(
+        writer: SegmentedRawWriter,
+        stats: CaptureStats,
+        deadline: float | None,
+    ) -> None:
+        nonlocal recorder_cancelled
+        del stats, deadline
+        writer.write_frame('{"event":"subscribe"}', "books")
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            recorder_cancelled = True
+            raise
+
+    def fail_checkpoint(*args: object, **kwargs: object) -> Path:
+        del args, kwargs
+        raise OSError("okx checkpoint disk failure")
+
+    monkeypatch.setattr(okx_l2_live_capture, "_record_loop", recorder)
+    monkeypatch.setattr(
+        okx_l2_live_capture, "CHECKPOINT_SECONDS", 0.001,
+    )
+    monkeypatch.setattr(
+        SegmentedRawWriter, "checkpoint", fail_checkpoint,
+    )
+
+    with pytest.raises(OSError, match="okx checkpoint disk failure"):
+        asyncio.run(record_books(tmp_path, minutes=1.0))
+
+    run = json.loads(next(
+        tmp_path.rglob("run.manifest.json")
+    ).read_text(encoding="utf-8"))
+    assert recorder_cancelled
+    assert run["status"] == "failed"
+    assert run["completion_claim"] is False
+    assert run["failure_detail"] == "OSError: okx checkpoint disk failure"
 
 
 def test_registry_can_be_replayed_idempotently(tmp_path: Path) -> None:

@@ -146,7 +146,7 @@ def _register_plan(root: Path, registry: Path, vintage_id: str) -> str:
 
 
 def test_v8_registry_rebuilds_to_v9_and_keeps_rows(tmp_path: Path) -> None:
-    """v8 物理表升级为 v9 后旧行、子表外键与索引不变。"""
+    """reader 拒绝迁移；显式写升级 v8 后旧行、外键与索引不变。"""
     registry = tmp_path / "governance.sqlite3"
     planned = seal_holdout_vintage(
         registry, "market-one",
@@ -166,6 +166,15 @@ def test_v8_registry_rebuilds_to_v9_and_keeps_rows(tmp_path: Path) -> None:
 
     _downgrade_vintage_table_to_v8(registry, ceiling=False)
     assert "'abandoned'" not in _vintage_table_sql(registry)
+    with pytest.raises(ValueError, match="拒绝隐式 schema 迁移"):
+        list_holdout_vintages(registry)
+    register_research_exposure(
+        registry,
+        "explicit-v8-migration",
+        "market-one",
+        _time("2026-01-01T00:00:00"),
+        _time("2026-02-01T00:00:00"),
+    )
     assert list_holdout_vintages(registry) == before
     assert "'abandoned'" in _vintage_table_sql(registry)
     with sqlite3.connect(registry) as connection:

@@ -41,6 +41,7 @@ from guvolu.research.governance import (
     list_holdout_vintages,
     register_frozen_forward_plan,
     register_frozen_forward_prediction,
+    register_research_exposure,
     seal_holdout_vintage,
     start_holdout_evaluation_attempt,
     upgrade_governance_write_ceiling,
@@ -374,7 +375,7 @@ def _downgrade_to_v7(registry: Path, *, ceiling: bool) -> None:
 
 
 def test_governance_v7_rows_migrate_to_burn(tmp_path: Path) -> None:
-    """旧 v7 计划行在自动或显式升级后缺省 burn。"""
+    """旧 v7 计划行只在显式写/ceiling 升级后缺省 burn。"""
     registry = tmp_path / "governance.sqlite3"
     vintage = seal_holdout_vintage(
         registry, "market-one",
@@ -389,6 +390,15 @@ def test_governance_v7_rows_migrate_to_burn(tmp_path: Path) -> None:
         "2" * 64, "tree-one", path, sha256, repository_root=tmp_path,
     )
     _downgrade_to_v7(registry, ceiling=False)
+    with pytest.raises(ValueError, match="拒绝隐式 schema 迁移"):
+        get_frozen_forward_plan(registry, plan_id)
+    register_research_exposure(
+        registry,
+        "explicit-v7-migration",
+        "market-one",
+        _time("2026-01-01T00:00:00"),
+        _time("2026-02-01T00:00:00"),
+    )
     assert get_frozen_forward_plan(registry, plan_id).missing_policy == "burn"
     with sqlite3.connect(registry) as connection:
         assert connection.execute(
@@ -1229,6 +1239,8 @@ def test_upgrade_rechecks_policy_column_after_write_lock(
     monkeypatch.setattr(
         governance_module, "_has_missing_policy_column", stale_probe,
     )
+    connection = governance_module._connect(registry, write=True)
+    connection.close()
     assert list_holdout_vintages(registry)[0].status == "sealed"
     assert outcomes[:2] == [False, True]
     with sqlite3.connect(registry) as connection:
@@ -1257,7 +1269,7 @@ def test_upgrade_translates_sqlite_operational_error(
         lambda _connection: False,
     )
     with pytest.raises(ValueError, match="研究治理注册表升级失败") as info:
-        list_holdout_vintages(registry)
+        governance_module._connect(registry, write=True)
     assert isinstance(info.value.__cause__, sqlite3.OperationalError)
     assert "duplicate column" in str(info.value)
 

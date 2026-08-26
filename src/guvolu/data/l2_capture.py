@@ -18,7 +18,11 @@ from guvolu.api.ws_common import reconnect_delay_seconds, to_text
 from guvolu.api.ws_public import PUBLIC_WS_URL as GMO_WS_URL
 from guvolu.data.book_l2_anchor import RestAnchorWorker
 from guvolu.data.paths import data_root as configured_data_root
-from guvolu.data.segmented_raw import SegmentedRawWriter, recover_open_segments
+from guvolu.data.segmented_raw import (
+    SegmentedRawWriter,
+    recover_open_segments,
+    supervise_capture_tasks,
+)
 from guvolu.venues.bitbank_stream import PUBLIC_WS_URL as BITBANK_WS_URL
 
 BITFLYER_WS_URL = "wss://ws.lightstream.bitflyer.com/json-rpc"
@@ -163,6 +167,10 @@ def _remaining(deadline: float | None) -> float:
     return min(SILENCE_TIMEOUT_SECONDS, max(0.05, deadline - time.monotonic()))
 
 
+def _bounded_reconnect_delay(consecutive_failures: int) -> float:
+    return reconnect_delay_seconds(min(max(0, consecutive_failures), 63))
+
+
 async def _periodic_anchor_loop(
     submit: AnchorSubmit,
     stats: CaptureStats,
@@ -237,7 +245,7 @@ async def _record_gmo(
             stats.consecutive_failures += 1
             stats.reconnects += 1
             await asyncio.sleep(
-                reconnect_delay_seconds(stats.consecutive_failures)
+                _bounded_reconnect_delay(stats.consecutive_failures)
             )
 
 
@@ -330,7 +338,7 @@ async def _record_bitbank(
             stats.consecutive_failures += 1
             stats.reconnects += 1
             await asyncio.sleep(
-                reconnect_delay_seconds(stats.consecutive_failures)
+                _bounded_reconnect_delay(stats.consecutive_failures)
             )
 
 
@@ -396,7 +404,7 @@ async def _record_bitflyer(
             stats.consecutive_failures += 1
             stats.reconnects += 1
             await asyncio.sleep(
-                reconnect_delay_seconds(stats.consecutive_failures)
+                _bounded_reconnect_delay(stats.consecutive_failures)
             )
 
 
@@ -446,55 +454,97 @@ async def record_l2(
         on_segment_sealed=progress,
     )
     stats = CaptureStats(venue_id, venue_symbol)
+    loop = asyncio.get_running_loop()
+    anchor_checkpoint_errors: list[BaseException] = []
+    anchor_checkpoint_failure: asyncio.Future[BaseException] = (
+        loop.create_future()
+    )
+
+    def anchor_settled(completed: int, failed: int) -> None:
+        try:
+            _checkpoint_anchor_settlement(
+                writer, stats, completed, failed,
+            )
+        except BaseException as exc:
+            anchor_checkpoint_errors.append(exc)
+            if not anchor_checkpoint_failure.done():
+                anchor_checkpoint_failure.set_result(exc)
+
     anchor_worker = RestAnchorWorker(
         root, venue_id, venue_symbol,
-        on_settled=lambda completed, failed: _checkpoint_anchor_settlement(
-            writer, stats, completed, failed
-        ),
+        on_settled=anchor_settled,
     )
-    anchor_worker.start()
     deadline = None if minutes <= 0 else time.monotonic() + minutes * 60
     status = "complete"
     failure: str | None = None
 
     async def checkpoint_loop() -> None:
-        while _active(deadline):
+        while True:
+            if not _active(deadline):
+                await asyncio.Event().wait()
             await asyncio.sleep(
                 min(CHECKPOINT_SECONDS, _remaining(deadline))
             )
             if _active(deadline):
                 writer.checkpoint(asdict(stats))
 
-    checkpoint_task = asyncio.create_task(checkpoint_loop())
-    anchor_task = asyncio.create_task(
-        _periodic_anchor_loop(anchor_worker.submit, stats, deadline)
-    )
+    async def anchor_checkpoint_monitor() -> None:
+        error = await anchor_checkpoint_failure
+        raise error
+
+    primary: BaseException | None = None
+    manifest: Path | None = None
     try:
-        await recorder(writer, stats, deadline, anchor_worker.submit)
-    except asyncio.CancelledError:
-        status = "interrupted"
-        raise
-    except Exception as exc:
-        status = "failed"
-        failure = f"{type(exc).__name__}: {exc}"
-        raise
-    finally:
-        checkpoint_task.cancel()
-        anchor_task.cancel()
-        try:
-            await checkpoint_task
-        except asyncio.CancelledError:
-            pass
-        try:
-            await anchor_task
-        except asyncio.CancelledError:
-            pass
+        anchor_worker.start()
+        await supervise_capture_tasks(
+            recorder(writer, stats, deadline, anchor_worker.submit),
+            checkpoint_loop(),
+            _periodic_anchor_loop(anchor_worker.submit, stats, deadline),
+            anchor_checkpoint_monitor(),
+        )
+    except BaseException as exc:
+        primary = exc
+    try:
         await anchor_worker.close()
-        stats.anchor_completed = anchor_worker.completed
-        stats.anchor_failed = anchor_worker.failed
+    except BaseException as close_error:
+        if primary is None:
+            primary = close_error
+        else:
+            primary.add_note(
+                "anchor worker close 未替换采集主异常: "
+                f"{type(close_error).__name__}: {close_error}"
+            )
+    stats.anchor_completed = anchor_worker.completed
+    stats.anchor_failed = anchor_worker.failed
+    if anchor_checkpoint_errors:
+        checkpoint_error = anchor_checkpoint_errors[0]
+        if primary is None:
+            primary = checkpoint_error
+        elif primary is not checkpoint_error:
+            primary.add_note(
+                "anchor settlement checkpoint 未替换采集主异常: "
+                f"{type(checkpoint_error).__name__}: {checkpoint_error}"
+            )
+    if primary is not None:
+        if isinstance(primary, asyncio.CancelledError):
+            status = "interrupted"
+        else:
+            status = "failed"
+            failure = f"{type(primary).__name__}: {primary}"
+    try:
         manifest = writer.finish(
             {**asdict(stats), "failure_detail": failure}, status=status
         )
+    except BaseException as finish_error:
+        if primary is None:
+            raise
+        primary.add_note(
+            "writer.finish 未替换采集主异常: "
+            f"{type(finish_error).__name__}: {finish_error}"
+        )
+    if primary is not None:
+        raise primary
+    assert manifest is not None
     return stats, manifest
 
 

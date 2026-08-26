@@ -970,7 +970,7 @@ def test_consumed_vintage_can_become_adaptive_but_never_holdout_again(
 def test_legacy_consumed_vintage_is_migrated_to_incomplete_attempt(
     tmp_path: Path,
 ) -> None:
-    """旧库已消费记录必须回填为明确且不可重跑的 incomplete 尝试。"""
+    """reader 不迁移旧库；后续显式写入口才回填 incomplete 尝试。"""
     registry = tmp_path / "governance.sqlite3"
     vintage = seal_holdout_vintage(
         registry,
@@ -990,6 +990,17 @@ def test_legacy_consumed_vintage_is_migrated_to_incomplete_attempt(
         connection.execute(
             "UPDATE governance_meta SET value='2' WHERE key='schema_version'"
         )
+    before = sha256_file(registry)
+    with pytest.raises(ValueError, match="拒绝隐式 schema 迁移"):
+        get_holdout_evaluation_attempt(registry, "legacy-evaluation")
+    assert sha256_file(registry) == before
+    register_research_exposure(
+        registry,
+        "explicit-migration-exposure",
+        "market-one",
+        _time("2026-01-01T00:00:00"),
+        _time("2026-02-01T00:00:00"),
+    )
     migrated = get_holdout_evaluation_attempt(registry, "legacy-evaluation")
     assert migrated.status == "incomplete"
     assert migrated.stage == "legacy_consumed_without_attempt"
@@ -1021,8 +1032,10 @@ def test_schema_write_ceiling_preserves_legacy_reader_deployment(
             ("schema_write_ceiling", "2"),
         )
 
+    pinned_before = sha256_file(registry)
     assert list_holdout_vintages(registry) == (vintage,)
     assert get_holdout_vintage(registry, vintage.vintage_id) == vintage
+    assert sha256_file(registry) == pinned_before
     with sqlite3.connect(registry) as connection:
         version = connection.execute(
             "SELECT value FROM governance_meta WHERE key='schema_version'"
@@ -1059,6 +1072,88 @@ def test_schema_write_ceiling_preserves_legacy_reader_deployment(
         assert connection.execute(
             "SELECT research_identity FROM research_exposure"
         ).fetchall() == [("compatible-exposure",)]
+
+
+def test_governance_read_does_not_create_a_missing_registry(
+    tmp_path: Path,
+) -> None:
+    """reader 不得把路径错误悄悄变成一个新治理库或目录。"""
+    registry = tmp_path / "missing-parent" / "governance.sqlite3"
+    with pytest.raises(FileNotFoundError, match="治理库不存在"):
+        list_holdout_vintages(registry)
+    assert not registry.exists()
+    assert not registry.parent.exists()
+
+
+def test_governance_read_connection_is_vfs_and_sql_read_only(
+    tmp_path: Path,
+) -> None:
+    """关闭 query_only 后仍不可写，证明底层 VFS 也以 mode=ro 打开。"""
+    registry = tmp_path / "governance.sqlite3"
+    vintage = seal_holdout_vintage(
+        registry,
+        "market-one",
+        _time("2027-01-01T00:00:00"),
+        _time("2027-02-01T00:00:00"),
+    )
+
+    def identity(path: Path) -> tuple[bool, int | None, int | None, str | None]:
+        if not path.exists():
+            return False, None, None, None
+        state = path.stat()
+        return True, state.st_size, state.st_mtime_ns, sha256_file(path)
+
+    before = identity(registry)
+    connection = governance_module._connect(registry)
+    try:
+        assert connection.execute("PRAGMA query_only").fetchone()[0] == 1
+        # query_only 是纵深防御，
+        # 不是唯一边界；关闭它
+        # 也不能获得写权限。
+        connection.execute("PRAGMA query_only=OFF")
+        assert connection.execute("PRAGMA query_only").fetchone()[0] == 0
+        with pytest.raises(sqlite3.OperationalError, match="readonly"):
+            connection.execute(
+                "UPDATE holdout_vintage SET status='consumed' WHERE vintage_id=?",
+                (vintage.vintage_id,),
+            )
+    finally:
+        connection.close()
+    after = identity(registry)
+    # SQLite 可在可写目录中
+    # 创建 WAL 辅助文件；调度
+    # wrapper 另以写共享守卫
+    # 阻止该行为。库 API 的硬
+    # 合同是主库 VFS 只读，即
+    # 使调用方关闭 query_only
+    # 也不能改变权威 DB。
+    assert after == before
+    assert get_holdout_vintage(registry, vintage.vintage_id) == vintage
+
+
+def test_governance_read_rejects_implicit_schema_migration(
+    tmp_path: Path,
+) -> None:
+    """旧 schema 的只读访问必须失败关闭且保持文件字节不变。"""
+    registry = tmp_path / "governance.sqlite3"
+    seal_holdout_vintage(
+        registry,
+        "market-one",
+        _time("2027-01-01T00:00:00"),
+        _time("2027-02-01T00:00:00"),
+    )
+    with sqlite3.connect(registry) as connection:
+        connection.execute(
+            "UPDATE governance_meta SET value='2' WHERE key='schema_version'"
+        )
+    before = sha256_file(registry)
+    with pytest.raises(ValueError, match="拒绝隐式 schema 迁移"):
+        list_holdout_vintages(registry)
+    assert sha256_file(registry) == before
+    with sqlite3.connect(registry) as connection:
+        assert connection.execute(
+            "SELECT value FROM governance_meta WHERE key='schema_version'"
+        ).fetchone() == ("2",)
 
 
 def test_explicit_schema_write_ceiling_upgrade_is_backed_up(
@@ -1434,8 +1529,16 @@ def test_legacy_verdict_without_manifest_attempt_is_rejected(tmp_path: Path) -> 
         connection.execute(
             "UPDATE governance_meta SET value='3' WHERE key='schema_version'"
         )
-    with pytest.raises(ValueError, match="无 manifest attempt"):
+    with pytest.raises(ValueError, match="拒绝隐式 schema 迁移"):
         list_holdout_vintages(registry)
+    with pytest.raises(ValueError, match="无 manifest attempt"):
+        register_research_exposure(
+            registry,
+            "invalid-legacy-migration",
+            "market-one",
+            _time("2026-01-01T00:00:00"),
+            _time("2026-02-01T00:00:00"),
+        )
 
 
 def test_holdout_verdict_and_completed_attempt_are_atomic(tmp_path: Path) -> None:
