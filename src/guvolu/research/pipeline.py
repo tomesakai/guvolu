@@ -38,6 +38,16 @@ from guvolu.research.governance import (
     register_active_head_receipt,
     register_research_exposure,
 )
+from guvolu.research.industry_evidence import (
+    INDUSTRY_EVIDENCE_METHOD_VERSION,
+    read_candidate_paths,
+    read_run_identity,
+)
+from guvolu.research.industry_evidence_run import (
+    NO_PAPER_ELIGIBLE_CANDIDATE,
+    generate_run_evidence,
+    paper_deployment_candidates,
+)
 from guvolu.research.panel import (
     PANEL_METHOD_VERSION,
     PANEL_SCHEMA_VERSION,
@@ -198,12 +208,15 @@ def _write_content_text(
 def _research_output_paths(
     output_base: Path,
     research_identity: str,
-    execution_evaluated_at: datetime,
+    run_started_at: datetime,
 ) -> tuple[str, Path, Path]:
-    """分离执行快照目录与可复用的研究制品目录。"""
+    """分离执行快照目录与可复用的研究制品目录。
+
+    运行标识取自运行起始时点，使证据可在执行截止前登记。
+    """
     run_id = stable_identifier("research-run", {
         "research_identity": research_identity,
-        "execution_evaluated_at": execution_evaluated_at.isoformat(),
+        "run_started_at": run_started_at.isoformat(),
     })
     return (
         run_id,
@@ -268,6 +281,95 @@ def _cost_replay_artifact(
         ".jsonl",
         cost_replay_body(panel, validation, config, research_identity),
     )
+
+def _industry_evidence_settings(
+    root: Path,
+    config: Mapping[str, object],
+    enabled_override: bool,
+) -> Path | None:
+    """读取行业证据开关与版本化阈值位置（G-06）。"""
+    section = config.get("research")
+    research: Mapping[str, object] = (
+        {} if section is None else _mapping(section, "research")
+    )
+    enabled = research.get("generate_industry_evidence", True)
+    if not isinstance(enabled, bool):
+        raise ValueError("research.generate_industry_evidence 必须为布尔")
+    if not enabled or not enabled_override:
+        return None
+    configured = Path(_text(
+        research.get(
+            "industry_evidence_config", "config/industry_evidence.json",
+        ),
+        "research.industry_evidence_config",
+    ))
+    path = (
+        configured.resolve() if configured.is_absolute()
+        else (root / configured).resolve()
+    )
+    try:
+        path.relative_to(root)
+    except ValueError as error:
+        raise ValueError("行业证据阈值配置必须位于项目目录内") from error
+    return path
+
+
+def _industry_evidence(
+    root: Path,
+    source_data_root: Path,
+    artifact_directory: Path,
+    config: Mapping[str, object],
+    manifest_view: Mapping[str, object],
+    summary_view: Mapping[str, object],
+    replay_path: Path,
+    feature_path: Path,
+    panel_to_time: datetime,
+    settings_path: Path | None,
+) -> tuple[Mapping[str, object], Mapping[str, Mapping[str, object]]]:
+    """在注册窗口内生成行业稳健性证据并返回登记记录。
+
+    开关关闭与没有 paper 可用候选都是有效结果，只做标注；
+    其余任何失败一律失败关闭，让整次研究运行失败。
+    """
+    if settings_path is None:
+        return {
+            "status": "disabled",
+            "reason": "research.generate_industry_evidence 已关闭",
+        }, {}
+    if not paper_deployment_candidates(summary_view):
+        return {
+            "status": "absent",
+            "reason": NO_PAPER_ELIGIBLE_CANDIDATE,
+        }, {}
+    try:
+        settings = _mapping(
+            json.loads(settings_path.read_text(encoding="utf-8")),
+            "industry_evidence",
+        )
+        evidence = generate_run_evidence(
+            settings,
+            read_run_identity(manifest_view, summary_view, config),
+            read_candidate_paths(
+                replay_path.read_bytes(), summary_view, panel_to_time,
+            ),
+            feature_path.read_bytes(),
+            source_data_root,
+            root,
+            artifact_directory,
+        )
+    except (OSError, ValueError, TypeError) as error:
+        raise ValueError(
+            f"行业稳健性证据生成失败: {type(error).__name__}: {error}"
+        ) from error
+    return {
+        "status": "generated",
+        "method_version": INDUSTRY_EVIDENCE_METHOD_VERSION,
+        "settings": _relative(settings_path, root),
+        "settings_sha256": sha256_file(settings_path),
+        **evidence.report(),
+    }, evidence.artifacts
+
+
 def _disabled_families() -> list[Mapping[str, object]]:
     """列出缺少事实闭环而固定为零的系列。"""
     return [
@@ -364,10 +466,12 @@ def run_research(
     family_scope: Sequence[str] | None = None,
     data_root: Path | None = None,
     panel_to_time: datetime | None = None,
+    generate_industry_evidence: bool = True,
 ) -> ResearchRunResult:
     """运行完整 CPU 策略研究闭环。
 
     `panel_to_time` 为命令行面板截止覆盖，只能早于配置上限。
+    `generate_industry_evidence` 为命令行开关，只能关闭配置已开启的生成。
     """
     root = repository_root.resolve()
     config_file = config_path.resolve()
@@ -398,7 +502,7 @@ def run_research(
     if inputs.receipt_path is None or inputs.receipt_sha256 is None:
         raise AssertionError("研究输入没有生成活动 head 收据")
     input_event = inputs.maximum_event_time
-    execution_evaluated_at = datetime.now(UTC)
+    run_started_at = datetime.now(UTC)
     exposure_start = parse_time(config.get("from_time"), "from_time")
     governance_path, data_scope, governance_config = (
         _governance_registry_path(root, config)
@@ -458,7 +562,7 @@ def run_research(
     run_id, run_directory, artifact_directory = _research_output_paths(
         output_base,
         research_identity,
-        execution_evaluated_at,
+        run_started_at,
     )
     config_snapshot = snapshot_verified_config_lineage(
         root, config_file, artifact_directory,
@@ -549,6 +653,60 @@ def run_research(
         maximum_age,
         minimum_bars,
     )
+    feature_path, feature_hash = _feature_artifact(
+        artifact_directory,
+        features,
+        panel,
+    )
+    trial_path, trial_hash = _trial_artifact(
+        artifact_directory,
+        validation,
+        research_identity,
+    )
+    replay_path, replay_hash = _cost_replay_artifact(
+        artifact_directory,
+        panel,
+        validation,
+        config,
+        research_identity,
+    )
+    registry_path, registry_hash = _write_content_text(
+        artifact_directory,
+        "candidate-registry",
+        ".json",
+        canonical_json(candidate_registry_payload(batches, config_hash)) + "\n",
+    )
+    family_evaluations = _family_payload(validation)
+    industry_evidence, industry_artifacts = _industry_evidence(
+        root,
+        source_data_root,
+        artifact_directory,
+        config,
+        {
+            "run_id": run_id,
+            "research_identity": research_identity,
+            "config_hash": config_hash,
+            "input_receipt_sha256": inputs.receipt_sha256,
+            "decision_time": strategy_decision_time.isoformat(),
+        },
+        {
+            "research_identity": research_identity,
+            "market_id": market_id,
+            "panel": {
+                "sha256": panel.panel_sha256,
+                "latest_available_time": (
+                    panel.latest_available_time.isoformat()
+                ),
+            },
+            "family_evaluations": family_evaluations,
+        },
+        replay_path,
+        feature_path,
+        panel_to_time_effective,
+        _industry_evidence_settings(root, config, generate_industry_evidence),
+    )
+    # 证据先于执行截止登记
+    execution_evaluated_at = datetime.now(UTC)
     operational_quality = gate_feature_snapshot(
         panel_quality(
             panel,
@@ -683,33 +841,10 @@ def run_research(
     )
     ablations = {
         "fixed_long": metrics_payload(fixed_position_metrics),
-        "single_strategy": _family_payload(validation),
+        "single_strategy": family_evaluations,
         "no_l2_overlay": allocation_payload(no_l2_position),
         "no_regime": allocation_payload(no_regime_position),
     }
-    feature_path, feature_hash = _feature_artifact(
-        artifact_directory,
-        features,
-        panel,
-    )
-    trial_path, trial_hash = _trial_artifact(
-        artifact_directory,
-        validation,
-        research_identity,
-    )
-    replay_path, replay_hash = _cost_replay_artifact(
-        artifact_directory,
-        panel,
-        validation,
-        config,
-        research_identity,
-    )
-    registry_path, registry_hash = _write_content_text(
-        artifact_directory,
-        "candidate-registry",
-        ".json",
-        canonical_json(candidate_registry_payload(batches, config_hash)) + "\n",
-    )
     target_payload = {
         "schema_version": PIPELINE_SCHEMA_VERSION,
         "run_id": run_id,
@@ -799,6 +934,10 @@ def run_research(
             "sha256": registry_hash,
             "bytes": registry_path.stat().st_size,
         },
+        **{
+            name: dict(record)
+            for name, record in sorted(industry_artifacts.items())
+        },
     }
     summary: dict[str, object] = {
         "schema_version": PIPELINE_SCHEMA_VERSION,
@@ -826,6 +965,7 @@ def run_research(
         "family_scope": list(resolved_family_scope),
         "market_id": market_id,
         "decision_time": strategy_decision_time.isoformat(),
+        "run_started_at": run_started_at.isoformat(),
         "execution_evaluated_at": execution_evaluated_at.isoformat(),
         "source_data_root": source_data_root_record,
         "source_data_snapshot": source_data_snapshot,
@@ -875,7 +1015,8 @@ def run_research(
         "market_state": _market_state_payload(market_state),
         "research_quality": quality_payload(research_quality),
         "operational_quality": quality_payload(operational_quality),
-        "family_evaluations": _family_payload(validation),
+        "family_evaluations": family_evaluations,
+        "industry_evidence": industry_evidence,
         "research_position": allocation_payload(research_position),
         "operational_position": allocation_payload(operational_position),
         "research_target_contract": research_target_contract,
@@ -917,7 +1058,9 @@ def run_research(
         "generator_method_version": GENERATOR_METHOD_VERSION,
         "family_scope": list(resolved_family_scope),
         "decision_time": strategy_decision_time.isoformat(),
+        "run_started_at": run_started_at.isoformat(),
         "execution_evaluated_at": execution_evaluated_at.isoformat(),
+        "industry_evidence": industry_evidence,
         "source_data_root": source_data_root_record,
         "source_data_snapshot": source_data_snapshot,
         "code_identity": asdict(identity),
