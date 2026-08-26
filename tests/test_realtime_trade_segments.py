@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import duckdb
 import pytest
 
-from guvolu.data import store, trade_capture
+from guvolu.data import store, trade_capture, trade_realtime_materialize
+from guvolu.data.materialize import sha256_file
 from guvolu.data.segmented_raw import SegmentedRawWriter
 from guvolu.data.trade_realtime_materialize import (
     TRADE_REALTIME_NORMALIZATION_VERSION,
@@ -21,6 +23,7 @@ from guvolu.data.trade_realtime_materialize import (
 def _write_segment(
     root: Path, venue: str, symbol: str, payloads: list[str], run_id: str,
     *, endpoint_revision: int | None = None,
+    segment_max_bytes: int = 1024 * 1024,
 ) -> Path:
     endpoint_id, current_revision = trade_capture.ENDPOINT_BINDINGS[venue]
     selected_revision = (
@@ -29,7 +32,7 @@ def _write_segment(
     writer = SegmentedRawWriter(
         root, venue, symbol, domain="trade_realtime", run_id=run_id,
         endpoint_id=endpoint_id, endpoint_revision=selected_revision,
-        segment_seconds=3600, segment_max_bytes=1024 * 1024,
+        segment_seconds=3600, segment_max_bytes=segment_max_bytes,
     )
     source_endpoints = {
         "gmo": "trades/ws",
@@ -501,3 +504,208 @@ def test_raw_v3_record_sequence_string_is_rejected_without_control_row(
         ).fetchone() == (0, 0)
     finally:
         conn.close()
+
+
+def _gmo_payload(price: str) -> str:
+    return json.dumps({
+        "channel": "trades", "price": price, "size": "0.01",
+        "side": "BUY", "timestamp": "2026-08-11T00:00:00.000Z",
+    })
+
+
+def _touch_run(root: Path, venue: str, symbol: str, run_id: str, stamp: float) -> None:
+    """固定 run 目录 mtime，让选择顺序可复核。"""
+    directory = (
+        root / "raw" / "realtime" / "trade_realtime"
+        / f"venue_id={venue}" / f"venue_symbol={symbol}" / f"run_id={run_id}"
+    )
+    os.utime(directory, (stamp, stamp))
+
+
+def test_latest_run_only_groups_by_venue_and_symbol(tmp_path: Path) -> None:
+    """同场所多 symbol 时，每流各自保留最新 run，不得丢流。"""
+    for symbol, run_id in (
+        ("BTC", "run-btc-old"), ("BTC", "run-btc-new"),
+        ("ETH", "run-eth-old"), ("ETH", "run-eth-new"),
+    ):
+        _write_segment(
+            tmp_path, "gmo", symbol, [_gmo_payload("17000000")], run_id,
+        )
+    # ETH 两个 run 均晚于 BTC。
+    _touch_run(tmp_path, "gmo", "BTC", "run-btc-old", 1_780_000_000.0)
+    _touch_run(tmp_path, "gmo", "BTC", "run-btc-new", 1_780_000_100.0)
+    _touch_run(tmp_path, "gmo", "ETH", "run-eth-old", 1_780_000_200.0)
+    _touch_run(tmp_path, "gmo", "ETH", "run-eth-new", 1_780_000_300.0)
+
+    selected = _sealed_inputs(tmp_path, latest_run_only=True)
+    assert {item.run_id for item in selected} == {"run-btc-new", "run-eth-new"}
+    assert len(_sealed_inputs(tmp_path)) == 4
+
+
+def test_latest_sealed_segments_per_stream_takes_newest(tmp_path: Path) -> None:
+    """每流最新 run 内按 sealed_at 取最新 N 片。"""
+    _write_segment(
+        tmp_path, "gmo", "BTC",
+        [_gmo_payload("17000001"), _gmo_payload("17000002"),
+         _gmo_payload("17000003")],
+        "run-btc-multi", segment_max_bytes=1,
+    )
+    run_directory = (
+        tmp_path / "raw" / "realtime" / "trade_realtime"
+        / "venue_id=gmo" / "venue_symbol=BTC" / "run_id=run-btc-multi"
+    )
+    manifests = sorted(run_directory.glob("segment-*.manifest.json"))
+    assert len(manifests) == 3
+    for index, manifest_path in enumerate(manifests):
+        body = json.loads(manifest_path.read_text(encoding="utf-8"))
+        body["sealed_at"] = f"2026-08-11T00:0{index}:00+00:00"
+        manifest_path.write_text(
+            json.dumps(body, ensure_ascii=False) + "\n", encoding="utf-8",
+        )
+
+    selected = _sealed_inputs(
+        tmp_path, latest_sealed_segments_per_stream=2,
+    )
+    assert [item.segment_sequence for item in selected] == [2, 3]
+
+
+def test_selection_modes_are_mutually_exclusive(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="互斥"):
+        _sealed_inputs(
+            tmp_path, latest_run_only=True,
+            latest_sealed_segments_per_stream=1,
+        )
+    with pytest.raises(ValueError, match="必须为正整数"):
+        _sealed_inputs(tmp_path, latest_sealed_segments_per_stream=0)
+
+
+def _count_hashes(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """统计 sha256_file 实际调用次数。"""
+    calls = [0]
+
+    def counted(path: Path) -> str:
+        calls[0] += 1
+        return sha256_file(path)
+
+    monkeypatch.setattr(
+        "guvolu.data.trade_realtime_materialize.sha256_file", counted,
+    )
+    return calls
+
+
+def test_registered_hash_prefilter_reuses_completed_input_hash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """已完成 attempt 的输入不再重算散列。"""
+    _write_segment(
+        tmp_path, "gmo", "BTC", [_gmo_payload("17000000")], "run-prefilter",
+    )
+    conn = store.connect(tmp_path)
+    try:
+        assert len(materialize_all(tmp_path, conn, report_reused=False)) == 1
+        calls = _count_hashes(monkeypatch)
+        results, stats = trade_realtime_materialize._materialize_cycle(
+            tmp_path, conn, report_reused=False,
+        )
+        assert [result.reused for result in results] == [True]
+        assert calls[0] == 0
+        assert (stats.hash_reused, stats.hash_recomputed) == (1, 0)
+        assert stats.scanned_manifests == 1
+        assert stats.elapsed_scan_seconds >= 0
+    finally:
+        conn.close()
+
+
+def test_verify_all_hashes_restores_full_recompute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """审计开关关闭预筛，回到逐个重算。"""
+    _write_segment(
+        tmp_path, "gmo", "BTC", [_gmo_payload("17000000")], "run-audit",
+    )
+    conn = store.connect(tmp_path)
+    try:
+        materialize_all(tmp_path, conn, report_reused=False)
+        calls = _count_hashes(monkeypatch)
+        _, stats = trade_realtime_materialize._materialize_cycle(
+            tmp_path, conn, report_reused=False, verify_all_hashes=True,
+        )
+        assert calls[0] == 1
+        assert (stats.hash_reused, stats.hash_recomputed) == (0, 1)
+    finally:
+        conn.close()
+
+
+def test_prefilter_still_fails_closed_on_size_mismatch(tmp_path: Path) -> None:
+    """预筛不得让磁盘字节数漂移逃过失败关闭。"""
+    _write_segment(
+        tmp_path, "gmo", "BTC", [_gmo_payload("17000000")], "run-size-drift",
+    )
+    conn = store.connect(tmp_path)
+    try:
+        materialize_all(tmp_path, conn, report_reused=False)
+        registered = trade_realtime_materialize._registered_input_hashes(conn)
+        assert len(registered) == 1
+        segment = tmp_path / next(iter(registered))
+        with segment.open("ab") as stream:
+            stream.write(b"\n")
+        with pytest.raises(ValueError, match="字节数不符"):
+            _sealed_inputs(tmp_path, registered_hashes=registered)
+    finally:
+        conn.close()
+
+
+def test_prefilter_rejects_manifest_rewritten_against_registry(
+    tmp_path: Path,
+) -> None:
+    """manifest 与登记散列不符时预筛抛错，不静默复用。"""
+    manifest_path = _write_segment(
+        tmp_path, "gmo", "BTC", [_gmo_payload("17000000")], "run-rewritten",
+    )
+    conn = store.connect(tmp_path)
+    try:
+        materialize_all(tmp_path, conn, report_reused=False)
+        registered = trade_realtime_materialize._registered_input_hashes(conn)
+        body = json.loads(manifest_path.read_text(encoding="utf-8"))
+        forged = hashlib.sha256(b"forged").hexdigest()
+        body.update({"sha256": forged, "artifact_id": f"sha256-{forged}"})
+        manifest_path.write_text(
+            json.dumps(body, ensure_ascii=False) + "\n", encoding="utf-8",
+        )
+        with pytest.raises(ValueError, match="登记散列不符"):
+            _sealed_inputs(tmp_path, registered_hashes=registered)
+    finally:
+        conn.close()
+
+
+def test_watch_cycle_reports_scan_observability(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """每轮 watch 输出扫描成本，便于运维发现退化。"""
+    _write_segment(
+        tmp_path, "gmo", "BTC", [_gmo_payload("17000000")], "run-watch",
+    )
+
+    def stop(_seconds: float) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("time.sleep", stop)
+    assert trade_realtime_materialize._watch(
+        tmp_path, 10.0, latest_sealed_segments_per_stream=1,
+    ) == 0
+    cycles = [
+        json.loads(line)
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("{")
+    ]
+    cycle = next(
+        row for row in cycles
+        if row["event"] == "trade_realtime_materialization_cycle"
+    )
+    assert cycle["input_selection"] == "latest_sealed_per_stream"
+    assert cycle["latest_sealed_segments_per_stream"] == 1
+    assert cycle["scanned_manifests"] == 1
+    assert cycle["hash_recomputed"] == 1
+    assert cycle["hash_reused"] == 0
+    assert cycle["elapsed_scan_seconds"] >= 0

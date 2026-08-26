@@ -93,6 +93,16 @@ class SegmentInput:
 
 
 @dataclass(frozen=True)
+class ScanStats:
+    """一轮输入选择的扫描成本，用于发现语料线性退化。"""
+
+    scanned_manifests: int
+    hash_recomputed: int
+    hash_reused: int
+    elapsed_scan_seconds: float
+
+
+@dataclass(frozen=True)
 class RealtimeTradeResult:
     """一个逐笔 segment 的物化结果。"""
 
@@ -198,17 +208,222 @@ _PARSERS = {
 }
 
 
-def _sealed_inputs(root: Path) -> list[SegmentInput]:
+def _validate_input_selection(
+    *,
+    latest_run_only: bool,
+    latest_sealed_segments_per_stream: int | None,
+) -> None:
+    """拒绝含糊或无界的增量选择参数。"""
+    limit = latest_sealed_segments_per_stream
+    if limit is not None and (
+        isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0
+    ):
+        raise ValueError("latest-sealed-segments-per-stream 必须为正整数")
+    if latest_run_only and limit is not None:
+        raise ValueError(
+            "latest-run-only 与 latest-sealed-segments-per-stream 互斥"
+        )
+
+
+def _run_rank(run_directory: Path) -> tuple[int, int, str]:
+    """open-run 优先，其次目录 mtime，再次 run_id。"""
+    run_id = run_directory.name.split("=", 1)[1]
+    if not run_id:
+        raise ValueError(f"逐笔 run 目录非法: {run_directory}")
+    open_run = int(
+        (run_directory / "checkpoint.json").is_file()
+        and next(run_directory.glob("segment-*.open"), None) is not None
+    )
+    return open_run, run_directory.stat().st_mtime_ns, run_id
+
+
+def _latest_stream_run_directories(
+    base: Path,
+) -> dict[tuple[str, str], Path]:
+    """按 (venue,symbol) 逐流定位最新 run 目录。
+
+    必须以流而非场所分组：同一场所有多个 venue_symbol，按场所选 run 会
+    让除最新一路以外的所有 symbol 直接从输入集消失。
+    """
+    latest: dict[tuple[str, str], tuple[int, int, str, Path]] = {}
+    for venue_directory in sorted(base.glob("venue_id=*")):
+        if not venue_directory.is_dir():
+            continue
+        venue_id = venue_directory.name.split("=", 1)[1]
+        if not venue_id:
+            raise ValueError(f"逐笔 venue 目录非法: {venue_directory}")
+        for symbol_directory in sorted(
+            venue_directory.glob("venue_symbol=*")
+        ):
+            if not symbol_directory.is_dir():
+                continue
+            venue_symbol = symbol_directory.name.split("=", 1)[1]
+            if not venue_symbol:
+                raise ValueError(f"逐笔 symbol 目录非法: {symbol_directory}")
+            stream = (venue_id, venue_symbol)
+            for run_directory in sorted(symbol_directory.glob("run_id=*")):
+                if not run_directory.is_dir():
+                    continue
+                candidate = (*_run_rank(run_directory), run_directory)
+                if candidate[:3] > latest.get(
+                    stream, (-1, -1, "", run_directory),
+                )[:3]:
+                    latest[stream] = candidate
+    return {stream: row[3] for stream, row in latest.items()}
+
+
+def _sealed_at(body: Mapping[str, object], manifest_path: Path) -> datetime:
+    """解析封口时刻；缺失或非法一律失败关闭。"""
+    recorded = body.get("sealed_at")
+    if not isinstance(recorded, str) or not recorded:
+        raise ValueError(f"逐笔封口 manifest 缺 sealed_at: {manifest_path}")
+    try:
+        parsed = datetime.fromisoformat(recorded)
+    except ValueError as exc:
+        raise ValueError(
+            f"逐笔封口 manifest sealed_at 非法: {manifest_path}"
+        ) from exc
+    if parsed.tzinfo is None:
+        raise ValueError(
+            f"逐笔封口 manifest sealed_at 缺时区: {manifest_path}"
+        )
+    return parsed
+
+
+def _latest_sealed_manifest_entries(
+    base: Path, limit: int,
+) -> list[tuple[Path, Mapping[str, object]]]:
+    """每流最新 run 内按 sealed_at 取最新 N 片。"""
+    selected: list[tuple[str, str, str, str, Path, Mapping[str, object]]] = []
+    for (venue_id, venue_symbol), run_directory in sorted(
+        _latest_stream_run_directories(base).items()
+    ):
+        candidates: list[
+            tuple[datetime, str, Path, Mapping[str, object]]
+        ] = []
+        for manifest_path in sorted(
+            run_directory.glob("segment-*.manifest.json")
+        ):
+            body = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(body, Mapping):
+                continue
+            if (
+                body.get("status") != "sealed"
+                or body.get("completion_claim") is not True
+            ):
+                continue
+            if (
+                body.get("venue_id") != venue_id
+                or body.get("venue_symbol") != venue_symbol
+                or str(body.get("run_id"))
+                != run_directory.name.split("=", 1)[1]
+            ):
+                raise ValueError(
+                    f"逐笔 manifest 身份与路径不一致: {manifest_path}"
+                )
+            candidates.append((
+                _sealed_at(body, manifest_path),
+                manifest_path.name, manifest_path, body,
+            ))
+        candidates.sort(key=lambda row: (row[0], row[1]))
+        selected.extend(
+            (
+                venue_id, venue_symbol, sealed_at.isoformat(), name,
+                manifest_path, body,
+            )
+            for sealed_at, name, manifest_path, body in candidates[-limit:]
+        )
+    selected.sort(key=lambda row: (row[0], row[1], row[2], row[3]))
+    return [(path, body) for _, _, _, _, path, body in selected]
+
+
+def _registered_input_hashes(
+    conn: sqlite3.Connection,
+) -> dict[str, tuple[str, int]]:
+    """取已完成逐笔 attempt 输入制品的登记散列与字节数。"""
+    rows = conn.execute(
+        "SELECT DISTINCT r.storage_path,r.sha256,r.byte_count FROM artifact r "
+        "JOIN partition_input i ON i.artifact_id=r.artifact_id "
+        "JOIN partition_attempt a ON a.attempt_id=i.attempt_id "
+        "WHERE a.domain='trade_realtime' AND a.status LIKE 'complete%' "
+        "AND r.artifact_kind='raw_realtime_segment'"
+    ).fetchall()
+    return {
+        str(row[0]): (str(row[1]), int(row[2])) for row in rows
+    }
+
+
+def _sealed_inputs(
+    root: Path, *, latest_run_only: bool = False,
+    latest_sealed_segments_per_stream: int | None = None,
+    registered_hashes: Mapping[str, tuple[str, int]] | None = None,
+) -> list[SegmentInput]:
+    return _scan_sealed_inputs(
+        root,
+        latest_run_only=latest_run_only,
+        latest_sealed_segments_per_stream=(
+            latest_sealed_segments_per_stream
+        ),
+        registered_hashes=registered_hashes,
+    )[0]
+
+
+def _scan_sealed_inputs(
+    root: Path, *, latest_run_only: bool = False,
+    latest_sealed_segments_per_stream: int | None = None,
+    registered_hashes: Mapping[str, tuple[str, int]] | None = None,
+) -> tuple[list[SegmentInput], ScanStats]:
+    """选择封口逐笔 segment，并报告本轮扫描成本。
+
+    ``registered_hashes`` 为控制面预筛：键是输入制品的登记 storage_path，
+    值是该制品已随某个完成态 trade_realtime attempt 登记的散列与字节数。
+    命中且磁盘字节数、manifest 散列与字节数三者一致时复用登记散列，不再
+    重算 SHA-256；任一不一致即抛错，不退化为静默重算。传 ``None`` 表示
+    回到逐个重算，用于审计。
+    """
+    started = time.monotonic()
     inputs: list[SegmentInput] = []
+    scanned = 0
+    recomputed = 0
+    reused = 0
     base = root / "raw" / "realtime" / "trade_realtime"
+    _validate_input_selection(
+        latest_run_only=latest_run_only,
+        latest_sealed_segments_per_stream=(
+            latest_sealed_segments_per_stream
+        ),
+    )
     if not base.is_dir():
-        return []
-    for manifest_path in sorted(base.rglob("segment-*.manifest.json")):
-        body = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if not isinstance(body, Mapping):
-            continue
-        if body.get("status") != "sealed" or body.get("completion_claim") is not True:
-            continue
+        return [], ScanStats(0, 0, 0, round(time.monotonic() - started, 3))
+    manifests: list[tuple[Path, Mapping[str, object]]]
+    if latest_sealed_segments_per_stream is not None:
+        manifests = _latest_sealed_manifest_entries(
+            base, latest_sealed_segments_per_stream,
+        )
+        scanned = len(manifests)
+    else:
+        manifest_paths: list[Path]
+        if latest_run_only:
+            manifest_paths = sorted(
+                path
+                for directory in _latest_stream_run_directories(base).values()
+                for path in directory.glob("segment-*.manifest.json")
+            )
+        else:
+            manifest_paths = sorted(base.rglob("segment-*.manifest.json"))
+        manifests = []
+        for manifest_path in manifest_paths:
+            scanned += 1
+            body = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(body, Mapping):
+                continue
+            if (
+                body.get("status") != "sealed"
+                or body.get("completion_claim") is not True
+            ):
+                continue
+            manifests.append((manifest_path, body))
+    for manifest_path, body in manifests:
         recorded = str(body["storage_path"])
         path = (root / recorded).resolve()
         try:
@@ -220,11 +435,24 @@ def _sealed_inputs(root: Path) -> list[SegmentInput]:
         ).resolve()
         if path != expected_path:
             raise ValueError(f"逐笔 manifest 与 segment 不同目录: {recorded}")
-        sha = sha256_file(path)
-        if sha != str(body["sha256"]):
-            raise ValueError(f"逐笔 segment 散列不符: {recorded}")
-        if path.stat().st_size != int(str(body["byte_count"])):
+        recorded_sha = str(body["sha256"])
+        recorded_bytes = int(str(body["byte_count"]))
+        if path.stat().st_size != recorded_bytes:
             raise ValueError(f"逐笔 segment 字节数不符: {recorded}")
+        registered = (
+            None if registered_hashes is None
+            else registered_hashes.get(recorded)
+        )
+        if registered is None:
+            sha = sha256_file(path)
+            recomputed += 1
+            if sha != recorded_sha:
+                raise ValueError(f"逐笔 segment 散列不符: {recorded}")
+        else:
+            if registered != (recorded_sha, recorded_bytes):
+                raise ValueError(f"逐笔 segment 登记散列不符: {recorded}")
+            sha = recorded_sha
+            reused += 1
         if body.get("artifact_id") not in {None, artifact_id(sha)}:
             raise ValueError(f"逐笔 segment artifact_id 不符: {recorded}")
         raw_schema_version = int(str(body.get("schema_version", 1)))
@@ -285,7 +513,9 @@ def _sealed_inputs(root: Path) -> list[SegmentInput]:
                 normalized_rows=0, rejected_rows=0,
             ),
         ))
-    return inputs
+    return inputs, ScanStats(
+        scanned, recomputed, reused, round(time.monotonic() - started, 3),
+    )
 
 
 def _bind_capability(
@@ -1009,9 +1239,38 @@ def materialize_segment(
 
 def materialize_all(
     root: Path, conn: sqlite3.Connection, *, report_reused: bool = True,
+    latest_run_only: bool = False,
+    latest_sealed_segments_per_stream: int | None = None,
+    verify_all_hashes: bool = False,
 ) -> list[RealtimeTradeResult]:
     """断点复用地物化全部封口逐笔 segment。"""
-    inputs = _sealed_inputs(root)
+    return _materialize_cycle(
+        root, conn, report_reused=report_reused,
+        latest_run_only=latest_run_only,
+        latest_sealed_segments_per_stream=(
+            latest_sealed_segments_per_stream
+        ),
+        verify_all_hashes=verify_all_hashes,
+    )[0]
+
+
+def _materialize_cycle(
+    root: Path, conn: sqlite3.Connection, *, report_reused: bool = True,
+    latest_run_only: bool = False,
+    latest_sealed_segments_per_stream: int | None = None,
+    verify_all_hashes: bool = False,
+) -> tuple[list[RealtimeTradeResult], ScanStats]:
+    """物化一轮并返回扫描成本。"""
+    inputs, stats = _scan_sealed_inputs(
+        root,
+        latest_run_only=latest_run_only,
+        latest_sealed_segments_per_stream=(
+            latest_sealed_segments_per_stream
+        ),
+        registered_hashes=(
+            None if verify_all_hashes else _registered_input_hashes(conn)
+        ),
+    )
     results: list[RealtimeTradeResult] = []
     for index, item in enumerate(inputs, start=1):
         try:
@@ -1041,7 +1300,7 @@ def materialize_all(
                 f"ignored={result.ignored_rows} rejected={result.rejected_rows}",
                 flush=True,
             )
-    return results
+    return results, stats
 
 
 def audit_realtime_trades(
@@ -1181,8 +1440,37 @@ def audit_realtime_trades(
     }
 
 
-def _watch(root: Path, interval: float) -> int:
+def _input_selection_label(
+    *,
+    latest_run_only: bool,
+    latest_sealed_segments_per_stream: int | None,
+) -> str:
+    _validate_input_selection(
+        latest_run_only=latest_run_only,
+        latest_sealed_segments_per_stream=(
+            latest_sealed_segments_per_stream
+        ),
+    )
+    if latest_run_only:
+        return "latest_run"
+    if latest_sealed_segments_per_stream is not None:
+        return "latest_sealed_per_stream"
+    return "all"
+
+
+def _watch(
+    root: Path, interval: float, *,
+    latest_run_only: bool = False,
+    latest_sealed_segments_per_stream: int | None = None,
+    verify_all_hashes: bool = False,
+) -> int:
     """持续追赶封口逐笔；启动锁竞争只延后本轮。"""
+    selection = _input_selection_label(
+        latest_run_only=latest_run_only,
+        latest_sealed_segments_per_stream=(
+            latest_sealed_segments_per_stream
+        ),
+    )
     def report_connect_error(exc: Exception, elapsed: float) -> None:
         print(json.dumps({
             "event": "trade_realtime_materialization_startup_error",
@@ -1203,15 +1491,31 @@ def _watch(root: Path, interval: float) -> int:
             started = time.monotonic()
             try:
                 with sqlite_writer_lock(root):
-                    cycle = materialize_all(root, conn, report_reused=False)
+                    cycle, stats = _materialize_cycle(
+                        root, conn, report_reused=False,
+                        latest_run_only=latest_run_only,
+                        latest_sealed_segments_per_stream=(
+                            latest_sealed_segments_per_stream
+                        ),
+                        verify_all_hashes=verify_all_hashes,
+                    )
                 created = [item for item in cycle if not item.reused]
                 print(json.dumps({
                     "event": "trade_realtime_materialization_cycle",
+                    "input_selection": selection,
+                    "latest_sealed_segments_per_stream": (
+                        latest_sealed_segments_per_stream
+                    ),
+                    "verify_all_hashes": verify_all_hashes,
                     "sealed_segments": len(cycle),
                     "materialized_now": len(created),
                     "trade_rows_now": sum(
                         item.trade_rows for item in created
                     ),
+                    "scanned_manifests": stats.scanned_manifests,
+                    "hash_recomputed": stats.hash_recomputed,
+                    "hash_reused": stats.hash_reused,
+                    "elapsed_scan_seconds": stats.elapsed_scan_seconds,
                     "elapsed_seconds": round(
                         time.monotonic() - started, 3
                     ),
@@ -1230,28 +1534,74 @@ def _watch(root: Path, interval: float) -> int:
             conn.close()
 
 
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("必须为正整数") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("必须为正整数")
+    return parsed
+
+
+def _add_selection_arguments(parser: argparse.ArgumentParser) -> None:
+    """挂载互斥的增量选择组与散列审计开关。"""
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--latest-run-only", action="store_true")
+    selection.add_argument(
+        "--latest-sealed-segments-per-stream",
+        type=_positive_int,
+        help="每个 (venue,symbol) 最新 run 仅取按 sealed_at 最新的 N 片",
+    )
+    parser.add_argument(
+        "--verify-all-hashes",
+        action="store_true",
+        help="关闭登记散列复用预筛，逐个重算 SHA-256 供审计",
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """命令行入口。"""
-    parser = argparse.ArgumentParser(description="三所实时逐笔 segment 物化")
+    parser = argparse.ArgumentParser(
+        description="三所实时逐笔 segment 物化",
+        allow_abbrev=False,
+    )
     parser.add_argument("--data-root", type=Path, default=None)
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("all")
-    sub.add_parser("audit")
-    watch = sub.add_parser("watch")
+    _add_selection_arguments(
+        sub.add_parser("all", allow_abbrev=False)
+    )
+    sub.add_parser("audit", allow_abbrev=False)
+    watch = sub.add_parser("watch", allow_abbrev=False)
     watch.add_argument("--interval-seconds", type=float, default=300.0)
+    _add_selection_arguments(watch)
     args = parser.parse_args(argv)
     root = (args.data_root or configured_data_root()).resolve()
     if args.command == "watch":
         interval = float(args.interval_seconds)
         if interval < 10:
             raise ValueError("interval-seconds 不得小于 10")
-        return _watch(root, interval)
+        return _watch(
+            root, interval,
+            latest_run_only=bool(args.latest_run_only),
+            latest_sealed_segments_per_stream=(
+                args.latest_sealed_segments_per_stream
+            ),
+            verify_all_hashes=bool(args.verify_all_hashes),
+        )
 
     conn = store.connect(root)
     try:
         if args.command == "all":
             with sqlite_writer_lock(root):
-                completed = materialize_all(root, conn)
+                completed = materialize_all(
+                    root, conn,
+                    latest_run_only=bool(args.latest_run_only),
+                    latest_sealed_segments_per_stream=(
+                        args.latest_sealed_segments_per_stream
+                    ),
+                    verify_all_hashes=bool(args.verify_all_hashes),
+                )
             result: object = [asdict(item) for item in completed]
             code = 0
         elif args.command == "audit":
