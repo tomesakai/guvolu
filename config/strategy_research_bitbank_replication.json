@@ -1,0 +1,269 @@
+{
+  "allocation": {
+    "directional_families": [
+      "trend",
+      "flow_trend",
+      "breakout",
+      "price_breakout"
+    ],
+    "l2_overlay_limit": 0.3,
+    "maximum_gross_weight": 0.85,
+    "mean_reversion_cap": 0.25,
+    "minimum_risk_reserve": 0.15,
+    "no_trade_band": 0.01,
+    "risk_aversion": 3.0,
+    "solver_iterations": 300,
+    "solver_step": 0.05,
+    "trend_breakout_cap": 0.6,
+    "turnover_penalty": 0.02,
+    "uncertainty_penalty": 0.1
+  },
+  "bar_interval": "1hour",
+  "cost_model": {
+    "capacity_notional_quote": 100000.0,
+    "fee_bps_assumption": 12.0,
+    "half_spread_bps_assumption": 2.0,
+    "impact_bps_assumption": 1.0,
+    "slippage_bps_assumption": 2.0
+  },
+  "cross_venue_shadow": {
+    "market_ids": [
+      "mkt__gmo__btc__r0",
+      "mkt__bitbank__btc_jpy__r0",
+      "mkt__bitflyer__btc_jpy__r0"
+    ],
+    "maximum_age_seconds": 5,
+    "minimum_quorum": 2,
+    "taker_fee_bps_assumptions": {
+      "bitbank": 12.0,
+      "bitflyer": 15.0,
+      "gmo": 5.0
+    }
+  },
+  "data_governance": {
+    "holdout_policy": {
+      "maximum_drawdown": 0.45,
+      "maximum_fdr_q": 0.2,
+      "minimum_bars": 2160,
+      "minimum_sharpe": 0.0,
+      "require_frozen_forward_predictions": true
+    },
+    "registry": "data/research/governance.sqlite3",
+    "scope": "DEV_ADAPTIVE"
+  },
+  "derivation_note": {
+    "changed_axes": [
+      "market_id",
+      "cost_model.fee_bps_assumption"
+    ],
+    "method_version": "cross-venue-replication-v1",
+    "reason": "out_of_venue_replication_of_price_breakout",
+    "source_config_path": "config/strategy_research_dense_pb.json",
+    "source_config_sha256": "31e0a553ea190f72d64fb088ec1c68eb65f5b1494ec1ab61957c1b0091279b15"
+  },
+  "evolution": {
+    "constraints": {
+      "breakout": {
+        "flow_confirmation": {
+          "maximum": 1.0,
+          "minimum": -1.0
+        },
+        "lookback": {
+          "maximum": 336,
+          "minimum": 12
+        }
+      },
+      "flow_trend": {
+        "entry_score": {
+          "maximum": 2.0,
+          "minimum": 0.25
+        },
+        "flow_confirmation": {
+          "maximum": 1.0,
+          "minimum": -1.0
+        },
+        "lookback": {
+          "maximum": 336,
+          "minimum": 12
+        }
+      },
+      "grid_shadow": {
+        "entry_score": {
+          "maximum": 3.0,
+          "minimum": 0.5
+        },
+        "lookback": {
+          "maximum": 168,
+          "minimum": 12
+        }
+      },
+      "mean_reversion": {
+        "entry_score": {
+          "maximum": 3.0,
+          "minimum": 0.5
+        },
+        "lookback": {
+          "maximum": 336,
+          "minimum": 12
+        }
+      },
+      "price_breakout": {
+        "lookback": {
+          "maximum": 336,
+          "minimum": 12
+        }
+      },
+      "trend": {
+        "entry_score": {
+          "maximum": 2.0,
+          "minimum": 0.25
+        },
+        "lookback": {
+          "maximum": 336,
+          "minimum": 12
+        }
+      }
+    },
+    "maximum_candidates_per_family": 24
+  },
+  "evolution_monitor": {
+    "fdr_q_deterioration_threshold": 0.05,
+    "minimum_history_runs": 3,
+    "parameter_association_threshold": 0.35,
+    "sharpe_decay_threshold": 0.25
+  },
+  "features": {
+    "lookbacks": [
+      24,
+      48,
+      72,
+      120,
+      168,
+      240,
+      336
+    ],
+    "maximum_structural_gap_bars_assumption": 4,
+    "state_lookback": 72,
+    "volume_lookback": 168
+  },
+  "from_time": "2019-01-01T00:00:00+00:00",
+  "market_id": "mkt__bitbank__btc_jpy__r0",
+  "notional_scale": 100000000,
+  "pipeline_version": "strategy-research-cpu-v9",
+  "schema_version": 1,
+  "strategies": {
+    "breakout": {
+      "annual_volatility_target": 0.4,
+      "flow_confirmations": [
+        -0.1,
+        0.1
+      ],
+      "lookbacks": [
+        24,
+        72,
+        168
+      ],
+      "maximum_target": 1.0
+    },
+    "flow_trend": {
+      "annual_volatility_target": 0.4,
+      "entry_scores": [
+        0.5,
+        1.0
+      ],
+      "exit_score": 0.0,
+      "flow_confirmations": [
+        -0.25,
+        0.0,
+        0.25
+      ],
+      "lookbacks": [
+        72,
+        168
+      ],
+      "maximum_target": 1.0,
+      "minimum_volume_score": 0.0
+    },
+    "grid_shadow": {
+      "entry_scores": [
+        1.0,
+        1.5
+      ],
+      "lookbacks": [
+        24,
+        72
+      ],
+      "maximum_target": 0.5
+    },
+    "mean_reversion": {
+      "annual_volatility_target": 0.25,
+      "entry_scores": [
+        1.0,
+        1.5
+      ],
+      "exit_score": -0.1,
+      "lookbacks": [
+        24,
+        72,
+        168
+      ],
+      "maximum_target": 0.75,
+      "trend_limit": 0.75
+    },
+    "price_breakout": {
+      "annual_volatility_target": 0.4,
+      "lookbacks": [
+        24,
+        48,
+        72,
+        120,
+        168,
+        240,
+        336
+      ],
+      "maximum_target": 1.0
+    },
+    "trend": {
+      "annual_volatility_target": 0.4,
+      "entry_scores": [
+        0.5,
+        1.0
+      ],
+      "exit_score": 0.0,
+      "lookbacks": [
+        24,
+        72,
+        168
+      ],
+      "maximum_target": 1.0
+    }
+  },
+  "strategy_decision_max_age_seconds": 3900,
+  "validation": {
+    "block_bootstrap_bars": 168,
+    "block_bootstrap_one_sided_alpha": 0.05,
+    "block_bootstrap_random_seed": 20260814,
+    "block_bootstrap_samples": 1024,
+    "complexity_penalty": 0.02,
+    "deflated_sharpe_gate_trial_count": "effective",
+    "maximum_block_bootstrap_p_value": 0.05,
+    "maximum_drawdown": 0.45,
+    "maximum_fdr_q": 0.2,
+    "maximum_probability_backtest_overfitting": 0.4,
+    "minimum_deflated_sharpe_probability": 0.95,
+    "minimum_median_parameter_neighbor_sharpe_retention": 0.5,
+    "minimum_oos_bars": 8000,
+    "minimum_oos_sharpe": 0.0,
+    "minimum_parameter_neighbor_count": 1,
+    "minimum_positive_fold_ratio": 0.5,
+    "minimum_positive_parameter_neighbor_ratio": 0.5,
+    "pbo_random_seed": 20260814,
+    "pbo_split_budget": 512
+  },
+  "walk_forward": {
+    "embargo_bars": 24,
+    "minimum_train_bars": 8760,
+    "step_bars": 2160,
+    "test_bars": 2160
+  }
+}
