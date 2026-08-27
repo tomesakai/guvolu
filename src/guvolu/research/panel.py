@@ -744,8 +744,15 @@ def _panel_path_groups(
         return (inputs.paths,)
     partition_paths = tuple(item.path.resolve() for item in inputs.partitions)
     input_paths = tuple(path.resolve() for path in inputs.paths)
+    # 空分区不读取也不成组
+    # 内容寻址下共用空文件
+    material_paths = tuple(
+        item.path.resolve()
+        for item in inputs.partitions
+        if item.row_count > 0
+    )
     if (
-        len(set(partition_paths)) != len(partition_paths)
+        len(set(material_paths)) != len(material_paths)
         or set(partition_paths) != set(input_paths)
     ):
         raise ValueError("冻结输入的文件覆盖与控制面分区不一致")

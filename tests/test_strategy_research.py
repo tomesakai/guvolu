@@ -2613,3 +2613,64 @@ def test_config_lineage_rejects_invalid_and_excessive_chains(
         parent_hash = hashlib.sha256(child.read_bytes()).hexdigest()
     with pytest.raises(ValueError, match="最大深度"):
         verify_config_lineage(tmp_path, parent)
+
+
+def _grouping_inputs(
+    paths: tuple[Path, ...],
+    partitions: tuple[FrozenPanelPartition, ...],
+) -> FrozenPanelInputs:
+    """构造只用于分组校验的冻结输入。"""
+    return FrozenPanelInputs(
+        market={
+            "market_id": "m", "venue_id": "bitbank", "mapping_revision": 0,
+            "tick_size": "1", "size_step": "0.1",
+        },
+        paths=paths,
+        head_generation="sha256-" + "3" * 64,
+        attempt_ids=tuple(f"a{index}" for index in range(len(partitions))),
+        artifact_ids=tuple(f"r{index}" for index in range(len(partitions))),
+        normalization_versions=("v1",),
+        maximum_event_time=_time(1),
+        partitions=partitions,
+    )
+
+
+def test_panel_groups_allow_content_addressed_empty_partitions(
+    tmp_path: Path,
+) -> None:
+    """空片段内容相同而共用一个制品时仍可成组。"""
+    # 稀疏市场会封存空片段
+    # 空 Parquet 散列必然相同
+    empty = tmp_path / "empty.parquet"
+    first = tmp_path / "first.parquet"
+    second = tmp_path / "second.parquet"
+    inputs = _grouping_inputs(
+        (empty, first, second),
+        (
+            FrozenPanelPartition(empty, 0, None, None),
+            FrozenPanelPartition(empty, 0, None, None),
+            FrozenPanelPartition(empty, 0, None, None),
+            FrozenPanelPartition(first, 1, _time(0, 10), _time(0, 10)),
+            FrozenPanelPartition(second, 1, _time(0, 20), _time(0, 20)),
+        ),
+    )
+    assert _panel_path_groups(inputs, _time(0), _time(1)) == (
+        (first.resolve(),), (second.resolve(),),
+    )
+
+
+def test_panel_groups_still_reject_duplicate_material_partitions(
+    tmp_path: Path,
+) -> None:
+    """两个有行分区共用一个文件仍必须拒绝。"""
+    # 有行文件重复会重复计数
+    shared = tmp_path / "shared.parquet"
+    inputs = _grouping_inputs(
+        (shared,),
+        (
+            FrozenPanelPartition(shared, 1, _time(0, 10), _time(0, 10)),
+            FrozenPanelPartition(shared, 2, _time(0, 20), _time(0, 20)),
+        ),
+    )
+    with pytest.raises(ValueError, match="冻结输入的文件覆盖与控制面分区不一致"):
+        _panel_path_groups(inputs, _time(0), _time(1))
