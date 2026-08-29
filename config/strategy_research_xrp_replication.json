@@ -28,13 +28,15 @@
   },
   "cross_venue_shadow": {
     "market_ids": [
-      "mkt__gmo__xrp__r0",
-      "mkt__bitbank__xrp_jpy__r0"
+      "mkt__gmo__btc__r0",
+      "mkt__bitbank__btc_jpy__r0",
+      "mkt__bitflyer__btc_jpy__r0"
     ],
     "maximum_age_seconds": 5,
     "minimum_quorum": 2,
     "taker_fee_bps_assumptions": {
       "bitbank": 12.0,
+      "bitflyer": 15.0,
       "gmo": 5.0
     }
   },
@@ -51,8 +53,7 @@
   },
   "derivation_note": {
     "changed_axes": [
-      "market_id",
-      "cross_venue_shadow"
+      "market_id"
     ],
     "method_version": "cross-instrument-replication-v1",
     "reason": "out_of_instrument_replication_of_price_breakout",
