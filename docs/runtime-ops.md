@@ -406,7 +406,9 @@ watcher 退化为近乎连续的全量重扫，长期占用 `sqlite_writer_lock`
 （`scripts/run_daily_materializer_catchup.ps1`，依次全量物化逐笔、L2 与市场
 状态）兜底。冻结运行根刷新（`scripts/refresh_frozen_runtime.py`）在 SQLite
 备份期间短暂持有生产数据根写锁，避免并发提交反复重启备份；各 watcher 按
-既有等锁语义顺延一轮。
+既有等锁语义顺延一轮。重型研究运行避开每小时第 15 至 45 分钟的冻结前向
+执行窗，不与冻结预测器争用计算与磁盘（2026-08-30 实测：并发时预测耗时
+约翻倍并触发预测年龄门失败）。
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run_trade_materializer.ps1 `

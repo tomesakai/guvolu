@@ -254,7 +254,7 @@ flowchart LR
 | **TBD-29** | 盘口判读标注与 book_feature 派生事件表 | 2026-08-10 增补 `analysis_run` 全判定台账、逐条件子分、基线与源码身份；`book_feature` 仅保留成立事件并引用 run。同日续补（库 v6）：台账加数值基准与窗列数两列、检索端点 `GET /api/analysis-runs`；区域分析与档带追踪响应加视界截断旗标（footprint-design 6.9 节）。自动扫描仍未实现 |
 | **TBD-30** | 判读层阈值标定方法 | 提案见同文档第 8 节序二，方法细则待开题时补 |
 | **TBD-31** | 保活链与进程操作端点 | 公共市场数据采用登录启动加五分钟幂等守护；包含三所 L2、逐笔、L2/逐笔物化、book-state 与 OFL 四类物化任务，不含交易进程。进程管理器仍按命令行收编，拉起幂等。见 [runtime-ops.md](runtime-ops.md) |
-| **TBD-32** | 法币汇率来源（美元系对照的汇率腿） | 仍未实现；任何 USD/USDT 与 JPY 比较必须使用独立、PIT 可审计的 FX 制品，缺 FX 时保持不同 instrument，不直接换算 |
+| **TBD-32** | 法币汇率来源（美元系对照的汇率腿） | 【提案 2026-08-30】三源零成本方案：日本银行官方日频参考价为审计锚；Open Exchange Rates 免费档（每月一千次、小时频）为主采集源；GMO Coin Forex 公共 API 为实时旁路（与执行所同集团，不充当独立腿）。FX 事实按 PIT 采集入 raw 与内容寻址制品后方可用于换算；实施前维持不同 instrument 不换算。供应商查证依据见 2026-08-29 调查（Kaiko、Tardis、CoinAPI 均无 GMO 覆盖，FX 腿无需付费源） |
 | **TBD-33** | 报警规则实例与 alert_event 派生表 | 提案 2026-08-08 见 [footprint-design.md](footprint-design.md) 第 6.8 节；随 OFL 页实施；提案实施中（2026-08-09）后端半场：`alert_event` 表（schema v3）、规则实例配置 `config/alert_rules.json`、报警清单与确认端点、区域判读落库即流上匹配；2026-08-10 规则实例增带几何维度（band_bp 标准带或显式价带，匹配器按规则带评估，缺省沿用请求带并记录来源），缺省规则带几何按复核快照 4.4 节再现几何取值；自动检测器属 TBD-30 未做 |
 | **TBD-34** | LLM 决策管线的输入输出构造与台账 | 提案 2026-08-09 见 [llm-pipeline-design.md](llm-pipeline-design.md)；研究进程内、无下单通路、输入内容寻址、输出 schema 校验 |
 | **TBD-35** | 热冷存储根、路径解析与迁移事务 | 【已实现首批 2026-08-22】逻辑 `storage_path` 继续保持数据根相对路径；物理存储根以稳定 `storage_root_id`、卷 GUID、分区 GUID、卷标、哨兵 SHA-256 和逻辑前缀路由共同识别。冷盘离线、身份不符或哨兵变异时读取失败，不按盘符猜测。E 盘兼作受控温层，但只接已封口、有散列、可重放制品；SQLite、锁、开放段与执行状态固定在 C 盘。迁移固定为规划、复制、双端散列、登记、切换、观察和热副本释放七阶段；原始事实不改写。结构见 [materialization-design.md](materialization-design.md) 第 8 节，操作见 [runtime-ops.md](runtime-ops.md) 第 8 节 |
