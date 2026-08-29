@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -171,6 +172,7 @@ def run_paper_step(
     *,
     market_id: str,
     symbol: str,
+    prediction_sha: str,
 ) -> dict[str, object]:
     """以独立 paper 目标运行 paper 执行器并校验零写报告。
 
@@ -197,6 +199,8 @@ def run_paper_step(
                     "--config", str(execution / PAPER_CONFIG),
                     "--ledger-root", str(execution / PAPER_LEDGER_ROOT),
                     "--report", str(report_path),
+                    "--source-prediction", str(prediction_path),
+                    "--source-prediction-sha256", prediction_sha,
                 ),
                 cwd=execution,
             )
@@ -263,6 +267,10 @@ def run_shadow(
         )).resolve()
         if not prediction_path.is_relative_to(runtime) or not prediction_path.is_file():
             raise ValueError("预测路径越出冻结运行根")
+        # 编排侧固定来源预测散列（v2 血缘）
+        prediction_sha = hashlib.sha256(
+            prediction_path.read_bytes()
+        ).hexdigest()
         decision_time = datetime.fromisoformat(_text(
             prediction.get("decision_time"), "decision_time",
         )).astimezone(UTC)
@@ -289,6 +297,8 @@ def run_shadow(
                     "--target", str(target_path), "--symbol", symbol,
                     "--budget-jpy", budget_jpy, "--ledger", str(ledger_path),
                     "--dry-run-report", str(report_path),
+                    "--source-prediction", str(prediction_path),
+                    "--source-prediction-sha256", prediction_sha,
                 ),
                 cwd=execution,
             )
@@ -302,6 +312,7 @@ def run_shadow(
             paper = run_paper_step(
                 execution, exec_python, prediction_path, prediction_id,
                 market_id=market_id, symbol=symbol,
+                prediction_sha=prediction_sha,
             )
         else:
             paper = {"status": "skipped", "reason": "--no-paper"}
