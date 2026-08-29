@@ -58,6 +58,19 @@ class WalkForwardFold:
 
 
 @dataclass(frozen=True)
+class SelectionStabilityGate:
+    """显式声明的选择稳定性闸门模式与阈值。
+
+    仅在配置声明 `selection_stability_gate_mode` 时存在；
+    旧配置（无该键）保持隐式 `pbo_hard` 行为且不产生披露。
+    """
+
+    mode: str
+    maximum_probability_backtest_overfitting: float
+    minimum_median_cscv_oos_rank: float | None = None
+
+
+@dataclass(frozen=True)
 class ValidationResult:
     """全家族验证及候选目标。"""
 
@@ -70,6 +83,7 @@ class ValidationResult:
     )
     block_bootstrap_method_version: str = BLOCK_BOOTSTRAP_METHOD_VERSION
     regime_attribution_method_version: str | None = None
+    selection_stability_gate: SelectionStabilityGate | None = None
 
 
 @dataclass(frozen=True)
@@ -114,6 +128,85 @@ def _number(value: object, name: str) -> float:
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         raise ValueError(f"{name} 必须为数值")
     return float(value)
+
+
+DEFAULT_MINIMUM_MEDIAN_CSCV_OOS_RANK = 0.5
+
+
+def parse_selection_stability_gate(
+    validation: Mapping[str, object],
+    maximum_pbo: float,
+) -> SelectionStabilityGate | None:
+    """解析选择稳定性闸门配置（G-06）。
+
+    未声明 `selection_stability_gate_mode` 时返回 None，
+    调用方保持既有 PBO 硬闸门行为与既有摘要字节；
+    声明后校验模式取值与阈值开区间 (0, 1)。
+    """
+    raw_mode = validation.get("selection_stability_gate_mode")
+    if raw_mode is None:
+        if "minimum_median_cscv_oos_rank" in validation:
+            raise ValueError(
+                "minimum_median_cscv_oos_rank 需要显式声明 "
+                "selection_stability_gate_mode"
+            )
+        return None
+    if raw_mode not in ("pbo_hard", "median_rank"):
+        raise ValueError(
+            "selection_stability_gate_mode 只能为 pbo_hard 或 median_rank"
+        )
+    if raw_mode == "pbo_hard":
+        if "minimum_median_cscv_oos_rank" in validation:
+            raise ValueError(
+                "pbo_hard 模式不接受 minimum_median_cscv_oos_rank"
+            )
+        return SelectionStabilityGate(
+            mode="pbo_hard",
+            maximum_probability_backtest_overfitting=maximum_pbo,
+        )
+    minimum_rank = _number(
+        validation.get(
+            "minimum_median_cscv_oos_rank",
+            DEFAULT_MINIMUM_MEDIAN_CSCV_OOS_RANK,
+        ),
+        "minimum_median_cscv_oos_rank",
+    )
+    if not 0.0 < minimum_rank < 1.0:
+        raise ValueError("minimum_median_cscv_oos_rank 必须位于零到一开区间")
+    return SelectionStabilityGate(
+        mode="median_rank",
+        maximum_probability_backtest_overfitting=maximum_pbo,
+        minimum_median_cscv_oos_rank=minimum_rank,
+    )
+
+
+def _selection_stability_reasons(
+    gate: SelectionStabilityGate | None,
+    maximum_pbo: float,
+    pbo: float,
+    median_cscv_rank: float,
+    cscv_split_count: int,
+) -> tuple[str, ...]:
+    """按闸门模式判定选择稳定性拒绝理由。
+
+    `median_rank` 模式要求折外平均秩中位数严格高于阈值；
+    分割数为零或秩缺失、非数时按 fail-closed 拒绝。
+    PBO 在该模式下仍完整计算并披露，不再阻断。
+    """
+    if gate is None or gate.mode == "pbo_hard":
+        if pbo > maximum_pbo:
+            return ("probability_backtest_overfitting_failed",)
+        return ()
+    minimum_rank = gate.minimum_median_cscv_oos_rank
+    if minimum_rank is None:
+        raise ValueError("median_rank 模式缺少秩中位数阈值")
+    if (
+        cscv_split_count <= 0
+        or math.isnan(median_cscv_rank)
+        or median_cscv_rank <= minimum_rank
+    ):
+        return ("median_cscv_oos_rank_failed",)
+    return ()
 
 
 def _probabilistic_sharpe_probability(
@@ -1324,6 +1417,9 @@ def walk_forward_validate(
         validation.get("maximum_probability_backtest_overfitting"),
         "maximum_probability_backtest_overfitting",
     )
+    selection_stability_gate = parse_selection_stability_gate(
+        validation, maximum_pbo,
+    )
     maximum_bootstrap_p = _number(
         validation.get("maximum_block_bootstrap_p_value"),
         "maximum_block_bootstrap_p_value",
@@ -1425,8 +1521,13 @@ def walk_forward_validate(
             reasons.append("fdr_threshold_failed")
         if item.positive_fold_ratio < minimum_positive_fold_ratio:
             reasons.append("positive_fold_ratio_failed")
-        if item.pbo > maximum_pbo:
-            reasons.append("probability_backtest_overfitting_failed")
+        reasons.extend(_selection_stability_reasons(
+            selection_stability_gate,
+            maximum_pbo,
+            item.pbo,
+            item.median_cscv_rank,
+            item.cscv_split_count,
+        ))
         if item.bootstrap_p > maximum_bootstrap_p:
             reasons.append("block_bootstrap_sharpe_failed")
         if effective_dsr < minimum_deflated_sharpe_probability:
@@ -1498,6 +1599,7 @@ def walk_forward_validate(
         family_validation_targets=family_validation_targets,
         block_bootstrap_method_version=block_bootstrap_method_version,
         regime_attribution_method_version=regime_attribution_method_version,
+        selection_stability_gate=selection_stability_gate,
     )
 
 

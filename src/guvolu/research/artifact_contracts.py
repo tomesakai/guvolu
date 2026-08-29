@@ -296,6 +296,20 @@ def family_payload(validation: ValidationResult) -> list[Mapping[str, object]]:
                 item.median_parameter_neighbor_sharpe_retention
             ),
         }
+        gate = validation.selection_stability_gate
+        # 未显式声明模式的旧摘要字节不变。
+        if gate is not None:
+            gate_payload: dict[str, object] = {
+                "mode": gate.mode,
+                "maximum_probability_backtest_overfitting": (
+                    gate.maximum_probability_backtest_overfitting
+                ),
+            }
+            if gate.minimum_median_cscv_oos_rank is not None:
+                gate_payload["minimum_median_cscv_oos_rank"] = (
+                    gate.minimum_median_cscv_oos_rank
+                )
+            payload["selection_stability_gate"] = gate_payload
         if validation.regime_attribution_method_version is not None:
             payload["regime_attribution"] = [
                 regime_attribution_payload(value)

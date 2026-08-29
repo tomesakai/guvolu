@@ -77,9 +77,17 @@ trial ledger，不删除失败候选（G-07）。准入同时要求：
 - 最大回撤不超过配置上限；
 - 全候选 Benjamini-Hochberg FDR 校正值不超过配置上限；
 - 成本后净收益为正的独立测试折比例达到配置下限；
-- CSCV 折块选择过拟合概率（PBO）不超过配置上限；
+- 选择稳定性闸门按配置声明的模式通过（见下段）；
 - 168 小时 studentized 循环折块 bootstrap 的 Sharpe 非正概率不超过 0.05；
 - 模式为 paper，shadow 不可因收益通过而获得本金。
+
+选择稳定性闸门由配置键 `selection_stability_gate_mode` 分派，键与阈值都随 `config_hash` 进入
+研究身份（G-06）。缺省 `pbo_hard` 为既有行为：`maximum_probability_backtest_overfitting`
+硬阻断，未声明该键的旧配置与旧运行重建逐字节不变。`median_rank` 改以 CSCV 折外平均秩中位数
+严格高于 `minimum_median_cscv_oos_rank`（纯噪声基线为 0.5）作准入；PBO 仍完整计算并写入摘要
+作披露，秩缺失或 CSCV 分割数为零时失败关闭拒绝。设第二种模式的依据即下文既有定性——`PBO`
+是选择稳定性诊断，不是盈利性指标：高度相关参数变体族在加密网格后折外秩趋近随机，PBO 硬阻断
+会与邻域证据的更密网格要求结构性互斥。两种模式的阈值只存在于版本化配置，本文不固化数值。
 
 结果同时输出固定多头、单策略、无 L2 overlay 和无 regime 消融。Sharpe 只是一项指标；
 报告还保留 turnover、drawdown、capacity、cost、hit rate、exposure 与质量归因。
