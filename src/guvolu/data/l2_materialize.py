@@ -349,10 +349,64 @@ _PARSERS = {
 }
 
 
+@dataclass(frozen=True)
+class ScanStats:
+    """一轮输入选择的扫描成本，用于发现语料线性退化。"""
+
+    scanned_manifests: int
+    hash_recomputed: int
+    hash_reused: int
+    elapsed_scan_seconds: float
+
+
+def _registered_input_hashes(
+    conn: sqlite3.Connection,
+) -> dict[str, tuple[str, int]]:
+    """取已完成 L2 attempt 输入制品的登记散列与字节数。"""
+    rows = conn.execute(
+        "SELECT DISTINCT r.storage_path,r.sha256,r.byte_count FROM artifact r "
+        "JOIN partition_input i ON i.artifact_id=r.artifact_id "
+        "JOIN partition_attempt a ON a.attempt_id=i.attempt_id "
+        "WHERE a.domain='book_l2' AND a.status LIKE 'complete%' "
+        "AND r.artifact_kind='raw_realtime_segment'"
+    ).fetchall()
+    return {
+        str(row[0]): (str(row[1]), int(row[2])) for row in rows
+    }
+
+
 def _sealed_inputs(
     root: Path, *, latest_run_only: bool = False,
     latest_sealed_segments_per_stream: int | None = None,
+    registered_hashes: Mapping[str, tuple[str, int]] | None = None,
 ) -> list[SegmentInput]:
+    return _scan_sealed_inputs(
+        root,
+        latest_run_only=latest_run_only,
+        latest_sealed_segments_per_stream=(
+            latest_sealed_segments_per_stream
+        ),
+        registered_hashes=registered_hashes,
+    )[0]
+
+
+def _scan_sealed_inputs(
+    root: Path, *, latest_run_only: bool = False,
+    latest_sealed_segments_per_stream: int | None = None,
+    registered_hashes: Mapping[str, tuple[str, int]] | None = None,
+) -> tuple[list[SegmentInput], ScanStats]:
+    """选择封口 L2 segment，并报告本轮扫描成本。
+
+    ``registered_hashes`` 为控制面预筛：键是输入制品的登记 storage_path，
+    值是该制品已随某个完成态 book_l2 attempt 登记的散列与字节数。命中且
+    磁盘字节数、manifest 散列与字节数三者一致时复用登记散列，不再重算
+    SHA-256；任一不一致即抛错，不退化为静默重算。传 ``None`` 表示回到
+    逐个重算，用于审计。
+    """
+    started = time.monotonic()
+    scanned = 0
+    recomputed = 0
+    reused = 0
     _validate_input_selection(
         latest_run_only=latest_run_only,
         latest_sealed_segments_per_stream=(
@@ -362,12 +416,13 @@ def _sealed_inputs(
     inputs: list[SegmentInput] = []
     base = _resolve_recorded_path(root, "raw/realtime/book_l2")
     if not base.is_dir():
-        return []
+        return [], ScanStats(0, 0, 0, round(time.monotonic() - started, 3))
     manifests: list[tuple[Path, Mapping[str, object]]]
     if latest_sealed_segments_per_stream is not None:
         manifests = _latest_sealed_manifest_entries(
             base, latest_sealed_segments_per_stream,
         )
+        scanned = len(manifests)
     else:
         manifest_paths: list[Path]
         if latest_run_only:
@@ -380,6 +435,7 @@ def _sealed_inputs(
             manifest_paths = sorted(base.rglob("segment-*.manifest.json"))
         manifests = []
         for manifest_path in manifest_paths:
+            scanned += 1
             body = json.loads(manifest_path.read_text(encoding="utf-8"))
             if not isinstance(body, Mapping):
                 continue
@@ -416,11 +472,24 @@ def _sealed_inputs(
         path = _resolve_recorded_path(root, recorded)
         if path != expected_path:
             raise ValueError(f"manifest 与 segment 不同目录: {recorded}")
-        sha = sha256_file(path)
-        if sha != str(body["sha256"]):
-            raise ValueError(f"segment 散列不符: {recorded}")
-        if path.stat().st_size != int(str(body["byte_count"])):
+        recorded_sha = str(body["sha256"])
+        recorded_bytes = int(str(body["byte_count"]))
+        if path.stat().st_size != recorded_bytes:
             raise ValueError(f"segment 字节数不符: {recorded}")
+        registered = (
+            None if registered_hashes is None
+            else registered_hashes.get(recorded)
+        )
+        if registered is None:
+            sha = sha256_file(path)
+            recomputed += 1
+            if sha != recorded_sha:
+                raise ValueError(f"segment 散列不符: {recorded}")
+        else:
+            if registered != (recorded_sha, recorded_bytes):
+                raise ValueError(f"segment 登记散列不符: {recorded}")
+            sha = recorded_sha
+            reused += 1
         if body.get("artifact_id") not in {None, artifact_id(sha)}:
             raise ValueError(f"segment artifact_id 不符: {recorded}")
         source_rows = int(str(body["record_count"]))
@@ -485,7 +554,10 @@ def _sealed_inputs(
                 normalized_rows=0, rejected_rows=0,
             ),
         ))
-    return inputs
+    return inputs, ScanStats(
+        scanned, recomputed, reused,
+        round(time.monotonic() - started, 3),
+    )
 
 
 def _validate_input_selection(
@@ -1790,13 +1862,37 @@ def materialize_all(
     report_reused: bool = True,
     latest_run_only: bool = False,
     latest_sealed_segments_per_stream: int | None = None,
+    verify_all_hashes: bool = False,
 ) -> list[L2Result]:
     """断点复用地物化全部已封口 L2 segment。"""
-    inputs = _sealed_inputs(
+    return _materialize_cycle(
+        root, conn, report_reused=report_reused,
+        latest_run_only=latest_run_only,
+        latest_sealed_segments_per_stream=(
+            latest_sealed_segments_per_stream
+        ),
+        verify_all_hashes=verify_all_hashes,
+    )[0]
+
+
+def _materialize_cycle(
+    root: Path,
+    conn: sqlite3.Connection,
+    *,
+    report_reused: bool = True,
+    latest_run_only: bool = False,
+    latest_sealed_segments_per_stream: int | None = None,
+    verify_all_hashes: bool = False,
+) -> tuple[list[L2Result], ScanStats]:
+    """物化一轮并返回扫描成本。"""
+    inputs, stats = _scan_sealed_inputs(
         root,
         latest_run_only=latest_run_only,
         latest_sealed_segments_per_stream=(
             latest_sealed_segments_per_stream
+        ),
+        registered_hashes=(
+            None if verify_all_hashes else _registered_input_hashes(conn)
         ),
     )
     results: list[L2Result] = []
@@ -1812,7 +1908,7 @@ def materialize_all(
                 f"ignored={result.ignored_rows} rejected={result.rejected_rows}",
                 flush=True,
             )
-    return results
+    return results, stats
 
 
 def audit_l2(root: Path, conn: sqlite3.Connection) -> dict[str, object]:
@@ -2081,6 +2177,7 @@ def _watch(
     *,
     latest_run_only: bool,
     latest_sealed_segments_per_stream: int | None,
+    verify_all_hashes: bool = False,
 ) -> int:
     selection = _watch_selection(
         latest_run_only=latest_run_only,
@@ -2096,6 +2193,7 @@ def _watch(
             latest_sealed_segments_per_stream=(
                 latest_sealed_segments_per_stream
             ),
+            verify_all_hashes=verify_all_hashes,
         )
 
 
@@ -2105,6 +2203,7 @@ def _watch_as_owner(
     *,
     latest_run_only: bool,
     latest_sealed_segments_per_stream: int | None,
+    verify_all_hashes: bool = False,
 ) -> int:
     """持续追赶封口盘口；启动锁竞争只延后本轮。"""
     def report_connect_error(exc: Exception, elapsed: float) -> None:
@@ -2127,12 +2226,13 @@ def _watch_as_owner(
             cycle_started = time.monotonic()
             try:
                 with sqlite_writer_lock(root):
-                    cycle = materialize_all(
+                    cycle, stats = _materialize_cycle(
                         root, conn, report_reused=False,
                         latest_run_only=latest_run_only,
                         latest_sealed_segments_per_stream=(
                             latest_sealed_segments_per_stream
                         ),
+                        verify_all_hashes=verify_all_hashes,
                     )
                     market_status_summary: dict[str, object] | None
                     market_status_error: Exception | None
@@ -2184,6 +2284,7 @@ def _watch_as_owner(
                     "latest_sealed_segments_per_stream": (
                         latest_sealed_segments_per_stream
                     ),
+                    "verify_all_hashes": verify_all_hashes,
                     "sealed_segments": len(cycle),
                     "materialized_now": len(created),
                     "frames_now": sum(
@@ -2192,6 +2293,10 @@ def _watch_as_owner(
                     "levels_now": sum(
                         result.level_rows for result in created
                     ),
+                    "scanned_manifests": stats.scanned_manifests,
+                    "hash_recomputed": stats.hash_recomputed,
+                    "hash_reused": stats.hash_reused,
+                    "elapsed_scan_seconds": stats.elapsed_scan_seconds,
                     "elapsed_seconds": round(
                         time.monotonic() - cycle_started, 3
                     ),
@@ -2244,6 +2349,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             "每个 (venue,symbol) 最新 run 仅物化按 sealed_at 最新的 N 片"
         ),
     )
+    all_parser.add_argument(
+        "--verify-all-hashes", action="store_true",
+        help="关闭控制面散列预筛，逐个重算输入散列",
+    )
     sub.add_parser("audit", help="审计活动 L2 输出", allow_abbrev=False)
     watch = sub.add_parser(
         "watch", help="周期追赶新封口 segment", allow_abbrev=False,
@@ -2258,6 +2367,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             "每个 (venue,symbol) 最新 run 仅追赶按 sealed_at 最新的 N 片"
         ),
     )
+    watch.add_argument(
+        "--verify-all-hashes", action="store_true",
+        help="关闭控制面散列预筛，逐个重算输入散列",
+    )
     args = parser.parse_args(argv)
     root = (args.data_root or configured_data_root()).resolve()
     if args.command == "watch":
@@ -2271,6 +2384,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             latest_sealed_segments_per_stream=(
                 args.latest_sealed_segments_per_stream
             ),
+            verify_all_hashes=bool(args.verify_all_hashes),
         )
 
     conn = store.connect(root)
@@ -2283,6 +2397,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     latest_sealed_segments_per_stream=(
                         args.latest_sealed_segments_per_stream
                     ),
+                    verify_all_hashes=bool(args.verify_all_hashes),
                 )
             results: object = [asdict(result) for result in completed]
             code = 0

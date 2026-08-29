@@ -363,13 +363,15 @@ book-state checkpoint v3 与 OFL v8 物化器。
 只有原采集器正常封口的段可进入旧版兼容重投影，崩溃尾段继续按
 `recovered_incomplete` 隔离。守护任务在受控切换完成并确认单写者后再恢复启用。
 
-### 8.1 实时逐笔增量输入选择
+### 8.1 实时物化器增量输入选择
 
-实时逐笔物化器每轮曾对 `raw/realtime/trade_realtime` 下全部
+实时逐笔与三所 L2 物化器每轮曾对各自 raw 目录下全部
 `segment-*.manifest.json` 做一次全量重扫，并逐段重算 SHA-256。该成本随语料
-线性增长：语料到达 15,024 段、631 MB 时单轮扫描已超过 watcher 的 300 秒周期，
+线性增长：逐笔语料到达 15,024 段、631 MB 时单轮扫描已超过 watcher 的 300 秒
+周期；L2 语料到达 35,567 段、27 GiB 时（2026-08-29 实测）单轮重散列长达数小时，
 watcher 退化为近乎连续的全量重扫，长期占用 `sqlite_writer_lock`，其他物化器
-以 `TimeoutError` 失败。
+以 `TimeoutError` 失败，全部活动 head 停滞。本节合同同时适用于
+`trade_realtime_materialize` 与 `l2_materialize` 两个入口。
 
 `all` 与 `watch` 两个子命令因此提供一组互斥的输入选择开关：
 
@@ -384,13 +386,14 @@ watcher 退化为近乎连续的全量重扫，长期占用 `sqlite_writer_lock`
 的所有流从输入集消失。
 
 散列复用预筛独立于上述选择，缺省启用。它先从控制面读取已属于完成态
-`trade_realtime` attempt 的输入制品登记散列与字节数，再逐段比对磁盘字节数、
-manifest 记录的散列与字节数；三者一致才复用登记散列，跳过全量重算。任一不一致
-即抛出错误并中止本轮，不退化为静默重算。预筛的正确性以 raw 不可变为前提，
-因此它不能发现保持字节数不变的原地改写；`--verify-all-hashes` 关闭预筛、
-回到逐段重算，用于审计。
+`trade_realtime` 或 `book_l2` attempt 的输入制品登记散列与字节数，再逐段比对
+磁盘字节数、manifest 记录的散列与字节数；三者一致才复用登记散列，跳过全量
+重算。任一不一致即抛出错误并中止本轮，不退化为静默重算。预筛的正确性以 raw
+不可变为前提，因此它不能发现保持字节数不变的原地改写；`--verify-all-hashes`
+关闭预筛、回到逐段重算，用于审计。
 
-每轮 `watch` 的 `trade_realtime_materialization_cycle` 事件附带
+每轮 `watch` 的 `trade_realtime_materialization_cycle` 与
+`l2_materialization_cycle` 事件附带
 `input_selection`、`latest_sealed_segments_per_stream`、`verify_all_hashes`、
 `scanned_manifests`、`hash_recomputed`、`hash_reused` 与 `elapsed_scan_seconds`。
 `scanned_manifests` 或 `elapsed_scan_seconds` 随日期上行即为退化信号；稳定运行时

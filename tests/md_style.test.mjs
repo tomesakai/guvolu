@@ -12,7 +12,7 @@ const EXCLUDE = new Set([
   ".git", "__pycache__", ".venv", ".venv-gpu", "venv", "node_modules",
   ".pytest_cache", ".mypy_cache", ".ruff_cache", "dist",
   "data", "logs",
-  "gpu-factor-mining-v1.1", "outsides",
+  "gpu-factor-mining-v1.1", "outsides", "worktrees",
 ]);
 
 const CJK = /[\u4e00-\u9fff]/;

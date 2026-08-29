@@ -1028,7 +1028,9 @@ def test_bounded_freshness_rechecks_selected_content_receipt(
     )
     _write_run_checkpoint(tmp_path, "gmo", "BTC", "run-current")
     segment = next(tmp_path.rglob("segment-000001.jsonl"))
-    segment.write_text("tampered\n", encoding="utf-8")
+    original = segment.read_bytes()
+    # 等长篡改，绕过字节数复核，专测散列复核。
+    segment.write_bytes(b"X" * (len(original) - 1) + b"\n")
 
     with pytest.raises(ValueError, match="segment 散列不符"):
         _sealed_inputs(
@@ -1332,3 +1334,114 @@ def test_raw_v3_rejects_endpoint_revision_not_recorded_by_manifest() -> None:
 
     with pytest.raises(ValueError, match="endpoint_revision"):
         _raw_metadata(envelope, item, descriptor)
+
+
+def _count_hashes(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """统计 sha256_file 实际调用次数。"""
+    calls = [0]
+    original = l2_module.sha256_file
+
+    def counted(path: Path) -> str:
+        calls[0] += 1
+        return original(path)
+
+    monkeypatch.setattr(l2_module, "sha256_file", counted)
+    return calls
+
+
+def test_l2_registered_hash_prefilter_reuses_completed_input_hash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """已完成 L2 attempt 的输入不再重算散列。"""
+    _write_segment(
+        tmp_path, "gmo", "BTC", "run-prefilter",
+        [(_gmo_payload(), "run-prefilter-c000001", "orderbooks")],
+        schema_version=3,
+    )
+    conn = store.connect(tmp_path)
+    try:
+        assert len(
+            l2_module.materialize_all(tmp_path, conn, report_reused=False)
+        ) == 1
+        calls = _count_hashes(monkeypatch)
+        results, stats = l2_module._materialize_cycle(
+            tmp_path, conn, report_reused=False,
+        )
+        assert [result.reused for result in results] == [True]
+        assert calls[0] == 0
+        assert (stats.hash_reused, stats.hash_recomputed) == (1, 0)
+        assert stats.scanned_manifests == 1
+        assert stats.elapsed_scan_seconds >= 0
+    finally:
+        conn.close()
+
+
+def test_l2_verify_all_hashes_restores_full_recompute(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """审计开关关闭预筛，回到逐个重算。"""
+    _write_segment(
+        tmp_path, "gmo", "BTC", "run-audit",
+        [(_gmo_payload(), "run-audit-c000001", "orderbooks")],
+        schema_version=3,
+    )
+    conn = store.connect(tmp_path)
+    try:
+        l2_module.materialize_all(tmp_path, conn, report_reused=False)
+        calls = _count_hashes(monkeypatch)
+        _, stats = l2_module._materialize_cycle(
+            tmp_path, conn, report_reused=False, verify_all_hashes=True,
+        )
+        assert calls[0] == 1
+        assert (stats.hash_reused, stats.hash_recomputed) == (0, 1)
+    finally:
+        conn.close()
+
+
+def test_l2_prefilter_still_fails_closed_on_size_mismatch(
+    tmp_path: Path,
+) -> None:
+    """预筛不得让磁盘字节数漂移逃过失败关闭。"""
+    _write_segment(
+        tmp_path, "gmo", "BTC", "run-size-drift",
+        [(_gmo_payload(), "run-size-drift-c000001", "orderbooks")],
+        schema_version=3,
+    )
+    conn = store.connect(tmp_path)
+    try:
+        l2_module.materialize_all(tmp_path, conn, report_reused=False)
+        registered = l2_module._registered_input_hashes(conn)
+        assert len(registered) == 1
+        segment = tmp_path / next(iter(registered))
+        with segment.open("ab") as stream:
+            stream.write(b"\n")
+        with pytest.raises(ValueError, match="字节数不符"):
+            _sealed_inputs(tmp_path, registered_hashes=registered)
+    finally:
+        conn.close()
+
+
+def test_l2_prefilter_rejects_manifest_rewritten_against_registry(
+    tmp_path: Path,
+) -> None:
+    """manifest 与登记散列不符时预筛抛错，不静默复用。"""
+    _write_segment(
+        tmp_path, "gmo", "BTC", "run-rewritten",
+        [(_gmo_payload(), "run-rewritten-c000001", "orderbooks")],
+        schema_version=3,
+    )
+    conn = store.connect(tmp_path)
+    try:
+        l2_module.materialize_all(tmp_path, conn, report_reused=False)
+        registered = l2_module._registered_input_hashes(conn)
+        manifest_path = next(
+            tmp_path.rglob("segment-000001.manifest.json")
+        )
+        body = json.loads(manifest_path.read_text(encoding="utf-8"))
+        forged = hashlib.sha256(b"forged").hexdigest()
+        body.update({"sha256": forged, "artifact_id": f"sha256-{forged}"})
+        manifest_path.write_text(json.dumps(body), encoding="utf-8")
+        with pytest.raises(ValueError, match="登记散列不符"):
+            _sealed_inputs(tmp_path, registered_hashes=registered)
+    finally:
+        conn.close()
