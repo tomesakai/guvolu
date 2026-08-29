@@ -6,7 +6,9 @@ param(
     [string]$Repository = '',
     [switch]$L2LatestRunOnly,
     [ValidateRange(1, 2147483647)]
-    [Nullable[int]]$L2LatestSealedSegmentsPerStream = $null
+    [Nullable[int]]$L2LatestSealedSegmentsPerStream = $null,
+    [ValidateRange(1, 2147483647)]
+    [Nullable[int]]$TradeLatestSealedSegmentsPerStream = $null
 )
 
 $ErrorActionPreference = 'Stop'
@@ -18,10 +20,11 @@ if ($L2LatestRunOnly -and $null -ne $L2LatestSealedSegmentsPerStream) {
 if (
     $Profile -eq 'ForwardMinimal' -and (
         $L2LatestRunOnly -or
-        $null -ne $L2LatestSealedSegmentsPerStream
+        $null -ne $L2LatestSealedSegmentsPerStream -or
+        $null -ne $TradeLatestSealedSegmentsPerStream
     )
 ) {
-    throw 'L2 input selection cannot be used with ForwardMinimal.'
+    throw 'Input selection cannot be used with ForwardMinimal.'
 }
 $RepoRoot = if ($Repository) {
     (Resolve-Path -LiteralPath $Repository).Path
@@ -859,6 +862,15 @@ foreach ($Materializer in $Materializers) {
         "-File `"$RunnerPath`" -Repository `"$RepoRoot`" " +
         '-IntervalSeconds 300'
     )
+    if (
+        $Materializer.Name -eq 'trade-realtime-materializer' -and
+        $null -ne $TradeLatestSealedSegmentsPerStream
+    ) {
+        $Arguments += (
+            ' -LatestSealedSegmentsPerStream ' +
+            [string]$TradeLatestSealedSegmentsPerStream
+        )
+    }
     $Started = Start-Process -FilePath 'powershell.exe' `
         -ArgumentList $Arguments -WorkingDirectory $RepoRoot `
         -WindowStyle $WindowStyle -PassThru

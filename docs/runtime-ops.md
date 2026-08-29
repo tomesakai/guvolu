@@ -402,7 +402,11 @@ watcher 退化为近乎连续的全量重扫，长期占用 `sqlite_writer_lock`
 运维缺省为：常驻 watcher 用 `--latest-sealed-segments-per-stream`，N 按封口周期
 与 watcher 周期之比留余量，取值随任务配置版本化（G-06），不在本文固化为事实；
 补历史与定期审计用缺省全量模式，并周期性加 `--verify-all-hashes` 做一次全量
-散列复核。
+散列复核。增量模式下超出最新窗口的封口段与 bitbank 市场状态由每日补漏任务
+（`scripts/run_daily_materializer_catchup.ps1`，依次全量物化逐笔、L2 与市场
+状态）兜底。冻结运行根刷新（`scripts/refresh_frozen_runtime.py`）在 SQLite
+备份期间短暂持有生产数据根写锁，避免并发提交反复重启备份；各 watcher 按
+既有等锁语义顺延一轮。
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run_trade_materializer.ps1 `

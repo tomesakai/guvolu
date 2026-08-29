@@ -104,7 +104,9 @@ def refresh_runtime(
     total_bytes = 0
     with sqlite_writer_lock(runtime_data, timeout_seconds=120.0):
         try:
-            _backup(source_db, temporary_db)
+            # 备份期静默生产写者，防外部提交重启备份
+            with sqlite_writer_lock(source_root, timeout_seconds=120.0):
+                _backup(source_db, temporary_db)
             inputs = _active_inputs(temporary_db, market_id)
             if not inputs:
                 raise LookupError(f"市场没有活动成交输出: {market_id}")

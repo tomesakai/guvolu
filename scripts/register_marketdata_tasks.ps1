@@ -2,7 +2,11 @@ param(
     [switch]$Unregister,
     [ValidateSet('Full', 'ForwardMinimal')]
     [string]$Profile = 'Full',
-    [string]$Repository = ''
+    [string]$Repository = '',
+    [ValidateRange(1, 2147483647)]
+    [Nullable[int]]$L2LatestSealedSegmentsPerStream = $null,
+    [ValidateRange(1, 2147483647)]
+    [Nullable[int]]$TradeLatestSealedSegmentsPerStream = $null
 )
 
 $ErrorActionPreference = 'Stop'
@@ -38,6 +42,18 @@ $Argument = (
     "-File `"$StartScript`" -WindowStyle Hidden " +
     "-Profile $Profile -Repository `"$RepoRoot`""
 )
+if ($null -ne $L2LatestSealedSegmentsPerStream) {
+    $Argument += (
+        ' -L2LatestSealedSegmentsPerStream ' +
+        [string]$L2LatestSealedSegmentsPerStream
+    )
+}
+if ($null -ne $TradeLatestSealedSegmentsPerStream) {
+    $Argument += (
+        ' -TradeLatestSealedSegmentsPerStream ' +
+        [string]$TradeLatestSealedSegmentsPerStream
+    )
+}
 $Action = New-ScheduledTaskAction -Execute 'powershell.exe' `
     -Argument $Argument -WorkingDirectory $RepoRoot
 $Principal = New-ScheduledTaskPrincipal -UserId $CurrentUser `
