@@ -6,7 +6,7 @@ import json
 import os
 import sqlite3
 import tempfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 from guvolu.data.durable_io import atomic_write_text
@@ -203,6 +203,12 @@ def _copy_rows(
     rows = source.execute(
         f"SELECT * FROM {table} WHERE {where}", parameters,
     ).fetchall()
+    return _insert_rows(target, table, rows)
+
+
+def _insert_rows(
+    target: sqlite3.Connection, table: str, rows: Sequence[sqlite3.Row],
+) -> int:
     if not rows:
         return 0
     placeholders = ",".join("?" for _ in range(len(rows[0])))
@@ -210,6 +216,37 @@ def _copy_rows(
         f"INSERT INTO {table} VALUES ({placeholders})", rows,
     )
     return len(rows)
+
+
+# 单条查询的键参数分块上限
+_IN_CHUNK_SIZE = 800
+
+
+def _copy_rows_chunked(
+    source: sqlite3.Connection,
+    target: sqlite3.Connection,
+    table: str,
+    key_column: str,
+    values: Sequence[str],
+    *,
+    row_filter: Callable[[sqlite3.Row], bool] | None = None,
+) -> int:
+    """按键分块复制，绕开 SQLite 变量数上限。
+
+    复合条件由 ``row_filter`` 在读出后判定，语义与整句 AND 相同；
+    键集合去重排序由调用方保证。
+    """
+    total = 0
+    for start in range(0, len(values), _IN_CHUNK_SIZE):
+        chunk = tuple(values[start:start + _IN_CHUNK_SIZE])
+        rows = source.execute(
+            f"SELECT * FROM {table} WHERE {key_column} IN ({_marks(chunk)})",
+            chunk,
+        ).fetchall()
+        if row_filter is not None:
+            rows = [row for row in rows if row_filter(row)]
+        total += _insert_rows(target, table, rows)
+    return total
 
 
 def _marks(values: Sequence[str]) -> str:
@@ -273,35 +310,23 @@ def _build_minimal_control_plane(
             f"market_id IN ({_marks(ordered_markets)})",
             ordered_markets,
         )
-        counts["partition_attempt"] = _copy_rows(
-            source,
-            target,
-            "partition_attempt",
-            f"attempt_id IN ({_marks(attempt_ids)})",
+        counts["partition_attempt"] = _copy_rows_chunked(
+            source, target, "partition_attempt", "attempt_id", attempt_ids,
+        )
+        counts["artifact"] = _copy_rows_chunked(
+            source, target, "artifact", "artifact_id", artifact_ids,
+        )
+        artifact_id_set = frozenset(artifact_ids)
+        counts["materialization_output"] = _copy_rows_chunked(
+            source, target, "materialization_output", "attempt_id",
             attempt_ids,
+            row_filter=lambda row: str(row["artifact_id"]) in artifact_id_set,
         )
-        counts["artifact"] = _copy_rows(
-            source,
-            target,
-            "artifact",
-            f"artifact_id IN ({_marks(artifact_ids)})",
-            artifact_ids,
-        )
-        counts["materialization_output"] = _copy_rows(
-            source,
-            target,
-            "materialization_output",
-            f"attempt_id IN ({_marks(attempt_ids)}) "
-            f"AND artifact_id IN ({_marks(artifact_ids)})",
-            (*attempt_ids, *artifact_ids),
-        )
-        counts["materialization_partition_head"] = _copy_rows(
-            source,
-            target,
-            "materialization_partition_head",
-            f"market_id IN ({_marks(ordered_markets)}) "
-            f"AND attempt_id IN ({_marks(attempt_ids)})",
-            (*ordered_markets, *attempt_ids),
+        market_id_set = frozenset(ordered_markets)
+        counts["materialization_partition_head"] = _copy_rows_chunked(
+            source, target, "materialization_partition_head", "attempt_id",
+            attempt_ids,
+            row_filter=lambda row: str(row["market_id"]) in market_id_set,
         )
         counts["l2_quality_window"] = _copy_rows(
             source,

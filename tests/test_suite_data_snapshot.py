@@ -203,3 +203,31 @@ def test_suite_data_snapshot_reuse_rejects_control_plane_tampering(
     connection.close()
     with pytest.raises(ValueError, match="控制面散列"):
         create_suite_data_snapshot(source, "market", output)
+
+
+def test_copy_rows_chunked_crosses_variable_limit_and_filters() -> None:
+    """分块复制跨越参数上限，复合条件由行过滤判定。"""
+    import sqlite3
+
+    from guvolu.research import suite_data_snapshot as module
+
+    source = sqlite3.connect(":memory:")
+    source.row_factory = sqlite3.Row
+    target = sqlite3.connect(":memory:")
+    source.execute("CREATE TABLE item (key TEXT, market TEXT)")
+    target.execute("CREATE TABLE item (key TEXT, market TEXT)")
+    keys = [f"k{i:05d}" for i in range(2001)]
+    source.executemany(
+        "INSERT INTO item VALUES (?, ?)",
+        [(k, "keep" if i % 2 == 0 else "drop") for i, k in enumerate(keys)],
+    )
+    copied = module._copy_rows_chunked(
+        source, target, "item", "key", tuple(sorted(keys)),
+        row_filter=lambda row: str(row["market"]) == "keep",
+    )
+    assert copied == 1001
+    assert target.execute("SELECT COUNT(*) FROM item").fetchone()[0] == 1001
+    total = module._copy_rows_chunked(
+        source, target, "item", "key", tuple(sorted(keys)),
+    )
+    assert total == 2001
