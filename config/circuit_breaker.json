@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "consecutive_failure_limit": 3,
+  "stream_gap_seconds": 90,
+  "asset_deviation_ratio": "0.01",
+  "asset_deviation_floor_jpy": "30"
+}

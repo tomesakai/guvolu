@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
+from guvolu.domain.errors import ApiSchemaError
 from guvolu.domain.enums import (
     ExecutionType,
     OrderStatus,
@@ -34,26 +35,50 @@ def _s_opt(data: Raw, key: str) -> str | None:
     return None if value is None else str(value)
 
 
+def _to_decimal(raw: str, key: str) -> Decimal:
+    """转换数值字段，不可解析视为响应契约违例。"""
+    try:
+        return Decimal(raw)
+    except ArithmeticError as error:
+        raise ApiSchemaError(f"字段不是十进制数值: {key}={raw!r}") from error
+
+
 def _dec(data: Raw, key: str) -> Decimal:
-    return Decimal(_s(data, key))
+    return _to_decimal(_s(data, key), key)
 
 
 def _dec_opt(data: Raw, key: str) -> Decimal | None:
     value = data.get(key)
-    return None if value is None else Decimal(str(value))
+    return None if value is None else _to_decimal(str(value), key)
 
 
 def _int(data: Raw, key: str) -> int:
-    return int(_s(data, key))
+    """转换整数字段，不可解析视为响应契约违例。"""
+    raw = _s(data, key)
+    try:
+        return int(raw)
+    except ValueError as error:
+        raise ApiSchemaError(f"字段不是整数: {key}={raw!r}") from error
 
 
 def _int_opt(data: Raw, key: str) -> int | None:
     value = data.get(key)
-    return None if value is None else int(str(value))
+    if value is None:
+        return None
+    raw = str(value)
+    try:
+        return int(raw)
+    except ValueError as error:
+        raise ApiSchemaError(f"字段不是整数: {key}={raw!r}") from error
 
 
 def _dt(data: Raw, key: str) -> datetime:
-    return datetime.fromisoformat(_s(data, key))
+    """转换时间字段，不可解析视为响应契约违例。"""
+    raw = _s(data, key)
+    try:
+        return datetime.fromisoformat(raw)
+    except ValueError as error:
+        raise ApiSchemaError(f"字段不是时间戳: {key}={raw!r}") from error
 
 
 def _dt_ms(data: Raw, key: str) -> datetime:

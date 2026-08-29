@@ -63,6 +63,7 @@
 | docs/2026-08-27-industry-evidence-in-pipeline.md | 时效快照 | 行业稳健性证据接入研究管线：接入点、注册窗口、开关、失败关闭语义与独立审计入口定位 |
 | docs/2026-08-11-account-assets-capability.md | 时效快照 | GMO Coin 与 bitFlyer 私有资产接口复核 |
 | docs/2026-08-10-persistence-audit.md | 时效快照 | 持久化完整性、恢复探针与历史损坏边界审计 |
+| docs/2026-08-22-paper-executor-phase1.md | 时效快照 | paper 执行器阶段一：第 2 版执行目标、paper 成交模型、差异账与覆盖层门控记录 |
 | docs/ui-design.md | 长期维护 | 控制面与可视化设计（TBD-12 至 17 提案载体） |
 | docs/storage-design.md | 长期维护 | Legacy 存储设计兼容索引；现行内容已迁移至物化、运行与订单流文档 |
 | docs/materialization-design.md | 长期维护 | P2 分析物化、键链、Parquet 与 DuckDB 边界 |
@@ -77,6 +78,7 @@
 | docs/runtime-ops.md | 长期维护 | 运行时保活与进程操作设计（TBD-31 提案载体） |
 | docs/order-flow-data-contract.md | 长期维护 | 订单流事实、回补边界、长期任务与前端反馈契约 |
 | docs/strategy-research.md | 长期维护 | PIT 策略研究、样本外验证、组合分配与 paper 目标位置契约 |
+| docs/execution-chain-design.md | 长期维护 | 执行链分阶段契约与意图账本设计（TBD-07、TBD-10、TBD-11 提案载体） |
 | docs/llm-pipeline-design.md | 长期维护 | LLM 决策管线接入设计（TBD-34 提案载体） |
 | .claude/skills/guvolu-rules/SKILL.md | 长期维护 | 自动加载的规则摘要 |
 

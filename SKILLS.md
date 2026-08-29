@@ -236,6 +236,7 @@
 | 执行目标（ExecutionTarget） | execution target | 執行目標 | 适配器由决策记录生成、仅供执行域消费的暴露目标快照 |
 | 搜索束（SearchBundle） | search bundle | 探索バンドル | GPU 搜索的内容寻址只读输入集合，含面板张量、掩码、搜索计划与容差身份 |
 | 三态逻辑 | three-valued logic | 三値論理 | 布尔运算含真、假与未知三种取值，未知表示缺失或不可判定 |
+| 意图账本 | intent ledger | インテント台帳 | 下单意图与其状态迁移的追加式持久化记录（T-05、R-07） |
 
 ### 用语铁律
 
@@ -271,6 +272,7 @@ guvolu/
 │   ├── research/                # 因子与 GPU 管线（G 章），无 TRADE 密钥
 │   ├── strategy/                # 纯函数（C-02）
 │   ├── risk/                    # 熔断与限额（T-11）
+│   ├── execution/               # 执行链发送编排（T-05、T-06）
 │   ├── ui/                      # 控制面（X 章）
 │   └── ops/
 │       └── kill_switch.py       # 独立入口（T-07）
