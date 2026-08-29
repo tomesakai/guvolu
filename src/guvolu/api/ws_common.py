@@ -19,6 +19,9 @@ from guvolu.domain.models import Raw
 # 订阅与退订限速（R-04，按 IP）
 SUBSCRIBE_INTERVAL_SECONDS = 1.1
 
+# 权限类错误码，重连无效（C-09）
+PERMISSION_WS_ERROR_CODES: frozenset[str] = frozenset({"ERR-5012"})
+
 # 断线重连退避下限与上限
 RECONNECT_BASE_SECONDS = 1.0
 RECONNECT_MAX_SECONDS = 60.0
@@ -45,6 +48,15 @@ def decode_frame(text: str) -> Raw:
         detail = str(payload["error"])
         raise WsError(f"WS 错误帧: {detail}", code=extract_error_code(detail))
     return payload
+
+
+def is_permission_ws_error(error: WsError) -> bool:
+    """判定权限类错误帧（C-09）。
+
+    此类错误重连无用，处置见 docs/error-catalog.md，
+    连接循环必须把它上抛给调用方而非退避重连。
+    """
+    return error.code in PERMISSION_WS_ERROR_CODES
 
 
 def command_wait_seconds(last_sent_at: float | None, now: float) -> float:

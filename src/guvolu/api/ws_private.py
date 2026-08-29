@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 import websockets
 from websockets.exceptions import WebSocketException
@@ -27,6 +28,7 @@ from guvolu.api.ws_common import (
     WsCommand,
     command_wait_seconds as command_wait_seconds,
     decode_frame as decode_frame,
+    is_permission_ws_error,
     reconnect_delay_seconds as reconnect_delay_seconds,
     text_sender,
     to_text,
@@ -39,6 +41,8 @@ from guvolu.domain.models import (
     WsPositionEvent,
     WsPositionSummaryEvent,
 )
+
+_LOGGER = logging.getLogger(__name__)
 
 WS_AUTH_PATH = "/v1/ws-auth"
 # 地址漏 /v1 会得到 404
@@ -198,11 +202,18 @@ class PrivateWsClient:
 
         重连成功后先执行 on_reconnect，由上层以 REST 全量快照对账
         （C-10、R-08），随后重放订阅；不得假设增量连续。
+        错误帧按 C-09 分类：权限类上抛调用方，其余记录后重连。
         """
         attempt = 0
         while True:
             try:
                 await self._session(on_reconnect)
+            except WsError as exc:
+                # 权限类重连无用，上抛
+                if is_permission_ws_error(exc):
+                    raise
+                _LOGGER.warning("私有 WS 帧异常后重连: %s", exc)
+                attempt += 1
             except (WebSocketException, OSError):
                 attempt += 1
             else:

@@ -26,6 +26,7 @@ from websockets.asyncio.client import ClientConnection
 from guvolu.api.transport import PublicTransport, RateLimiter
 from guvolu.api.ws_common import SHARED_PACER, reconnect_delay_seconds, to_text
 from guvolu.api.ws_public import PUBLIC_WS_URL
+from guvolu.data.durable_io import atomic_write_bytes
 from guvolu.data.kline_plan import (
     MINUTE_HISTORY_START,
     YEARLY_INTERVALS,
@@ -411,9 +412,9 @@ def _archive_one(
             missing += 1
             continue
         resp.raise_for_status()
-        target.parent.mkdir(parents=True, exist_ok=True)
-        # gz 原件照常落盘，异常另行登记
-        target.write_bytes(resp.content)
+        # gz 原件原子落盘，异常另行登记
+        # 写一半崩溃不得留下目标文件
+        atomic_write_bytes(target, resp.content)
         verify_archive_payload(DATA_ROOT, symbol, date, resp.content)
         got += 1
         if got % 200 == 0:

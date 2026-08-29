@@ -27,6 +27,9 @@ from guvolu.venues.bitbank_stream import PUBLIC_WS_URL as BITBANK_WS_URL
 
 BITFLYER_WS_URL = "wss://ws.lightstream.bitflyer.com/json-rpc"
 SILENCE_TIMEOUT_SECONDS = 90.0
+# 数据帧级静默预算；
+# 协议控制帧不得续期（C-10）。
+DATA_SILENCE_TIMEOUT_SECONDS = 300.0
 CHECKPOINT_SECONDS = 60.0
 ANCHOR_PERIODIC_SECONDS = 300.0
 ENDPOINT_BINDINGS = {
@@ -167,6 +170,25 @@ def _remaining(deadline: float | None) -> float:
     return min(SILENCE_TIMEOUT_SECONDS, max(0.05, deadline - time.monotonic()))
 
 
+def _fresh_data_deadline() -> float:
+    """仅真实盘口数据帧可调用，重置数据静默预算。"""
+    return time.monotonic() + DATA_SILENCE_TIMEOUT_SECONDS
+
+
+def _data_recv_budget(deadline: float | None, data_deadline: float) -> float:
+    """单次 recv 预算，受 wire 静默与数据静默双重上限。"""
+    return min(
+        _remaining(deadline),
+        max(0.05, data_deadline - time.monotonic()),
+    )
+
+
+def _check_data_silence(data_deadline: float, label: str) -> None:
+    """数据静默超预算即抛连接错误，走既有重连路径。"""
+    if time.monotonic() >= data_deadline:
+        raise ConnectionError(f"{label} 数据静默超时")
+
+
 def _bounded_reconnect_delay(consecutive_failures: int) -> float:
     return reconnect_delay_seconds(min(max(0, consecutive_failures), 63))
 
@@ -211,14 +233,17 @@ async def _record_gmo(
                     "symbol": writer.venue_symbol,
                 }))
                 _trigger_anchor(anchor_submit, stats, connection_id)
+                data_deadline = _fresh_data_deadline()
                 while _active(deadline):
                     try:
                         raw = await asyncio.wait_for(
-                            connection.recv(), _remaining(deadline)
+                            connection.recv(),
+                            _data_recv_budget(deadline, data_deadline),
                         )
                     except TimeoutError:
                         if not _active(deadline):
                             return
+                        _check_data_silence(data_deadline, "GMO L2")
                         raise ConnectionError("GMO L2 静默超时")
                     recv_ts_utc, recv_ts_mono_ns = _receive_clock()
                     text = to_text(raw)
@@ -235,8 +260,10 @@ async def _record_gmo(
                     else:
                         if payload.get("channel") == "orderbooks":
                             _observed_data(stats)
+                            data_deadline = _fresh_data_deadline()
                         else:
                             stats.control_frames += 1
+                    _check_data_silence(data_deadline, "GMO L2")
         except (OSError, ConnectionError, WebSocketException):
             if not _active(deadline):
                 return
@@ -304,14 +331,17 @@ async def _record_bitbank(
                         "42" + json.dumps(["join-room", room], separators=(",", ":"))
                     )
                 _trigger_anchor(anchor_submit, stats, connection_id)
+                data_deadline = _fresh_data_deadline()
                 while _active(deadline):
                     try:
                         raw = await asyncio.wait_for(
-                            connection.recv(), _remaining(deadline)
+                            connection.recv(),
+                            _data_recv_budget(deadline, data_deadline),
                         )
                     except TimeoutError:
                         if not _active(deadline):
                             return
+                        _check_data_silence(data_deadline, "bitbank L2")
                         raise ConnectionError("bitbank L2 静默超时")
                     recv_ts_utc, recv_ts_mono_ns = _receive_clock()
                     text = to_text(raw)
@@ -324,12 +354,16 @@ async def _record_bitbank(
                     )
                     stats.wire_frames += 1
                     if text == "2":
+                        # Engine.IO 心跳是控制帧，
+                        # 不得续期数据预算。
                         await connection.send("3")
                         stats.control_frames += 1
                     elif channel_id != "protocol_control":
                         _observed_data(stats)
+                        data_deadline = _fresh_data_deadline()
                     else:
                         stats.control_frames += 1
+                    _check_data_silence(data_deadline, "bitbank L2")
         except (OSError, ConnectionError, WebSocketException):
             if not _active(deadline):
                 return
@@ -365,14 +399,17 @@ async def _record_bitflyer(
                         "id": request_id,
                     }))
                 _trigger_anchor(anchor_submit, stats, connection_id)
+                data_deadline = _fresh_data_deadline()
                 while _active(deadline):
                     try:
                         raw = await asyncio.wait_for(
-                            connection.recv(), _remaining(deadline)
+                            connection.recv(),
+                            _data_recv_budget(deadline, data_deadline),
                         )
                     except TimeoutError:
                         if not _active(deadline):
                             return
+                        _check_data_silence(data_deadline, "bitFlyer L2")
                         raise ConnectionError("bitFlyer L2 静默超时")
                     recv_ts_utc, recv_ts_mono_ns = _receive_clock()
                     text = to_text(raw)
@@ -394,8 +431,10 @@ async def _record_bitflyer(
                             and channel_id != "protocol_control"
                         ):
                             _observed_data(stats)
+                            data_deadline = _fresh_data_deadline()
                         else:
                             stats.control_frames += 1
+                    _check_data_silence(data_deadline, "bitFlyer L2")
         except (OSError, ConnectionError, WebSocketException):
             if not _active(deadline):
                 return

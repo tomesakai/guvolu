@@ -4,11 +4,13 @@
 """
 import asyncio
 import json
+import logging
 from collections.abc import Mapping
 from decimal import Decimal
 from pathlib import Path
 
 import pytest
+import websockets
 
 from guvolu.api.transport import HttpMethod, Params, PrivateTransport, RateLimiter
 from guvolu.api.ws_private import (
@@ -423,3 +425,87 @@ def test_keepalive_rejects_non_positive_interval(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError):
         asyncio.run(scenario())
+
+
+class _FakeConnection:
+    """离线连接替身：按脚本产出帧后结束会话（C-13）。"""
+
+    def __init__(self, frames: list[str]) -> None:
+        self._frames = iter(frames)
+        self.sent: list[str] = []
+
+    async def send(self, text: str) -> None:
+        self.sent.append(text)
+
+    def __aiter__(self) -> "_FakeConnection":
+        return self
+
+    async def __anext__(self) -> str:
+        try:
+            return next(self._frames)
+        except StopIteration:
+            raise StopAsyncIteration from None
+
+
+class _FakeConnect:
+    """离线连接上下文替身，不触网（C-13）。"""
+
+    def __init__(self, connection: _FakeConnection) -> None:
+        self._connection = connection
+
+    async def __aenter__(self) -> _FakeConnection:
+        return self._connection
+
+    async def __aexit__(self, *args: object) -> None:
+        return None
+
+
+class _StopRun(Exception):
+    """终止 run 循环的测试信号。"""
+
+
+def test_run_reraises_permission_error_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ERR-5012 权限错误帧重连无用，必须上抛调用方（C-09）。"""
+    connection = _FakeConnection([ERROR_FRAME])
+    monkeypatch.setattr(
+        websockets, "connect", lambda _: _FakeConnect(connection)
+    )
+    client = PrivateWsClient(TOKEN, pacer=CommandPacer())
+
+    with pytest.raises(WsError) as caught:
+        asyncio.run(client.run())
+    assert caught.value.code == "ERR-5012"
+
+
+def test_run_reconnects_after_non_permission_ws_error(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    """未知频道等非权限 WsError 记录后按退避重连。"""
+    connection = _FakeConnection([json.dumps({"channel": "ticker"})])
+    connect_calls = 0
+
+    def connect(_: str) -> _FakeConnect:
+        nonlocal connect_calls
+        connect_calls += 1
+        if connect_calls > 1:
+            raise _StopRun
+        return _FakeConnect(connection)
+
+    delays: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        delays.append(delay)
+
+    monkeypatch.setattr(websockets, "connect", connect)
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    client = PrivateWsClient(TOKEN, pacer=CommandPacer())
+
+    with caplog.at_level(logging.WARNING, logger="guvolu.api.ws_private"):
+        with pytest.raises(_StopRun):
+            asyncio.run(client.run())
+
+    assert connect_calls == 2
+    assert delays == [reconnect_delay_seconds(1)]
+    assert any("未知私有频道" in message for message in caplog.messages)

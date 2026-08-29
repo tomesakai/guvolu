@@ -162,6 +162,15 @@ def _bitbank_writer(root: Path, run_id: str) -> SegmentedRawWriter:
     )
 
 
+def _bitflyer_writer(root: Path, run_id: str) -> SegmentedRawWriter:
+    endpoint_id, endpoint_revision = trade_capture.ENDPOINT_BINDINGS["bitflyer"]
+    return SegmentedRawWriter(
+        root, "bitflyer", "BTC_JPY", domain="trade_realtime", run_id=run_id,
+        endpoint_id=endpoint_id, endpoint_revision=endpoint_revision,
+        segment_seconds=3600, segment_max_bytes=1024 * 1024,
+    )
+
+
 def _raw_rows(writer: SegmentedRawWriter) -> list[dict[str, Any]]:
     writer.finish()
     paths = sorted(writer.directory.glob("segment-*.jsonl"))
@@ -2017,3 +2026,73 @@ def test_bitbank_cancelled_error_propagates_without_retry(
         "RuntimeError: cleanup must not mask cancel"
     )
     writer.finish()
+
+
+def test_bitflyer_endless_capture_reconnects_after_silence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """常驻模式静默必须有界并走重连路径，不得无界阻塞。"""
+    connection = _Connection([], silent=True)
+    connect_calls = 0
+
+    def connect(_: str) -> _ConnectionContext:
+        nonlocal connect_calls
+        connect_calls += 1
+        if connect_calls > 1:
+            raise _StopRecorder
+        return _ConnectionContext(connection)
+
+    monkeypatch.setattr(websockets, "connect", connect)
+    monkeypatch.setattr(asyncio, "sleep", _no_delay)
+    monkeypatch.setattr(trade_capture, "SILENCE_TIMEOUT_SECONDS", 0.02)
+    writer = _bitflyer_writer(tmp_path, "run-bitflyer-silence")
+    stats = trade_capture.CaptureStats("bitflyer", "BTC_JPY")
+    started = time.monotonic()
+
+    with pytest.raises(_StopRecorder):
+        asyncio.run(trade_capture._record_bitflyer(writer, stats, None))
+    rows = _raw_rows(writer)
+
+    assert time.monotonic() - started < 5.0
+    assert connect_calls == stats.connection_attempts == 2
+    assert rows == []
+    assert stats.wire_frames == stats.data_frames == 0
+    assert stats.disconnects == stats.reconnects == 1
+    assert stats.consecutive_failures == 1
+    assert json.loads(connection.sent[0]) == {
+        "jsonrpc": "2.0", "method": "subscribe",
+        "params": {"channel": "lightning_executions_BTC_JPY"}, "id": 1,
+    }
+
+
+def test_bitflyer_finite_deadline_silence_ends_run_without_reconnect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """run deadline 在静默期内到期时正常收尾，不误计重连。"""
+    connection = _Connection([], silent=True)
+    connect_calls = 0
+
+    def connect(_: str) -> _ConnectionContext:
+        nonlocal connect_calls
+        connect_calls += 1
+        return _ConnectionContext(connection)
+
+    monkeypatch.setattr(websockets, "connect", connect)
+    writer = _bitflyer_writer(tmp_path, "run-bitflyer-deadline")
+    stats = trade_capture.CaptureStats("bitflyer", "BTC_JPY")
+    started = time.monotonic()
+
+    # 剩余预算低于 recv 预算下限，
+    # 超时必然落在 deadline 之后。
+    async def scenario() -> None:
+        await trade_capture._record_bitflyer(
+            writer, stats, time.monotonic() + 0.01,
+        )
+
+    asyncio.run(scenario())
+    writer.finish()
+
+    assert time.monotonic() - started < 5.0
+    assert connect_calls == 1
+    assert stats.reconnects == stats.disconnects == 0
+    assert stats.consecutive_failures == 0
