@@ -35,8 +35,10 @@ from guvolu.domain.intent import (
 )
 from guvolu.domain.symbols import SpotSymbol
 
-# 第 2 版只增血缘字段（D-06）
-SCHEMA_VERSION = 2
+# 第 3 版只增写预算标记（D-06）
+SCHEMA_VERSION = 3
+# 写预算标记的落盘文本（T-11）
+_WRITE_BUDGET_TEXT = {True: "consumed", False: "exempt"}
 # 账本在数据根下的相对位置
 LEDGER_RELATIVE_PATH = Path("execution") / "intent_ledger.jsonl"
 
@@ -71,11 +73,16 @@ class DuplicateOrderId(LedgerError):
 
 @dataclass(frozen=True, slots=True)
 class LedgerEntry:
-    """单意图的当前视图。"""
+    """单意图的当前视图。
+
+    write_budget_consumed 是 SENDING 迁移行的写预算标记；空值
+    表示旧版行无标记，消费方按消耗计，保守口径（T-11）。
+    """
 
     intent: OrderIntent
     state: IntentState
     order_id: int | None
+    write_budget_consumed: bool | None = None
 
 
 def _required_text(record: Mapping[str, object], key: str) -> str:
@@ -161,6 +168,7 @@ class IntentLedger:
         order_id: int | None = None,
         reason: str | None = None,
         evidence: Mapping[str, str] | None = None,
+        write_budget: bool | None = None,
         at: datetime | None = None,
     ) -> None:
         """校验并落盘一次迁移，落盘成功后更新内存视图（R-07）。"""
@@ -179,15 +187,29 @@ class IntentLedger:
             "order_id": order_id,
             "reason": reason,
             "evidence": None if evidence is None else dict(evidence),
+            "write_budget": (
+                None
+                if write_budget is None
+                else _WRITE_BUDGET_TEXT[write_budget]
+            ),
         }
         self._append(record)
-        self._apply(intent_id, entry, target, order_id)
+        self._apply(intent_id, entry, target, order_id, write_budget)
 
     def begin_send(
-        self, intent_id: str, *, at: datetime | None = None
+        self,
+        intent_id: str,
+        *,
+        consumes_write_budget: bool | None = None,
+        at: datetime | None = None,
     ) -> None:
-        """闸门通过后进入在途（T-05）。"""
-        self.transition(intent_id, IntentState.SENDING, at=at)
+        """闸门通过后进入在途（T-05），并记写预算标记（T-11）。"""
+        self.transition(
+            intent_id,
+            IntentState.SENDING,
+            write_budget=consumes_write_budget,
+            at=at,
+        )
 
     def gate_reject(
         self, intent_id: str, *, reason: str, at: datetime | None = None
@@ -287,6 +309,14 @@ class IntentLedger:
         """取意图映射的交易所委托号。"""
         return self._entry(intent_id).order_id
 
+    def consumed_write_budget(self, intent_id: str) -> bool:
+        """该意图过闸时是否消耗写预算（T-11）。
+
+        标记来自 SENDING 迁移行；旧版行无标记按消耗计，保守。
+        """
+        flag = self._entry(intent_id).write_budget_consumed
+        return True if flag is None else flag
+
     def intent_id_for_order(self, order_id: int) -> str | None:
         """按交易所委托号反查意图（T-05 关联键）。"""
         return self._order_map.get(order_id)
@@ -373,10 +403,17 @@ class IntentLedger:
         entry: LedgerEntry,
         target: IntentState,
         order_id: int | None,
+        write_budget: bool | None = None,
     ) -> None:
         new_order = entry.order_id if order_id is None else order_id
+        budget_flag = entry.write_budget_consumed
+        if target is IntentState.SENDING and write_budget is not None:
+            budget_flag = write_budget
         self._entries[intent_id] = replace(
-            entry, state=target, order_id=new_order
+            entry,
+            state=target,
+            order_id=new_order,
+            write_budget_consumed=budget_flag,
         )
         if target is IntentState.ACCEPTED and order_id is not None:
             self._order_map[order_id] = intent_id
@@ -506,10 +543,21 @@ class IntentLedger:
             }
         else:
             raise LedgerCorrupt(f"第 {number} 行证据非键值表")
+        budget_raw = record.get("write_budget")
+        write_budget: bool | None
+        if budget_raw is None:
+            # 旧版行无标记，读取为空值
+            write_budget = None
+        elif budget_raw == _WRITE_BUDGET_TEXT[True]:
+            write_budget = True
+        elif budget_raw == _WRITE_BUDGET_TEXT[False]:
+            write_budget = False
+        else:
+            raise LedgerCorrupt(f"第 {number} 行写预算标记非法")
         try:
             self._validate(entry, target, order_id, evidence)
         except (LedgerError, IntentTransitionError) as exc:
             raise LedgerCorrupt(
                 f"第 {number} 行迁移非法: {exc}"
             ) from exc
-        self._apply(intent_id, entry, target, order_id)
+        self._apply(intent_id, entry, target, order_id, write_budget)

@@ -25,6 +25,9 @@ ORDER_PATH = "/v1/order"
 class TradeClientSender:
     """把意图翻译为写路径调用，实现发送编排的 OrderSender。"""
 
+    # 真实写路径消耗写预算（T-11）
+    consumes_write_budget = True
+
     def __init__(self, client: TradeClient) -> None:
         self._client = client
 

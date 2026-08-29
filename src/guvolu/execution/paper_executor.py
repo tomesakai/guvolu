@@ -40,6 +40,7 @@ from guvolu.execution.conversion import (
     convert_target_to_delta_order,
 )
 from guvolu.execution.dispatch import DispatchResult, dispatch_order_intent
+from guvolu.execution.limit_replay import replay_limit_usage
 from guvolu.execution.dry_run_executor import (
     ORDER_ENDPOINT,
     ExecutorError,
@@ -71,7 +72,7 @@ from guvolu.risk.circuit_breaker import (
     CircuitBreaker,
     load_breaker_thresholds,
 )
-from guvolu.risk.limits import LimitGate, trading_day
+from guvolu.risk.limits import LimitGate
 from guvolu.risk.service_gate import allows_new_intent
 
 # 执行器只消费 paper 模式目标
@@ -497,6 +498,9 @@ class PaperFillSender:
     send 只会抛出 PaperSettled 或 PaperRejected，永不返回委托号；
     本类不持有任何私有客户端或密钥（T-02、T-13）。
     """
+
+    # 零写路径不消耗写预算（T-11）
+    consumes_write_budget = False
 
     def __init__(
         self,
@@ -965,43 +969,6 @@ def recover_interrupted_paper_sends(
     for intent_id in marked:
         ledger.paper_reject(intent_id, reason=PAPER_RECOVERY_REASON, at=at)
     return marked
-
-
-def replay_limit_usage(
-    limit_gate: LimitGate, ledger: IntentLedger, *, moment: datetime
-) -> dict[str, object]:
-    """自意图账本重放当日已过限额闸门的用量（T-11）。
-
-    逐小时单发命令行的闸门只在内存，须按交易日重建累计。
-    口径与内存闸门一致：进入 SENDING 及其后状态的意图在过闸
-    时已计入，paper 拒绝亦不回退，保守计数。
-    """
-    day = trading_day(moment)
-    total_jpy = Decimal("0")
-    order_count = 0
-    replayed: list[str] = []
-    for intent_id in ledger.intent_ids():
-        state = ledger.state(intent_id)
-        if state in {IntentState.RECORDED, IntentState.GATE_REJECTED}:
-            continue
-        intent = ledger.intent(intent_id)
-        if trading_day(intent.created_at) != day:
-            continue
-        if intent.price is None:
-            raise PaperExecutorError(
-                f"paper 意图账本含非限价意图 {intent_id}"
-            )
-        total_jpy += intent.notional_jpy()
-        order_count += 1
-        replayed.append(intent_id)
-    limit_gate.seed_usage(day, total_jpy, order_count)
-    usage = limit_gate.usage()
-    return {
-        "trading_day": day.isoformat(),
-        "total_jpy": format(usage.total_jpy, "f"),
-        "order_count": usage.order_count,
-        "replayed_intents": replayed,
-    }
 
 
 def render_report(

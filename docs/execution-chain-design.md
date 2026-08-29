@@ -47,6 +47,8 @@ float 到 Decimal 转换闸门（G-05，唯一转换点）
 | 熔断全撤接线 | `src/guvolu/execution/emergency_stop.py` | 阶段三实现 |
 | 对账会话 | `src/guvolu/execution/reconcile_session.py` 与 `scripts/run_reconcile_session.py` | 阶段三实现 |
 | 常驻浸泡进程 | `src/guvolu/execution/soak_runner.py` 与 `scripts/run_execution_soak.ps1` | 阶段四实现 |
+| 跨进程在途锁 | `src/guvolu/execution/inflight_lock.py` | 阶段四增补 |
+| 限额用量重放 | `src/guvolu/execution/limit_replay.py` | 阶段四增补 |
 
 G-05 转换点：研究域目标位置的数值以 float 承载，进入执行域时必须经
 `execution.conversion` 完成 float 到 Decimal 的转换，并按品种 `tickSize`
@@ -72,21 +74,24 @@ G-05 转换点：研究域目标位置的数值以 float 承载，进入执行�
 - 位置：数据根下 `execution/intent_ledger.jsonl`，由 `data.paths.data_root` 于运行时解析，代码不硬编码绝对路径（C-04）。
 - 形态：追加式 JSONL，每行一条事件，写入即 fsync（复用 `data/durable_io` 原语）；意图创建行先于任何发送落盘（T-05），每次状态迁移各成一行（R-07），永不覆写既有行。
 - 映射：受理时登记交易所 `orderId` 与 `intent_id` 的映射，`orderId` 不得重复映射（T-05、D-05）。
-- 在途约束：同品种同一时刻至多一笔在途写请求；`SENDING` 与 `SEND_TIMEOUT` 均占用在途额度，超时意图未经查询定论前不得对同品种再发（T-05、T-06）。
+- 在途约束：同品种同一时刻至多一笔在途写请求；`SENDING` 与 `SEND_TIMEOUT` 均占用在途额度，超时意图未经查询定论前不得对同品种再发（T-05、T-06）。多进程各持独立账本时，消耗写预算的发送期间另持品种级独占文件锁（数据根 `execution/.inflight/<symbol>.lock`，`execution.inflight_lock`，锁随进程句柄释放）：`begin_send` 前非阻塞取得，终态落账后释放，取不到即按闸门拒绝；零写发送路径不取锁。
 - 恢复：装载时重放全量事件重建状态并复验每次迁移合法性；进程中断留下的尾部不完整行移入同目录 `.partial-` 旁证文件后截断主文件，不静默丢弃字节；处于 `SENDING` 的意图恢复后经显式标记转入 `SEND_TIMEOUT`，等待查询决策（T-06）。
 - 事件行字段：
 
 | 字段 | intent 行 | transition 行 |
 |---|---|---|
-| `schema_version` | 1 | 1 |
+| `schema_version` | 3 | 3 |
 | `record` | `intent` | `transition` |
 | `at` | 落盘时刻（UTC） | 迁移时刻（UTC） |
 | 标识 | `intent_id`、`correlation_id` | `intent_id` |
 | 委托字段 | `symbol`、`side`、`execution_type`、`size`、`price`、`time_in_force`、`created_at` | 无 |
-| 迁移字段 | 无 | `source`、`target`、`order_id`、`reason`、`evidence` |
+| 迁移字段 | 无 | `source`、`target`、`order_id`、`reason`、`evidence`、`write_budget` |
 
 金额与数量以字符串落盘（D-07）。`evidence` 为查询证据键值表，离开
-`SEND_TIMEOUT` 的迁移必须携带（T-06）。
+`SEND_TIMEOUT` 的迁移必须携带（T-06）。第 2 版增血缘字段、第 3 版增
+`write_budget` 标记，均只增字段（D-06），旧版行兼容读取。`write_budget`
+只在进入 `SENDING` 的迁移行有值，取 `consumed` 或 `exempt`，记录该笔
+是否消耗写预算（T-11，口径见第 5 节）；无标记的旧版行按消耗计。
 
 ## 4. 意图状态机
 
@@ -120,8 +125,8 @@ G-05 转换点：研究域目标位置的数值以 float 承载，进入执行�
 终态：其后的委托生命周期（成交、撤销、失效）属对账域，由阶段三经 READ_ONLY
 消费（T-03、U-01），不回写意图账本。`DRY_RUN_BLOCKED` 是本地终点：拦截发生
 在任何网络调用之前，与交易所明确拒绝的 `REJECTED` 严格区分（T-03），不计入
-熔断的写路径异常计数，是模拟运行彩排的预期终点（T-04）；限额累计在过闸时
-已记入且不回退，使彩排与实盘的限额口径一致。
+熔断的写路径异常计数，是模拟运行彩排的预期终点（T-04）；三限额校验在
+彩排与实盘同口径执行，用量累计仅真实写请求记入（第 5 节）。
 
 ## 5. 风控闸门
 
@@ -135,7 +140,7 @@ G-05 转换点：研究域目标位置的数值以 float 承载，进入执行�
 | 4 | 在途约束 | T-05 | 拒绝意图 |
 | 5 | 三限额 | T-11 | 拒绝意图并触发熔断 |
 
-- 三限额（T-11）：单笔金额、单日累计金额、单日笔数，取值来自 `domain.config.Limits`（装载时已按绝对硬顶截取）。名义金额为 `size` 乘限价，市价意图乘调用方给出的参考价；单日归属按 JST 06:00 交易日边界（C-11、D-08）。累计在通过闸门时记入，随后即使发送超时或被拒也不回退，保守计数。运行时限额只可调低，调高请求直接拒绝（X-05）。超限不是普通拒绝，而是按 T-11 触发熔断。
+- 三限额（T-11）：单笔金额、单日累计金额、单日笔数，取值来自 `domain.config.Limits`（装载时已按绝对硬顶截取）。名义金额为 `size` 乘限价，市价意图乘调用方给出的参考价；单日归属按 JST 06:00 交易日边界（C-11、D-08）。三项校验对全部发送模式照常执行；用量累计只在发送边界消耗写预算（`OrderSender.consumes_write_budget` 为真，即真实写路径）时记入——T-11 的语义边界是真实写请求，零写终态（模拟拦截、paper 结算与拒绝）不占单日预算；记入后即使发送超时或被拒也不回退，保守计数。账本的 `SENDING` 迁移行落 `write_budget` 标记（第 3 节），dry-run、paper 与浸泡入口启动时经 `execution.limit_replay` 按该标记重放当日用量。运行时限额只可调低，调高请求直接拒绝（X-05）。超限不是普通拒绝，而是按 T-11 触发熔断。
 - 服务状态门禁（R-03）：仅 `OPEN` 允许生成新意图。撤单不经本门禁，与紧急停止开关口径一致（T-07 紧急路径必须随时可达）；维护期交易所拒绝撤单时由错误处置承担。
 - 熔断器（R-02）：状态机仅 `NORMAL` 与 `TRIPPED` 两态。计数域为写路径连续异常（明确失败、超时、网络错各计一次，成功清零）；双通道对账不一致计入同一计数（R-08）；行情断流秒数与资产异动达到阈值直接触发。触发动作为拒绝新意图，并自阶段三起执行登记的紧急停止全撤（T-07，接线见第 9 节）；进程退出动作未接入。复位仅经显式运维调用，不自动恢复。阈值从版本化配置 `config/circuit_breaker.json` 读取（G-06）。
 

@@ -54,6 +54,7 @@ from guvolu.execution.frozen_target_adapter import (
     FrozenTargetError,
     validate_frozen_prediction_bytes,
 )
+from guvolu.execution.limit_replay import replay_limit_usage
 from guvolu.execution.paper_config import (
     DEFAULT_PAPER_CONFIG_PATH,
     TARGET_MODES,
@@ -146,6 +147,9 @@ class ExecutorError(GuvoluError):
 
 class _DryRunSender:
     """无私钥的模拟发送边界；绝不构造私有客户端。"""
+
+    # 零写路径不消耗写预算（T-11）
+    consumes_write_budget = False
 
     def send(self, intent: OrderIntent) -> int:
         del intent
@@ -977,6 +981,8 @@ def main(
     breaker_config: Path = args.breaker_config
     breaker = CircuitBreaker(load_breaker_thresholds(breaker_config))
     limit_gate = LimitGate(config.limits)
+    # 重放当日用量（T-11）
+    replay_limit_usage(limit_gate, ledger, moment=execution_moment)
     sender: OrderSender = _DryRunSender()
     outcome = execute_plan(
         plan,

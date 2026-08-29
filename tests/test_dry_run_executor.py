@@ -825,6 +825,98 @@ def test_cli_gate_reject_returns_one(
     assert records[-1]["target"] == "GATE_REJECTED"
 
 
+def seed_budget_intents(ledger_path: Path, *, consumed: bool) -> None:
+    """预置四笔各 500 JPY 的当日意图，按参数标记写预算。"""
+    ledger = IntentLedger(ledger_path)
+    for index in range(4):
+        intent_id = f"it-seed-{index}"
+        ledger.record_intent(
+            OrderIntent(
+                intent_id=intent_id,
+                correlation_id="co-seed",
+                symbol=SpotSymbol("BTC"),
+                side=Side.BUY,
+                execution_type=ExecutionType.LIMIT,
+                size=Decimal("0.0005"),
+                price=Decimal("1000000"),
+                time_in_force=None,
+                created_at=MOMENT,
+            ),
+            at=MOMENT,
+        )
+        ledger.begin_send(
+            intent_id, consumes_write_budget=consumed, at=MOMENT
+        )
+        if consumed:
+            ledger.accept(intent_id, 637100 + index, at=MOMENT)
+        else:
+            ledger.block_dry_run(intent_id, reason="模拟拦截", at=MOMENT)
+
+
+def run_cli_with_seeded_ledger(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    consumed: bool,
+) -> tuple[int, dict[str, Any]]:
+    """预置账本后离线跑一次命令行，返回退出码与报告。"""
+    forbid_network(monkeypatch)
+    monkeypatch.delenv("GMO_COIN_TRADE_API_KEY", raising=False)
+    monkeypatch.delenv("GMO_COIN_TRADE_API_SECRET", raising=False)
+    monkeypatch.delenv("GUVOLU_MODE", raising=False)
+    monkeypatch.delenv("GUVOLU_DAY_JPY_MAX", raising=False)
+    monkeypatch.delenv("GUVOLU_DAY_COUNT_MAX", raising=False)
+    monkeypatch.delenv("GUVOLU_ORDER_JPY_MAX", raising=False)
+    monkeypatch.setenv("GUVOLU_LOG_DIR", str(tmp_path / "logs"))
+    ledger_path = tmp_path / "intent_ledger.jsonl"
+    seed_budget_intents(ledger_path, consumed=consumed)
+    target = write_v2_target(tmp_path, target=0.6)
+    report_path = tmp_path / "report.json"
+    code = main(
+        [
+            "--target", str(target),
+            *source_prediction_arguments(target),
+            "--target-config", str(ROOT / "config" / "paper_executor.json"),
+            "--rules", str(write_rules(tmp_path)),
+            "--reference-price", "1000000",
+            "--service-status", "OPEN",
+            "--ledger", str(ledger_path),
+            "--breaker-config", str(BREAKER_CONFIG),
+            "--env-file", str(tmp_path / "absent.env"),
+            "--dry-run-report", str(report_path),
+        ],
+        moment=MOMENT,
+    )
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert isinstance(report, dict)
+    return code, report
+
+
+def test_cli_replays_consumed_day_usage_and_rejects_over_budget(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """启动重放当日已消耗用量，超预算即闸门拒绝（T-11）。"""
+    code, report = run_cli_with_seeded_ledger(
+        tmp_path, monkeypatch, consumed=True
+    )
+    assert code == 1
+    assert report["intent"]["state"] == "GATE_REJECTED"
+    assert "当日累计" in report["intent"]["reason"]
+
+
+def test_cli_replay_ignores_zero_write_terminal_intents(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """零写终态不占预算：同额度旧行不再触发限额拒绝（T-11）。"""
+    code, report = run_cli_with_seeded_ledger(
+        tmp_path, monkeypatch, consumed=False
+    )
+    assert code == 0
+    assert report["intent"]["state"] == "DRY_RUN_BLOCKED"
+
+
 def test_cli_zero_target_skips_intent(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

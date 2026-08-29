@@ -289,7 +289,7 @@ def test_full_exposure_buys_from_zero_and_records_everything(
 
     intent_rows = ledger_rows(runtime.ledger_directory / INTENT_LEDGER_NAME)
     created = intent_rows[0]
-    assert created["schema_version"] == 2
+    assert created["schema_version"] == 3
     assert created["prediction_id"] == "prediction-one"
     assert created["decision_time"] == DECISION.isoformat()
     assert created["correlation_id"] == target.correlation_id
@@ -898,21 +898,54 @@ def test_replay_limit_usage_counts_only_gated_intents_of_the_day(
         gate.commit(Decimal("1"), MOMENT)
 
 
-@pytest.mark.parametrize(
-    ("env_line", "match"),
-    [
-        ("GUVOLU_DAY_COUNT_MAX=1", "当日笔数"),
-        ("GUVOLU_DAY_JPY_MAX=600", "当日累计"),
-    ],
-)
-def test_cli_day_limits_accumulate_across_invocations(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, env_line: str, match: str,
+def test_replay_limit_usage_counts_only_write_budget_consumers(
+    tmp_path: Path,
 ) -> None:
-    """逐小时单发命令行，当日限额用量跨进程累计（T-11）。"""
+    """账本混有 paper 与真实受理意图时，重放只计后者（T-11）。"""
+    ledger = IntentLedger(tmp_path / INTENT_LEDGER_NAME)
+    ledger.record_intent(seeded_intent("real", prediction_id="pr"), at=MOMENT)
+    ledger.begin_send("real", consumes_write_budget=True, at=MOMENT)
+    ledger.accept("real", 637001, at=MOMENT)
+    ledger.record_intent(seeded_intent("paper", prediction_id="pp"), at=MOMENT)
+    ledger.begin_send("paper", consumes_write_budget=False, at=MOMENT)
+    ledger.paper_fill(
+        "paper", reason="结算", evidence={"fill_basis": "x"}, at=MOMENT,
+    )
+    gate = LimitGate(Limits(
+        order_jpy_max=Decimal("500"),
+        day_jpy_max=Decimal("2000"),
+        day_count_max=50,
+    ))
+
+    usage = replay_limit_usage(gate, ledger, moment=MOMENT)
+
+    assert usage["replayed_intents"] == ["real"]
+    assert usage["order_count"] == 1
+    assert Decimal(str(usage["total_jpy"])) == Decimal("100")
+    reopened = IntentLedger(tmp_path / INTENT_LEDGER_NAME)
+    fresh_gate = LimitGate(Limits(
+        order_jpy_max=Decimal("500"),
+        day_jpy_max=Decimal("2000"),
+        day_count_max=50,
+    ))
+    replayed = replay_limit_usage(fresh_gate, reopened, moment=MOMENT)
+    assert replayed["replayed_intents"] == ["real"]
+
+
+def test_cli_paper_fills_do_not_consume_daily_budget_across_invocations(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """paper 零写终态不占单日预算：每日多笔不熔断（T-11）。
+
+    单日仅一笔的限额下连续两次结算均须成功；用量重放只统计
+    消耗写预算的意图，paper 结算行标记为不消耗，重放为零。
+    """
     for name in ("GUVOLU_DAY_COUNT_MAX", "GUVOLU_DAY_JPY_MAX"):
         monkeypatch.delenv(name, raising=False)
     env_file = tmp_path / "limits.env"
-    env_file.write_text(env_line + "\n", encoding="utf-8")
+    env_file.write_text(
+        "GUVOLU_DAY_COUNT_MAX=1\nGUVOLU_DAY_JPY_MAX=600\n", encoding="utf-8"
+    )
 
     first = main(cli_args(
         tmp_path, write_target(tmp_path, target=1.0),
@@ -932,14 +965,38 @@ def test_cli_day_limits_accumulate_across_invocations(
         (tmp_path / "second.json").read_text(encoding="utf-8")
     )
 
-    assert second == 1
-    assert second_report["status"] == "GATE_REJECTED"
-    assert match in second_report["intent"]["reason"]
+    assert second == 0
+    assert second_report["status"] == "PAPER_FILLED"
     usage = second_report["startup"]["limit_usage"]
-    assert usage["order_count"] == 1
-    assert Decimal(usage["total_jpy"]) == Decimal("500")
-    assert usage["replayed_intents"] == [first_report["intent"]["intent_id"]]
+    assert usage["order_count"] == 0
+    assert Decimal(usage["total_jpy"]) == Decimal("0")
+    assert usage["replayed_intents"] == []
     assert second_report["endpoints"]["write_touched"] == []
+    ledger = IntentLedger(
+        tmp_path / "root" / "execution" / "paper" / INTENT_LEDGER_NAME
+    )
+    first_intent = first_report["intent"]["intent_id"]
+    assert ledger.consumed_write_budget(first_intent) is False
+
+
+def test_cli_paper_still_rehearses_single_order_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """paper 仍彩排单笔上限：超限照旧闸门拒绝（T-11）。"""
+    for name in ("GUVOLU_DAY_COUNT_MAX", "GUVOLU_DAY_JPY_MAX"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("GUVOLU_ORDER_JPY_MAX", raising=False)
+    env_file = tmp_path / "limits.env"
+    env_file.write_text("GUVOLU_ORDER_JPY_MAX=100\n", encoding="utf-8")
+
+    code = main(cli_args(
+        tmp_path, write_target(tmp_path, target=1.0),
+        report="reject.json", env_file=env_file,
+    ))
+    report = json.loads((tmp_path / "reject.json").read_text(encoding="utf-8"))
+    assert code == 1
+    assert report["status"] == "GATE_REJECTED"
+    assert "超上限" in report["intent"]["reason"]
 
 
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), "0.5", True])
