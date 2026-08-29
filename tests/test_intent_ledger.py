@@ -229,7 +229,12 @@ def test_partial_tail_recovery(tmp_path: Path) -> None:
         handle.write(partial)
     recovered = IntentLedger(ledger.path)
     assert recovered.state("it01") is IntentState.SENDING
-    sidecars = list(tmp_path.glob("intent_ledger.jsonl.partial-*"))
+    # 原子写会留下锁文件，排除后计数
+    sidecars = [
+        item
+        for item in tmp_path.glob("intent_ledger.jsonl.partial-*")
+        if not item.name.endswith(".lock")
+    ]
     assert len(sidecars) == 1
     assert sidecars[0].read_bytes() == partial
     assert recovered.path.read_bytes().endswith(b"\n")
