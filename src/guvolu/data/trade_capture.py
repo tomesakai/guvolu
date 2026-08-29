@@ -1180,15 +1180,16 @@ async def _record_bitflyer(
                     "params": {"channel": channel}, "id": 1,
                 }))
                 while _active(deadline):
-                    if deadline is None:
-                        raw = await connection.recv()
-                    else:
-                        try:
-                            raw = await asyncio.wait_for(
-                                connection.recv(), _remaining(deadline)
-                            )
-                        except TimeoutError:
+                    try:
+                        # 常驻模式同样有界等待，
+                        # 静默走重连路径（C-10）。
+                        raw = await asyncio.wait_for(
+                            connection.recv(), _remaining(deadline)
+                        )
+                    except TimeoutError:
+                        if not _active(deadline):
                             return
+                        raise ConnectionError("bitFlyer trades 静默超时")
                     recv_ts_utc, recv_ts_mono_ns = _receive_clock()
                     text = to_text(raw)
                     payload = _json_mapping(text)

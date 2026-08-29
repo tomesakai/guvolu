@@ -100,7 +100,8 @@ class BitflyerReadClient:
                 if response.status_code == 200:
                     break
                 error = ApiHttpError(response.status_code, GET_BALANCE_PATH)
-                if response.status_code < 500:
+                # 429 属可恢复限速，同 5xx 退避
+                if response.status_code != 429 and response.status_code < 500:
                     raise error
                 last_error = error
             if attempt + 1 < GET_RETRY_MAX:
