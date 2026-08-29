@@ -306,3 +306,32 @@ PowerShell 包装 `scripts/run_execution_soak.ps1`）把第 9 节的单轮逻辑
 时间差取观测时点与事实时戳之差，按轮与累计汇总计数、最小、均值、
 最大，随每轮报告落盘。观测不改变裁决与熔断计数逻辑（R-08 口径
 不变）。
+
+## 13. 最小实盘 canary 入口（阶段五）
+
+入口为 [scripts/run_live_canary.py](../scripts/run_live_canary.py)，逻辑在
+`execution.live_canary`。它是 T-12 第三级「最小手数实盘」的唯一入口，按
+[策略研究管线](strategy-research.md) 第 6 节 canary 合同实现，不服务任何
+自动化调度。
+
+- 前置条件：`GUVOLU_MODE=live` 由人工显式设置（T-04、A-01），入口不代为
+  切换；进程必须挂交互式终端，启动横幅醒目标示 live 模式、委托计划、
+  当前限额与将触碰的全部端点，随后要求两重键入确认——原样口令与名义
+  金额复述（X-02）。任一确认失败即退出，不发送任何写请求。
+- 计划约束：固定现物 BTC 单笔限价买入；限价缺省取最优买价并向下取整到
+  tick，不得越过最优买价；名义不超过 canary 合同 500 JPY 与当前 T-11
+  单笔限额的较小者；数量须落在取引ルール步长与上下限内。
+- 入场前先定退出（R-01）：等待窗口届满即经 `POST /v1/cancelOrder` 撤单
+  并轮询确认终态；撤单后仍未确认终态时明示改用 kill-switch（T-07）。
+- 过程约束：发送经第 3 至 5 节统一编排（意图先落盘、五道闸门、消耗写
+  预算、跨进程在途锁）；服务状态非 OPEN 不发写请求（R-03）；发送前核对
+  可用 JPY 覆盖名义加手续费缓冲（R-06）；委托状态一律以 READ_ONLY 轮询
+  为准（T-03）；发送超时经第 8 节超时对账查询后决策（T-06）。
+- 落盘：意图账本沿第 3 节契约；终局报告内容寻址落在数据根
+  `execution/canary/`，含计划、终态、撤单标记、前后资产快照（amount 与
+  available 分列，U-03）与触碰端点清单（A-03、R-07）。
+- 端点口径（A-03）：读取为 `GET /v1/status`、`GET /v1/symbols`、
+  `GET /v1/orderbooks`、`GET /v1/account/assets`、`GET /v1/orders`、
+  `GET /v1/activeOrders`、`GET /v1/latestExecutions`；写入为
+  `POST /v1/order` 与 `POST /v1/cancelOrder`。
+- 完成后按合同立即停机复核，不自动扩到其他品种、来源或资金规模。
