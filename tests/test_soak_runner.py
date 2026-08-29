@@ -19,8 +19,15 @@ from guvolu.api.public_client import PublicClient
 from guvolu.api.trade_client import TradeClient
 from guvolu.data.intent_ledger import IntentLedger
 from guvolu.domain.config import Limits
-from guvolu.domain.enums import RunMode, ServiceStatus, WsChannel
-from guvolu.domain.errors import ApiNetworkError
+from guvolu.domain.enums import (
+    ExecutionType,
+    RunMode,
+    ServiceStatus,
+    Side,
+    WsChannel,
+)
+from guvolu.domain.errors import ApiNetworkError, GmoApiError
+from guvolu.domain.intent import OrderIntent
 from guvolu.domain.models import Order
 from guvolu.domain.symbols import SpotSymbol
 from guvolu.execution.conversion import MarketRule
@@ -28,15 +35,18 @@ from guvolu.execution.dual_reconcile import PrivateEvent
 from guvolu.execution.emergency_stop import arm_emergency_stop
 from guvolu.execution.reconcile_session import ReconcileSession
 from guvolu.execution.soak_runner import (
+    MAINTENANCE_PAUSE_LIMIT_SECONDS,
     RACE_REST_FIRST_EXECUTION,
     RACE_REST_ONLY,
     RACE_WS_ONLY,
+    MaintenanceWindow,
     MarketInputs,
     RecordingSnapshotReader,
     SoakError,
     SoakPaths,
     SoakRunner,
     ensure_dry_run,
+    is_maintenance_signal,
     main,
     run_soak,
 )
@@ -162,6 +172,7 @@ def make_runner(
     reader: SessionReader | None = None,
     target_path: Path | None = None,
     mode: RunMode = RunMode.DRY_RUN,
+    market_status: ServiceStatus = ServiceStatus.OPEN,
 ) -> tuple[SoakRunner, SoakPaths, CircuitBreaker, SessionReader]:
     """构造被测浸泡状态机与其落盘路径。"""
     inner = reader if reader is not None else SessionReader()
@@ -187,7 +198,7 @@ def make_runner(
         breaker=breaker,
         emergency=emergency,
         symbol=SpotSymbol("BTC"),
-        market_source=StaticMarketSource(),
+        market_source=StaticMarketSource(market_status),
         limit_gate=LimitGate(
             Limits(
                 order_jpy_max=Decimal("500"),
@@ -591,3 +602,235 @@ def test_cli_offline_max_rounds(
     assert checkpoint["stop_reason"] == "max-rounds"
     heartbeat = read_json(paths.heartbeat)
     assert heartbeat["rounds_completed"] == 2
+
+
+def maintenance_error() -> GmoApiError:
+    """构造例行维护窗的业务错误（ERR-5201）。"""
+    return GmoApiError(
+        codes=("ERR-5201",),
+        messages=("MAINTENANCE. Please wait for a while",),
+        path="/v1/activeOrders",
+        http_status=200,
+    )
+
+
+class MaintenanceReader(SessionReader):
+    """挂单查询先返回若干次 ERR-5201 再恢复的替身。"""
+
+    def __init__(self, failures: int) -> None:
+        super().__init__()
+        self.remaining = failures
+
+    def active_orders(
+        self, symbol: str, page: int | None = None, count: int | None = None
+    ) -> tuple[Order, ...]:
+        if self.remaining > 0:
+            self.remaining -= 1
+            raise maintenance_error()
+        return super().active_orders(symbol, page, count)
+
+
+def test_is_maintenance_signal_classification() -> None:
+    """ERR-5201 与非 OPEN 状态是维护窗，网络错不是。"""
+    assert is_maintenance_signal(maintenance_error())
+    assert is_maintenance_signal(MaintenanceWindow("维护窗"))
+    assert not is_maintenance_signal(
+        ApiNetworkError("/v1/activeOrders", "注入的网络错")
+    )
+    assert not is_maintenance_signal(
+        GmoApiError(
+            codes=("ERR-5106",),
+            messages=("Invalid request parameter.",),
+            path="/v1/activeOrders",
+            http_status=200,
+        )
+    )
+
+
+def test_service_status_not_open_raises_maintenance_window(
+    tmp_path: Path,
+) -> None:
+    """服务状态非 OPEN 时本轮抛维护窗异常，不动累积状态。"""
+    runner, _paths, breaker, _reader = make_runner(
+        tmp_path, market_status=ServiceStatus.MAINTENANCE
+    )
+    with pytest.raises(MaintenanceWindow):
+        runner.run_round(MOMENT)
+    assert runner.rounds_completed == 0
+    assert breaker.consecutive_failures == 0
+
+
+def test_soak_survives_consecutive_maintenance_rounds(tmp_path: Path) -> None:
+    """连续多轮 ERR-5201 不停机，恢复后正常轮换（R-03）。"""
+    reader = MaintenanceReader(failures=5)
+    runner, paths, breaker, _reader = make_runner(tmp_path, reader=reader)
+    client = FakeStream()
+
+    async def scenario() -> str:
+        return await run_soak(
+            runner,
+            client,
+            interval_seconds=0.01,
+            max_rounds=1,
+            poll_seconds=0.01,
+        )
+
+    reason = asyncio.run(scenario())
+    assert reason == "max-rounds"
+    assert runner.rounds_completed == 1
+    report = read_report(paths)
+    kinds = [item["record"] for item in report]
+    assert kinds.count("maintenance_pause") == 5
+    assert "round_error" not in kinds
+    assert kinds[-1] == "round"
+    pause = report[0]
+    assert pause["record"] == "maintenance_pause"
+    assert pause["limit_seconds"] == MAINTENANCE_PAUSE_LIMIT_SECONDS
+    assert "ERR-5201" in str(pause["detail"])
+    checkpoint = read_json(paths.checkpoint)
+    assert checkpoint["stop_reason"] == "max-rounds"
+
+
+def test_maintenance_pause_total_duration_limit(tmp_path: Path) -> None:
+    """连续维护窗超总时长上限即返回停机信号，防呆。"""
+    runner, paths, _breaker, _reader = make_runner(tmp_path)
+    assert runner.record_maintenance_pause("维护窗", MOMENT) is False
+    within = MOMENT + timedelta(seconds=MAINTENANCE_PAUSE_LIMIT_SECONDS)
+    assert runner.record_maintenance_pause("维护窗", within) is False
+    beyond = within + timedelta(seconds=1)
+    assert runner.record_maintenance_pause("维护窗", beyond) is True
+    # 成功一轮后计时清零
+    runner.run_round(beyond)
+    later = beyond + timedelta(hours=8)
+    assert runner.record_maintenance_pause("维护窗", later) is False
+    report = read_report(paths)
+    pauses = [
+        item for item in report if item["record"] == "maintenance_pause"
+    ]
+    assert pauses[-1]["paused_since"] == later.isoformat()
+
+
+def test_run_soak_stops_when_maintenance_limit_exceeded(
+    tmp_path: Path,
+) -> None:
+    """维护窗超时长上限时驻留循环以防呆事由停机。"""
+    reader = MaintenanceReader(failures=1000)
+    runner, paths, _breaker, _reader = make_runner(tmp_path, reader=reader)
+    # 预置起点使下一次暂停即越限
+    early = MOMENT - timedelta(
+        seconds=MAINTENANCE_PAUSE_LIMIT_SECONDS + 60
+    )
+    runner.record_maintenance_pause("维护窗", early)
+    client = FakeStream()
+
+    async def scenario() -> str:
+        return await run_soak(
+            runner,
+            client,
+            interval_seconds=0.01,
+            poll_seconds=0.01,
+        )
+
+    reason = asyncio.run(scenario())
+    assert reason == "maintenance-limit"
+    assert runner.rounds_completed == 0
+    checkpoint = read_json(paths.checkpoint)
+    assert checkpoint["stop_reason"] == "maintenance-limit"
+
+
+def test_cli_replays_day_usage_into_limit_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """命令行启动时按账本标记重放当日已消耗用量（T-11）。"""
+    forbid_network(monkeypatch)
+    monkeypatch.setenv("GMO_COIN_READ_ONLY_API_KEY", "dummy-key")
+    monkeypatch.setenv("GMO_COIN_READ_ONLY_API_SECRET", "dummy-secret")
+    monkeypatch.setenv("GMO_COIN_TRADE_API_KEY", "dummy-key")
+    monkeypatch.setenv("GMO_COIN_TRADE_API_SECRET", "dummy-secret")
+    monkeypatch.delenv("GUVOLU_MODE", raising=False)
+    monkeypatch.setenv("GUVOLU_LOG_DIR", str(tmp_path / "logs"))
+    ledger_path = tmp_path / "intent_ledger.jsonl"
+    seeded = IntentLedger(ledger_path)
+    now = datetime.now(UTC)
+    consumed = OrderIntent(
+        intent_id="it-consumed",
+        correlation_id="co-seed",
+        symbol=SpotSymbol("BTC"),
+        side=Side.BUY,
+        execution_type=ExecutionType.LIMIT,
+        size=Decimal("0.0001"),
+        price=Decimal("1000000"),
+        time_in_force=None,
+        created_at=now,
+    )
+    seeded.record_intent(consumed, at=now)
+    seeded.begin_send("it-consumed", consumes_write_budget=True, at=now)
+    seeded.accept("it-consumed", 637001, at=now)
+    exempt = OrderIntent(
+        intent_id="it-exempt",
+        correlation_id="co-seed",
+        symbol=SpotSymbol("BTC"),
+        side=Side.BUY,
+        execution_type=ExecutionType.LIMIT,
+        size=Decimal("0.0001"),
+        price=Decimal("1000000"),
+        time_in_force=None,
+        created_at=now,
+    )
+    seeded.record_intent(exempt, at=now)
+    seeded.begin_send("it-exempt", consumes_write_budget=False, at=now)
+    seeded.block_dry_run("it-exempt", reason="模拟拦截", at=now)
+    reader = SessionReader()
+    reader.per_order[637001] = ()
+
+    def fake_read_client(transport: object) -> SessionReader:
+        return reader
+
+    monkeypatch.setattr(soak_runner, "ReadClient", fake_read_client)
+    monkeypatch.setattr(
+        soak_runner, "create_ws_token", lambda transport: "tok"
+    )
+    monkeypatch.setattr(
+        soak_runner, "revoke_ws_token", lambda transport, token: None
+    )
+    monkeypatch.setattr(
+        soak_runner, "PrivateWsClient", lambda token: FakeStream()
+    )
+    captured: dict[str, object] = {}
+    original_replay = soak_runner.replay_limit_usage
+
+    def recording_replay(
+        gate: LimitGate, ledger: IntentLedger, *, moment: datetime
+    ) -> dict[str, object]:
+        result = original_replay(gate, ledger, moment=moment)
+        captured["result"] = result
+        captured["usage"] = gate.usage()
+        return result
+
+    monkeypatch.setattr(soak_runner, "replay_limit_usage", recording_replay)
+    paths = make_paths(tmp_path)
+    code = main(
+        [
+            "--rules", str(write_rules(tmp_path)),
+            "--reference-price", "1000000",
+            "--service-status", "OPEN",
+            "--ledger", str(ledger_path),
+            "--breaker-config", str(BREAKER_CONFIG),
+            "--session-config", str(SESSION_CONFIG),
+            "--env-file", str(tmp_path / "absent.env"),
+            "--report", str(paths.report),
+            "--checkpoint", str(paths.checkpoint),
+            "--heartbeat", str(paths.heartbeat),
+            "--stop-file", str(paths.stop_file),
+            "--interval-seconds", "0.01",
+            "--max-rounds", "1",
+        ]
+    )
+    assert code == 0
+    result = captured["result"]
+    assert isinstance(result, dict)
+    assert result["replayed_intents"] == ["it-consumed"]
+    assert result["order_count"] == 1
+    usage = captured["usage"]
+    assert getattr(usage, "order_count") == 1
+    assert getattr(usage, "total_jpy") == Decimal("100")

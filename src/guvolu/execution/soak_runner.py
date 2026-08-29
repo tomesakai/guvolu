@@ -51,7 +51,7 @@ from guvolu.data.intent_ledger import LEDGER_RELATIVE_PATH, IntentLedger
 from guvolu.data.paths import data_root
 from guvolu.domain.config import load_config
 from guvolu.domain.enums import RunMode, ServiceStatus, WsChannel
-from guvolu.domain.errors import GuvoluError
+from guvolu.domain.errors import GmoApiError, GuvoluError
 from guvolu.domain.intent import (
     LOCAL_TERMINAL_STATES,
     IntentState,
@@ -90,6 +90,7 @@ from guvolu.execution.reconcile_session import (
     snapshot_payload,
     timeout_outcome_payload,
 )
+from guvolu.execution.limit_replay import replay_limit_usage
 from guvolu.execution.timeout_scheduler import BackoffPolicy
 from guvolu.execution.trade_sender import TradeClientSender
 from guvolu.risk.circuit_breaker import (
@@ -99,6 +100,7 @@ from guvolu.risk.circuit_breaker import (
     load_breaker_thresholds,
 )
 from guvolu.risk.limits import LimitGate
+from guvolu.risk.service_gate import allows_new_intent
 
 # 浸泡落盘的 schema 版本
 SOAK_SCHEMA_VERSION = 1
@@ -114,6 +116,10 @@ STOP_POLL_SECONDS = 1.0
 HEARTBEAT_MIN_INTERVAL_SECONDS = 10.0
 # 连续轮次错误上限
 ROUND_ERROR_LIMIT = 3
+# 例行维护窗错误码（处置见错误码册）
+MAINTENANCE_ERROR_CODE = "ERR-5201"
+# 连续维护窗总时长上限秒，超过仍停机防呆
+MAINTENANCE_PAUSE_LIMIT_SECONDS = 4 * 3600.0
 # 令牌生命周期端点（A-03）
 WS_AUTH_CREATE_ENDPOINT = "POST /v1/ws-auth"
 WS_AUTH_EXTEND_ENDPOINT = "PUT /v1/ws-auth"
@@ -127,6 +133,20 @@ _RACE_CATEGORIES = (RACE_WS_ONLY, RACE_REST_ONLY, RACE_REST_FIRST_EXECUTION)
 
 class SoakError(GuvoluError):
     """浸泡进程输入非法或启动条件不满足。"""
+
+
+class MaintenanceWindow(GuvoluError):
+    """例行维护窗：读取路径等待恢复 OPEN，不算故障（R-03）。"""
+
+
+def is_maintenance_signal(error: GuvoluError) -> bool:
+    """判定异常是否例行维护窗（ERR-5201 处置册、R-03）。"""
+    if isinstance(error, MaintenanceWindow):
+        return True
+    return (
+        isinstance(error, GmoApiError)
+        and MAINTENANCE_ERROR_CODE in error.codes
+    )
 
 
 def ensure_dry_run(mode: RunMode) -> None:
@@ -419,6 +439,7 @@ class SoakRunner:
         self._reconnects = 0
         self._rounds = 0
         self._round_errors = 0
+        self._maintenance_since: datetime | None = None
         self._ws_events_total = 0
         self._ws_outcomes_pending: list[WsApplyOutcome] = []
         self._stop_reason: str | None = None
@@ -500,8 +521,18 @@ class SoakRunner:
         self._last_heartbeat_at = moment
 
     def run_round(self, now: datetime | None = None) -> dict[str, object]:
-        """执行一轮：快照对账、超时处理、差分决策并落盘。"""
+        """执行一轮：快照对账、超时处理、差分决策并落盘。
+
+        服务状态非 OPEN 时抛出维护窗异常，本轮不做任何快照与
+        差分，由驻留循环记为维护窗暂停而非轮错误（R-03）。
+        """
         moment = now if now is not None else datetime.now(UTC)
+        inputs = self._market_source.current()
+        if not allows_new_intent(inputs.service_status):
+            # 维护窗跳过本轮，不动累积状态
+            raise MaintenanceWindow(
+                f"服务状态 {inputs.service_status.value}，维护窗暂停对账轮"
+            )
         realign = self._realign_pending
         self._realign_pending = False
         ws_outcomes = tuple(self._ws_outcomes_pending)
@@ -529,7 +560,6 @@ class SoakRunner:
         delta: DeltaDecision | None = None
         outcome: tuple[OrderIntent, DispatchResult] | None = None
         if target_error is None and target_value is not None:
-            inputs = self._market_source.current()
             delta = self._session.decide_delta(
                 target_value,
                 rule=inputs.rule,
@@ -556,6 +586,7 @@ class SoakRunner:
                 self._touch_write(ORDER_ENDPOINT)
         self._rounds += 1
         self._round_errors = 0
+        self._maintenance_since = None
         payload: dict[str, object] = {
             "schema_version": SOAK_SCHEMA_VERSION,
             "record": "round",
@@ -631,6 +662,33 @@ class SoakRunner:
         self._write_checkpoint(moment, "running")
         self.heartbeat(moment, force=True)
         return self._round_errors
+
+    def record_maintenance_pause(
+        self, detail: str, now: datetime | None = None
+    ) -> bool:
+        """登记维护窗暂停并落盘；超总时长上限返回真。
+
+        维护窗是可预期状态而非故障（错误码册 ERR-5201）：跳过
+        本轮、不递增轮错误计数，直至状态恢复；连续维护窗超过
+        MAINTENANCE_PAUSE_LIMIT_SECONDS 仍停机防呆。
+        """
+        moment = now if now is not None else datetime.now(UTC)
+        if self._maintenance_since is None:
+            self._maintenance_since = moment
+        elapsed = (moment - self._maintenance_since).total_seconds()
+        payload: dict[str, object] = {
+            "schema_version": SOAK_SCHEMA_VERSION,
+            "record": "maintenance_pause",
+            "at": moment.isoformat(),
+            "detail": detail,
+            "paused_since": self._maintenance_since.isoformat(),
+            "elapsed_seconds": elapsed,
+            "limit_seconds": MAINTENANCE_PAUSE_LIMIT_SECONDS,
+        }
+        self._append_report(payload)
+        self._write_checkpoint(moment, "running")
+        self.heartbeat(moment, force=True)
+        return elapsed > MAINTENANCE_PAUSE_LIMIT_SECONDS
 
     def finalize(self, reason: str, now: datetime | None = None) -> None:
         """停止收尾：写终态 checkpoint 与心跳。"""
@@ -776,8 +834,9 @@ async def run_soak(
 
     订阅 orderEvents 与 executionEvents 后并发运行连接循环与
     事件消费；重连回调把下一轮标记为强制全量快照并立即唤醒
-    （C-10）。轮内错误落盘留痕，连续达上限即停止。返回停止
-    事由；退出前完成当轮并写终态 checkpoint。
+    （C-10）。轮内错误落盘留痕，连续达上限即停止；例行维护窗
+    只记暂停不计错误，连续超总时长上限仍停机。返回停止事由；
+    退出前完成当轮并写终态 checkpoint。
     """
     if interval_seconds <= 0:
         raise SoakError("轮次间隔必须为正")
@@ -804,7 +863,12 @@ async def run_soak(
             try:
                 runner.run_round()
             except GuvoluError as exc:
-                if runner.record_round_error(str(exc)) >= ROUND_ERROR_LIMIT:
+                if is_maintenance_signal(exc):
+                    # 维护窗暂停不计轮错误（R-03）
+                    if runner.record_maintenance_pause(str(exc)):
+                        runner.request_stop("maintenance-limit")
+                        continue
+                elif runner.record_round_error(str(exc)) >= ROUND_ERROR_LIMIT:
                     runner.request_stop("round-errors")
                     continue
             else:
@@ -1007,6 +1071,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     budget_jpy = decimal_argument(str(args.budget_jpy), "--budget-jpy")
     if budget_jpy <= 0:
         raise SoakError("预算必须为正")
+    limit_gate = LimitGate(config.limits)
+    # 重放当日用量（T-11）
+    replay_limit_usage(limit_gate, ledger, moment=datetime.now(UTC))
     runner = SoakRunner(
         mode=config.mode,
         session=session,
@@ -1016,7 +1083,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         emergency=emergency,
         symbol=symbol,
         market_source=market_source,
-        limit_gate=LimitGate(config.limits),
+        limit_gate=limit_gate,
         whitelist=config.spot_whitelist,
         sender=TradeClientSender(trade),
         paths=_resolve_paths(args),
