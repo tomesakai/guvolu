@@ -229,7 +229,7 @@ def test_paper_failure_keeps_prediction_and_dry_run_result(
 
 def test_stale_prediction_fails_before_target_adaptation(chain: FakeChain) -> None:
     """超过保守年龄上限的冻结预测不得进入任何执行适配。"""
-    chain.prediction_decision_time = datetime.now(UTC) - timedelta(minutes=51)
+    chain.prediction_decision_time = datetime.now(UTC) - timedelta(minutes=56)
 
     with pytest.raises(ValueError, match="冻结预测过期"):
         _run_chain(chain)
