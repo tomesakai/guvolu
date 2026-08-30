@@ -20,7 +20,7 @@ PAPER_ROOT = "data/execution/paper"
 TARGET_DIRECTORY = "data/execution/targets"
 PAPER_MODE = "paper"
 DRY_RUN_MODE = "dry-run"
-DEFAULT_MAX_PREDICTION_AGE_MINUTES = 45
+DEFAULT_MAX_PREDICTION_AGE_MINUTES = 50
 # 去重与待对账报告不含 mode
 PAPER_STATUSES_WITHOUT_ROW = frozenset({
     "duplicate_prediction", "needs_reconciliation",
@@ -360,7 +360,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--max-prediction-age-minutes", type=int,
         default=DEFAULT_MAX_PREDICTION_AGE_MINUTES,
-        help="进入执行适配前允许的最大预测年龄；缺省 45 分钟，预留过期缓冲",
+        help="进入执行适配前允许的最大预测年龄；缺省 50 分钟，预留过期缓冲",
     )
     parser.add_argument(
         "--no-paper", action="store_true", help="跳过 paper 执行步骤",
