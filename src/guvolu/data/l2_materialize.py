@@ -769,8 +769,13 @@ def _bounded_latest_stream_run_contracts(
                     f"L2 symbol 目录非法: {symbol_directory}"
                 )
             stream = (venue_id, venue_symbol)
+            seen_run_directory = False
             for run_directory in sorted(symbol_directory.glob("run_id=*")):
                 if not run_directory.is_dir():
+                    continue
+                seen_run_directory = True
+                if _is_legacy_run_directory(run_directory):
+                    # 旧版 run 不参选，最新 run 必须为 v3
                     continue
                 contract = _bounded_run_contract(
                     run_directory,
@@ -782,7 +787,38 @@ def _bounded_latest_stream_run_contracts(
                 prior = latest.get(stream)
                 if prior is None or candidate[:2] > prior[:2]:
                     latest[stream] = candidate
+            if seen_run_directory and stream not in latest:
+                raise ValueError(
+                    f"流没有任何 v3 run 候选: {venue_id}/{venue_symbol}"
+                )
     return {stream: row[2] for stream, row in latest.items()}
+
+
+def _is_legacy_run_directory(run_directory: Path) -> bool:
+    """判定 run 状态合同是否显式声明为 v3 之前的旧版。
+
+    仅当恰有一个状态文件、可解析为 JSON 对象且 schema_version 为
+    小于 3 的整数时判为旧版；其余情形一律交由严格合同失败关闭，
+    不得借本判定掩盖真实损坏。某流全部 run 均为旧版时选择器无
+    候选，仍会响亮失败。
+    """
+    checkpoint = run_directory / "checkpoint.json"
+    terminal = run_directory / "run.manifest.json"
+    states = [path for path in (checkpoint, terminal) if path.is_file()]
+    if len(states) != 1:
+        return False
+    try:
+        body = json.loads(states[0].read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(body, Mapping):
+        return False
+    version = body.get("schema_version")
+    return (
+        isinstance(version, int)
+        and not isinstance(version, bool)
+        and version < 3
+    )
 
 
 def _latest_run_directories(base: Path) -> dict[str, Path]:

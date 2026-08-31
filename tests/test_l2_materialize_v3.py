@@ -1445,3 +1445,47 @@ def test_l2_prefilter_rejects_manifest_rewritten_against_registry(
             _sealed_inputs(tmp_path, registered_hashes=registered)
     finally:
         conn.close()
+
+
+def _write_legacy_run_manifest(root: Path, venue: str, symbol: str, run_id: str) -> Path:
+    """写一个 v3 之前的终态 run 状态合同。"""
+    directory = (
+        root / "raw/realtime/book_l2" / f"venue_id={venue}"
+        / f"venue_symbol={symbol}" / f"run_id={run_id}"
+    )
+    directory.mkdir(parents=True, exist_ok=True)
+    body = {
+        "schema_version": 1, "status": "complete", "completion_claim": True,
+        "run_id": run_id, "venue_id": venue, "venue_symbol": symbol,
+        "domain": "book_l2",
+        "started_at": (BASE - timedelta(days=10)).isoformat(),
+        "finished_at": (BASE - timedelta(days=10, minutes=-1)).isoformat(),
+        "record_count": 0, "segment_count": 0, "segments": [],
+    }
+    path = directory / "run.manifest.json"
+    path.write_text(json.dumps(body), encoding="utf-8")
+    return directory
+
+
+def test_bounded_selection_skips_legacy_run_directories(
+    tmp_path: Path,
+) -> None:
+    """旧版 run 不参选，不再使整轮 bounded 选择失败。"""
+    _write_legacy_run_manifest(tmp_path, "gmo", "BTC", "run-legacy-v1x")
+    _write_segment(
+        tmp_path, "gmo", "BTC", "run-live",
+        [(_gmo_payload(), "run-live-c000001", "orderbooks")],
+        schema_version=3,
+    )
+    _write_run_checkpoint(tmp_path, "gmo", "BTC", "run-live")
+    selected = _sealed_inputs(tmp_path, latest_sealed_segments_per_stream=1)
+    assert [item.run_id for item in selected] == ["run-live"]
+
+
+def test_bounded_selection_fails_when_stream_has_only_legacy_runs(
+    tmp_path: Path,
+) -> None:
+    """全旧版流没有 v3 候选，仍响亮失败不静默跳过。"""
+    _write_legacy_run_manifest(tmp_path, "gmo", "BTC", "run-legacy-only")
+    with pytest.raises(ValueError):
+        _sealed_inputs(tmp_path, latest_sealed_segments_per_stream=1)
