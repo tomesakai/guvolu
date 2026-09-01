@@ -69,7 +69,7 @@ $Definition = [ordered]@{
     start_when_available = $true
     allow_start_on_batteries = $true
     wake_to_run = $true
-    execution_time_limit_minutes = 45
+    execution_time_limit_minutes = 55
     restart_count = 3
     restart_interval_minutes = 5
 }
@@ -88,7 +88,7 @@ $Principal = New-ScheduledTaskPrincipal `
 $Settings = New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew `
     -StartWhenAvailable -AllowStartIfOnBatteries `
     -DontStopIfGoingOnBatteries -WakeToRun `
-    -ExecutionTimeLimit (New-TimeSpan -Minutes 45) `
+    -ExecutionTimeLimit (New-TimeSpan -Minutes 55) `
     -RestartCount $Definition.restart_count `
     -RestartInterval (New-TimeSpan -Minutes $Definition.restart_interval_minutes) `
     -Hidden

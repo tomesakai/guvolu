@@ -67,7 +67,7 @@ def test_live_registration_describes_direct_versioned_action(
     first_run = datetime.fromisoformat(definition["first_run_local"])
     assert (first_run.hour, first_run.minute) == (9, 25)
     assert first_run.utcoffset() == timedelta(hours=9)
-    assert definition["execution_time_limit_minutes"] == 45
+    assert definition["execution_time_limit_minutes"] == 55
 
 
 @pytest.mark.skipif(POWERSHELL is None, reason="需要 Windows PowerShell")
