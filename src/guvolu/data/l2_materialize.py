@@ -14,7 +14,7 @@ import uuid
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO, cast
@@ -2051,11 +2051,46 @@ def audit_l2(root: Path, conn: sqlite3.Connection) -> dict[str, object]:
 def _refresh_quality_nonblocking(
     root: Path, conn: sqlite3.Connection,
 ) -> tuple[dict[str, object] | None, Exception | None]:
-    """刷新控制遥测；错误作为值交给 watch 记录，不撤销事实物化。"""
-    try:
-        from guvolu.data.l2_quality import refresh_recent
+    """刷新控制遥测；错误作为值交给 watch 记录，不撤销事实物化。
 
-        return refresh_recent(root, conn), None
+    质量计算耗时且只读事实，在写锁外执行；仅 upsert 遥测行时
+    短暂取写锁，避免长时间占锁饿死其他写者（R-04 保守取向）。
+    """
+    try:
+        from collections import defaultdict
+
+        from guvolu.data.l2_quality import (
+            MATERIALIZED_FRESH_SECONDS,
+            QUALITY_VERSION,
+            _floor_window,
+            compute_quality_windows,
+            upsert_quality_windows,
+        )
+
+        minutes = 20
+        finished = datetime.now(UTC)
+        windows = compute_quality_windows(
+            root, conn, finished - timedelta(minutes=minutes), finished,
+            computed_at=finished,
+        )
+        with sqlite_writer_lock(root):
+            upserted = upsert_quality_windows(conn, windows)
+        counts: dict[str, int] = defaultdict(int)
+        for row in windows:
+            counts[row.status] += 1
+        return {
+            "quality_version": QUALITY_VERSION,
+            "materialized_freshness_threshold_seconds": (
+                MATERIALIZED_FRESH_SECONDS
+            ),
+            "from": _floor_window(
+                finished - timedelta(minutes=minutes)
+            ).isoformat(),
+            "to": finished.isoformat(),
+            "windows": len(windows),
+            "upserted": upserted,
+            "status_counts": dict(sorted(counts.items())),
+        }, None
     except Exception as exc:
         return None, exc
 
@@ -2286,11 +2321,10 @@ def _watch_as_owner(
                         market_status_summary, market_status_error = (
                             _refresh_market_status_nonblocking(root, conn)
                         )
-                    # 质量遥测共用写锁。
-                    # 已完成事实不阻断追赶。
-                    quality_summary, quality_error = (
-                        _refresh_quality_nonblocking(root, conn)
-                    )
+                # 质量锁外计算，upsert 短暂取锁
+                quality_summary, quality_error = (
+                    _refresh_quality_nonblocking(root, conn)
+                )
                 created = [result for result in cycle if not result.reused]
                 if quality_error is not None:
                     print(json.dumps({

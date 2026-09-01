@@ -607,7 +607,9 @@ def test_watch_quality_failure_is_observable_and_nonblocking(
     def fail_refresh(*_args: object, **_kwargs: object) -> dict[str, object]:
         raise RuntimeError("quality probe failed")
 
-    monkeypatch.setattr(quality_module, "refresh_recent", fail_refresh)
+    monkeypatch.setattr(
+        quality_module, "compute_quality_windows", fail_refresh
+    )
     conn = _connection(tmp_path)
     try:
         summary, error = _refresh_quality_nonblocking(tmp_path, conn)
