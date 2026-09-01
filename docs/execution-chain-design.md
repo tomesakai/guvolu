@@ -335,3 +335,38 @@ PowerShell 包装 `scripts/run_execution_soak.ps1`）把第 9 节的单轮逻辑
   `GET /v1/activeOrders`、`GET /v1/latestExecutions`；写入为
   `POST /v1/order` 与 `POST /v1/cancelOrder`。
 - 完成后按合同立即停机复核，不自动扩到其他品种、来源或资金规模。
+
+## 14. 授权信封（阶段六）
+
+授权信封是 live 自动交易的边界合同：维护者填值签发的内容寻址 JSON
+文件。live 执行路径启动时校验信封，任一条件不满足即拒绝进入 live；
+用量随意图账本持久追踪，重启不重置；触界即按登记动作熔断停机。
+签发信封与运行上膛命令构成两重人工确认（X-02 语义由「每委托键入」
+改为「每信封一次」，2026-09-01 经维护者确认）。T-12 三级中的最小
+手数实盘由首封实现：`envelope_jpy_total` 等于单笔上限即只容一笔，
+耗尽停机复核后方可签发常规信封。
+
+| 字段 | 语义 | 越界处置 |
+|---|---|---|
+| `valid_from` / `valid_until` | 有效期，UTC | 期外拒绝进入 live |
+| `order_jpy_max` | 单笔名义上限，不得超过 T-11 硬顶 | 拒单 |
+| `day_jpy_max` / `day_count_max` | 当日累计额与笔数，不得超过 T-11 硬顶 | 熔断（T-11） |
+| `envelope_jpy_total` | 信封生命周期累计下单总额 | 耗尽即停机 |
+| `max_position_jpy` | 多头持仓名义上限 | 拒绝加仓 |
+| `max_cumulative_loss_jpy` | 信封内已实现加浮动亏损熔断线 | 熔断并执行 `on_trip` |
+| `breaker` | 连续写失败、断流秒数、资产异动比例与下限 | 熔断（R-02） |
+| `on_trip` | `cancel_only` 或 `cancel_and_flatten` | 熔断动作 |
+| `day_loss_jpy_max` | 当日已实现加浮动亏损熔断线 | 当日停机 |
+| `canary_first_order_jpy_max` | 信封首单名义上限（T-12 最小手数级），首单终态且双通道对账通过后解除 | 首单拒超 |
+| `max_prediction_age_minutes` | 陈旧目标不执行 | 跳过该轮 |
+| `market_risk.price_move_pause` | 参考价短窗急变超阈即暂停下单一段时间，仅允许撤单 | 暂停下单 |
+| `market_risk.spread_skip_bp` | 盘口价差超阈跳过该轮 | 跳过该轮 |
+| `market_risk.min_book_depth_ratio` | 对手侧盘口深度不足委托名义倍数跳过 | 跳过该轮 |
+| `market_risk.stream_gap_seconds` | 行情断流超秒数熔断（R-02） | 熔断 |
+| `ops_breaker` | 连续写失败、资产异动比例与下限 | 熔断（R-02） |
+| `symbols` | 现物品种白名单（T-09 子集） | 拒单 |
+
+信封文件位于 `config/authorization_envelope.json`，SHA-256 进入执行
+报告与意图账本行；具体取值由维护者签发时决定（G-06），不在本文固化。
+上膛协议：维护者签发信封、设 `GUVOLU_MODE=live` 并亲自启动或注册
+live 执行任务；代理可编写与测试全部代码，不代行上膛与首次启动。

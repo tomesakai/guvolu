@@ -11,8 +11,9 @@ from guvolu.domain.errors import ConfigError
 from guvolu.domain.symbols import SpotSymbol
 
 # 绝对硬顶（T-11），修改须重启进程
-MAX_ORDER_JPY_CEILING = Decimal("1000")
-MAX_DAY_JPY_CEILING = Decimal("3000")
+# 2026-09-01 维护者确认上调
+MAX_ORDER_JPY_CEILING = Decimal("10000")
+MAX_DAY_JPY_CEILING = Decimal("10000")
 MAX_DAY_COUNT_CEILING = 50
 
 
@@ -100,13 +101,14 @@ def load_config(env_file: Path | None = None) -> Config:
     )
     limits = Limits(
         order_jpy_max=min(
-            Decimal(get("GUVOLU_ORDER_JPY_MAX", "500")), MAX_ORDER_JPY_CEILING
+            Decimal(get("GUVOLU_ORDER_JPY_MAX", "10000")),
+            MAX_ORDER_JPY_CEILING,
         ),
         day_jpy_max=min(
-            Decimal(get("GUVOLU_DAY_JPY_MAX", "2000")), MAX_DAY_JPY_CEILING
+            Decimal(get("GUVOLU_DAY_JPY_MAX", "10000")), MAX_DAY_JPY_CEILING
         ),
         day_count_max=min(
-            int(get("GUVOLU_DAY_COUNT_MAX", "50")), MAX_DAY_COUNT_CEILING
+            int(get("GUVOLU_DAY_COUNT_MAX", "48")), MAX_DAY_COUNT_CEILING
         ),
     )
     return Config(

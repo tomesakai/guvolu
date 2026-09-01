@@ -791,7 +791,8 @@ def test_cli_gate_reject_returns_one(
     monkeypatch.setenv("GMO_COIN_TRADE_API_KEY", "dummy-key")
     monkeypatch.setenv("GMO_COIN_TRADE_API_SECRET", "dummy-secret")
     monkeypatch.delenv("GUVOLU_MODE", raising=False)
-    monkeypatch.delenv("GUVOLU_ORDER_JPY_MAX", raising=False)
+    # 钉住单笔限额，场景为预算越限
+    monkeypatch.setenv("GUVOLU_ORDER_JPY_MAX", "500")
     monkeypatch.setenv("GUVOLU_LOG_DIR", str(tmp_path / "logs"))
     ledger_path = tmp_path / "intent_ledger.jsonl"
     report_path = tmp_path / "report.json"
@@ -864,9 +865,10 @@ def run_cli_with_seeded_ledger(
     monkeypatch.delenv("GMO_COIN_TRADE_API_KEY", raising=False)
     monkeypatch.delenv("GMO_COIN_TRADE_API_SECRET", raising=False)
     monkeypatch.delenv("GUVOLU_MODE", raising=False)
-    monkeypatch.delenv("GUVOLU_DAY_JPY_MAX", raising=False)
-    monkeypatch.delenv("GUVOLU_DAY_COUNT_MAX", raising=False)
-    monkeypatch.delenv("GUVOLU_ORDER_JPY_MAX", raising=False)
+    # 钉住场景限额，不随仓库缺省漂移
+    monkeypatch.setenv("GUVOLU_DAY_JPY_MAX", "2000")
+    monkeypatch.setenv("GUVOLU_DAY_COUNT_MAX", "50")
+    monkeypatch.setenv("GUVOLU_ORDER_JPY_MAX", "500")
     monkeypatch.setenv("GUVOLU_LOG_DIR", str(tmp_path / "logs"))
     ledger_path = tmp_path / "intent_ledger.jsonl"
     seed_budget_intents(ledger_path, consumed=consumed)

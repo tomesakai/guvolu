@@ -775,7 +775,7 @@ def _bounded_latest_stream_run_contracts(
                     continue
                 seen_run_directory = True
                 if _is_legacy_run_directory(run_directory):
-                    # 旧版 run 不参选，最新 run 必须为 v3
+                    # 旧版 run 不参选
                     continue
                 contract = _bounded_run_contract(
                     run_directory,
