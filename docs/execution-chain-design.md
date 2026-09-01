@@ -368,5 +368,8 @@ PowerShell 包装 `scripts/run_execution_soak.ps1`）把第 9 节的单轮逻辑
 
 信封文件位于 `config/authorization_envelope.json`，SHA-256 进入执行
 报告与意图账本行；具体取值由维护者签发时决定（G-06），不在本文固化。
-上膛协议：维护者签发信封、设 `GUVOLU_MODE=live` 并亲自启动或注册
-live 执行任务；代理可编写与测试全部代码，不代行上膛与首次启动。
+上膛协议：维护者签发信封并亲自注册 -live 每小时任务
+（`scripts/register_frozen_live_task.ps1`）；`GUVOLU_MODE=live` 由
+live 串联仅注入 live 执行器子进程，链内 dry-run 与 paper 子进程
+保持缺省模式（T-04）。代理可编写与测试全部代码，不代行上膛与
+首次启动。解除武装即注销 -live 任务并恢复 shadow 任务。

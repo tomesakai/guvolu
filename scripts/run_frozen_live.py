@@ -3,14 +3,16 @@
 复用 run_frozen_shadow 的刷新、预测、dry-run 与 paper 步骤
 （导入函数，不复制）；随后以 live 模式目标调用执行仓的
 run_live_executor.py（参数含来源预测血缘）。live 步骤失败不
-影响预测登记，命令行返回非零码。本脚本不设置运行模式，
-GUVOLU_MODE=live 由维护者按上膛协议亲自配置（T-04、A-01，
-执行链设计第 14 节）。
+影响预测登记，命令行返回非零码。链内 dry-run 与 paper 子进程
+保持缺省模式；GUVOLU_MODE=live 仅注入 live 执行器这一个子
+进程（T-04 缺省不实盘）。本脚本唯一入口是维护者按上膛协议
+亲自注册的 -live 任务（A-01，执行链设计第 14 节）。
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Sequence
@@ -72,6 +74,9 @@ def run_live_step(
         returncode: int | None = None
         if not reused:
             report_path.parent.mkdir(parents=True, exist_ok=True)
+            # live 模式仅注入本子进程（T-04）
+            live_env = dict(os.environ)
+            live_env["GUVOLU_MODE"] = LIVE_MODE
             result = _run(
                 (
                     str(exec_python),
@@ -82,6 +87,7 @@ def run_live_step(
                     "--report", str(report_path),
                 ),
                 cwd=execution,
+                env=live_env,
             )
             returncode = result.returncode
             if not report_path.is_file():
