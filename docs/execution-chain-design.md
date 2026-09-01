@@ -369,7 +369,28 @@ PowerShell 包装 `scripts/run_execution_soak.ps1`）把第 9 节的单轮逻辑
 信封文件位于 `config/authorization_envelope.json`，SHA-256 进入执行
 报告与意图账本行；具体取值由维护者签发时决定（G-06），不在本文固化。
 上膛协议：维护者签发信封并亲自注册 -live 每小时任务
-（`scripts/register_frozen_live_task.ps1`）；`GUVOLU_MODE=live` 由
-live 串联仅注入 live 执行器子进程，链内 dry-run 与 paper 子进程
-保持缺省模式（T-04）。代理可编写与测试全部代码，不代行上膛与
-首次启动。解除武装即注销 -live 任务并恢复 shadow 任务。
+（`scripts/register_frozen_live_task.ps1`，起点与信封 `valid_from`
+对齐）；`GUVOLU_MODE=live` 由 live 串联仅注入 live 执行器子进程，
+链内 dry-run 与 paper 子进程保持缺省模式（T-04）。代理可编写与
+测试全部代码，不代行上膛与首次启动。解除武装即注销 -live 任务并
+恢复 shadow 任务。
+
+正当拒绝与崩溃可区分：执行器各拒绝启动路径把
+`kind=live_refusal_report` 报告写到 `--report` 目的地，串联层判读
+为 `status=refused`（退出 0），与 `failed` 严格区分；信封到期、
+耗尽或维护窗不再伪装成故障。
+
+上膛期间必须运行 live 伴随观察进程
+（`scripts/run_live_observer.ps1`，入口
+`guvolu.execution.live_observer`）：READ_ONLY 周期巡视超龄挂单、
+卡滞在途意图、持仓名义超限与信封熔断状态，逐轮 JSONL 留痕并写
+心跳。它全程零写——不持 TRADE 密钥、不写意图账本（账本只做宽容
+只读扫描，不隔离不截断），处置动作留给人工（kill-switch 单命令
+包装为 `scripts/run_kill_switch.ps1`）。浸泡进程仍限模拟运行，
+live 下的实时监视仅由本观察进程承担。
+
+熔断解除即换封：信封状态文件按 SHA-256 身份落盘
+（`data/execution/envelope/state-<sha12>.json`），`tripped_at`
+一经写入即对该信封永久生效，任何人不改写状态文件。人工复核后
+恢复 live 的唯一路径是签发一份新信封（新字节即新身份、新状态），
+再按上膛协议重新武装。
