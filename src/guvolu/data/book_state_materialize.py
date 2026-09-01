@@ -499,8 +499,8 @@ def _watch(root: Path, poll_seconds: float) -> int:
             cycle_started = time.monotonic()
             try:
                 results = materialize_all(root, conn)
-                with sqlite_writer_lock(root):
-                    report = audit(root, conn)
+                # 复核只读，不占写锁
+                report = audit(root, conn)
                 print(json.dumps({
                     "event": "book_state_materialization_cycle",
                     "markets": len(results),
@@ -542,13 +542,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     conn = connect(root)
     try:
         if args.command == "audit":
-            with sqlite_writer_lock(root):
-                report = audit(root, conn)
+            report = audit(root, conn)
             print(json.dumps(report, ensure_ascii=False, indent=2))
             return 0 if report["ok"] else 1
         materialize_all(root, conn)
-        with sqlite_writer_lock(root):
-            audit(root, conn)
+        audit(root, conn)
         return 0
     finally:
         conn.close()
