@@ -246,6 +246,15 @@ class _Reader:
     ) -> tuple[Order, ...]:
         return self._active
 
+    def executions(
+        self,
+        order_id: int | None = None,
+        execution_ids: Sequence[int] | None = None,
+    ) -> tuple[Execution, ...]:
+        return tuple(
+            row for row in self._executions if row.order_id == order_id
+        )
+
     def latest_executions(
         self, symbol: str, page: int | None = None, count: int | None = None,
     ) -> tuple[Execution, ...]:
@@ -598,16 +607,23 @@ def test_main_refuses_non_live_mode(
     monkeypatch.delenv("GUVOLU_MODE", raising=False)
     monkeypatch.setenv("GMO_COIN_TRADE_API_KEY", "sk_live_sentinel_key")
     monkeypatch.setenv("GMO_COIN_TRADE_API_SECRET", "sk_live_sentinel_secret")
+    report_path = tmp_path / "refusal-report.json"
     exit_code = main([
         "--target", str(tmp_path / "missing-target.json"),
         "--source-prediction", str(tmp_path / "missing-prediction.json"),
         "--source-prediction-sha256", "0" * 64,
+        "--report", str(report_path),
     ])
     captured = capsys.readouterr()
     assert exit_code == EXIT_REFUSED
     assert "not_live" in captured.out
     assert "sk_live_sentinel" not in captured.out
     assert "sk_live_sentinel" not in captured.err
+    # 正当拒绝也写报告，与崩溃可区分
+    refusal = json.loads(report_path.read_text(encoding="utf-8"))
+    assert refusal["kind"] == "live_refusal_report"
+    assert refusal["status"] == "not_live"
+    assert "sk_live_sentinel" not in report_path.read_text(encoding="utf-8")
 
 
 def test_main_refuses_tripped_envelope(

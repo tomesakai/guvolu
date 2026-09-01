@@ -3,7 +3,7 @@
   "market_id": "mkt__gmo__btc__r0",
   "symbol": "BTC",
   "bar_interval": "1hour",
-  "risk_budget_jpy": "500",
+  "risk_budget_jpy": "5000",
   "no_trade_band": "0.01",
   "taker_fee_fallback_bps": "5",
   "taker_fee_cache_seconds": 86400,

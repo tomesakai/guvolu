@@ -140,7 +140,7 @@ def write_v2_target(
     market_id: str = "mkt__gmo__btc__r0",
     symbol: str = "BTC",
     target: float = 0.6,
-    risk_budget_jpy: Decimal = Decimal("500"),
+    risk_budget_jpy: Decimal = Decimal("5000"),
 ) -> Path:
     """经公共 adapter 写出真实内容寻址 v2 目标。"""
     from guvolu.execution.frozen_target_adapter import (
@@ -572,7 +572,7 @@ def test_adapter_v2_target_reaches_ledger_with_exact_lineage(
     artifact = load_target_artifact(target_path)
     assert artifact.run_id == prediction_id
     assert artifact.symbol == SpotSymbol("BTC")
-    assert artifact.risk_budget_jpy == Decimal("500")
+    assert artifact.risk_budget_jpy == Decimal("5000")
     ledger_path = tmp_path / "ledger" / "intent_ledger.jsonl"
     report_path = tmp_path / "report.json"
     code = main(
@@ -872,16 +872,20 @@ def run_cli_with_seeded_ledger(
     monkeypatch.setenv("GUVOLU_LOG_DIR", str(tmp_path / "logs"))
     ledger_path = tmp_path / "intent_ledger.jsonl"
     seed_budget_intents(ledger_path, consumed=consumed)
-    target = write_v2_target(tmp_path, target=0.6)
+    # 场景钉住五百日元预算
+    target = write_v2_target(
+        tmp_path, target=0.6, risk_budget_jpy=Decimal("500"),
+    )
     report_path = tmp_path / "report.json"
     code = main(
         [
             "--target", str(target),
             *source_prediction_arguments(target),
-            "--target-config", str(ROOT / "config" / "paper_executor.json"),
+            "--target-config", str(write_target_config(tmp_path)),
             "--rules", str(write_rules(tmp_path)),
             "--reference-price", "1000000",
             "--service-status", "OPEN",
+            "--budget-jpy", "500",
             "--ledger", str(ledger_path),
             "--breaker-config", str(BREAKER_CONFIG),
             "--env-file", str(tmp_path / "absent.env"),

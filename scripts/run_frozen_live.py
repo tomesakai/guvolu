@@ -33,9 +33,10 @@ LIVE_REPORT_ROOT = "data/execution/live/reports"
 LIVE_TASK_LOG = "data/execution/live/frozen-forward/task.jsonl"
 
 
-def _validate_live_report(path: Path, prediction_id: str) -> dict[str, object]:
+def _validate_live_report(
+    report: dict[str, object], prediction_id: str
+) -> dict[str, object]:
     """校验 live 报告：live 模式与预测身份。"""
-    report = _object(json.loads(path.read_text(encoding="utf-8")), "live report")
     if report.get("mode") != LIVE_MODE:
         raise ValueError("live report 不是 live 模式")
     artifact = _object(report.get("artifact"), "live report artifact")
@@ -57,8 +58,9 @@ def run_live_step(
     """适配 live 目标并调用执行仓 live 执行器。
 
     预算以执行仓版本化配置为准（G-06），不经命令行覆盖。同一
-    预测的报告已存在时复用，不重复发送。任何失败只记为
-    status=failed，不抛出，不影响前序登记结果。
+    预测的报告已存在时复用，不重复发送。执行器正当拒绝记为
+    status=refused；任何失败只记为 status=failed，不抛出，
+    不影响前序登记结果。
     """
     live: dict[str, object] = {"status": "failed"}
     try:
@@ -95,7 +97,20 @@ def run_live_step(
                 raise RuntimeError(
                     f"live 执行失败({result.returncode}): {detail}"
                 )
-        report = _validate_live_report(report_path, prediction_id)
+        parsed = _object(
+            json.loads(report_path.read_text(encoding="utf-8")),
+            "live report",
+        )
+        if parsed.get("kind") == "live_refusal_report":
+            # 正当拒绝不算失败（第 14 节）
+            live.update({
+                "status": "refused",
+                "returncode": returncode,
+                "refusal_status": parsed.get("status"),
+                "detail": parsed.get("detail"),
+            })
+            return live
+        report = _validate_live_report(parsed, prediction_id)
         live.update({
             "status": "reused" if reused else "completed",
             "returncode": returncode,
@@ -126,7 +141,7 @@ def run_live(
     market_id: str,
     *,
     symbol: str = "BTC",
-    budget_jpy: str = "500",
+    budget_jpy: str = "5000",
     max_prediction_age_minutes: int = DEFAULT_MAX_PREDICTION_AGE_MINUTES,
     paper_enabled: bool = True,
 ) -> dict[str, object]:
@@ -173,7 +188,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--plan-id", required=True)
     parser.add_argument("--market-id", default="mkt__gmo__btc__r0")
     parser.add_argument("--symbol", default="BTC")
-    parser.add_argument("--budget-jpy", default="500")
+    parser.add_argument("--budget-jpy", default="5000")
     parser.add_argument(
         "--max-prediction-age-minutes", type=int,
         default=DEFAULT_MAX_PREDICTION_AGE_MINUTES,

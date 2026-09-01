@@ -829,7 +829,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target", type=Path, help="target-position 制品路径")
     parser.add_argument("--symbol", default="BTC", help="现物品种，缺省 BTC")
     parser.add_argument(
-        "--budget-jpy", default="500", help="名义预算 JPY，缺省 500"
+        "--budget-jpy", default="5000", help="名义预算 JPY，缺省 5000"
     )
     parser.add_argument(
         "--rules", type=Path, default=None,

@@ -35,8 +35,8 @@ from guvolu.domain.intent import (
 )
 from guvolu.domain.symbols import SpotSymbol
 
-# 第 3 版只增写预算标记（D-06）
-SCHEMA_VERSION = 3
+# 第 4 版只增信封散列字段（D-06）
+SCHEMA_VERSION = 4
 # 写预算标记的落盘文本（T-11）
 _WRITE_BUDGET_TEXT = {True: "consumed", False: "exempt"}
 # 账本在数据根下的相对位置
@@ -101,12 +101,15 @@ def _optional_text(record: Mapping[str, object], key: str) -> str | None:
     return value
 
 
-def _intent_record(intent: OrderIntent, at: datetime) -> dict[str, object]:
+def _intent_record(
+    intent: OrderIntent, at: datetime, envelope_sha256: str | None
+) -> dict[str, object]:
     """序列化意图创建行，金额与数量落字符串（D-07）。"""
     return {
         "schema_version": SCHEMA_VERSION,
         "record": "intent",
         "at": at.isoformat(),
+        "envelope_sha256": envelope_sha256,
         "intent_id": intent.intent_id,
         "correlation_id": intent.correlation_id,
         "symbol": str(intent.symbol),
@@ -132,8 +135,12 @@ def _intent_record(intent: OrderIntent, at: datetime) -> dict[str, object]:
 class IntentLedger:
     """追加式意图账本。单写边界内使用，不做并发仲裁。"""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self, path: Path, *, envelope_sha256: str | None = None
+    ) -> None:
         self._path = path
+        # live 授权信封散列，随意图创建行落盘
+        self._envelope_sha256 = envelope_sha256
         self._entries: dict[str, LedgerEntry] = {}
         self._order_map: dict[int, str] = {}
         self._load()
@@ -155,7 +162,9 @@ class IntentLedger:
         if intent.intent_id in self._entries:
             raise DuplicateIntent(f"重复意图: {intent.intent_id}")
         moment = at if at is not None else datetime.now(UTC)
-        self._append(_intent_record(intent, moment))
+        self._append(
+            _intent_record(intent, moment, self._envelope_sha256)
+        )
         self._entries[intent.intent_id] = LedgerEntry(
             intent=intent, state=IntentState.RECORDED, order_id=None
         )

@@ -59,6 +59,28 @@ def test_record_persists_before_send(tmp_path: Path) -> None:
     assert body.endswith("\n")
 
 
+def test_intent_row_carries_envelope_sha256(tmp_path: Path) -> None:
+    """live 账本创建行落信封散列，可单独回溯授权（第 14 节）。"""
+    sha = "e" * 64
+    ledger = IntentLedger(
+        tmp_path / "live_ledger.jsonl", envelope_sha256=sha
+    )
+    ledger.record_intent(make_intent("it01"))
+    row = json.loads(
+        ledger.path.read_text(encoding="utf-8").splitlines()[0]
+    )
+    assert row["envelope_sha256"] == sha
+    # 非 live 账本无信封散列，落空值
+    plain = open_ledger(tmp_path)
+    plain.record_intent(make_intent("it02"))
+    plain_row = json.loads(
+        plain.path.read_text(encoding="utf-8").splitlines()[0]
+    )
+    assert plain_row["envelope_sha256"] is None
+    # 旧账本重放不受新增字段影响
+    assert IntentLedger(ledger.path).state("it01") is IntentState.RECORDED
+
+
 def test_duplicate_intent_rejected(tmp_path: Path) -> None:
     """intent_id 不得重复（D-05）。"""
     ledger = open_ledger(tmp_path)

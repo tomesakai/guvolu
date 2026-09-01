@@ -177,6 +177,120 @@ def test_run_frozen_live_reuses_existing_report(tmp_path: Path) -> None:
     assert live["envelope_sha256"] == "e" * 64
 
 
+def test_run_frozen_live_marks_refusal_as_refused(tmp_path: Path) -> None:
+    """执行器正当拒绝判读为 refused，与崩溃 failed 区分。"""
+    sys.path.insert(0, str(REPO / "scripts"))
+    try:
+        from run_frozen_live import run_live_step
+    finally:
+        sys.path.pop(0)
+    execution = tmp_path / "execution"
+    prediction_id = "prediction-live-0003"
+    report_dir = execution / "data/execution/live/reports"
+    report_dir.mkdir(parents=True)
+    refusal = {
+        "schema_version": 1,
+        "kind": "live_refusal_report",
+        "status": "envelope_expired",
+        "detail": "信封不在有效期内，拒绝进入 live",
+    }
+    (report_dir / f"{prediction_id}.json").write_text(
+        json.dumps(refusal, ensure_ascii=False), encoding="utf-8",
+    )
+    prediction_path = tmp_path / "prediction.json"
+    prediction_path.write_text("{}", encoding="utf-8")
+
+    import run_frozen_live as module
+
+    original = module._adapt_target
+    module._adapt_target = (  # type: ignore[assignment]
+        lambda *args, **kwargs: report_dir / "target-known.json"
+    )
+    try:
+        live = run_live_step(
+            execution, execution / ".venv/Scripts/python.exe",
+            prediction_path, prediction_id,
+            market_id="mkt__gmo__btc__r0", symbol="BTC",
+            prediction_sha="f" * 64,
+        )
+    finally:
+        module._adapt_target = original
+    assert live["status"] == "refused"
+    assert live["refusal_status"] == "envelope_expired"
+    assert "error" not in live
+
+
+def test_live_mode_injected_only_into_live_subprocess(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """GUVOLU_MODE=live 仅进入 live 执行器子进程环境（T-04）。"""
+    sys.path.insert(0, str(REPO / "scripts"))
+    try:
+        from run_frozen_live import run_live_step
+    finally:
+        sys.path.pop(0)
+    monkeypatch.delenv("GUVOLU_MODE", raising=False)
+    execution = tmp_path / "execution"
+    prediction_id = "prediction-live-0004"
+    report_dir = execution / "data/execution/live/reports"
+    report_dir.mkdir(parents=True)
+    prediction_path = tmp_path / "prediction.json"
+    prediction_path.write_text("{}", encoding="utf-8")
+    captured_envs: list[dict[str, str] | None] = []
+
+    class _Result:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(
+        command: object, *, cwd: object = None, env: object = None,
+    ) -> object:
+        assert env is None or isinstance(env, dict)
+        captured_envs.append(env)
+        (report_dir / f"{prediction_id}.json").write_text(
+            json.dumps({
+                "mode": "live",
+                "artifact": {"run_id": prediction_id},
+                "gate_verdict": "skip",
+                "resolution": None,
+                "final_order_status": None,
+                "endpoints": {"write_touched": []},
+                "envelope": {"sha256": "e" * 64},
+            }, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return _Result()
+
+    import os
+
+    import run_frozen_live as module
+
+    original_adapt = module._adapt_target
+    original_run = module._run
+    module._adapt_target = (  # type: ignore[assignment]
+        lambda *args, **kwargs: report_dir / "target-known.json"
+    )
+    module._run = fake_run  # type: ignore[assignment]
+    try:
+        live = run_live_step(
+            execution, execution / ".venv/Scripts/python.exe",
+            prediction_path, prediction_id,
+            market_id="mkt__gmo__btc__r0", symbol="BTC",
+            prediction_sha="f" * 64,
+        )
+    finally:
+        module._adapt_target = original_adapt
+        module._run = original_run
+    assert live["status"] == "completed"
+    assert len(captured_envs) == 1
+    live_env = captured_envs[0]
+    assert live_env is not None
+    assert live_env["GUVOLU_MODE"] == "live"
+    # 父进程环境不被污染
+    assert "GUVOLU_MODE" not in os.environ
+
+
 def test_run_frozen_live_records_failure_without_raising(
     tmp_path: Path,
 ) -> None:

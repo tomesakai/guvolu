@@ -135,6 +135,7 @@ ASSETS_ENDPOINT = "GET /v1/account/assets"
 ORDERS_ENDPOINT = "GET /v1/orders"
 ACTIVE_ORDERS_ENDPOINT = "GET /v1/activeOrders"
 LATEST_EXECUTIONS_ENDPOINT = "GET /v1/latestExecutions"
+EXECUTIONS_ENDPOINT = "GET /v1/executions"
 # 委托终态集合（对账域口径）
 TERMINAL_ORDER_STATUSES = frozenset(
     {OrderStatus.EXECUTED, OrderStatus.CANCELED, OrderStatus.EXPIRED}
@@ -159,6 +160,12 @@ class LiveReader(Protocol):
     def active_orders(
         self, symbol: str, page: int | None = None, count: int | None = None
     ) -> tuple[Order, ...]: ...
+
+    def executions(
+        self,
+        order_id: int | None = None,
+        execution_ids: Sequence[int] | None = None,
+    ) -> tuple[Execution, ...]: ...
 
     def latest_executions(
         self, symbol: str, page: int | None = None, count: int | None = None
@@ -510,13 +517,13 @@ def verify_first_order(
 ) -> tuple[bool, dict[str, object]]:
     """首单快照对账：委托快照与成交一览两视图相互校验。
 
-    以 GET /v1/orders 的终态快照与 GET /v1/latestExecutions 的
-    成交合计相互校验（R-08 口径的快照两视图；本执行器无 WS
-    通道，实时通道对账由浸泡进程承担）。一致方可解除首单
-    canary 压额（T-12）。
+    以 GET /v1/orders 的终态快照与 GET /v1/executions 按委托号
+    查得的成交合计相互校验（R-08 口径的快照两视图；本执行器无
+    WS 通道，实时通道对账由伴随观察进程承担）。按委托号查询
+    不受一览分页窗口影响。一致方可解除首单 canary 压额（T-12）。
     """
-    executions = runtime.reader.latest_executions(order.symbol)
-    runtime.read_touched.append(LATEST_EXECUTIONS_ENDPOINT)
+    executions = runtime.reader.executions(order_id=order.order_id)
+    runtime.read_touched.append(EXECUTIONS_ENDPOINT)
     matched = tuple(
         row for row in executions if row.order_id == order.order_id
     )
@@ -532,7 +539,7 @@ def verify_first_order(
         "execution_total_size": format(executed_total, "f"),
         "execution_count": len(matched),
         "consistent": consistent,
-        "endpoints": [ORDERS_ENDPOINT, LATEST_EXECUTIONS_ENDPOINT],
+        "endpoints": [ORDERS_ENDPOINT, EXECUTIONS_ENDPOINT],
     }
     return consistent, evidence
 
@@ -599,6 +606,10 @@ def flatten_position(
             intent_id=intent.intent_id,
             notional_jpy=size * reference_price,
             at=now,
+        )
+        # T-11 当日计量同步补记，不设卡
+        runtime.limit_gate.seed_usage(
+            trading_day(now), size * reference_price, 1
         )
         try:
             order_id = runtime.sender.send(intent)
@@ -764,12 +775,20 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _refusal(status: str, detail: str) -> int:
-    """打印拒绝启动的明确状态（不含任何密钥）。"""
-    print(json.dumps(
-        {"status": status, "detail": detail},
-        ensure_ascii=False, sort_keys=True,
-    ))
+def _refusal(
+    status: str, detail: str, *, report: str | None = None
+) -> int:
+    """输出拒绝启动报告，使正当拒绝与崩溃可区分（不含任何密钥）。"""
+    body = {
+        "schema_version": 1,
+        "kind": "live_refusal_report",
+        "status": status,
+        "detail": detail,
+        "generated_at": datetime.now(UTC).isoformat(),
+    }
+    print(json.dumps(body, ensure_ascii=False, sort_keys=True))
+    if report is not None and report != "-":
+        _emit_report(body, report)
     return EXIT_REFUSED
 
 
@@ -880,12 +899,14 @@ def main(
     args = build_parser().parse_args(argv)
     env_file: Path | None = args.env_file
     config = load_config(env_file)
+    report_destination = str(args.report)
     if config.mode is not RunMode.LIVE:
         # 不打印任何密钥（T-01、A-06）
         return _refusal(
             "not_live",
             "当前不是 live 模式。切换实盘需人工设置 GUVOLU_MODE=live"
             "（T-04、A-01），本入口不会代为切换。",
+            report=report_destination,
         )
     now = moment if moment is not None else datetime.now(UTC)
     try:
@@ -893,7 +914,9 @@ def main(
             Path(args.envelope), whitelist=config.spot_whitelist
         )
     except GuvoluError as exc:
-        return _refusal("envelope_invalid", str(exc))
+        return _refusal(
+            "envelope_invalid", str(exc), report=report_destination
+        )
     root = data_root()
     usage = EnvelopeUsage.for_envelope(envelope)
     state_store = EnvelopeStateStore.for_envelope(envelope)
@@ -903,14 +926,20 @@ def main(
             "envelope_tripped",
             f"信封已于 {state.tripped_at.isoformat()} 熔断锁定:"
             f" {state.trip_reason}，停机待人工复核",
+            report=report_destination,
         )
     if not envelope.valid_from <= now < envelope.valid_until:
-        return _refusal("envelope_expired", "信封不在有效期内，拒绝进入 live")
+        return _refusal(
+            "envelope_expired",
+            "信封不在有效期内，拒绝进入 live",
+            report=report_destination,
+        )
     if usage.total_jpy() >= envelope.envelope_jpy_total:
         return _refusal(
             "envelope_exhausted",
             f"信封总额已耗尽: 已用 {usage.total_jpy()} JPY /"
             f" {envelope.envelope_jpy_total} JPY，停机复核",
+            report=report_destination,
         )
     artifact = load_target_artifact(Path(args.target))
     verify_v2_source_prediction(
@@ -980,13 +1009,15 @@ def main(
         return _refusal(
             "service_not_open",
             f"服务状态 {service_status.value}，不发写请求（R-03）",
+            report=report_destination,
         )
     ledger_arg: Path | None = args.ledger
     ledger_path = (
         ledger_arg if ledger_arg is not None
         else root / LIVE_RELATIVE_DIR / LIVE_LEDGER_NAME
     )
-    ledger = IntentLedger(ledger_path)
+    # 信封散列随意图创建行落账（第 14 节）
+    ledger = IntentLedger(ledger_path, envelope_sha256=envelope.sha256)
     thresholds = merged_breaker_thresholds(
         load_breaker_thresholds(Path(args.breaker_config)), envelope
     )

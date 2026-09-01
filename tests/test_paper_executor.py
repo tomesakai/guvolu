@@ -289,7 +289,7 @@ def test_full_exposure_buys_from_zero_and_records_everything(
 
     intent_rows = ledger_rows(runtime.ledger_directory / INTENT_LEDGER_NAME)
     created = intent_rows[0]
-    assert created["schema_version"] == 3
+    assert created["schema_version"] == 4
     assert created["prediction_id"] == "prediction-one"
     assert created["decision_time"] == DECISION.isoformat()
     assert created["correlation_id"] == target.correlation_id
