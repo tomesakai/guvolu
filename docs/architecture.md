@@ -145,7 +145,7 @@ schema v2 / `book-l2-normalization-v2`。OFL 当前代码契约为 schema v2 /
 旧 raw v1 不补造当时未记录的端点修订、连接/频道与单调时钟，重投影时相应列为
 NULL 并带质量降级。
 
-质量与旁路观察各自保持独立域：`l2-quality-v1` 生成五分钟质量窗口，bitbank
+质量与旁路观察各自保持独立域：`l2-quality-v2` 生成五分钟质量窗口，bitbank
 市场状态使用 `market-status-normalization-v1`，三所 REST 盘口锚点使用独立不可变
 raw artifact 与 schema v2 / `book-l2-anchor-normalization-v2` 事实。REST 锚点只做
 状态旁路核验，不伪装成 WS L2 事件、不补写断流，也不静默修正 WS 事实。SQLite

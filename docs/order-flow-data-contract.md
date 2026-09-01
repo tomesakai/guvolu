@@ -140,8 +140,11 @@ decision time 与方法版本物化为独立 dataset。禁止先混池逐笔或�
 
 ### 3.5 L2 质量、市场状态与 REST 锚点
 
-`l2-quality-v1` 从活动 L2 事实确定性产生五分钟窗口；SQLite
-`l2_quality_window` 只是低基数查询摘要。bitbank circuit-break/status 使用独立
+`l2-quality-v2` 从活动 L2 事实确定性产生五分钟窗口；SQLite
+`l2_quality_window` 只是低基数查询摘要。v2 相对 v1 的唯一修订：
+recv-source 偏移仅在窗口中位数低于 -1000 毫秒时判 `clock_skewed`
+并降级；稳定的小幅来源时钟领先（实测三所约 -310 毫秒）不再整窗降级。
+历史 v1 窗口保留原判定，不回算。bitbank circuit-break/status 使用独立
 `market_status_observation` schema v1 / `market-status-normalization-v1` 及扫描
 断点，不把状态消息混入 `book_l2_frame`。两者失败均不回滚已经提交的 L2 事实。
 
@@ -329,7 +332,7 @@ flowchart LR
         OKXL2["OKX 历史 L2 schema 2 / norm v2<br/>frame + level"]
         TRADE["历史逐笔 v2 / 实时逐笔 v3"]
         KLINE["market_kline"]
-        QUALITY["l2-quality-v1<br/>五分钟窗口"]
+        QUALITY["l2-quality-v2<br/>五分钟窗口"]
         MSTATUS["market_status_observation v1"]
         AOBS["anchor observation + reconciliation v2"]
         L3["L3 schema v1 合同<br/>无 active fact"]

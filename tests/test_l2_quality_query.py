@@ -26,7 +26,7 @@ def _quality_root(root: Path) -> None:
             market_id=MARKET_ID,
             window_start="2026-08-12T00:00:00+00:00",
             window_end="2026-08-12T00:05:00+00:00",
-            quality_version="l2-quality-v1",
+            quality_version="l2-quality-v2",
             source_head_generation="sha256-" + "a" * 64,
             source_attempt_ids='["attempt-1"]', source_attempt_count=1,
             source_normalization_versions='["book-l2-normalization-v4"]',

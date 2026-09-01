@@ -695,7 +695,7 @@ diff。whole `S` 到达时权威替换本地簿，再按 `s` 升序应用所有 
 
 | 域 | 事实或摘要 | 作用 | 禁止事项 |
 |---|---|---|---|
-| L2 质量 | `l2-quality-v1` 五分钟窗口与 `l2_quality_window` 摘要 | 汇总 fresh/stale、gap、sequence、reject、深度与延迟 | 不把摘要当逐帧证据，不据此补帧 |
+| L2 质量 | `l2-quality-v2` 五分钟窗口与 `l2_quality_window` 摘要 | 汇总 fresh/stale、gap、sequence、reject、深度与延迟 | 不把摘要当逐帧证据，不据此补帧 |
 | 市场状态 | `market_status_observation` schema v1 / `market-status-normalization-v1` | 保存 bitbank circuit-break/status 原文语义及扫描断点 | 不混入 L2 frame，不把推断写成来源声明 |
 | REST 锚点 | 独立 REST raw artifact、`book_l2_anchor_observation` 与 reconciliation schema v2 | 在连接打开、重连或周期触发时旁路比较最新可信 WS book-state | 不伪装成 WS 事件，不补写断流，不静默修 WS |
 

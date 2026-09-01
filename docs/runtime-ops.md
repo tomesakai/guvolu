@@ -27,7 +27,7 @@
 > `recovered_incomplete` 不进入事实活动头，鲜活稀疏流不会被误封。
 
 > 文档类别：长期维护，登记于 [docs/00-rules-registry.md](00-rules-registry.md)。
-> 范围：查询服务、采集进程、回补任务的保活链、互监与前端拉起；**不含交易进程**——实盘切换与交易进程管理始终是人工确认事项（A-01），不入本设计。
+> 范围：查询服务、采集进程、回补任务的保活链、互监与前端拉起；**不含交易进程**——实盘切换与交易进程管理始终是人工确认事项（A-01），不入本设计。live 上膛协议、`-live` 每小时任务、伴随观察进程与 kill-switch 包装登记于[执行链设计第 14 节](execution-chain-design.md)。
 > 平台前提：Windows，Python 绝对路径调用（PATH 漂移教训），任务计划程序为系统级守护位。
 
 ## 1. 进程清单与保活责任链
@@ -69,7 +69,8 @@ GMO 实时逐笔即使在无限期运行模式也使用九十秒数据静默看�
 `trades` 数据帧才清零连续失败计数。这样 `ERR-5003` 等服务端错误不会被误当成
 健康控制帧而使采集器永久静默。
 
-L2 watcher 每轮在 L2 主事实提交之外刷新 `l2-quality-v1` 和 bitbank 市场状态；
+`l2-quality-v2` 五分钟窗口由独立进程 `guvolu.data.quality_watcher` 刷新
+（见第 8.1 节）；L2 watcher 每轮在 L2 主事实提交之外仅刷新 bitbank 市场状态。
 任一旁路失败只记录错误并等待下一轮，不能回滚或阻塞 L2。REST anchor 的
 connection-open/reconnect/periodic 触发必须投递后台有界队列，网络请求、Decimal
 解析、散列和 reconciliation 均不得占用 WS 接收循环。队列满、限频、超时或来源

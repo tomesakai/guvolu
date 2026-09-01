@@ -57,7 +57,7 @@ def _snapshot(
 
 def _quality(venue: str, **changes: Any) -> dict[str, Any]:
     result: dict[str, Any] = {
-        "quality_version": "l2-quality-v1", "window_start": "w1",
+        "quality_version": "l2-quality-v2", "window_start": "w1",
         "computed_at": (DECISION - timedelta(seconds=5)).isoformat(),
         "status": "ok", "reasons": [],
         "source_attempt_ids": [f"attempt-{venue}"],

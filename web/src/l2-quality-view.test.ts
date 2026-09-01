@@ -7,7 +7,7 @@ function quality(
   patch: Partial<L2QualityResponse>,
 ): L2QualityResponse {
   return {
-    schema_version: 1, market_id: "mkt", quality_version: "l2-quality-v1",
+    schema_version: 1, market_id: "mkt", quality_version: "l2-quality-v2",
     status: "ok", reasons: [], window_start: null, window_end: null,
     window_clock_basis: "ingest", frames: 10, snapshot_frames: 1,
     delta_frames: 9, checksum_status: "unsupported",

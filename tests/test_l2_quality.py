@@ -432,6 +432,36 @@ def test_negative_signed_recv_source_offset_is_clock_skewed(
     assert "negative_recv_source_offset_clock_skew" in json.loads(row.reasons)
 
 
+def test_small_stable_negative_offset_stays_measurable(
+    tmp_path: Path,
+) -> None:
+    market = "mkt__gmo__btc__r0"
+    path = tmp_path / "materialized/gmo-small-offset.parquet"
+    # 来源钟领先三百毫秒属常态。
+    _write_frames(path, [
+        _row("g1", market, "gmo", 1, "snapshot", endpoint="orderbooks/ws",
+             source_offset=-0.31, quality=[]),
+    ])
+    conn = _connection(tmp_path)
+    try:
+        _register(tmp_path, conn, market, "gmo", "p", path,
+                  BASE + timedelta(seconds=1), BASE + timedelta(seconds=1))
+        conn.commit()
+        row = compute_quality_windows(
+            tmp_path, conn, BASE, BASE + timedelta(minutes=5),
+            market_ids=(market,), computed_at=BASE + timedelta(minutes=6),
+        )[0]
+    finally:
+        conn.close()
+    assert row.recv_source_offset_samples == 1
+    assert row.recv_source_offset_p50_ms == pytest.approx(-310)
+    assert row.latency_status == "measurable"
+    assert "negative_recv_source_offset_clock_skew" not in json.loads(
+        row.reasons
+    )
+    assert row.status == "ok"
+
+
 def test_legacy_missing_connection_is_unknown_not_fake_zero(
     tmp_path: Path,
 ) -> None:

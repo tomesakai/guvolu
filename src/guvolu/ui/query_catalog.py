@@ -19,7 +19,7 @@ from guvolu.data.storage_paths import storage_resolver
 
 CATALOG_SCHEMA_VERSION = 1
 L2_QUALITY_SCHEMA_VERSION = 1
-L2_QUALITY_VERSION = "l2-quality-v1"
+L2_QUALITY_VERSION = "l2-quality-v2"
 L2_MATERIALIZED_FRESHNESS_THRESHOLD_SECONDS = 12 * 60
 L2_FRESHNESS_BASIS = "latest_materialized_observation_time"
 

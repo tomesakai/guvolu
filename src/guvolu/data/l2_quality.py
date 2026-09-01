@@ -25,8 +25,10 @@ from guvolu.data import store
 from guvolu.data.paths import data_root as configured_data_root
 from guvolu.data.sqlite_writer_lock import sqlite_writer_lock
 
-QUALITY_VERSION = "l2-quality-v1"
+QUALITY_VERSION = "l2-quality-v2"
 WINDOW_SECONDS = 300
+# 中位偏移超此值才判偏斜。
+CLOCK_SKEW_TOLERANCE_MS = 1000.0
 OBSERVED_SILENCE_NS = 30_000_000_000
 DEFAULT_RECENT_MINUTES = 20
 # 封口与 watch 各五分钟。
@@ -625,7 +627,12 @@ def _build_window(
     p95: float | None
     if offsets:
         p50, p95 = _percentile(offsets, 0.50), _percentile(offsets, 0.95)
-        latency_status = "clock_skewed" if any(value < 0 for value in offsets) else "measurable"
+        # 稳定的小幅来源时钟领先不降级。
+        latency_status = (
+            "clock_skewed"
+            if p50 < -CLOCK_SKEW_TOLERANCE_MS
+            else "measurable"
+        )
         if latency_status == "clock_skewed":
             reasons.add("negative_recv_source_offset_clock_skew")
     else:

@@ -29,7 +29,7 @@ MON 的盘口回答三个扫读问题：最优买卖报价是否可交易、带�
 两者不得互换。盘口 header 常驻显示价差 tick（`spread Nt`）；覆盖范围、微价格和完整价差细节通过中线悬浮说明提供。当前显示不做档位聚合，不扩大原始覆盖。
 
 MON 的健康语义来自
-`/api/v2/markets/{market_id}/book/l2/quality` 的 `l2-quality-v1` 五分钟窗口，
+`/api/v2/markets/{market_id}/book/l2/quality` 的 `l2-quality-v2` 五分钟窗口，
 至少显示 fresh/stale、gap、sequence/regression、reject、深度范围和物化延迟。
 bitbank market status 与三所 REST anchor 目前没有稳定 UI 合同，不能被前端暗并成
 一个“健康”布尔值。未来展示 anchor 时必须同时给出 endpoint revision、触发原因、
