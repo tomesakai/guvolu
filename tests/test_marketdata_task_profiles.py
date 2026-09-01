@@ -22,6 +22,7 @@ RUNNERS = (
     "run_trade_materializer.ps1",
     "run_book_state_materializer.ps1",
     "run_orderflow_tile_watcher.ps1",
+    "run_quality_watcher.ps1",
 )
 MODULES = (
     "l2_capture",
@@ -30,6 +31,7 @@ MODULES = (
     "trade_realtime_materialize",
     "book_state_materialize",
     "orderflow_tile_materialize",
+    "quality_watcher",
 )
 
 
@@ -71,7 +73,7 @@ def test_forward_minimal_profile_preserves_raw_and_required_trade_path() -> None
     assert "[Nullable[int]]$L2LatestSealedSegmentsPerStream = $null" in script
     assert "L2LatestRunOnly and L2LatestSealedSegmentsPerStream" in script
     assert " -LatestSealedSegmentsPerStream " in script
-    assert "L2 input selection cannot be used with ForwardMinimal" in script
+    assert "Input selection cannot be used with ForwardMinimal" in script
     assert "function Assert-L2MaterializerSelection" in script
     assert "existing process selection differs" in script
     assert "Get-RepositoryL2MaterializerProcess" in script
@@ -1110,10 +1112,10 @@ def test_full_junction_alias_reentry_reuses_all_marketdata_processes(
                 row for row in _read_probe(log)
                 if "record" in row["argv"] or "watch" in row["argv"]
             ]
-            if len(held) == 10:
+            if len(held) == 11:
                 break
             time.sleep(0.05)
-        assert len(held) == 10
+        assert len(held) == 11
         held_pids = {row["pid"] for row in held}
 
         second = launch(alias)
@@ -1123,10 +1125,10 @@ def test_full_junction_alias_reentry_reuses_all_marketdata_processes(
             row for row in _read_probe(log)
             if "record" in row["argv"] or "watch" in row["argv"]
         ]
-        assert len(after) == 10
+        assert len(after) == 11
         assert {row["pid"] for row in after} == held_pids
         assert sum("record" in row["argv"] for row in after) == 6
-        assert sum("watch" in row["argv"] for row in after) == 4
+        assert sum("watch" in row["argv"] for row in after) == 5
     finally:
         release.touch(exist_ok=True)
         time.sleep(0.25)

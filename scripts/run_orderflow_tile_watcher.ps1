@@ -1,4 +1,4 @@
-param(
+﻿param(
     [int]$IntervalSeconds = 300,
     [string]$Repository = ''
 )

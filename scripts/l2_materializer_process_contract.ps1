@@ -1,4 +1,4 @@
-function ConvertTo-L2ProcessCommandTokens {
+﻿function ConvertTo-L2ProcessCommandTokens {
     param(
         [Parameter(Mandatory = $true)]
         [string]$CommandLine
@@ -207,6 +207,12 @@ public static class L2PhysicalPath {
         }
         $Description = [L2PhysicalPath]::Describe($ExistingPath)
         $ResolvedPath = [string]$Description[0]
+        # 去掉 \\?\ 前缀，PS 5.1 Join-Path 不接受
+        if ($ResolvedPath.StartsWith('\\?\UNC\')) {
+            $ResolvedPath = '\\' + $ResolvedPath.Substring(8)
+        } elseif ($ResolvedPath.StartsWith('\\?\')) {
+            $ResolvedPath = $ResolvedPath.Substring(4)
+        }
         foreach ($Part in $Tail) {
             $ResolvedPath = Join-Path $ResolvedPath $Part
         }

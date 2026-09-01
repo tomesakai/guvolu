@@ -1,4 +1,4 @@
-# 浸泡进程包装：设定编码与模块路径后前台运行，Ctrl+C 直达进程。
+﻿# 浸泡进程包装：设定编码与模块路径后前台运行，Ctrl+C 直达进程。
 # 其余参数原样转交 scripts/run_execution_soak.py，用法见执行链设计第 12 节。
 param(
     [string]$Repository = (Split-Path -Parent $PSScriptRoot),

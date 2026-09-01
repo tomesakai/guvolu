@@ -1,4 +1,4 @@
-param(
+﻿param(
     [switch]$Disarm
 )
 
@@ -33,9 +33,11 @@ if ($Disarm) {
         Unregister-ScheduledTask -TaskName $ShadowTask -Confirm:$false
         Write-Host "removed $ShadowTask"
     }
+    # 起点与信封 valid_from 对齐（第 14 节）
     & (Join-Path $PSScriptRoot 'register_frozen_live_task.ps1') @Common `
-        -StartUtc '2026-08-24T00:00:00Z' -EndUtc '2026-10-01T00:00:00Z' | Out-Null
+        -StartUtc '2026-09-01T00:00:00Z' -EndUtc '2026-10-01T00:00:00Z' | Out-Null
     Write-Host "armed: live task registered"
+    Write-Host "reminder: start scripts/run_live_observer.ps1 while armed"
 }
 
 Get-ScheduledTask -TaskName "guvolu-frozen-forward-*" |

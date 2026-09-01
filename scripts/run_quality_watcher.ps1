@@ -1,4 +1,4 @@
-param(
+﻿param(
     [int]$IntervalSeconds = 300,
     [string]$Repository = ''
 )
@@ -12,6 +12,25 @@ $RepoRoot = if ($Repository) {
 }
 $PythonPath = Join-Path $RepoRoot '.venv\Scripts\python.exe'
 $DataRoot = Join-Path $RepoRoot 'data'
-Write-Host "guvolu quality-watcher started; interval=${IntervalSeconds}s."
+$LogDirectory = Join-Path $RepoRoot 'logs'
+$LogPath = Join-Path $LogDirectory 'quality-watcher.log'
+
+New-Item -ItemType Directory -Force -Path $LogDirectory | Out-Null
+try {
+    $Host.UI.RawUI.WindowTitle = 'guvolu quality-watcher'
+} catch {
+    # 无交互宿主缺 RawUI，忽略。
+}
+Set-Location -LiteralPath $RepoRoot
+function Write-VisibleLog {
+    process {
+        $Line = [string]$_
+        Write-Host $Line
+        $Line | Out-File -LiteralPath $LogPath -Append -Encoding utf8
+    }
+}
+"$(Get-Date -Format o) guvolu quality-watcher started; interval=${IntervalSeconds}s." |
+    Write-VisibleLog
 & $PythonPath -m guvolu.data.quality_watcher --data-root $DataRoot `
-    watch --interval-seconds $IntervalSeconds
+    watch --interval-seconds $IntervalSeconds 2>&1 |
+    Write-VisibleLog
