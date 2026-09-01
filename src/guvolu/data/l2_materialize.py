@@ -2249,6 +2249,7 @@ def _watch(
     latest_run_only: bool,
     latest_sealed_segments_per_stream: int | None,
     verify_all_hashes: bool = False,
+    refresh_quality: bool = True,
 ) -> int:
     selection = _watch_selection(
         latest_run_only=latest_run_only,
@@ -2265,6 +2266,7 @@ def _watch(
                 latest_sealed_segments_per_stream
             ),
             verify_all_hashes=verify_all_hashes,
+            refresh_quality=refresh_quality,
         )
 
 
@@ -2275,6 +2277,7 @@ def _watch_as_owner(
     latest_run_only: bool,
     latest_sealed_segments_per_stream: int | None,
     verify_all_hashes: bool = False,
+    refresh_quality: bool = True,
 ) -> int:
     """持续追赶封口盘口；启动锁竞争只延后本轮。"""
     def report_connect_error(exc: Exception, elapsed: float) -> None:
@@ -2321,10 +2324,17 @@ def _watch_as_owner(
                         market_status_summary, market_status_error = (
                             _refresh_market_status_nonblocking(root, conn)
                         )
-                # 质量锁外计算，upsert 短暂取锁
-                quality_summary, quality_error = (
-                    _refresh_quality_nonblocking(root, conn)
-                )
+                quality_summary: dict[str, object] | None
+                quality_error: Exception | None
+                if refresh_quality:
+                    # 质量锁外计算，upsert 短暂取锁
+                    quality_summary, quality_error = (
+                        _refresh_quality_nonblocking(root, conn)
+                    )
+                else:
+                    # 质量由独立进程刷新，物化热循环不承载
+                    quality_summary = {"deferred": True}
+                    quality_error = None
                 created = [result for result in cycle if not result.reused]
                 if quality_error is not None:
                     print(json.dumps({
@@ -2441,6 +2451,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--verify-all-hashes", action="store_true",
         help="关闭控制面散列预筛，逐个重算输入散列",
     )
+    watch.add_argument(
+        "--no-quality", action="store_true",
+        help="物化热循环不刷新质量，交由独立进程",
+    )
     args = parser.parse_args(argv)
     root = (args.data_root or configured_data_root()).resolve()
     if args.command == "watch":
@@ -2455,6 +2469,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.latest_sealed_segments_per_stream
             ),
             verify_all_hashes=bool(args.verify_all_hashes),
+            refresh_quality=not bool(args.no_quality),
         )
 
     conn = store.connect(root)

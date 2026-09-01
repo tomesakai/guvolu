@@ -814,7 +814,8 @@ foreach ($Collector in $Collectors) {
 $Materializers = @(
     @{ Name = 'trade-realtime-materializer'; Module = 'guvolu.data.trade_realtime_materialize'; Runner = 'run_trade_materializer.ps1' },
     @{ Name = 'book-state-materializer'; Module = 'guvolu.data.book_state_materialize'; Runner = 'run_book_state_materializer.ps1' },
-    @{ Name = 'orderflow-tile-watcher'; Module = 'guvolu.data.orderflow_tile_materialize'; Runner = 'run_orderflow_tile_watcher.ps1' }
+    @{ Name = 'orderflow-tile-watcher'; Module = 'guvolu.data.orderflow_tile_materialize'; Runner = 'run_orderflow_tile_watcher.ps1' },
+    @{ Name = 'quality-watcher'; Module = 'guvolu.data.quality_watcher'; Runner = 'run_quality_watcher.ps1' }
 )
 if ($Profile -eq 'ForwardMinimal') {
     $PausedMaterializers = @(

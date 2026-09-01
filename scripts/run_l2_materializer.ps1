@@ -86,7 +86,10 @@ Set-Location -LiteralPath $RepoRoot
 Start-Transcript -Path $LogPath -Append | Out-Null
 try {
     Write-Host "guvolu l2-materializer started; interval=${IntervalSeconds}s."
-    $Arguments = @('watch', '--interval-seconds', [string]$IntervalSeconds)
+    # 质量由独立进程刷新，不占物化热循环
+    $Arguments = @(
+        'watch', '--interval-seconds', [string]$IntervalSeconds, '--no-quality'
+    )
     if ($LatestRunOnly) {
         $Arguments += '--latest-run-only'
     }
