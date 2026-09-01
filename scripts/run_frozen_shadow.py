@@ -322,6 +322,8 @@ def run_shadow(
             "completed_at": datetime.now(UTC).isoformat(),
             "plan_id": plan_id,
             "prediction_id": prediction_id,
+            "prediction_path": str(prediction_path),
+            "prediction_sha256": prediction_sha,
             "decision_time": decision_time.isoformat(),
             "prediction_age_seconds": round(age.total_seconds(), 3),
             "aggregate_target": prediction.get("aggregate_target"),
