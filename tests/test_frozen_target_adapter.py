@@ -174,7 +174,7 @@ def test_adapter_rejects_budget_over_ceiling_and_bad_mode(tmp_path: Path) -> Non
     _prediction(source)
 
     with pytest.raises(FrozenTargetError, match="risk_budget_jpy"):
-        _build(source, risk_budget_jpy=Decimal("1001"))
+        _build(source, risk_budget_jpy=Decimal("10001"))
     with pytest.raises(FrozenTargetError, match="risk_budget_jpy"):
         _build(source, risk_budget_jpy=Decimal("0"))
     for value in ("NaN", "Infinity", "-Infinity"):
