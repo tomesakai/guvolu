@@ -1338,9 +1338,16 @@ def audit_realtime_trades(
             total += count
             if count != int(expected) or int(result[1] or 0) or int(result[2] or 0):
                 errors.append(f"逐笔计数、键或 PIT 失败: {attempt}")
+            # 合并件来源数按输入登记核对
+            expected_sources = int(conn.execute(
+                "SELECT COUNT(*) FROM partition_input "
+                "WHERE attempt_id=? AND normalized_rows>0",
+                (attempt,),
+            ).fetchone()[0])
             if count and (
                 int(result[3]) != 1 or str(result[4]) != str(market)
-                or int(result[5]) != 1 or int(result[6]) != 1
+                or int(result[5]) != max(expected_sources, 1)
+                or int(result[6]) != 1
                 or str(result[7]) != str(version)
             ):
                 errors.append(f"逐笔市场、原件或版本失败: {attempt}")

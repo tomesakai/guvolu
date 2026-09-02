@@ -5,6 +5,8 @@ import hashlib
 import sqlite3
 from pathlib import Path
 
+import pytest
+
 from scripts.refresh_frozen_runtime import refresh_runtime
 
 
@@ -49,12 +51,33 @@ def _source(root: Path) -> Path:
 def test_refresh_runtime_is_verified_and_idempotent(tmp_path: Path) -> None:
     source = _source(tmp_path)
     runtime = tmp_path / "runtime"
-    first = refresh_runtime(source, runtime, "market-one")
+    first = refresh_runtime(source, runtime, "market-one", verify_all=True)
     second = refresh_runtime(source, runtime, "market-one")
     assert first["quick_check"] == "ok"
+    assert second["quick_check"] == "skipped"
     assert first["inputs"] == 1
     assert second["methods"] == {"copied": 0, "hardlinked": 0, "reused": 1}
     assert not (runtime / ".locks").exists()
     assert (
         runtime / "data" / "materialized" / "trade.parquet"
     ).read_bytes() == b"sealed-trade-fact"
+    # 备份临时库与其伴随文件不得残留
+    leftovers = [
+        path.name for path in (runtime / "data").iterdir()
+        if path.name.startswith(".guvolu.refresh.")
+    ]
+    assert leftovers == []
+
+
+def test_refresh_runtime_rejects_tampered_reused_input_on_verify_all(
+    tmp_path: Path,
+) -> None:
+    """复用件缺省只核字节数，verify_all 才重算散列。"""
+    source = _source(tmp_path)
+    runtime = tmp_path / "runtime"
+    refresh_runtime(source, runtime, "market-one")
+    frozen = runtime / "data" / "materialized" / "trade.parquet"
+    frozen.write_bytes(b"sealed-trade-fake")
+    refresh_runtime(source, runtime, "market-one")
+    with pytest.raises(ValueError, match="散列不符"):
+        refresh_runtime(source, runtime, "market-one", verify_all=True)

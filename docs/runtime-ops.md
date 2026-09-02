@@ -404,17 +404,24 @@ watcher 退化为近乎连续的全量重扫，长期占用 `sqlite_writer_lock`
 与 watcher 周期之比留余量，取值随任务配置版本化（G-06），不在本文固化为事实；
 补历史与定期审计用缺省全量模式，并周期性加 `--verify-all-hashes` 做一次全量
 散列复核。增量模式下超出最新窗口的封口段与 bitbank 市场状态由每日补漏任务
-（`scripts/run_daily_materializer_catchup.ps1`，依次全量物化逐笔、L2 与市场
-状态）兜底。冻结运行根刷新（`scripts/refresh_frozen_runtime.py`）在 SQLite
-备份期间短暂持有生产数据根写锁，避免并发提交反复重启备份；各 watcher 按
-既有等锁语义顺延一轮。重型研究运行避开每小时第 15 至 45 分钟的冻结前向
+（`scripts/run_daily_materializer_catchup.ps1`，依次全量物化逐笔、按日合并
+逐笔实时段、L2 与市场状态）兜底。逐笔实时段合并（TBD-40，
+`guvolu.data.trade_realtime_compact`）只在当日结束一小时后进行，切换活动
+head 到 `day/YYYY-MM-DD`；被合并段的物化 attempt 仍完成，常驻物化器按
+完成 attempt 复用而不重新激活段头。冻结运行根刷新（`scripts/refresh_frozen_runtime.py`）以单步
+在线备份复制控制库，临时库关闭回滚日志，不持生产数据根写锁（2026-09-02
+实测：分步带日志备份持锁约十三分钟，全部物化器随之写锁超时；单步无日志
+备份 3.2 GB 约十秒）；每小时缺省只校验新落地制品与外键
+闭合，复用件散列与整库 quick_check 由 `--verify-all` 承担，留给日常复核。
+重型研究运行避开每小时第 15 至 45 分钟的冻结前向
 执行窗，不与冻结预测器争用计算与磁盘（2026-08-30 实测：并发时预测耗时
 约翻倍并触发预测年龄门失败）。L2 质量遥测由独立进程
 `guvolu.data.quality_watcher` 刷新，物化 watcher 以 `--no-quality` 运行：
 质量计算实测约七分半，留在物化热循环会把 cycle 撑到十余分钟并与每小时
 冻结刷新争用写锁（2026-09-01 实测）。持生产写锁的定时任务须共用一张时刻表：
-冻结刷新每小时第 12 至 14 分持锁，每日补漏任务因此定在 03:16（2026-08-31
-实测：补漏定在 04:50 时其锁跨入 05:12 刷新导致该轮失败）。
+每日补漏任务定在 03:16，避开每小时第 12 分起的冻结前向链路（2026-08-31
+实测：补漏定在 04:50 时其锁跨入 05:12 刷新导致该轮失败；刷新自 2026-09-02
+起不再持生产写锁，时刻表纪律仍保留以避免争用磁盘与计算）。
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run_trade_materializer.ps1 `

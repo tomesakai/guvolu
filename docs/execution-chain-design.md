@@ -387,7 +387,18 @@ PowerShell 包装 `scripts/run_execution_soak.ps1`）把第 9 节的单轮逻辑
 心跳。它全程零写——不持 TRADE 密钥、不写意图账本（账本只做宽容
 只读扫描，不隔离不截断），处置动作留给人工（kill-switch 单命令
 包装为 `scripts/run_kill_switch.ps1`）。浸泡进程仍限模拟运行，
-live 下的实时监视仅由本观察进程承担。
+live 下的实时监视仅由本观察进程承担。观察进程必须从执行仓启动
+（`-Repository` 指向执行仓），账本、心跳与观察记录才与 live 执行器
+同一数据根；由维护者用 `scripts/register_live_observer_task.ps1`
+注册登录拉起与每五分钟守护两项计划任务，进程退出后自动重新拉起
+（2026-09-02 实测：手工启动的观察进程无人守护，心跳中断六小时未被
+发现，且缺省账本路径指向主仓而非执行仓）。
+
+live 执行器启动时先把账本里遗留的 SENDING 意图转入超时态并按
+READ_ONLY 对账（T-06）：恰一候选即受理并映射委托号，零候选记
+FAILED，多候选保持超时态占用在途待人工处置；结果随报告
+`recovered_sends` 留痕。熔断清仓的意图落账冲突记为
+`ledger_conflict`，不中断全撤与信封锁定序列。
 
 熔断解除即换封：信封状态文件按 SHA-256 身份落盘
 （`data/execution/envelope/state-<sha12>.json`），`tripped_at`

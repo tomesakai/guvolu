@@ -680,3 +680,101 @@ def test_main_refuses_exhausted_envelope(
     captured = capsys.readouterr()
     assert exit_code == EXIT_REFUSED
     assert "envelope_exhausted" in captured.out
+
+
+def _sending_intent(ledger: IntentLedger, *, at: datetime) -> OrderIntent:
+    """在账本里留下一笔处于 SENDING 的意图，模拟进程中断。"""
+    intent = OrderIntent(
+        intent_id="itmtinterrupt0001",
+        correlation_id="co" + "b" * 16,
+        symbol=BTC,
+        side=Side.BUY,
+        execution_type=ExecutionType.LIMIT,
+        size=Decimal("0.00003"),
+        price=PRICE,
+        time_in_force=None,
+        created_at=at,
+    )
+    ledger.record_intent(intent, at=at)
+    ledger.begin_send(intent.intent_id, consumes_write_budget=True, at=at)
+    return intent
+
+
+def test_recover_interrupted_sends_resolves_by_read_only(
+    tmp_path: Path,
+) -> None:
+    """遗留 SENDING 先转超时态，恰一候选即受理并映射委托号（T-06）。"""
+    from guvolu.execution.live_executor import recover_interrupted_sends
+
+    ledger = IntentLedger(tmp_path / "ledger.jsonl")
+    intent = _sending_intent(ledger, at=NOW - timedelta(minutes=30))
+    reader = _Reader(active=(_order(7001, OrderStatus.ORDERED),))
+    recovered = recover_interrupted_sends(ledger, reader, now=NOW)
+    assert recovered == [{
+        "intent_id": intent.intent_id,
+        "state": IntentState.ACCEPTED.value,
+        "order_id": "7001",
+    }]
+    assert ledger.intent_id_for_order(7001) == intent.intent_id
+    # 恢复后账本不再在途，新意图可发
+    assert ledger.in_flight(BTC) == ()
+
+
+def test_recover_interrupted_sends_keeps_ambiguity_in_flight(
+    tmp_path: Path,
+) -> None:
+    """多候选保持超时态占用在途，留待人工处置。"""
+    from guvolu.execution.live_executor import recover_interrupted_sends
+
+    ledger = IntentLedger(tmp_path / "ledger.jsonl")
+    intent = _sending_intent(ledger, at=NOW - timedelta(minutes=30))
+    reader = _Reader(active=(
+        _order(7001, OrderStatus.ORDERED),
+        _order(7002, OrderStatus.ORDERED),
+    ))
+    recovered = recover_interrupted_sends(ledger, reader, now=NOW)
+    assert recovered[0]["state"] == IntentState.SEND_TIMEOUT.value
+    assert "歧义" in recovered[0]["reason"]
+    assert ledger.in_flight(BTC) == (intent.intent_id,)
+    # 无遗留时不触碰任何读端点
+    assert recover_interrupted_sends(
+        IntentLedger(tmp_path / "empty.jsonl"), reader, now=NOW
+    ) == []
+
+
+def test_trip_flatten_ledger_conflict_still_locks_envelope(
+    tmp_path: Path,
+) -> None:
+    """清仓意图落账冲突不中断熔断序列，信封仍锁定。"""
+    events: list[str] = []
+    reader = _Reader(assets=_assets(jpy="1000", btc="0.000216"))
+    sender = _Sender(events)
+    runtime = _runtime(
+        tmp_path, reader=reader, sender=sender, state=_cleared_state()
+    )
+    # 同品种已有在途意图，清仓落账必然冲突
+    _sending_intent(runtime.ledger, at=NOW - timedelta(minutes=1))
+    plan = build_plan(
+        _artifact(), rule=RULE, reference_price=PRICE,
+        budget_jpy=Decimal("500"),
+    )
+
+    def cancel_all() -> int:
+        events.append("cancel_all")
+        return 0
+
+    exit_code, fragment = run_live_cycle(
+        runtime, plan,
+        assets=reader.assets(),
+        price_observed_at=NOW - timedelta(seconds=120),
+        book=_book(),
+        cancel_all=cancel_all,
+        now=NOW,
+    )
+    assert exit_code == EXIT_ANOMALY
+    assert fragment["gate_verdict"] == "trip"
+    assert events == ["cancel_all"]
+    flatten = fragment["trip"]["flatten"]
+    assert flatten["status"] == "ledger_conflict"
+    assert sender.sent == []
+    assert runtime.state_store.load().tripped_at is not None

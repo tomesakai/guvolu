@@ -262,6 +262,7 @@ flowchart LR
 | **TBD-37** | 运行根与权威注册库的物理落位 | 【已实施首批 2026-08-23】2026-08-23 运行根与权威注册库已落 D 盘（见 [研究里程碑与冻结运行根切换快照](2026-08-23-research-milestone-and-runtime-switch.md) 第 5 节），E 盘不再在任何决策链上；提案原文保留如下。【提案 2026-08-22】冻结前向 shadow 的运行根与其登记前向预测的治理注册库当前位于 E 盘温层运行根（[runtime-ops.md](runtime-ops.md) 第 8 节；`scripts/run_frozen_shadow.py` 的 `--registry` 指向运行根内注册库）；E 盘为 USB 外置 SSD，桥接器不提供可信序列号（[materialization-design.md](materialization-design.md) 第 8.1 节）。提案把运行根与权威注册库落内置盘，E 盘只作不可变冷层，不承担运行时权威读写；与 TBD-35 关联，确认后同步修订该条职责表述。2026-08-22 晚 E 盘 USB 挂死事故见 [理论体系整理与最快实盘路径快照](2026-08-22-theory-system-and-fastest-live-path.md) 第 1.3 节 |
 | **TBD-38** | 容量阶梯改双判据 | 【提案 2026-08-22】现行 D 盘阶梯以剩余百分比为唯一判据（[runtime-ops.md](runtime-ops.md) 第 8 节）。背景：2026-08-22 观测 D 盘剩余仅约 19%，占用主体为非项目数据，guvolu 实占约 16 GB，百分比判据触发的处置与本项目占用不相称。提案改为「项目配额 + 绝对剩余」双判据，任一越限才动作；阈值为版本化配置（G-06） |
 | **TBD-39** | 决策生成 I/O 契约 v2 | 【提案 2026-08-22】把冻结前向预测拆为决策输入、决策记录、执行目标三份契约：显式有效期、单一目标域、决策输入内容寻址、意图账本回链与计划级缺预测处置。提案全文见 [决策生成 I/O 契约 v2 提案](2026-08-22-decision-io-contract-v2.md)；确认前现行 `frozen-forward-v1` 与执行仓适配器契约继续有效。计划级 `missing_policy` 已实现（分支 `research/missing-policy`，治理 schema v8，见 [strategy-research.md](strategy-research.md) 第 6.1 节），其余项仍为提案；`missing_policy` 已合入 main（治理 schema v8），新 vintage 计划以 `zero_exposure` 登记（见 [研究里程碑与冻结运行根切换快照](2026-08-23-research-milestone-and-runtime-switch.md) 第 4 节） |
+| **TBD-40** | 逐笔实时物化的活动 head 合并 | 【已实施首批 2026-09-03】`guvolu.data.trade_realtime_compact` 按 UTC 日拼接已过宽限期的实时段为单一 Parquet，新 attempt 经 `materialization_dependency` 指向各段 attempt，输入登记按 `source_artifact_id` 归入 raw 段制品，活动 head 切到 `day/YYYY-MM-DD` 并撤销段头，原段制品与 attempt 保留；每日补漏任务承担例行合并，首批已把 GMO BTC 5,301 个段头合并为 22 个日头。【提案 2026-09-02】GMO BTC 逐笔实时活动 head 现为每个封口段一个 Parquet（5,457 个文件、97 MB、日增约 250 个），冻结树按物理文件构造逐文件 OR 谓词做资格摘要，DuckDB 扫描随文件数线性增长（2026-09-02 实测约二十四分钟，占每小时链路一半以上，并将在数日内单独击穿 55 分钟预测年龄门）。提案在物化层把已封口、已过当日的实时段按日合并为单一 Parquet 并切换活动 head，合并件保留 `normalization_version`、行数与事件时间范围，原段制品不改写（D-02）；冻结树代码不动，只感知文件数下降。与每小时冻结运行根刷新的单步备份改造（见 [runtime-ops.md](runtime-ops.md) 第 8 节）共同构成链路时限的两项主修 |
 
 ## 3. 执行架构
 
@@ -430,5 +431,6 @@ DuckDB 列裁剪、CPU 完成 schema/PIT/散列验证、盘口重放与 Decimal/
 | TBD-37 | 运行根与权威注册库落位 | — |
 | TBD-38 | 容量阶梯双判据 | — |
 | TBD-39 | 决策生成 I/O 契约 v2 | 8 |
+| TBD-40 | 逐笔实时活动 head 合并 | — |
 
 *讨论确定后，将 TBD 条目改写为【已锁定】并说明理由；若上升为不可协商约束，同时补入 SKILLS.md 对应章节，并同步 0 号文档登记（W-01）。*

@@ -98,12 +98,18 @@ def _load(tmp_path: Path, body: dict[str, object]) -> AuthorizationEnvelope:
 def test_load_issued_envelope_and_identity() -> None:
     """已签发首封可装载，身份为文件字节 SHA-256。"""
     path = REPO / "config" / "authorization_envelope.json"
+    issued = json.loads(path.read_text(encoding="utf-8"))
     envelope = load_envelope(path, whitelist=WHITELIST)
     assert envelope.sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
     assert envelope.sha12 == envelope.sha256[:12]
     assert envelope.symbols == frozenset({BTC})
-    assert envelope.order_jpy_max == Decimal("10000")
-    assert envelope.canary_first_order_jpy_max == Decimal("500")
+    # 额度只核与文件一致（T-11）
+    assert envelope.order_jpy_max == Decimal(issued["order_jpy_max"])
+    assert envelope.order_jpy_max <= Decimal("10000")
+    assert envelope.canary_first_order_jpy_max == Decimal(
+        issued["canary_first_order_jpy_max"]
+    )
+    assert envelope.canary_first_order_jpy_max <= envelope.order_jpy_max
     assert envelope.on_trip is OnTrip.CANCEL_AND_FLATTEN
     assert envelope.market_risk.stream_gap_seconds == 90
     assert envelope.ops_breaker.consecutive_failure_limit == 3

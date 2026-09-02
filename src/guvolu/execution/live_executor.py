@@ -29,7 +29,7 @@ from typing import Protocol
 from guvolu.api.public_client import PublicClient
 from guvolu.api.read_client import ReadClient
 from guvolu.api.trade_client import TradeClient
-from guvolu.data.intent_ledger import IntentLedger
+from guvolu.data.intent_ledger import IntentLedger, LedgerError
 from guvolu.data.paths import data_root
 from guvolu.domain.config import Config, load_config
 from guvolu.domain.enums import (
@@ -100,6 +100,7 @@ from guvolu.execution.paper_fill_model import (
     load_book_snapshot_file,
 )
 from guvolu.execution.reconcile import (
+    ReadOnlyOrderReader,
     ReconcileAmbiguity,
     resolve_send_timeout,
 )
@@ -597,10 +598,16 @@ def flatten_position(
     payload["intent_id"] = intent.intent_id
     try:
         # 清仓意图先落盘（T-05）
-        runtime.ledger.record_intent(intent, at=now)
-        runtime.ledger.begin_send(
-            intent.intent_id, consumes_write_budget=True, at=now
-        )
+        # 落账冲突不中断熔断序列
+        try:
+            runtime.ledger.record_intent(intent, at=now)
+            runtime.ledger.begin_send(
+                intent.intent_id, consumes_write_budget=True, at=now
+            )
+        except LedgerError as exc:
+            payload["status"] = "ledger_conflict"
+            payload["reason"] = f"清仓意图落账失败，留待人工处置: {exc}"
+            return payload
         # 清仓豁免额度门仍记录用量
         runtime.usage.append(
             intent_id=intent.intent_id,
@@ -642,6 +649,35 @@ def flatten_position(
         return payload
     finally:
         lock.release()
+
+
+def recover_interrupted_sends(
+    ledger: IntentLedger,
+    reader: ReadOnlyOrderReader,
+    *,
+    now: datetime,
+) -> list[dict[str, str]]:
+    """进程恢复：遗留 SENDING 先转超时态，再按 READ_ONLY 对账（T-06）。
+
+    对账歧义的意图保持超时态占用在途，后续周期对该品种自然拒绝
+    新意图，直到人工处置；恢复结果随报告留痕。
+    """
+    recovered: list[dict[str, str]] = []
+    for intent_id in ledger.mark_interrupted_sends(at=now):
+        record = {"intent_id": intent_id}
+        try:
+            resolution = resolve_send_timeout(
+                intent_id, ledger=ledger, reader=reader, moment=now
+            )
+        except ReconcileAmbiguity as exc:
+            record["state"] = IntentState.SEND_TIMEOUT.value
+            record["reason"] = f"对账歧义，保持在途待人工处置: {exc}"
+        else:
+            record["state"] = ledger.state(intent_id).value
+            if resolution.order_id is not None:
+                record["order_id"] = str(resolution.order_id)
+        recovered.append(record)
+    return recovered
 
 
 def execute_on_trip(
@@ -1026,6 +1062,12 @@ def main(
     # 重放当日用量（T-11）
     replay_limit_usage(limit_gate, ledger, moment=now)
     reader = ReadClient.from_config(config)
+    # 上次进程中断的发送先对账（T-06）
+    recovered_sends = recover_interrupted_sends(ledger, reader, now=now)
+    if recovered_sends:
+        read_touched.extend(
+            (ACTIVE_ORDERS_ENDPOINT, LATEST_EXECUTIONS_ENDPOINT)
+        )
     trade = TradeClient.from_config(config)
     sender = TradeClientSender(trade)
 
@@ -1111,6 +1153,7 @@ def main(
             "write_touched": list(runtime.write_touched),
         },
         "ledger_path": str(ledger_path),
+        "recovered_sends": recovered_sends,
         "usage_path": str(usage.path),
         "state_path": str(state_store.path),
         "exit_code": exit_code,

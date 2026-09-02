@@ -18,6 +18,11 @@ try {
         --data-root $DataRoot all | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "trade catchup exit $LASTEXITCODE" }
     Write-Host 'trade catchup done'
+    # 已过当日的实时段按日合并（TBD-40）
+    & $Python -m guvolu.data.trade_realtime_compact `
+        --data-root $DataRoot --market-id mkt__gmo__btc__r0 | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "trade compaction exit $LASTEXITCODE" }
+    Write-Host 'trade compaction done'
     & $Python -m guvolu.data.l2_materialize --data-root $DataRoot all | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "l2 catchup exit $LASTEXITCODE" }
     Write-Host 'l2 catchup done'
