@@ -408,7 +408,9 @@ watcher 退化为近乎连续的全量重扫，长期占用 `sqlite_writer_lock`
 逐笔实时段、L2 与市场状态）兜底。逐笔实时段合并（TBD-40，
 `guvolu.data.trade_realtime_compact`）只在当日结束一小时后进行，切换活动
 head 到 `day/YYYY-MM-DD`；被合并段的物化 attempt 仍完成，常驻物化器按
-完成 attempt 复用而不重新激活段头。冻结运行根刷新（`scripts/refresh_frozen_runtime.py`）以单步
+完成 attempt 复用而不重新激活段头。合并前先撤销零行实时段的活动指针：
+零行输出内容相同即共用一件制品，多个头指向同一文件会使研究面板的逐文件
+控制合同失配（2026-09-04 SOL 实测），attempt 与制品仍保留。冻结运行根刷新（`scripts/refresh_frozen_runtime.py`）以单步
 在线备份复制控制库，临时库关闭回滚日志，不持生产数据根写锁（2026-09-02
 实测：分步带日志备份持锁约十三分钟，全部物化器随之写锁超时；单步无日志
 备份 3.2 GB 约十秒）；每小时缺省只校验新落地制品与外键

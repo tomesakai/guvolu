@@ -445,14 +445,33 @@ def compact_market(
     now: datetime | None = None,
     grace_seconds: int = DEFAULT_GRACE_SECONDS,
 ) -> list[CompactionResult]:
-    """在写锁内合并一个市场所有已过宽限期的日。"""
+    """在写锁内合并一个市场所有已过宽限期的日。
+
+    先撤销零行实时段的活动指针：零行输出不承载事实，且内容相同的
+    零行段共用同一制品文件，多个头指向同一文件会让研究面板的逐文件
+    控制合同失配（2026-09-04 SOL 实测四个头共用一件）。
+    """
     moment = now if now is not None else datetime.now(UTC)
     with sqlite_writer_lock(root):
+        retire_empty_segment_heads(conn, market_id)
         plans = plan_days(
             _active_heads(conn, market_id), now=moment,
             grace_seconds=grace_seconds,
         )
         return [compact_day(root, conn, market_id, plan) for plan in plans]
+
+
+def retire_empty_segment_heads(conn: sqlite3.Connection, market_id: str) -> int:
+    """撤销零行实时段的活动指针，返回撤销数；attempt 与制品保留。"""
+    cursor = conn.execute(
+        "DELETE FROM materialization_partition_head WHERE market_id=? "
+        "AND domain=? AND partition_key NOT LIKE ? AND attempt_id IN ("
+        "SELECT o.attempt_id FROM materialization_output o "
+        "WHERE o.dataset=? AND o.row_count=0)",
+        (market_id, DOMAIN, f"{PARTITION_PREFIX}%", DATASET_TRADE),
+    )
+    conn.commit()
+    return int(cursor.rowcount)
 
 
 def _result_payload(result: CompactionResult) -> dict[str, object]:

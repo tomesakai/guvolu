@@ -167,3 +167,59 @@ def test_merge_refuses_duplicate_observations(tmp_path: Path) -> None:
             tmp_path / "merged.parquet",
         )
     assert not (tmp_path / "merged.parquet").exists()
+
+
+def test_compaction_retires_zero_row_segment_heads(tmp_path: Path) -> None:
+    """零行实时段的活动指针撤销，非零段与日分区不受影响。"""
+    from guvolu.data.trade_realtime_compact import retire_empty_segment_heads
+
+    _write_segment(tmp_path, "run-a", [
+        _trade("17000000", "2026-08-11T00:00:00.000Z"),
+    ])
+    conn = store.connect(tmp_path)
+    try:
+        materialize_all(tmp_path, conn, report_reused=False)
+        head = conn.execute(
+            "SELECT attempt_id FROM materialization_partition_head "
+            "WHERE market_id=? AND domain='trade_realtime'", (MARKET,),
+        ).fetchone()[0]
+        # 伪造两个零行段头指向同一输出
+        artifact = conn.execute(
+            "SELECT artifact_id FROM materialization_output WHERE attempt_id=?",
+            (head,),
+        ).fetchone()[0]
+        for index in (1, 2):
+            attempt = f"trade-rt-empty{index}"
+            conn.execute(
+                "INSERT INTO partition_attempt (attempt_id,market_id,domain,"
+                "partition_key,normalization_version,input_set_hash,status,"
+                "source_rows,normalized_rows,ignored_rows,rejected_rows,"
+                "started_at,finished_at,code_version,config_hash) VALUES "
+                "(?,?,?,?,?,?,'complete',0,0,0,0,'t','t','working-tree','h')",
+                (
+                    attempt, MARKET, "trade_realtime",
+                    f"run-empty/segment-{index:06d}",
+                    "trade-realtime-normalization-v4", f"hash{index}",
+                ),
+            )
+            conn.execute(
+                "INSERT INTO materialization_output VALUES (?,?,?,0,NULL,NULL,'t')",
+                (attempt, artifact, "trade_observation"),
+            )
+            conn.execute(
+                "INSERT INTO materialization_partition_head VALUES (?,?,?,?,?,?)",
+                (
+                    MARKET, "trade_realtime", f"run-empty/segment-{index:06d}",
+                    "trade-realtime-normalization-v4", attempt, "t",
+                ),
+            )
+        conn.commit()
+        assert len(_heads(conn)) == 3
+        assert retire_empty_segment_heads(conn, MARKET) == 2
+        assert set(_heads(conn)) == {"run-a/segment-000001"}
+        # 再跑合并：零行头已不在，日分区正常生成
+        results = compact_market(tmp_path, conn, MARKET, now=AFTER)
+        assert _heads(conn) == {"day/2026-08-11": 1}
+        assert results[0].merged_heads == 1
+    finally:
+        conn.close()
