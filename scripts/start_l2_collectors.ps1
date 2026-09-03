@@ -1,4 +1,4 @@
-param(
+﻿param(
     [ValidateSet('Normal', 'Hidden')]
     [string]$WindowStyle = 'Normal'
 )
@@ -9,6 +9,30 @@ $PythonPath = Join-Path $RepoRoot '.venv\Scripts\python.exe'
 
 if (-not (Test-Path -LiteralPath $PythonPath -PathType Leaf)) {
     throw "Project Python runtime is missing: $PythonPath"
+}
+# 窗口安置：隐藏启动后无激活显示到副屏
+# 窗口安置由启动方负责
+$env:GUVOLU_WINDOW_PLACED = '1'
+$WindowPlacementLoaded = $false
+$WindowPlacementPath = Join-Path $PSScriptRoot 'window_placement.ps1'
+if ($WindowStyle -eq 'Normal' -and (Test-Path -LiteralPath $WindowPlacementPath)) {
+    try {
+        . $WindowPlacementPath
+        $WindowPlacementLoaded = $true
+    } catch {
+        Write-Warning "[window-placement] helper unavailable: $($_.Exception.Message)"
+    }
+}
+$LaunchWindowStyle = if ($WindowStyle -eq 'Normal' -and $WindowPlacementLoaded) {
+    'Hidden'
+} else {
+    $WindowStyle
+}
+function Move-StartedWindow {
+    param([Parameter(Mandatory = $true)][int]$ProcessId)
+    if ($WindowStyle -eq 'Normal' -and $WindowPlacementLoaded) {
+        Move-StartedWindowToSecondary -ProcessId $ProcessId
+    }
 }
 
 $Collectors = @(
@@ -41,7 +65,8 @@ foreach ($Collector in $Collectors) {
         '-Venue', $Venue,
         '-Symbol', $Symbol,
         '-Name', $Collector.Name
-    ) -WorkingDirectory $RepoRoot -WindowStyle $WindowStyle -PassThru
+    ) -WorkingDirectory $RepoRoot -WindowStyle $LaunchWindowStyle -PassThru
+    Move-StartedWindow -ProcessId $Started.Id
     Write-Host "[$($Collector.Name)] window started PID=$($Started.Id)"
 }
 
@@ -58,6 +83,7 @@ if ($ExistingMaterializer.Count -gt 0) {
     $Started = Start-Process -FilePath 'powershell.exe' -ArgumentList @(
         '-NoProfile', '-NoExit', '-ExecutionPolicy', 'Bypass',
         '-File', $MaterializerRunner, '-IntervalSeconds', '300'
-    ) -WorkingDirectory $RepoRoot -WindowStyle $WindowStyle -PassThru
+    ) -WorkingDirectory $RepoRoot -WindowStyle $LaunchWindowStyle -PassThru
+    Move-StartedWindow -ProcessId $Started.Id
     Write-Host "[l2-materializer] window started PID=$($Started.Id)"
 }

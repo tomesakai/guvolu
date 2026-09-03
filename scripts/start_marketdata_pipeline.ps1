@@ -1,4 +1,4 @@
-param(
+﻿param(
     [ValidateSet('Normal', 'Hidden')]
     [string]$WindowStyle = 'Normal',
     [ValidateSet('Full', 'ForwardMinimal')]
@@ -37,6 +37,30 @@ $DataRoot = Join-Path $RepoRoot 'data'
 $RunnerRoot = $PSScriptRoot
 $L2RunnerPath = Join-Path $RunnerRoot 'run_l2_materializer.ps1'
 . (Join-Path $PSScriptRoot 'l2_materializer_process_contract.ps1')
+# 窗口安置：隐藏启动后无激活显示到副屏
+# 窗口安置由启动方负责
+$env:GUVOLU_WINDOW_PLACED = '1'
+$WindowPlacementLoaded = $false
+$WindowPlacementPath = Join-Path $PSScriptRoot 'window_placement.ps1'
+if ($WindowStyle -eq 'Normal' -and (Test-Path -LiteralPath $WindowPlacementPath)) {
+    try {
+        . $WindowPlacementPath
+        $WindowPlacementLoaded = $true
+    } catch {
+        Write-Warning "[window-placement] helper unavailable: $($_.Exception.Message)"
+    }
+}
+$LaunchWindowStyle = if ($WindowStyle -eq 'Normal' -and $WindowPlacementLoaded) {
+    'Hidden'
+} else {
+    $WindowStyle
+}
+function Move-StartedWindow {
+    param([Parameter(Mandatory = $true)][int]$ProcessId)
+    if ($WindowStyle -eq 'Normal' -and $WindowPlacementLoaded) {
+        Move-StartedWindowToSecondary -ProcessId $ProcessId
+    }
+}
 $L2OwnerDirectory = Join-Path $DataRoot '.locks'
 $L2OwnerLockPath = Join-Path `
     $L2OwnerDirectory 'l2-materializer-owner.lock'
@@ -666,7 +690,8 @@ function Start-OrConfirm-L2Owner {
     }
     $Started = Start-Process -FilePath 'powershell.exe' `
         -ArgumentList $Arguments -WorkingDirectory $RepoRoot `
-        -WindowStyle $WindowStyle -PassThru
+        -WindowStyle $LaunchWindowStyle -PassThru
+    Move-StartedWindow -ProcessId $Started.Id
     try {
         $Truth = Wait-L2OwnerTruth -ExpectedSelection $Expected
     } catch {
@@ -807,7 +832,8 @@ foreach ($Collector in $Collectors) {
     )
     $Started = Start-Process -FilePath 'powershell.exe' `
         -ArgumentList $Arguments -WorkingDirectory $RepoRoot `
-        -WindowStyle $WindowStyle -PassThru
+        -WindowStyle $LaunchWindowStyle -PassThru
+    Move-StartedWindow -ProcessId $Started.Id
     Write-Host "[$($Collector.Name)] window started PID=$($Started.Id)"
 }
 
@@ -874,7 +900,8 @@ foreach ($Materializer in $Materializers) {
     }
     $Started = Start-Process -FilePath 'powershell.exe' `
         -ArgumentList $Arguments -WorkingDirectory $RepoRoot `
-        -WindowStyle $WindowStyle -PassThru
+        -WindowStyle $LaunchWindowStyle -PassThru
+    Move-StartedWindow -ProcessId $Started.Id
     Write-Host "[$($Materializer.Name)] window started PID=$($Started.Id)"
 }
 
@@ -896,7 +923,8 @@ if ($ExistingQuery.Count -gt 0) {
     }
     $QueryStarted = Start-Process -FilePath 'powershell.exe' `
         -ArgumentList $QueryArguments -WorkingDirectory $RepoRoot `
-        -WindowStyle $WindowStyle -PassThru
+        -WindowStyle $LaunchWindowStyle -PassThru
+    Move-StartedWindow -ProcessId $QueryStarted.Id
     Write-Host "[query-service] window started PID=$($QueryStarted.Id)"
 }
 if ($Profile -eq 'Full') {

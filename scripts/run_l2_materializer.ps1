@@ -82,6 +82,15 @@ try {
 } catch {
     # RawUI is optional in non-interactive hosts.
 }
+$WindowPlacementPath = Join-Path $PSScriptRoot 'window_placement.ps1'
+if (-not $env:GUVOLU_WINDOW_PLACED -and (Test-Path -LiteralPath $WindowPlacementPath)) {
+    try {
+        . $WindowPlacementPath
+        Move-OwnWindowToSecondary
+    } catch {
+        Write-Warning "[window-placement] skipped: $($_.Exception.Message)"
+    }
+}
 Set-Location -LiteralPath $RepoRoot
 Start-Transcript -Path $LogPath -Append | Out-Null
 try {
