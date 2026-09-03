@@ -276,6 +276,9 @@ class PrivateTransport:
         self._log_write(
             correlation_id, method, path, body, response.status_code, payload, None
         )
+        if response.status_code >= 500:
+            # 网关层错误下写结果未知（T-06）
+            raise ApiNetworkError(path, f"HTTP {response.status_code}")
         return _extract_data(payload, path, response.status_code)
 
     def _log_write(

@@ -54,6 +54,17 @@ def _run_search(
     return Path(str(summary["proposal"]))
 
 
+def _ensure_search_cutoff(search_config: Path, panel_to_time: datetime) -> None:
+    """搜索配置的面板截止必须与本轮截止一致，否则拒绝开搜。"""
+    raw = json.loads(search_config.read_text(encoding="utf-8"))
+    configured = parse_time(str(raw.get("panel_to_time")), "panel_to_time")
+    if configured != panel_to_time:
+        raise ValueError(
+            f"搜索配置 panel_to_time {configured.isoformat()} 与本轮"
+            f" --to-time {panel_to_time.isoformat()} 不一致"
+        )
+
+
 def _inherited_environment() -> dict[str, str]:
     import os
 
@@ -107,6 +118,8 @@ def run_cycle(
 ) -> dict[str, object]:
     """执行一轮闭环并写出周期报告。"""
     started = datetime.now(UTC)
+    if proposal is None:
+        _ensure_search_cutoff(search_config, panel_to_time)
     proposal_path = (
         proposal.resolve() if proposal is not None
         else _run_search(root, gpu_python, search_config, data_root, device)

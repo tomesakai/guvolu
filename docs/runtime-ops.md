@@ -431,6 +431,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run_trade_materializ
 uv run python -m guvolu.data.trade_realtime_materialize --data-root data all --verify-all-hashes
 ```
 
+写锁缺省等待 120 秒（`sqlite_writer_lock`），备份类长持锁任务已改为不持锁；
+启动器与补漏脚本设置 `PYTHONIOENCODING=utf-8`，否则中文输出经控制台代码页
+转录会乱码（存储内容本身是 UTF-8）。
+
 ### 8.2 决策级研究的静态数据快照
 
 决策级研究要求活动成交 head 全程不变，而常驻物化器每 300 秒推进一次；此前

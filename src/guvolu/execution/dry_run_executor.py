@@ -43,6 +43,7 @@ from guvolu.domain.symbols import SpotSymbol
 from guvolu.execution.conversion import (
     MarketRule,
     OrderProposal,
+    convert_target_to_delta_order,
     convert_target_to_order,
 )
 from guvolu.execution.dispatch import (
@@ -185,6 +186,10 @@ class DryRunPlan:
     reference_price: Decimal
     proposal: OrderProposal | None
     skip_reason: str | None
+    # 差分计划：持仓与差分数量
+    position_size: Decimal | None = None
+    desired_size: Decimal | None = None
+    delta_size: Decimal | None = None
 
 
 def _required_str(payload: Mapping[str, object], key: str) -> str:
@@ -655,6 +660,41 @@ def build_plan(
         reference_price=reference_price,
         proposal=proposal,
         skip_reason=None,
+    )
+
+
+def build_delta_plan(
+    artifact: TargetArtifact,
+    *,
+    rule: MarketRule,
+    reference_price: Decimal,
+    budget_jpy: Decimal,
+    position_size: Decimal,
+    no_trade_band: Decimal,
+) -> DryRunPlan:
+    """按 READ_ONLY 持仓折算差分计划：目标高于持仓买入，低于则卖出。
+
+    live 目标跟踪必须用差分而非从零折算（第 9 节）：从零折算会在
+    目标持续非零时每轮重复买入全额，且目标归零时永不卖出。持仓
+    取 READ_ONLY 资产的 available（T-03）。
+    """
+    decision = convert_target_to_delta_order(
+        artifact.aggregate_target,
+        position_size=position_size,
+        budget_jpy=budget_jpy,
+        reference_price=reference_price,
+        rule=rule,
+        no_trade_band=no_trade_band,
+    )
+    return DryRunPlan(
+        artifact=artifact,
+        budget_jpy=budget_jpy,
+        reference_price=reference_price,
+        proposal=decision.proposal,
+        skip_reason=decision.skip_reason,
+        position_size=decision.position_size,
+        desired_size=decision.desired_size,
+        delta_size=decision.delta_size,
     )
 
 

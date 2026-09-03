@@ -10,6 +10,8 @@ $RepoRoot = (Resolve-Path -LiteralPath $Repository).Path
 $Python = Join-Path $RepoRoot '.venv\Scripts\python.exe'
 $DataRoot = Join-Path $RepoRoot 'data'
 $LogDir = Join-Path $RepoRoot 'logs'
+# 中文输出按 UTF-8，避免转录乱码
+$env:PYTHONIOENCODING = 'utf-8'
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 Start-Transcript -Path (Join-Path $LogDir 'daily-materializer-catchup.log') `
     -Append | Out-Null

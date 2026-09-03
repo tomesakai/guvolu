@@ -11,6 +11,8 @@
     [Nullable[int]]$TradeLatestSealedSegmentsPerStream = $null
 )
 
+# 中文输出按 UTF-8
+$env:PYTHONIOENCODING = 'utf-8'
 $ErrorActionPreference = 'Stop'
 if ($L2LatestRunOnly -and $null -ne $L2LatestSealedSegmentsPerStream) {
     throw (

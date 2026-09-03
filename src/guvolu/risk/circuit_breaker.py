@@ -133,6 +133,14 @@ class CircuitBreaker:
         self._consecutive_failures = 0
         self._trip_reason = None
 
+    def seed_failures(self, count: int) -> None:
+        """注入跨进程持久化的连续异常计数（R-02）。"""
+        if count < 0:
+            raise ValueError("连续异常计数不得为负")
+        self._consecutive_failures = count
+        if count >= self._thresholds.consecutive_failure_limit:
+            self.trip(f"连续写路径异常 {count} 次（跨周期累计）")
+
     def record_write_success(self) -> None:
         """写路径成功，连续异常清零。"""
         self._consecutive_failures = 0

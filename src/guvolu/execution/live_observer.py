@@ -27,6 +27,7 @@ from guvolu.api.public_client import PublicClient
 from guvolu.api.read_client import ReadClient
 from guvolu.data.durable_io import atomic_write_text, durable_append_bytes
 from guvolu.data.paths import data_root
+from guvolu.domain.errors import GuvoluError
 from guvolu.domain.config import load_config
 from guvolu.domain.intent import IN_FLIGHT_STATES, IntentState
 from guvolu.domain.models import Asset
@@ -270,15 +271,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     stop_path = root / STOP_FILE_RELATIVE_PATH
     while True:
         now = datetime.now(UTC)
-        cycle = observe_once(
-            reader=reader,
-            public=public,
-            envelope=envelope,
-            state=state_store.load(),
-            ledger_path=ledger_path,
-            now=now,
-            stale_age_seconds=float(args.stale_age_seconds),
-        )
+        try:
+            cycle = observe_once(
+                reader=reader,
+                public=public,
+                envelope=envelope,
+                state=state_store.load(),
+                ledger_path=ledger_path,
+                now=now,
+                stale_age_seconds=float(args.stale_age_seconds),
+            )
+        except GuvoluError as exc:
+            # 单轮读取失败：记错误心跳，下轮再试
+            _append_jsonl(observation_path, {
+                "schema_version": OBSERVER_SCHEMA_VERSION,
+                "record": "observation",
+                "at": now.isoformat(),
+                "status": "error",
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+            _write_heartbeat(heartbeat_path, now=now, status="error")
+            print(f"观察轮次失败: {exc}")
+            if args.once:
+                return 1
+            time.sleep(float(args.interval_seconds))
+            continue
         _append_jsonl(observation_path, cycle.record)
         _write_heartbeat(
             heartbeat_path, now=now, status=str(cycle.record["status"])

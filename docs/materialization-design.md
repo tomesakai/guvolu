@@ -44,6 +44,14 @@ source bytes -> artifact_id + normalization_version
 partition_attempt -> output artifact_id
 ```
 
+活动头除推进外允许两类撤销（2026-09-04 登记，TBD-40）：按日合并把被合并段的
+活动指针撤销并指向合并 attempt；零行实时段（内容相同即共用一件制品）的活动
+指针撤销。两类都只删 `materialization_partition_head` 行，attempt、输出与制品
+保留，`materialization_dependency` 记录合并血缘。合并件目录形态为
+`day=YYYY-MM-DD/part-<sha12>.parquet`，分区键 `day/YYYY-MM-DD`；实时段形态为
+`run_id=<id>/segment=NNNNNN/`，分区键 `<run_id>/segment-NNNNNN`。合并件不写
+清单文件，登记以输出制品行为准。
+
 三个键的职责不可合并：
 
 | 键 | 回答的问题 | 变化条件 |

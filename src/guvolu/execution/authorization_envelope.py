@@ -495,6 +495,8 @@ class EnvelopeState:
     paused_until: datetime | None = None
     tripped_at: datetime | None = None
     trip_reason: str | None = None
+    # 跨周期累计的写路径连续异常（R-02）
+    consecutive_failures: int = 0
 
 
 def _baseline_payload(
@@ -594,7 +596,11 @@ class EnvelopeStateStore:
             )
         except ValueError as exc:
             raise EnvelopeError("状态时刻字段非法") from exc
+        failures_raw = parsed.get("consecutive_failures", 0)
+        if not isinstance(failures_raw, int) or failures_raw < 0:
+            raise EnvelopeError("状态字段 consecutive_failures 非法")
         return EnvelopeState(
+            consecutive_failures=failures_raw,
             first_order_cleared=bool(parsed.get("first_order_cleared", False)),
             loss_baseline=_baseline_from(
                 parsed.get("loss_baseline"), "loss_baseline"
@@ -636,6 +642,7 @@ class EnvelopeStateStore:
                 else state.tripped_at.isoformat()
             ),
             "trip_reason": state.trip_reason,
+            "consecutive_failures": state.consecutive_failures,
         }
         body = json.dumps(
             payload, ensure_ascii=False, sort_keys=True, indent=2
@@ -1046,10 +1053,15 @@ def evaluate_envelope_gates(
             baseline=new_state.day_baseline,
             current_value_jpy=inputs.current_value_jpy,
         ),
-        check_envelope_total(
-            envelope,
-            used_total_jpy=inputs.used_total_jpy,
-            order_notional_jpy=inputs.order_notional_jpy,
+        (
+            _gate("envelope_total", True, VERDICT_HALT, "减仓豁免")
+            if inputs.order_side is Side.SELL
+            and inputs.order_notional_jpy is not None
+            else check_envelope_total(
+                envelope,
+                used_total_jpy=inputs.used_total_jpy,
+                order_notional_jpy=inputs.order_notional_jpy,
+            )
         ),
         check_prediction_age(
             envelope, decision_time=inputs.decision_time, now=inputs.now
@@ -1058,21 +1070,32 @@ def evaluate_envelope_gates(
     if inputs.order_notional_jpy is not None:
         if inputs.order_side is None:
             raise EnvelopeError("委托门禁缺少方向输入")
+        if inputs.order_side is Side.SELL:
+            # 减仓豁免额度门（R-01）
+            records.extend(
+                _gate(name, True, VERDICT_REJECT, "减仓豁免")
+                for name in (
+                    "day_budget", "order_max", "first_order_canary",
+                )
+            )
+        else:
+            records.extend([
+                check_day_budget(
+                    envelope,
+                    day_used_jpy=inputs.day_used_jpy,
+                    day_order_count=inputs.day_order_count,
+                    order_notional_jpy=inputs.order_notional_jpy,
+                ),
+                check_order_max(
+                    envelope, order_notional_jpy=inputs.order_notional_jpy
+                ),
+                check_first_order_canary(
+                    envelope,
+                    new_state,
+                    order_notional_jpy=inputs.order_notional_jpy,
+                ),
+            ])
         records.extend([
-            check_day_budget(
-                envelope,
-                day_used_jpy=inputs.day_used_jpy,
-                day_order_count=inputs.day_order_count,
-                order_notional_jpy=inputs.order_notional_jpy,
-            ),
-            check_order_max(
-                envelope, order_notional_jpy=inputs.order_notional_jpy
-            ),
-            check_first_order_canary(
-                envelope,
-                new_state,
-                order_notional_jpy=inputs.order_notional_jpy,
-            ),
             check_position_cap(
                 envelope,
                 order_side=inputs.order_side,

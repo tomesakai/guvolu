@@ -76,9 +76,12 @@ def _dt(data: Raw, key: str) -> datetime:
     """转换时间字段，不可解析视为响应契约违例。"""
     raw = _s(data, key)
     try:
-        return datetime.fromisoformat(raw)
+        parsed = datetime.fromisoformat(raw)
     except ValueError as error:
         raise ApiSchemaError(f"字段不是时间戳: {key}={raw!r}") from error
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ApiSchemaError(f"时间戳缺少时区: {key}={raw!r}")
+    return parsed
 
 
 def _dt_ms(data: Raw, key: str) -> datetime:

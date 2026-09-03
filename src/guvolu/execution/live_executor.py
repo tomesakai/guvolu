@@ -29,6 +29,7 @@ from typing import Protocol
 from guvolu.api.public_client import PublicClient
 from guvolu.api.read_client import ReadClient
 from guvolu.api.trade_client import TradeClient
+from guvolu.api.transport import RateLimiter
 from guvolu.data.intent_ledger import IntentLedger, LedgerError
 from guvolu.data.paths import data_root
 from guvolu.domain.config import Config, load_config
@@ -76,7 +77,9 @@ from guvolu.execution.dispatch import DispatchResult, dispatch_order_intent
 from guvolu.execution.dry_run_executor import (
     ORDER_ENDPOINT,
     DryRunPlan,
+    ExecutorError,
     TargetArtifact,
+    build_delta_plan,
     build_plan,
     fetch_market_rule,
     load_market_rule,
@@ -147,6 +150,15 @@ _JPY = "JPY"
 EXIT_OK = 0
 EXIT_ANOMALY = 1
 EXIT_REFUSED = 2
+# 买入前 JPY 手续费余量
+FEE_BUFFER_RATIO = Decimal("1.001")
+# 超时后等落账的秒数
+SEND_TIMEOUT_SETTLE_SECONDS = 5.0
+# 观察心跳超龄秒数
+OBSERVER_MAX_AGE_SECONDS = 300.0
+OBSERVER_HEARTBEAT_RELATIVE_PATH = LIVE_RELATIVE_DIR / "observer_heartbeat.json"
+# 维护窗错误码（docs/error-catalog.md）
+MAINTENANCE_ERROR_CODE = "ERR-5201"
 
 
 class LiveExecutorError(GuvoluError):
@@ -462,9 +474,7 @@ def execute_live_order(
             (ACTIVE_ORDERS_ENDPOINT, LATEST_EXECUTIONS_ENDPOINT)
         )
         try:
-            resolution = resolve_send_timeout(
-                intent.intent_id, ledger=runtime.ledger, reader=runtime.reader
-            )
+            resolution = resolve_send_timeout_settled(runtime, intent)
         except ReconcileAmbiguity as exc:
             return LiveOrderOutcome(
                 intent, result, None, False,
@@ -496,7 +506,13 @@ def execute_live_order(
             intent, result, snapshot, False, "窗口内到达终态", True,
         )
     # R-01：窗口届满执行退出条件
-    runtime.sender.cancel(result.order_id)
+    cancel_error: str | None = None
+    try:
+        runtime.sender.cancel(result.order_id)
+    except GuvoluError as exc:
+        # 撤单结果未知转查询（T-06）
+        cancel_error = f"{type(exc).__name__}: {exc}"
+        runtime.breaker.record_write_failure()
     runtime.write_touched.append(CANCEL_ENDPOINT)
     snapshot = poll_order(
         runtime, result.order_id,
@@ -504,12 +520,45 @@ def execute_live_order(
     )
     if snapshot is not None and snapshot.status in TERMINAL_ORDER_STATUSES:
         return LiveOrderOutcome(
-            intent, result, snapshot, True, "届满撤单并确认终态", True,
+            intent, result, snapshot, True,
+            "届满撤单并确认终态" if cancel_error is None
+            else f"撤单请求异常（{cancel_error}）但委托已到终态",
+            True,
         )
     return LiveOrderOutcome(
         intent, result, snapshot, True,
-        "撤单后未确认终态，请立即人工复核或使用 kill-switch（T-07）",
+        (
+            f"撤单请求异常（{cancel_error}）且委托未到终态，"
+            "委托可能仍挂在交易所，请立即人工复核或使用 kill-switch（T-07）"
+            if cancel_error is not None else
+            "撤单后未确认终态，请立即人工复核或使用 kill-switch（T-07）"
+        ),
         False,
+    )
+
+
+def resolve_send_timeout_settled(
+    runtime: LiveRuntime, intent: OrderIntent,
+) -> "TimeoutResolution":
+    """先等交易所落账再对账；零候选时再等一次复查后才判 FAILED。"""
+    from guvolu.execution.reconcile import TimeoutResolution as _Resolution
+
+    del _Resolution
+    runtime.sleep(SEND_TIMEOUT_SETTLE_SECONDS)
+    probe = _timeout_candidates(runtime, intent)
+    if not probe:
+        runtime.sleep(SEND_TIMEOUT_SETTLE_SECONDS)
+    return resolve_send_timeout(
+        intent.intent_id, ledger=runtime.ledger, reader=runtime.reader,
+    )
+
+
+def _timeout_candidates(runtime: LiveRuntime, intent: OrderIntent) -> bool:
+    """只读探查是否已出现同品种活动委托或成交。"""
+    symbol = str(intent.symbol)
+    return bool(
+        runtime.reader.active_orders(symbol)
+        or runtime.reader.latest_executions(symbol)
     )
 
 
@@ -717,6 +766,49 @@ def execute_on_trip(
     return payload
 
 
+def _decimal_text(value: Decimal | None) -> str | None:
+    return None if value is None else format(value, "f")
+
+
+def apply_jpy_headroom(plan: DryRunPlan, assets: Sequence[Asset]) -> DryRunPlan:
+    """买入前核可用 JPY 含手续费余量；不足即改为零写跳过（R-06）。"""
+    proposal = plan.proposal
+    if proposal is None or proposal.side is not Side.BUY:
+        return plan
+    available = _asset_available(assets, _JPY)
+    required = proposal.notional_jpy * FEE_BUFFER_RATIO
+    if available >= required:
+        return plan
+    return replace(
+        plan, proposal=None,
+        skip_reason=(
+            f"可用 JPY {available} 低于名义额含手续费余量 {required}，"
+            "本轮不买入"
+        ),
+    )
+
+
+def reconcile_usage_with_ledger(
+    usage: EnvelopeUsage, ledger: IntentLedger, *, now: datetime,
+) -> tuple[str, ...]:
+    """把账本里已消耗写预算但用量文件缺失的意图补记为用量（T-11）。"""
+    recorded = {row.intent_id for row in usage.rows}
+    added: list[str] = []
+    for intent_id in ledger.intent_ids():
+        if intent_id in recorded or not ledger.consumed_write_budget(intent_id):
+            continue
+        intent = ledger.intent(intent_id)
+        if intent.price is None:
+            continue
+        usage.append(
+            intent_id=intent_id,
+            notional_jpy=intent.size * intent.price,
+            at=intent.created_at,
+        )
+        added.append(intent_id)
+    return tuple(added)
+
+
 def write_live_report(
     body: Mapping[str, object], directory: Path
 ) -> Path:
@@ -794,6 +886,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--breaker-config", type=Path, default=DEFAULT_THRESHOLDS_PATH,
         help="熔断阈值配置路径，与信封逐项取更严（G-06）",
+    )
+    parser.add_argument(
+        "--observer-heartbeat", type=Path, default=None,
+        help="观察进程心跳文件；缺省数据根 execution/live/observer_heartbeat.json",
     )
     parser.add_argument(
         "--envelope", type=Path, default=DEFAULT_ENVELOPE_PATH,
@@ -977,6 +1073,77 @@ def main(
             f" {envelope.envelope_jpy_total} JPY，停机复核",
             report=report_destination,
         )
+    if any(
+        value is not None
+        for value in (args.rules, args.reference_price, args.book, args.service_status)
+    ):
+        return _refusal(
+            "debug_override_in_live",
+            "live 模式不接受 --rules/--reference-price/--book/--service-status"
+            " 覆盖，行情与服务状态必须来自公开端点（R-03）",
+            report=report_destination,
+        )
+    heartbeat_arg: Path | None = args.observer_heartbeat
+    heartbeat_path = (
+        heartbeat_arg if heartbeat_arg is not None
+        else root / OBSERVER_HEARTBEAT_RELATIVE_PATH
+    )
+    heartbeat_age = observer_heartbeat_age(heartbeat_path, now=now)
+    if heartbeat_age is None or heartbeat_age > OBSERVER_MAX_AGE_SECONDS:
+        return _refusal(
+            "observer_stale",
+            "伴随观察进程心跳缺失或超龄"
+            f"（{'无' if heartbeat_age is None else f'{heartbeat_age:.0f} 秒'}），"
+            "上膛期间必须有观察进程（第 14 节）",
+            report=report_destination,
+        )
+    try:
+        return _run_live_main(
+            args, config, envelope, usage, state_store, state,
+            root=root, now=now, report_destination=report_destination,
+        )
+    except GmoApiError as exc:
+        status = (
+            "maintenance" if MAINTENANCE_ERROR_CODE in exc.codes
+            else "api_error"
+        )
+        return _refusal(status, f"交易所接口错误: {exc}", report=report_destination)
+    except ApiNetworkError as exc:
+        return _refusal(
+            "network_error", f"网络或超时: {exc}", report=report_destination,
+        )
+    except (LiveExecutorError, ExecutorError) as exc:
+        return _refusal(
+            "target_invalid", f"目标或前置条件不满足: {exc}",
+            report=report_destination,
+        )
+
+
+def observer_heartbeat_age(path: Path, *, now: datetime) -> float | None:
+    """观察进程心跳年龄秒数；缺失或不可读返回 None。"""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        at = datetime.fromisoformat(str(payload["at"]))
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if at.tzinfo is None:
+        return None
+    return (now - at).total_seconds()
+
+
+def _run_live_main(
+    args: argparse.Namespace,
+    config: Config,
+    envelope: AuthorizationEnvelope,
+    usage: EnvelopeUsage,
+    state_store: EnvelopeStateStore,
+    state: EnvelopeState,
+    *,
+    root: Path,
+    now: datetime,
+    report_destination: str,
+) -> int:
+    """拒绝检查之后的 live 主体；异常由 main 转为拒绝报告。"""
     artifact = load_target_artifact(Path(args.target))
     verify_v2_source_prediction(
         artifact,
@@ -1054,21 +1221,25 @@ def main(
     )
     # 信封散列随意图创建行落账（第 14 节）
     ledger = IntentLedger(ledger_path, envelope_sha256=envelope.sha256)
+    reconcile_usage_with_ledger(usage, ledger, now=now)
     thresholds = merged_breaker_thresholds(
         load_breaker_thresholds(Path(args.breaker_config)), envelope
     )
     breaker = CircuitBreaker(thresholds)
+    # 连续异常跨周期累计（R-02）
+    breaker.seed_failures(state.consecutive_failures)
     limit_gate = LimitGate(config.limits)
     # 重放当日用量（T-11）
     replay_limit_usage(limit_gate, ledger, moment=now)
-    reader = ReadClient.from_config(config)
+    private_limiter = RateLimiter(config.private_rps)
+    reader = ReadClient.from_config(config, limiter=private_limiter)
     # 上次进程中断的发送先对账（T-06）
     recovered_sends = recover_interrupted_sends(ledger, reader, now=now)
     if recovered_sends:
         read_touched.extend(
             (ACTIVE_ORDERS_ENDPOINT, LATEST_EXECUTIONS_ENDPOINT)
         )
-    trade = TradeClient.from_config(config)
+    trade = TradeClient.from_config(config, limiter=private_limiter)
     sender = TradeClientSender(trade)
 
     def cancel_all() -> int:
@@ -1097,12 +1268,15 @@ def main(
     budget = artifact.risk_budget_jpy
     if budget is None:
         raise LiveExecutorError("live 目标缺少 risk_budget_jpy")
-    plan = build_plan(
+    plan = build_delta_plan(
         artifact,
         rule=rule,
         reference_price=reference_price,
         budget_jpy=budget,
+        position_size=_asset_available(assets_before, str(symbol)),
+        no_trade_band=target_config.no_trade_band,
     )
+    plan = apply_jpy_headroom(plan, assets_before)
     exit_code, fragment = run_live_cycle(
         runtime, plan,
         assets=assets_before,
@@ -1158,6 +1332,16 @@ def main(
         "state_path": str(state_store.path),
         "exit_code": exit_code,
     }
+    report["delta_plan"] = {
+        "position_size": _decimal_text(plan.position_size),
+        "desired_size": _decimal_text(plan.desired_size),
+        "delta_size": _decimal_text(plan.delta_size),
+    }
+    runtime.state = replace(
+        runtime.state,
+        consecutive_failures=runtime.breaker.consecutive_failures,
+    )
+    runtime.save_state()
     report.update(fragment)
     report_path = write_live_report(report, root / LIVE_RELATIVE_DIR)
     report["report_path"] = str(report_path)

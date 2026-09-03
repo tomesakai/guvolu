@@ -22,6 +22,7 @@ from typing import Any
 import duckdb
 
 from guvolu.data import store
+from guvolu.data.sqlite_writer_lock import sqlite_writer_lock
 from guvolu.data.durable_io import atomic_write_text
 from guvolu.data.materialize import (
     SourceArtifact,
@@ -622,7 +623,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     conn = store.connect(root)
     try:
         if args.command == "all":
-            result: object = [asdict(item) for item in materialize_all(root, conn)]
+            # 控制面写入取单写锁
+            with sqlite_writer_lock(root):
+                result: object = [
+                    asdict(item) for item in materialize_all(root, conn)
+                ]
             code = 0
         else:
             result = audit_klines(root, conn)

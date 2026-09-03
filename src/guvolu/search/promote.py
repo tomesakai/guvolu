@@ -122,7 +122,8 @@ def family_trial_evidence(
         row = _object(json.loads(line), "trial")
         if row.get("record_type") != "search_trial":
             continue
-        family = str(row.get("family"))
+        # 结构 challenger 计入父流派
+        family = str(row.get("family")).split("~", 1)[0]
         if family not in evaluated:
             continue
         evaluated[family] += 1
@@ -169,6 +170,10 @@ def family_trial_evidence(
             if isinstance(candidate, (int, float)) and 1.0 <= float(candidate):
                 effective = min(float(candidate), float(evaluated[family]))
                 method = str(returns_evidence.get("method_version"))
+            oos_std = returns_evidence.get("oos_sharpe_std")
+            if isinstance(oos_std, (int, float)) and float(oos_std) >= 0.0:
+                # 样本外离散度才是被去膨胀的统计量
+                deviation = float(oos_std)
         evidence[family] = {
             "evaluated": evaluated[family],
             "screen_passed": passed[family],

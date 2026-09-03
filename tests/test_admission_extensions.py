@@ -214,8 +214,9 @@ def test_family_trial_evidence_reads_search_ledger(tmp_path: Path) -> None:
         ["trend"],
     )
     trend = evidence["trend"]
-    assert trend["evaluated"] == 4
-    assert trend["screen_passed"] == 2
+    # 结构 challenger 计入父流派
+    assert trend["evaluated"] == 6
+    assert trend["screen_passed"] == 3
     assert 1.0 <= trend["effective_trial_count"] <= 4.0  # type: ignore[operator]
     assert trend["annual_sharpe_std"] > 0
     assert len(str(trend["ledger_sha256"])) == 64

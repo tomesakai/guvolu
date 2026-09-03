@@ -569,7 +569,8 @@ def standardize_rows(torch: object, values: Tensor) -> tuple[Tensor, int]:
     norm = centered.pow(2).sum(dim=1).sqrt()
     constant = norm <= 0.0
     safe = norm.where(~constant, norm.new_ones(()))
-    standardized = (centered / safe.unsqueeze(1)).to(values.new_zeros(()).float().dtype)
+    # 双精度：相关矩阵特征值对精度敏感
+    standardized = (centered / safe.unsqueeze(1)).to(values.new_zeros(()).double().dtype)
     standardized[constant] = 0.0
     return standardized, int(constant.sum().item())
 

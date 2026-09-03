@@ -427,6 +427,8 @@ def compact_day(
             len(plan.heads), rows, storage, False,
         )
     except Exception as exc:
+        # 未完成事务先回滚，活动头不受半途影响
+        conn.rollback()
         temporary.unlink(missing_ok=True)
         conn.execute(
             "UPDATE partition_attempt SET status='failed',finished_at=?,"

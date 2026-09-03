@@ -353,6 +353,10 @@ class IntentLedger:
             and (symbol is None or entry.intent.symbol == symbol)
         )
 
+    def intent_ids(self) -> tuple[str, ...]:
+        """全部意图号（装载顺序）。"""
+        return tuple(self._entries)
+
     def interrupted_sends(self) -> tuple[str, ...]:
         """列出仍处 SENDING 的意图，恢复后结果未知（T-06）。"""
         return tuple(
