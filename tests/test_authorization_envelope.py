@@ -312,6 +312,14 @@ def test_gate_boundaries(tmp_path: Path) -> None:
         envelope, price_observed_at=NOW - timedelta(seconds=91), now=NOW,
     )
     assert not stale.passed and stale.verdict == VERDICT_TRIP
+    # 交易所时间戳略早于本机：时钟容差内新鲜
+    assert check_stream_freshness(
+        envelope, price_observed_at=NOW + timedelta(seconds=4.9), now=NOW,
+    ).passed
+    future = check_stream_freshness(
+        envelope, price_observed_at=NOW + timedelta(seconds=5.1), now=NOW,
+    )
+    assert not future.passed and future.verdict == VERDICT_TRIP
     assert check_prediction_age(
         envelope, decision_time=NOW - timedelta(minutes=55), now=NOW,
     ).passed

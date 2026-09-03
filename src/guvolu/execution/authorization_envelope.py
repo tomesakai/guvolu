@@ -40,6 +40,8 @@ USAGE_SCHEMA_VERSION = 1
 STATE_SCHEMA_VERSION = 1
 # 参考价历史保留窗口秒数
 PRICE_HISTORY_WINDOW_SECONDS = 600
+# 参考价时间戳允许早于本机时刻的秒数
+CLOCK_SKEW_TOLERANCE_SECONDS = 5
 # 基点换算分母
 _BP = Decimal("10000")
 
@@ -789,14 +791,20 @@ def check_stream_freshness(
     price_observed_at: datetime,
     now: datetime,
 ) -> GateRecord:
-    """行情陈旧门：参考价观测超时距即熔断（R-02）。"""
+    """行情陈旧门：参考价观测超时距即熔断（R-02）。
+
+    交易所时间戳可略早于本机时刻：本机钟差约负三百毫秒，且参考价
+    在周期时刻之后才取得（2026-09-03 实测负 0.1 秒误熔断）。负年龄
+    在时钟容差内视为新鲜；超出容差同样视为异常熔断。
+    """
     age = (now - price_observed_at).total_seconds()
     limit = envelope.market_risk.stream_gap_seconds
     return _gate(
         "stream_freshness",
-        0 <= age <= limit,
+        -CLOCK_SKEW_TOLERANCE_SECONDS <= age <= limit,
         VERDICT_TRIP,
-        f"参考价观测距今 {age:.1f} 秒，阈值 {limit} 秒",
+        f"参考价观测距今 {age:.1f} 秒，阈值 {limit} 秒"
+        f"（时钟容差 {CLOCK_SKEW_TOLERANCE_SECONDS} 秒）",
     )
 
 

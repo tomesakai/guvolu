@@ -362,7 +362,7 @@ PowerShell 包装 `scripts/run_execution_soak.ps1`）把第 9 节的单轮逻辑
 | `market_risk.price_move_pause` | 参考价短窗急变超阈即暂停下单一段时间，仅允许撤单 | 暂停下单 |
 | `market_risk.spread_skip_bp` | 盘口价差超阈跳过该轮 | 跳过该轮 |
 | `market_risk.min_book_depth_ratio` | 对手侧盘口深度不足委托名义倍数跳过 | 跳过该轮 |
-| `market_risk.stream_gap_seconds` | 行情断流超秒数熔断（R-02） | 熔断 |
+| `market_risk.stream_gap_seconds` | 行情断流超秒数熔断（R-02）；参考价时间戳早于本机时刻五秒内视为新鲜（2026-09-03 实测本机钟差负 0.1 秒误熔断后增设） | 熔断 |
 | `ops_breaker` | 连续写失败、资产异动比例与下限 | 熔断（R-02） |
 | `symbols` | 现物品种白名单（T-09 子集） | 拒单 |
 
