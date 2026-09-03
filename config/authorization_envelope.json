@@ -1,16 +1,16 @@
 {
   "schema_version": 1,
-  "issued_at": "2026-09-02T00:00:00Z",
-  "valid_from": "2026-09-02T00:00:00Z",
-  "valid_until": "2026-09-05T00:00:00Z",
+  "issued_at": "2026-09-03T11:00:00Z",
+  "valid_from": "2026-09-03T11:00:00Z",
+  "valid_until": "2026-09-10T00:00:00Z",
   "symbols": ["BTC"],
   "order_jpy_max": "3000",
   "day_jpy_max": "3000",
   "day_count_max": 6,
   "envelope_jpy_total": "3000",
   "max_position_jpy": "3000",
-  "max_cumulative_loss_jpy": "1500",
-  "day_loss_jpy_max": "1500",
+  "max_cumulative_loss_jpy": "1000",
+  "day_loss_jpy_max": "600",
   "canary_first_order_jpy_max": "3000",
   "max_prediction_age_minutes": 55,
   "market_risk": {
@@ -19,7 +19,7 @@
       "threshold_bp": "500",
       "pause_seconds": 3600
     },
-    "spread_skip_bp": "50",
+    "spread_skip_bp": "20",
     "min_book_depth_ratio": "3",
     "stream_gap_seconds": 90
   },
