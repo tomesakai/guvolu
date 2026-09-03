@@ -62,6 +62,7 @@
 | docs/2026-08-27-industry-evidence-generator-v1.md | 时效快照 | 行业稳健性证据生成器 v1：成本、尾部、压力、容量四类构造规则、失败关闭边界与政策键判定 |
 | docs/2026-08-27-industry-evidence-in-pipeline.md | 时效快照 | 行业稳健性证据接入研究管线：接入点、注册窗口、开关、失败关闭语义与独立审计入口定位 |
 | docs/2026-09-01-cross-venue-replication-snapshot.md | 时效快照 | 跨所与跨品种复现证据：price_breakout 同构复现、trend 场所噪声判读、XRP 反转与 median_rank 对照 |
+| docs/2026-09-03-eth-cross-symbol-replication.md | 时效快照 | ETH 跨品种预注册复现：冻结参数为折冠军众数并通过全部门禁；搜索循环提案计入搜索试验后 DSR 不合格 |
 | docs/2026-08-11-account-assets-capability.md | 时效快照 | GMO Coin 与 bitFlyer 私有资产接口复核 |
 | docs/2026-08-10-persistence-audit.md | 时效快照 | 持久化完整性、恢复探针与历史损坏边界审计 |
 | docs/2026-08-22-paper-executor-phase1.md | 时效快照 | paper 执行器阶段一：第 2 版执行目标、paper 成交模型、差异账与覆盖层门控记录 |
