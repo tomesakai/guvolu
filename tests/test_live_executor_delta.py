@@ -222,3 +222,26 @@ def test_main_refuses_stale_observer_and_debug_overrides(
     assert "debug_override_in_live" in capsys.readouterr().out
     assert main(common, moment=NOW) == EXIT_REFUSED
     assert "observer_stale" in capsys.readouterr().out
+
+
+def test_make_marketable_crosses_spread() -> None:
+    """买单取最优卖价、卖单取最优买价，名义额随价重算。"""
+    from guvolu.execution.live_executor import make_marketable
+
+    buy = build_delta_plan(
+        _artifact(target=0.5), rule=RULE, reference_price=PRICE,
+        budget_jpy=Decimal("5000"), position_size=Decimal("0"),
+        no_trade_band=Decimal("0.01"),
+    )
+    priced = make_marketable(buy, _book(), RULE)
+    assert priced.proposal is not None
+    assert priced.proposal.price == Decimal("12000001")
+    assert priced.proposal.notional_jpy == priced.proposal.size * Decimal("12000001")
+    sell = build_delta_plan(
+        _artifact(target=0.0), rule=RULE, reference_price=PRICE,
+        budget_jpy=Decimal("5000"), position_size=Decimal("0.0002"),
+        no_trade_band=Decimal("0.01"),
+    )
+    priced = make_marketable(sell, _book(), RULE)
+    assert priced.proposal is not None and priced.proposal.price == Decimal("11999999")
+    assert make_marketable(sell, None, RULE).proposal is sell.proposal

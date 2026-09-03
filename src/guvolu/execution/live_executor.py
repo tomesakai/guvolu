@@ -72,7 +72,7 @@ from guvolu.execution.authorization_envelope import (
     load_envelope,
     observe_price,
 )
-from guvolu.execution.conversion import MarketRule
+from guvolu.execution.conversion import MarketRule, _ceil_step, _floor_step
 from guvolu.execution.dispatch import DispatchResult, dispatch_order_intent
 from guvolu.execution.dry_run_executor import (
     ORDER_ENDPOINT,
@@ -770,6 +770,29 @@ def _decimal_text(value: Decimal | None) -> str | None:
     return None if value is None else format(value, "f")
 
 
+def make_marketable(
+    plan: DryRunPlan, book: BookSnapshot | None, rule: MarketRule,
+) -> DryRunPlan:
+    """限价改为可立即成交价：买取最优卖价，卖取最优买价。
+
+    以最新成交价挂单可能整个等待窗都不成交，届满撤单后本轮空转；
+    GMO BTC 常态价差不足一个基点，跨过价差换取确定成交。数量不变，
+    名义额随价重算，仍受后续信封门禁约束。
+    """
+    proposal = plan.proposal
+    if proposal is None or book is None or not book.bids or not book.asks:
+        return plan
+    if proposal.side is Side.BUY:
+        price = _ceil_step(book.best_ask, rule.tick_size)
+    else:
+        price = _floor_step(book.best_bid, rule.tick_size)
+    if price <= 0:
+        return plan
+    return replace(plan, proposal=replace(
+        proposal, price=price, notional_jpy=proposal.size * price,
+    ))
+
+
 def apply_jpy_headroom(plan: DryRunPlan, assets: Sequence[Asset]) -> DryRunPlan:
     """买入前核可用 JPY 含手续费余量；不足即改为零写跳过（R-06）。"""
     proposal = plan.proposal
@@ -1276,6 +1299,7 @@ def _run_live_main(
         position_size=_asset_available(assets_before, str(symbol)),
         no_trade_band=target_config.no_trade_band,
     )
+    plan = make_marketable(plan, book, rule)
     plan = apply_jpy_headroom(plan, assets_before)
     exit_code, fragment = run_live_cycle(
         runtime, plan,
