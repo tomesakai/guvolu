@@ -210,6 +210,21 @@ def test_promote_writes_lineage_root_with_source(tmp_path: Path) -> None:
     proposal_path = root / "reports" / "proposal.json"
     proposal_path.parent.mkdir(parents=True)
     proposal_path.write_text(json.dumps(proposal), encoding="utf-8")
+    # 搜索结果台账：提升时汇总为家族试验证据
+    ledger_dir = proposal_path.parent / "search-result-test"
+    ledger_dir.mkdir()
+    ledger_rows = [
+        json.dumps({
+            "record_type": "search_trial", "family": "trend",
+            "screen_passed": index % 2 == 0,
+            "metrics": {"sharpe": 0.4 + 0.2 * index},
+            "resample": {"fold_test_sharpe": [0.1 * index, -0.2, 0.3]},
+        })
+        for index in range(5)
+    ]
+    (ledger_dir / "trial-ledger-sha256-t.jsonl").write_text(
+        chr(10).join(ledger_rows) + chr(10), encoding="utf-8",
+    )
     loaded, digest = load_proposal(proposal_path)
     assert loaded["search_run_id"] == "search-run-test" and len(digest) == 64
     result = promoted_config(root, proposal_path)
@@ -221,6 +236,18 @@ def test_promote_writes_lineage_root_with_source(tmp_path: Path) -> None:
     source = result.config["search_loop_source"]
     assert source["parent_config_sha256"] == parent_hash
     assert source["proposal_sha256"] == digest
+    trials = source["family_trials"]["trend"]
+    assert trials["evaluated"] == 5 and trials["screen_passed"] == 3
+    assert 1.0 <= trials["effective_trial_count"] <= 5.0
+    validation = result.config["validation"]
+    assert validation["deployment_candidate_rule"] == (
+        "most_selected_fold_champion"
+    )
+    assert validation["minimum_benchmark_sharpe_excess"] == 0.05
+    outside = tmp_path / "outside.json"
+    outside.write_text(json.dumps(proposal), encoding="utf-8")
+    with pytest.raises(ValueError, match="越出项目目录"):
+        promoted_config(root, outside)
     output = write_promoted_config(root, result)
     assert output.parent == root / "config"
     assert output.name.startswith("strategy_research_candidate_")

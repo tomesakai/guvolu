@@ -111,6 +111,39 @@ mixed 与 unavailable 六桶。桶内只发布成本后 log-return 贡献、观�
 实际目标暴露；所有桶的收益与观测数必须严格加总回原 stitched 路径。该 v1 归因不参与候选选择、
 准入或调参，只用于回答收益集中在哪种预先定义状态，避免先看结果再发明 regime。
 
+### 4.1 准入扩展（2026-09-03）
+
+2026-09-03 的方法审查发现三处与业界标准不符的缺口，均以配置显式声明的准入扩展修正，
+未声明的旧配置字节零漂移（摘要不新增键）：
+
+| 缺口 | 修正 | 配置键 |
+|---|---|---|
+| 部署候选按全样本（含全部测试折）排名选出，测试信息泄漏进部署参数与邻域门 | 部署候选改取各折训练冠军的众数，同分取候选号最小者 | `validation.deployment_candidate_rule` 为 `most_selected_fold_champion`；`full_sample` 保留为旧口径 |
+| 搜索循环评估过的候选（一次约 8,462 个）提升为 9 候选配置后，DSR 只按 9 个试验去膨胀 | 提升时从搜索台账汇总各流派评估数、粗筛数、折级得分相关性有效试验数与年化 Sharpe 离散度，研究验证把评估数计入原始试验数、取更大的有效试验数，并以搜索离散度为 DSR 基准下限 | `search_loop_source.family_trials`（由 `search-loop-promote-v2` 写入，含台账散列） |
+| 固定多头基准只作消融披露，准入不设超额门 | 拼接路径 Sharpe 减同掩码固定多头 Sharpe 低于阈值即拒绝，理由码 `benchmark_sharpe_excess_failed` | `validation.minimum_benchmark_sharpe_excess`，提升配置缺省 0.05 |
+
+有效试验数在搜索循环内按候选样本外收益序列的相关矩阵计算
+（`returns-correlation-galwey-v1`）：主口径为 Galwey 特征值估计（特征值平方根
+之和的平方除以候选数），同时登记参与率（N 平方除以相关系数平方和）作诊断；随提案
+`families.<流派>.summary.trial_evidence` 登记，提升时优先采用，无该证据时回退到
+台账折级得分向量的 Gram 等价算法（与 `_effective_trial_count` 逐值一致）。不用
+参与率作计数的原因：它在平均相关平方为 r 时饱和于 1/r，2,160 个趋势候选只报
+1.95 个有效试验；折级 Sharpe 相关更被同期市场状态主导，只报 1.63。同一候选在原始
+计数 2,169 下 DSR 为 0.80，在上述宽松口径下为 0.999，Galwey 口径落在两者之间，
+是本管线采用的多重检验计数。
+
+`scripts/run_strategy_evolution_cycle.py` 把生成到裁决串成一轮：在只读静态快照上跑
+搜索循环，提升 proposed 流派为新配置（写入试验证据与准入扩展），对每份配置在同一
+快照与面板截止上运行完整研究，汇总家族准入结论为周期报告
+（`reports/strategy-evolution/cycle-<时刻>.json`）。面板截止必须早于当前 holdout
+vintage 起点；合格候选是否进入后继冻结计划仍由维护者决定（A-05）。静态快照的做法
+见 [runtime-ops.md](runtime-ops.md) 第 8 节。
+
+仍未修正、列为后续工作的项：embargo（24 柱）小于最长特征回看窗且无测试后清洗；
+PSR 与 FDR 把小时收益按独立样本计数；成本模型未由真实成交校准，冲击不随名义额
+变化；`median_rank` 模式弱于 PBO 硬门且在密网格失败后引入；奇偶校验子集按 Sharpe
+截取前 256 名存在选择偏差。
+
 ## 5. 质量、状态与分配
 
 质量向量为 `integrity/freshness/clock/coverage/PIT/lineage`。任一依赖维度失败，分配器必须

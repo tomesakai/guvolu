@@ -75,6 +75,11 @@ python scripts\promote_search_results.py --proposal reports\strategy-search\<sea
 python scripts\run_strategy_research.py --config config\strategy_research_candidate_<sha12>.json
 ```
 
+2026-09-03 起可用 `scripts/run_strategy_evolution_cycle.py --data-root <静态快照>
+--to-time <holdout 起点之前>` 把搜索、提升与决策级研究串成一轮（见
+[策略研究管线](strategy-research.md) 第 4.1 节）；提升自 `search-loop-promote-v2` 起
+把搜索台账的家族试验证据写入配置，研究验证据此计入 DSR 试验数。
+
 制品位于 `reports/strategy-search/<search_run_id>/`：`manifest.json`、`candidate-registry.json`、
 `structural-challengers-<family>.json`、`search-bundle-<sha>/`、`search-result-<sha>/`（含
 `trial-ledger-<sha>.jsonl`、`targets-*.bin`、`parity/`）、`panel/research-panel-sha256-<sha>.parquet`

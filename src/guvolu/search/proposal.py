@@ -391,6 +391,7 @@ def _family_proposal(
     family_evidence: Mapping[str, CandidateEvidence],
     thresholds: ProposalThresholds,
     fallback_budget: int,
+    trial_evidence: Mapping[str, object] | None = None,
 ) -> Mapping[str, object]:
     """为一个注册流派产出受约束网格提案。"""
     strategies = research_config.get("strategies")
@@ -409,13 +410,16 @@ def _family_proposal(
         if _within_constraints(research_config, family, item.candidate.parameters)
     ]
     flat_exact = [item for item in within if flat_by_id[item.candidate.candidate_id].flat]
-    summary = {
+    summary: dict[str, object] = {
         "evaluated": len(family_evidence),
         "screen_passed": sum(item.screen_passed for item in family_evidence.values()),
         "exact": len(exact),
         "exact_within_constraints": len(within),
         "flat_exact": len(flat_exact),
     }
+    if trial_evidence is not None:
+        # 收益相关性有效试验数
+        summary["trial_evidence"] = dict(trial_evidence)
     if not flat_exact:
         if not exact:
             reason = "no_exact_candidate"
@@ -557,12 +561,18 @@ def build_proposal(
     for candidate_id, item in evidence.items():
         by_label.setdefault(item.label, {})[candidate_id] = item
     for family in sorted(budgets):
+        raw_trial_evidence = run_body.get("family_trial_evidence")
+        trial_evidence = (
+            raw_trial_evidence.get(family)
+            if isinstance(raw_trial_evidence, Mapping) else None
+        )
         families[family] = _family_proposal(
             family,
             research_config,
             by_label.get(family, {}),
             thresholds,
             budgets[family]["candidate_budget"],
+            trial_evidence if isinstance(trial_evidence, Mapping) else None,
         )
     for label, items in sorted(by_label.items()):
         if label in budgets:

@@ -195,6 +195,12 @@ class FamilyEvaluation:
     cscv_excluded_fold_count: int = 0
     periods_per_year: float = 365.0 * 24.0
     regime_attribution: tuple[RegimeAttribution, ...] = ()
+    # 准入扩展（配置显式声明时才填充）
+    benchmark_sharpe: float | None = None
+    benchmark_sharpe_excess: float | None = None
+    search_trial_count: int = 0
+    search_effective_trial_count: float = 0.0
+    deployment_candidate_rule: str | None = None
 
 
 @dataclass(frozen=True)

@@ -20,7 +20,7 @@ from guvolu.research.validation import (
     make_folds,
 )
 from guvolu.search.kernels import KernelSession
-from guvolu.search.torch_runtime import Tensor
+from guvolu.search.torch_runtime import Tensor, torch_module_or_none
 
 RESAMPLE_METHOD_VERSION = "searchfast-resample-v1"
 RESAMPLE_TOLERANCE_VERSION = "searchfast-resample-tolerance-v1"
@@ -255,6 +255,9 @@ class ResampleMetrics:
     pbo: float
     cscv_median_rank: float
     cscv_split_count: int
+    # 样本外收益逐行标准化，常量行置零
+    oos_standardized: Tensor | None = None
+    constant_rows: int = 0
 
     def rows(self) -> tuple[Mapping[str, object], ...]:
         """导出逐候选的 JSON 可序列化行。"""
@@ -538,6 +541,7 @@ def resample_chunk(
     rank_median, pbo, median_rank, split_count = _cscv(
         session, fold_test, spec, family_cscv_seed(family, spec.cscv_seed),
     )
+    standardized, constant_rows = standardize_rows(torch, oos_values)
     return ResampleMetrics(
         folds=folds,
         fold_train_sharpe=torch.stack(train_sharpes, dim=1),
@@ -553,7 +557,59 @@ def resample_chunk(
         pbo=pbo,
         cscv_median_rank=median_rank,
         cscv_split_count=split_count,
+        oos_standardized=standardized,
+        constant_rows=constant_rows,
     )
+
+
+def standardize_rows(torch: object, values: Tensor) -> tuple[Tensor, int]:
+    """把 [C×N] 收益逐行零均值单位范数化；常量行置零并计数。"""
+    del torch
+    centered = values - values.mean(dim=1, keepdim=True)
+    norm = centered.pow(2).sum(dim=1).sqrt()
+    constant = norm <= 0.0
+    safe = norm.where(~constant, norm.new_ones(()))
+    standardized = (centered / safe.unsqueeze(1)).to(values.new_zeros(()).float().dtype)
+    standardized[constant] = 0.0
+    return standardized, int(constant.sum().item())
+
+
+def effective_trial_count_from_standardized(
+    chunks: Sequence[Tensor],
+    constant_rows: int,
+) -> Mapping[str, float]:
+    """按候选样本外收益相关矩阵估计流派有效试验数。
+
+    相关矩阵由标准化行的外积得到，常量行与其它行相关为零、自相关
+    为一。主口径为 Galwey 特征值估计：特征值平方根之和的平方除以
+    特征值之和（等于候选数）。同时给出参与率（N 平方除以相关系数
+    平方和）作诊断：参与率在平均相关平方为 r 时饱和于 1/r，无论
+    候选多少都只报个位数，作多重检验计数过于宽松。
+    """
+    count = sum(int(chunk.shape[0]) for chunk in chunks)
+    if count <= 1:
+        return {"effective_trial_count": float(count), "participation_ratio": float(count)}
+    torch = torch_module_or_none()
+    if torch is None:
+        raise RuntimeError("torch 不可用")
+    stacked = chunks[0] if len(chunks) == 1 else torch.cat(list(chunks), dim=0)
+    correlation = (stacked @ stacked.T).to(torch.float64)
+    diagonal = correlation.diagonal()
+    # 常量行对角补一
+    diagonal[diagonal <= 0.0] = 1.0
+    squared_sum = float(correlation.pow(2).sum().item())
+    participation = (
+        min(max(count * count / squared_sum, 1.0), float(count))
+        if squared_sum > 0.0 else float(count)
+    )
+    eigenvalues = torch.linalg.eigvalsh(correlation).clamp(min=0.0)
+    trace = float(eigenvalues.sum().item())
+    galwey = (
+        min(max(float(eigenvalues.sqrt().sum().item()) ** 2 / trace, 1.0), float(count))
+        if trace > 0.0 else float(count)
+    )
+    del correlation
+    return {"effective_trial_count": galwey, "participation_ratio": participation}
 
 
 @dataclass(frozen=True)

@@ -429,6 +429,18 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run_trade_materializ
 uv run python -m guvolu.data.trade_realtime_materialize --data-root data all --verify-all-hashes
 ```
 
+### 8.2 决策级研究的静态数据快照
+
+决策级研究要求活动成交 head 全程不变，而常驻物化器每 300 秒推进一次；此前
+只能静默物化器，代价是冻结前向链路失去新鲜成交柱。2026-09-03 起改用静态
+快照：把冻结运行根的数据目录整体复制到 `D:\dev\guvolu-research-snapshot\data`
+（robocopy，排除 `.locks` 与刷新临时库），再从生产数据根补齐快照控制库里
+其余活动 head 的输出文件（三所最近三段 book_l2、book-state、市场状态、OFL
+瓦片与 K 线，约 1.4 GB），并删除快照库中其它 book_l2 头。研究以
+`--data-root <快照>` 与 `--to-time <holdout 起点之前>` 运行，全程不碰生产，
+不需静默任何进程；GMO BTC 单流派完整研究实测约 5 分钟。快照是一次性
+制品，登记与研究制品仍写项目目录，用后可删。
+
 ## 9. 未决项登记
 
 | 编号 | 问题 | 本文提案 |

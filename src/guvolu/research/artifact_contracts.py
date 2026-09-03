@@ -310,6 +310,23 @@ def family_payload(validation: ValidationResult) -> list[Mapping[str, object]]:
                     gate.minimum_median_cscv_oos_rank
                 )
             payload["selection_stability_gate"] = gate_payload
+        admission = validation.admission_extensions
+        # 未声明准入扩展的旧摘要字节不变。
+        if admission is not None:
+            payload["admission_extensions"] = {
+                "deployment_candidate_rule": (
+                    admission.deployment_candidate_rule
+                ),
+                "minimum_benchmark_sharpe_excess": (
+                    admission.minimum_benchmark_sharpe_excess
+                ),
+                "benchmark_sharpe": item.benchmark_sharpe,
+                "benchmark_sharpe_excess": item.benchmark_sharpe_excess,
+                "search_trial_count": item.search_trial_count,
+                "search_effective_trial_count": (
+                    item.search_effective_trial_count
+                ),
+            }
         if validation.regime_attribution_method_version is not None:
             payload["regime_attribution"] = [
                 regime_attribution_payload(value)

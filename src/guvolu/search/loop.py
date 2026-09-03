@@ -708,6 +708,11 @@ def run_search_loop(
         "search_bundle_identity": bundle.identity.payload(),
         "search_plan_id": candidates.plan["search_plan_id"],
         "search_result_id": manifest.get("search_result_id"),
+        "family_trial_evidence": {
+            str(item.get("family")): item.get("trial_evidence")
+            for item in manifest.get("families", ())
+            if isinstance(item, Mapping) and item.get("trial_evidence")
+        },
         "cost_model": dict(cost_model),
         "resample": spec.payload(),
         "options": options.payload(),

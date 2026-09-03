@@ -84,6 +84,7 @@ class ValidationResult:
     block_bootstrap_method_version: str = BLOCK_BOOTSTRAP_METHOD_VERSION
     regime_attribution_method_version: str | None = None
     selection_stability_gate: SelectionStabilityGate | None = None
+    admission_extensions: AdmissionExtensions | None = None
 
 
 @dataclass(frozen=True)
@@ -131,6 +132,83 @@ def _number(value: object, name: str) -> float:
 
 
 DEFAULT_MINIMUM_MEDIAN_CSCV_OOS_RANK = 0.5
+DEPLOYMENT_RULE_FULL_SAMPLE = "full_sample"
+DEPLOYMENT_RULE_MOST_SELECTED = "most_selected_fold_champion"
+BENCHMARK_EXCESS_REASON = "benchmark_sharpe_excess_failed"
+
+
+@dataclass(frozen=True)
+class ExternalTrials:
+    """来自搜索循环的家族级试验证据（DSR 计数下限）。"""
+
+    evaluated: int
+    screen_passed: int
+    effective_trial_count: float
+    annual_sharpe_std: float
+    ledger_sha256: str
+
+
+@dataclass(frozen=True)
+class AdmissionExtensions:
+    """配置显式声明的准入扩展；旧配置无该项时保持零漂移。
+
+    `deployment_candidate_rule` 决定部署候选来源：`full_sample` 为
+    全样本冠军（含测试段信息），`most_selected_fold_champion` 为
+    各折训练段冠军的众数（不看测试段）。
+    `minimum_benchmark_sharpe_excess` 要求拼接路径 Sharpe 超过同
+    掩码固定多头基准。`external_trials` 把搜索循环评估过的候选数
+    计入 DSR 试验数，并以其 Sharpe 离散度为 DSR 基准下限。
+    """
+
+    deployment_candidate_rule: str
+    minimum_benchmark_sharpe_excess: float | None
+    external_trials: Mapping[str, ExternalTrials]
+
+
+def parse_admission_extensions(
+    validation: Mapping[str, object],
+    search_loop_source: object,
+) -> AdmissionExtensions | None:
+    """解析准入扩展；三项均未声明时返回 None。"""
+    raw_rule = validation.get("deployment_candidate_rule")
+    raw_excess = validation.get("minimum_benchmark_sharpe_excess")
+    raw_trials: object = None
+    if isinstance(search_loop_source, Mapping):
+        raw_trials = search_loop_source.get("family_trials")
+    if raw_rule is None and raw_excess is None and not raw_trials:
+        return None
+    rule = DEPLOYMENT_RULE_FULL_SAMPLE if raw_rule is None else raw_rule
+    if rule not in {DEPLOYMENT_RULE_FULL_SAMPLE, DEPLOYMENT_RULE_MOST_SELECTED}:
+        raise ValueError(
+            "deployment_candidate_rule 只能为 full_sample 或"
+            " most_selected_fold_champion"
+        )
+    excess: float | None = None
+    if raw_excess is not None:
+        excess = _number(raw_excess, "minimum_benchmark_sharpe_excess")
+    trials: dict[str, ExternalTrials] = {}
+    if raw_trials:
+        for family, raw_item in _mapping(raw_trials, "family_trials").items():
+            item = _mapping(raw_item, f"family_trials.{family}")
+            evaluated = _integer(item.get("evaluated"), "evaluated")
+            screen_passed = item.get("screen_passed")
+            if not isinstance(screen_passed, int) or screen_passed < 0:
+                raise ValueError("screen_passed 必须为非负整数")
+            effective = _number(
+                item.get("effective_trial_count"), "effective_trial_count",
+            )
+            if not 1.0 <= effective <= float(evaluated):
+                raise ValueError("effective_trial_count 须位于一到 evaluated")
+            std = _number(item.get("annual_sharpe_std"), "annual_sharpe_std")
+            if std < 0.0:
+                raise ValueError("annual_sharpe_std 不得为负")
+            digest = item.get("ledger_sha256")
+            if not isinstance(digest, str) or len(digest) != 64:
+                raise ValueError("ledger_sha256 必须为 64 位散列")
+            trials[str(family)] = ExternalTrials(
+                evaluated, int(screen_passed), effective, std, digest,
+            )
+    return AdmissionExtensions(str(rule), excess, trials)
 
 
 def parse_selection_stability_gate(
@@ -257,16 +335,22 @@ def _deflated_sharpe_probability(
     values: Sequence[float],
     trial_period_sharpes: Sequence[float],
     trial_count: float,
+    dispersion_floor: float = 0.0,
 ) -> tuple[float, float]:
-    """计算 Bailey--López de Prado DSR 与每期 Sharpe 基准。"""
+    """计算 Bailey--López de Prado DSR 与每期 Sharpe 基准。
+
+    `dispersion_floor` 为试验 Sharpe 离散度下限：紧凑网格的候选
+    Sharpe 几乎相同会使基准退化为零，搜索阶段的离散度补上这一项。
+    """
     if trial_count < 1.0:
         raise ValueError("DSR 试验数不得小于一")
     if not trial_period_sharpes:
         raise ValueError("DSR 缺少试验 Sharpe")
-    dispersion = (
+    dispersion = max(
         statistics.pstdev(trial_period_sharpes)
         if len(trial_period_sharpes) > 1
-        else 0.0
+        else 0.0,
+        dispersion_floor,
     )
     benchmark = 0.0
     if trial_count > 1.0 and dispersion > 0.0:
@@ -1097,6 +1181,9 @@ def walk_forward_validate(
         _mapping(config.get("walk_forward"), "walk_forward"),
     )
     validation = _mapping(config.get("validation"), "validation")
+    admission = parse_admission_extensions(
+        validation, config.get("search_loop_source"),
+    )
     complexity_penalty = _number(
         validation.get("complexity_penalty"), "complexity_penalty",
     )
@@ -1346,10 +1433,25 @@ def walk_forward_validate(
             if regime_attribution_method_version is not None
             else ()
         )
+        deployment_candidate = selected_full
+        if (
+            admission is not None
+            and admission.deployment_candidate_rule
+            == DEPLOYMENT_RULE_MOST_SELECTED
+        ):
+            # 折冠军众数，不看测试段
+            winner = max(
+                sorted(selection_counts),
+                key=lambda identifier: selection_counts[identifier],
+            )
+            deployment_candidate = next(
+                candidate for candidate in family_candidates
+                if candidate.candidate_id == winner
+            )
         pending.append(_PendingFamily(
             family=family,
-            mode=selected_full.mode,
-            deployment_candidate=selected_full,
+            mode=deployment_candidate.mode,
+            deployment_candidate=deployment_candidate,
             fold_selected_candidate_ids=tuple(selected_candidate_ids),
             oos_returns=compact_oos_returns,
             metrics=metrics,
@@ -1398,6 +1500,25 @@ def walk_forward_validate(
         for candidate_id, metrics in candidate_oos_metrics.items()
     }
     annualization_scale = math.sqrt(periods_per_year)
+    benchmark_sharpe: float | None = None
+    if (
+        admission is not None
+        and admission.minimum_benchmark_sharpe_excess is not None
+    ):
+        # 同掩码固定多头基准
+        fixed_targets = tuple(1.0 for _bar in bars)
+        benchmark_sharpe = _masked_metrics(
+            bars,
+            fixed_targets,
+            strategy_returns(
+                bars, fixed_targets, one_way_cost_rate, maximum_gap_seconds,
+            ),
+            common_oos_mask,
+            one_way_cost_rate,
+            capacity_notional,
+            maximum_gap_seconds,
+            periods_per_year,
+        ).sharpe
     for item in pending:
         p_values[f"family-walk-forward:{item.family}"] = item.metrics.p_value
     q_values = _fdr_q_values(p_values)
@@ -1466,15 +1587,33 @@ def walk_forward_validate(
             candidate_oos_metrics[candidate_id].sharpe / annualization_scale
             for candidate_id in family_candidate_ids
         )
+        external = (
+            None if admission is None
+            else admission.external_trials.get(item.family)
+        )
+        dispersion_floor = 0.0
+        search_trial_count = 0
+        search_effective = 0.0
+        if external is not None:
+            # 搜索阶段试验计入，取更大的有效数
+            search_trial_count = external.evaluated
+            search_effective = external.effective_trial_count
+            raw_trial_count += external.evaluated
+            effective_trial_count = max(
+                effective_trial_count, external.effective_trial_count,
+            )
+            dispersion_floor = external.annual_sharpe_std / annualization_scale
         raw_dsr, raw_benchmark = _deflated_sharpe_probability(
             item.oos_returns,
             candidate_period_sharpes,
             float(raw_trial_count),
+            dispersion_floor,
         )
         effective_dsr, effective_benchmark = _deflated_sharpe_probability(
             item.oos_returns,
             candidate_period_sharpes,
             effective_trial_count,
+            dispersion_floor,
         )
         neighbors = _parameter_neighbors(
             item.deployment_candidate,
@@ -1541,6 +1680,15 @@ def walk_forward_validate(
             reasons.append("positive_parameter_neighbor_ratio_failed")
         if median_neighbor_retention < minimum_neighbor_sharpe_retention:
             reasons.append("parameter_neighbor_sharpe_retention_failed")
+        benchmark_excess: float | None = None
+        if (
+            benchmark_sharpe is not None
+            and admission is not None
+            and admission.minimum_benchmark_sharpe_excess is not None
+        ):
+            benchmark_excess = item.metrics.sharpe - benchmark_sharpe
+            if benchmark_excess < admission.minimum_benchmark_sharpe_excess:
+                reasons.append(BENCHMARK_EXCESS_REASON)
         evaluations.append(FamilyEvaluation(
             family=item.family,
             mode=item.mode,
@@ -1590,6 +1738,14 @@ def walk_forward_validate(
             cscv_excluded_fold_count=len(folds) - cscv_used_fold_count,
             periods_per_year=periods_per_year,
             regime_attribution=item.regime_attribution,
+            benchmark_sharpe=benchmark_sharpe,
+            benchmark_sharpe_excess=benchmark_excess,
+            search_trial_count=search_trial_count,
+            search_effective_trial_count=search_effective,
+            deployment_candidate_rule=(
+                None if admission is None
+                else admission.deployment_candidate_rule
+            ),
         ))
     return ValidationResult(
         families=tuple(sorted(evaluations, key=lambda item: item.family)),
@@ -1600,6 +1756,7 @@ def walk_forward_validate(
         block_bootstrap_method_version=block_bootstrap_method_version,
         regime_attribution_method_version=regime_attribution_method_version,
         selection_stability_gate=selection_stability_gate,
+        admission_extensions=admission,
     )
 
 

@@ -220,3 +220,34 @@ def test_resample_screen_thresholds() -> None:
     assert screen.passes(row)
     assert not ResampleScreen(maximum_pbo=0.2).passes(row)
     assert not ResampleScreen(minimum_oos_sharpe=1.0).passes(row)
+
+
+def test_returns_correlation_effective_trial_count() -> None:
+    """收益相关性有效试验数：同行为一，正交为 N，常量行只计自身。"""
+    from guvolu.search.resample import (
+        effective_trial_count_from_standardized,
+        standardize_rows,
+    )
+
+    base = torch.tensor([[1.0, -1.0, 2.0, 0.0], [1.0, -1.0, 2.0, 0.0]])
+    identical, constant = standardize_rows(torch, base)
+    assert constant == 0
+    same = effective_trial_count_from_standardized([identical], 0)
+    assert same["effective_trial_count"] == pytest.approx(1.0)
+    assert same["participation_ratio"] == pytest.approx(1.0)
+    orthogonal = torch.tensor([[1.0, -1.0, 0.0, 0.0], [0.0, 0.0, 1.0, -1.0]])
+    rows, _ = standardize_rows(torch, orthogonal)
+    free = effective_trial_count_from_standardized([rows], 0)
+    assert free["effective_trial_count"] == pytest.approx(2.0)
+    assert free["participation_ratio"] == pytest.approx(2.0)
+    mixed = torch.tensor([[1.0, 2.0, 3.0, 4.0], [4.0, 3.0, 2.0, 1.0], [5.0, 5.0, 5.0, 5.0]])
+    rows, constant = standardize_rows(torch, mixed)
+    assert constant == 1
+    # 特征值 2、0、1
+    estimates = effective_trial_count_from_standardized(
+        [rows[:2], rows[2:]], constant,
+    )
+    assert estimates["participation_ratio"] == pytest.approx(9.0 / 5.0)
+    assert estimates["effective_trial_count"] == pytest.approx(
+        (math.sqrt(2.0) + 1.0) ** 2 / 3.0
+    )

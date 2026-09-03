@@ -46,6 +46,7 @@ from guvolu.search.parity import (
     exact_reference,
 )
 from guvolu.search.resample import (
+    effective_trial_count_from_standardized,
     ResampleMetrics,
     ResampleScreen,
     ResampleSpec,
@@ -62,6 +63,7 @@ RUNNER_METHOD_VERSION = "searchfast-runner-v1"
 SEARCH_RESULT_SCHEMA_VERSION = 1
 SEARCH_RESULT_METHOD_VERSION = "searchfast-search-result-v1"
 PRECISION = "f32"
+EFFECTIVE_TRIAL_METHOD_VERSION = "returns-correlation-galwey-v1"
 REASON_LOOKBACK = "lookback_not_in_panel"
 REASON_NEGATIVE_SIZING = "negative_sizing_parameter"
 
@@ -282,6 +284,9 @@ def evaluate_bundle(
         ledger.append_rows(rows)
         targets_store: array[float] = array("f")
         accepted_ids: list[str] = []
+        standardized_chunks: list[object] = []
+        constant_rows = 0
+        family_oos_sharpes: list[object] = []
         for start, stop in candidate_chunks(len(accepted_rows), options.candidate_chunk):
             subset = accepted_rows[start:stop]
             chunk_family = _subset_family(family, subset)
@@ -306,6 +311,10 @@ def evaluate_bundle(
                 resample_rows = resampled.rows()
                 if folds_record is None:
                     folds_record = fold_payload(resampled.folds)
+                if resampled.oos_standardized is not None:
+                    standardized_chunks.append(resampled.oos_standardized)
+                    constant_rows += resampled.constant_rows
+                    family_oos_sharpes.append(resampled.oos_sharpe)
             targets_store.frombytes(_tensor_f32_bytes(targets))
             chunk_rows: list[LedgerRow] = []
             for offset, row_index in enumerate(subset):
@@ -347,6 +356,22 @@ def evaluate_bundle(
         if options.device.startswith("cuda"):
             torch.cuda.synchronize()
         targets_record = _write_targets(work_directory, family.family, targets_store)
+        trial_evidence: dict[str, object] | None = None
+        if standardized_chunks:
+            # 流派级有效试验数按收益相关性
+            sharpes = torch.cat([tensor for tensor in family_oos_sharpes])  # type: ignore[list-item]
+            estimates = effective_trial_count_from_standardized(
+                standardized_chunks, constant_rows,  # type: ignore[arg-type]
+            )
+            trial_evidence = {
+                "method_version": EFFECTIVE_TRIAL_METHOD_VERSION,
+                "evaluated": len(accepted_ids),
+                "effective_trial_count": estimates["effective_trial_count"],
+                "participation_ratio": estimates["participation_ratio"],
+                "constant_rows": constant_rows,
+                "oos_sharpe_std": float(sharpes.std(unbiased=False).item()),
+            }
+            standardized_chunks.clear()
         elapsed = time.perf_counter() - family_started
         total_candidates += len(family.parameter_rows)
         families_payload.append({
@@ -358,6 +383,7 @@ def evaluate_bundle(
             "targets": targets_record,
             "bar_count": bar_count,
             "elapsed_seconds": elapsed,
+            "trial_evidence": trial_evidence,
         })
     ledger_path, ledger_sha256 = ledger.finalize()
     total_elapsed = time.perf_counter() - started
