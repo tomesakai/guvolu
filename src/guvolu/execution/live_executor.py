@@ -157,7 +157,7 @@ SEND_TIMEOUT_SETTLE_SECONDS = 5.0
 # 观察心跳超龄秒数
 OBSERVER_MAX_AGE_SECONDS = 300.0
 OBSERVER_HEARTBEAT_RELATIVE_PATH = LIVE_RELATIVE_DIR / "observer_heartbeat.json"
-# 维护窗错误码（docs/error-catalog.md）
+# 维护窗错误码
 MAINTENANCE_ERROR_CODE = "ERR-5201"
 
 
