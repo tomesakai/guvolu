@@ -19,9 +19,16 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "trade catchup exit $LASTEXITCODE" }
     Write-Host 'trade catchup done'
     # 已过当日的实时段按日合并（TBD-40）
-    & $Python -m guvolu.data.trade_realtime_compact `
-        --data-root $DataRoot --market-id mkt__gmo__btc__r0 | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "trade compaction exit $LASTEXITCODE" }
+    $CompactMarkets = @(
+        'mkt__gmo__btc__r0', 'mkt__gmo__eth__r0', 'mkt__gmo__xrp__r0',
+        'mkt__gmo__sol__r0', 'mkt__gmo__doge__r0',
+        'mkt__bitbank__btc_jpy__r0', 'mkt__bitflyer__btc_jpy__r0'
+    )
+    foreach ($Market in $CompactMarkets) {
+        & $Python -m guvolu.data.trade_realtime_compact `
+            --data-root $DataRoot --market-id $Market | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "trade compaction exit $LASTEXITCODE ($Market)" }
+    }
     Write-Host 'trade compaction done'
     & $Python -m guvolu.data.l2_materialize --data-root $DataRoot all | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "l2 catchup exit $LASTEXITCODE" }
