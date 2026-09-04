@@ -470,7 +470,7 @@ def execute_live_order(
     ):
         return replace(passive, passive=passive_record)
     if not passive.terminal:
-        # 被动单未到终态，不可再发第二阶段（T-05）
+        # 被动未到终态不发第二阶段（T-05）
         return replace(passive, passive=passive_record)
     remaining = _floor_step(proposal.size - executed, runtime.rule.size_step)
     if remaining < runtime.rule.min_order_size:
