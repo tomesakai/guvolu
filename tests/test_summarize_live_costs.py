@@ -70,6 +70,22 @@ def _write_live_fixture(root: Path) -> None:
     (live / "live-report-sha256-refusal.json").write_text(
         json.dumps({"kind": "live_refusal_report"}), encoding="utf-8",
     )
+    canary_dir = root / "data/execution/canary"
+    canary_dir.mkdir(parents=True)
+    (canary_dir / "intent_ledger.jsonl").write_text(
+        json.dumps({
+            "record": "intent", "intent_id": "itc", "symbol": "BTC",
+            "side": "BUY", "size": "0.00002", "price": "12591999",
+        }) + "\n",
+        encoding="utf-8",
+    )
+    (canary_dir / "canary-report-sha256-x.json").write_text(
+        json.dumps({
+            "kind": "live_canary_report", "intent_id": "itc",
+            "order_id": 7000000001, "reference_price": None,
+        }),
+        encoding="utf-8",
+    )
 
 
 def test_collect_orders_links_ledger_transitions_and_report_reference(
@@ -78,7 +94,11 @@ def test_collect_orders_links_ledger_transitions_and_report_reference(
     """账本给出委托号与意图上下文，报告补参考价；无账本的报告也收集。"""
     _write_live_fixture(tmp_path)
     orders = costs.collect_orders(tmp_path)
-    assert set(orders) == {8894858272, 8894420923}
+    assert set(orders) == {8894858272, 8894420923, 7000000001}
+    canary_order = orders[7000000001]
+    assert canary_order.side == "BUY"
+    assert canary_order.limit_price == "12591999"
+    assert canary_order.reference_price is None
     sell = orders[8894858272]
     assert sell.intent_id == "it1"
     assert sell.side == "SELL"

@@ -392,7 +392,11 @@ READ_ONLY 限速与磁盘。
 live 账本与报告收集委托号，按 READ_ONLY 成交明细逐委托取成交，
 以名义额加权得费率、相对报告参考价的滑点与 maker 占比（GMO
 `fee` 为负即 maker 返还），报告落在
-`data/execution/live/cost-summary/`，用于校准成本模型假设。
+`data/execution/live/cost-summary/`，用于校准成本模型假设。首两笔实测
+（2026-09-03，各 0.00002 BTC、名义约 252 JPY）手续费均被向上取整为
+1 JPY，即 39.7 bp，远高于名义费率 5 bp；卖出相对参考价滑点 3.7 bp。
+取整效应随名义增大而消退，名义 2,000 JPY 以上落回 5 bp 量级，因此
+微量单只用于验证通路，不能据此评估成本模型。
 
 正当拒绝与崩溃可区分：执行器各拒绝启动路径把
 `kind=live_refusal_report` 报告写到 `--report` 目的地，串联层判读

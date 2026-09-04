@@ -27,7 +27,9 @@ from guvolu.domain.config import load_config
 from guvolu.domain.models import Execution
 
 LIVE_DIRECTORY = Path("data/execution/live")
+CANARY_DIRECTORY = Path("data/execution/canary")
 SUMMARY_DIRECTORY = LIVE_DIRECTORY / "cost-summary"
+REPORT_KINDS = frozenset({"live_execution_report", "live_canary_report"})
 BPS = Decimal("10000")
 
 
@@ -79,15 +81,37 @@ def _load_reports(root: Path) -> list[dict[str, object]]:
     live = root / LIVE_DIRECTORY
     candidates = list(live.glob("live-report-sha256-*.json"))
     candidates.extend((live / "reports").glob("*.json"))
+    candidates.extend((root / CANARY_DIRECTORY).glob("canary-report-sha256-*.json"))
     reports: list[dict[str, object]] = []
     for path in sorted(candidates):
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
-        if isinstance(payload, dict) and payload.get("kind") == "live_execution_report":
+        if isinstance(payload, dict) and payload.get("kind") in REPORT_KINDS:
             reports.append(payload)
     return reports
+
+
+def _ledgers(root: Path) -> list[Path]:
+    paths: list[Path] = []
+    for directory in (LIVE_DIRECTORY, CANARY_DIRECTORY):
+        paths.extend((root / directory).rglob("intent_ledger*.jsonl"))
+    return sorted(paths)
+
+
+def _report_intent(report: Mapping[str, object]) -> tuple[str | None, int | None]:
+    """报告里的意图号与委托号；canary 报告平铺在顶层。"""
+    intent = report.get("intent")
+    if isinstance(intent, Mapping):
+        order = intent.get("order_id")
+        return _text(intent.get("intent_id")), (
+            None if order is None else int(str(order))
+        )
+    order = report.get("order_id")
+    return _text(report.get("intent_id")), (
+        None if order is None else int(str(order))
+    )
 
 
 def _text(value: object) -> str | None:
@@ -98,7 +122,7 @@ def collect_orders(root: Path) -> dict[int, OrderContext]:
     """从账本与报告收集委托号及上下文；报告的参考价按意图关联。"""
     intents: dict[str, dict[str, object]] = {}
     order_by_intent: dict[str, int] = {}
-    for ledger in sorted((root / LIVE_DIRECTORY).rglob("intent_ledger*.jsonl")):
+    for ledger in _ledgers(root):
         for row in _load_lines(ledger):
             kind = row.get("record")
             intent_id = _text(row.get("intent_id"))
@@ -111,17 +135,16 @@ def collect_orders(root: Path) -> dict[int, OrderContext]:
     reference_by_intent: dict[str, str] = {}
     reference_by_order: dict[int, str] = {}
     for report in _load_reports(root):
-        intent = report.get("intent")
+        intent_id, order_id = _report_intent(report)
         reference = _text(report.get("reference_price"))
-        if not isinstance(intent, Mapping) or reference is None:
+        if intent_id is not None and order_id is not None:
+            order_by_intent.setdefault(intent_id, order_id)
+        if reference is None:
             continue
-        intent_id = _text(intent.get("intent_id"))
         if intent_id is not None:
             reference_by_intent[intent_id] = reference
-        if intent.get("order_id") is not None:
-            reference_by_order[int(str(intent["order_id"]))] = reference
-            if intent_id is not None:
-                order_by_intent.setdefault(intent_id, int(str(intent["order_id"])))
+        if order_id is not None:
+            reference_by_order[order_id] = reference
     orders: dict[int, OrderContext] = {}
     for intent_id, order_id in order_by_intent.items():
         row = intents.get(intent_id, {})
