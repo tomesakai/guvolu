@@ -432,5 +432,6 @@ def test_production_registry_registers_workbook_rows_plus_local_extension(
             ("EP-0007", None),
             ("EP-0032", None),
         ("EP-0075", None),
+        ("EP-0076", None),
     ]
     conn.close()

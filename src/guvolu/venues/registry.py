@@ -26,6 +26,12 @@ _RAW_GMO = "2026-08-08/gmo/symbols.jsonl:1"
 _RAW_GMO_ARCHIVE = "docs/2026-08-06-gmo-data-scope-survey.md:35-59"
 _RAW_BITBANK = "2026-08-08/bitbank/spot_pairs.jsonl:1"
 _RAW_BITFLYER = "2026-08-07/bitflyer/markets.jsonl:1"
+# GMO 外国為替FX 公共 ticker
+# 2026-09-04 单次 GET 实测
+_RAW_GMO_FX = "official/gmo-forex-public-ticker"
+GMO_FX_OBSERVED_AT = "2026-09-04T02:19:27+00:00"
+# 汇率腿首批只登记美元日元
+GMO_FX_SYMBOLS: tuple[str, ...] = ("USD_JPY",)
 
 # GMO 已实测的官方逐笔现货品种。
 # 无 ``_JPY`` 后缀即现物市场。
@@ -146,6 +152,7 @@ VENUE_ROWS: list[VenueRow] = [
     ("hyperliquid", "exchange", "reference", "mixed", "UTC00", 0),
     ("bitfinex", "exchange", "reference", "mixed", "UTC00", 0),
     ("bitstamp", "exchange", "reference", "mixed", "UTC00", 0),
+    ("gmo_fx", "exchange", "reference", "微秒", "UTC00", 0),
 ]
 
 _JPY_SPOT_BASES = sorted({
@@ -165,6 +172,10 @@ INSTRUMENT_ROWS: list[InstrumentRow] = [
         for symbol in _GMO_CURRENT_LEVERAGE_RULES
     ],
     ("SPOT:BTC/USDT", "BTC", "USDT", "spot"),
+    *[
+        (f"FX:{symbol[:3]}/{symbol[4:]}", symbol[:3], symbol[4:], "fx")
+        for symbol in GMO_FX_SYMBOLS
+    ],
 ]
 
 # bitbank 档位由位数字段换算
@@ -221,6 +232,13 @@ INSTRUMENT_MAP_ROWS: list[InstrumentMapRow] = [
      0, OBSERVED_AT, "official/binance-public-data"),
     ("okx", "BTC-USDT", "SPOT:BTC/USDT", "0.1", "0.00000001", "0.00001",
      0, "2026-08-11T10:00:00+00:00", "official/okx-public-instruments"),
+    *[
+        (
+            "gmo_fx", symbol, f"FX:{symbol[:3]}/{symbol[4:]}",
+            None, None, None, 0, GMO_FX_OBSERVED_AT, _RAW_GMO_FX,
+        )
+        for symbol in GMO_FX_SYMBOLS
+    ],
 ]
 
 # 逐笔端点最早可得日，二分探测实测
@@ -320,6 +338,7 @@ CAPABILITY_ROWS: list[CapabilityRow] = [
     _cap("coincheck", "trade", "/api/trades", 1, "public", "unknown", "none", "none", "fixed", "mixed", "documented", "implemented", "https://coincheck.com/documents/exchange/api", 1),
     _cap("coincheck", "book_realtime", "{pair}-orderbook", 1, "public", "none", "delta_l2", "none", "fixed", "mixed", "documented", "implemented", "https://coincheck.com/documents/exchange/api", 1),
     _cap("binance", "trade", "data.binance.vision/aggTrades", 1, "public", "archive", "aggregate", "checksum", "weight", "mixed", "documented", "implemented", "https://github.com/binance/binance-public-data", 1),
+    _cap("gmo_fx", "fx_rate", "public/v1/ticker", 1, "public", "none", "quote_snapshot", "none", "fixed", "iso8601", "measured", "implemented", "https://api.coin.z.com/fxdocs/", 0),
 ]
 
 

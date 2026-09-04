@@ -469,10 +469,52 @@ def okx_live_endpoint_revisions() -> tuple[EndpointRevisionRow, ...]:
     )
 
 
+def gmo_forex_endpoint_revisions() -> tuple[EndpointRevisionRow, ...]:
+    """返回 GMO 外国為替FX 公共 ticker 的本地登记端点修订（TBD-32）。
+
+    工作簿未登记该端点；本地以 EP-0076 追加，``source_schema_revision``
+    明示本地扩展。自然键 host 为 ``forex-api.coin.z.com``，与 EP-0006、
+    EP-0007 的 ``api.coin.z.com`` 身份不同，故不复用其稳定 ID。响应形态
+    依据 2026-09-04 单次 GET 实测（A-04）。
+    """
+    observed = "2026-09-04T02:19:27+00:00"
+    return (
+        EndpointRevisionRow(
+            endpoint_id="EP-0076",
+            revision_id=0,
+            venue_id="gmo_fx",
+            identity=EndpointNaturalIdentity(
+                legal_entity="GMO Coin, Inc.",
+                venue_brand="GMO Coin",
+                product="Forex",
+                environment="prod",
+                region="Japan",
+                transport="HTTPS",
+                protocol="public v1",
+                auth_mode="P0",
+                host="forex-api.coin.z.com",
+                port=443,
+                base_path_or_channel="/public/v1",
+                data_level="ticker",
+            ),
+            scope="public/ticker",
+            source_schema_revision=(
+                "local_registry_extension:forex-ticker@2026-09-04"
+            ),
+            documentation_uri="https://api.coin.z.com/fxdocs/",
+            documentation_sha256=None,
+            effective_from="2026-09-04T00:00:00+00:00",
+            valid_until="9999-12-31T23:59:59+00:00",
+            registered_at=observed,
+        ),
+    )
+
+
 def registered_realtime_endpoint_revisions() -> tuple[EndpointRevisionRow, ...]:
     """返回当前采集与 REST 锚点实际使用的端点修订。"""
     return (
         *live_jpy_realtime_endpoint_revisions(),
         *live_jpy_rest_l2_endpoint_revisions(),
         *okx_live_endpoint_revisions(),
+        *gmo_forex_endpoint_revisions(),
     )

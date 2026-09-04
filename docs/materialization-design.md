@@ -198,6 +198,31 @@ data/materialized/trade_observation/
 
 若整月全部是已确认的 `empty/0`，仍提交一个保留完整列结构的零行 Parquet、清单、输入绑定与活动头，作为可恢复覆盖断点。不同空月的 Parquet 字节相同，因此共享同一 `artifact_id`；SQLite schema v20 允许一个内容身份拥有多个 `artifact_location`，但以唯一 partial index 保证恰有一个 canonical location。查询活动头可复用 canonical 字节，不能因零行而把已确认空月反复排入待办。
 
+`fx_rate` 数据集（TBD-32 实时旁路）沿用同一封口段到 Parquet 的登记链：每个
+raw v3 封口段一个 attempt、一个 `part-<散列前十二位>.parquet` 与清单，活动 head
+以 `market_id + domain=fx_rate + run/segment` 为键。
+
+```text
+data/raw/realtime/fx_rate/venue_id=gmo_fx/venue_symbol=USD_JPY/run_id=<run>/
+  segment-000001.jsonl
+  segment-000001.manifest.json
+data/materialized/fx_rate/
+  schema_version=1/
+    normalization_version=fx-rate-normalization-v1/
+      venue_id=gmo_fx/
+        market_id=mkt__gmo_fx__usd_jpy__r0/
+          run_id=<run>/
+            segment=000001/
+              part-<输出散列前十二位>.parquet
+              manifest-<attempt_id>.json
+```
+
+事实列为 `observation_id`（来源、symbol、事件时刻、原件与行号）、`bid`、`ask`、
+`mid` 十进制文本、`status`（`OPEN` 或 `CLOSE`）与 raw v3 端点、连接、频道证据；
+`event_time` 取交易所 `timestamp`，`available_time` 取事件与落盘较晚者（D-03、
+D-04）。多 symbol 共用一次请求时，各 symbol 目录保存同一份完整原文，不裁剪
+响应（D-02）；未登记市场的 symbol 物化失败关闭。
+
 ## 7. 延迟与调度
 
 | 数据 | 物化触发 | 目标延迟 | 原因 |

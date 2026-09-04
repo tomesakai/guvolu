@@ -43,7 +43,7 @@ def test_capability_registry_is_complete_and_honest(tmp_path: Path) -> None:
     """现行来源四域齐备，L3 候选不冒充已接入。"""
     conn = connect(tmp_path)
     register_all(conn)
-    assert conn.execute("SELECT COUNT(*) FROM venue").fetchone()[0] == 12
+    assert conn.execute("SELECT COUNT(*) FROM venue").fetchone()[0] == 13
     assert conn.execute(
         "SELECT COUNT(*) FROM venue_capability_revision"
     ).fetchone()[0] == len(CAPABILITY_ROWS)

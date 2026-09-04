@@ -13,6 +13,7 @@
 | 来源 | 角色 | 证据文档 | 证据等级 |
 |---|---|---|---|
 | GMO Coin | 执行加行情 | [能力报告](2026-08-05-gmo-api-capability-report.md)、[勘误](2026-08-05-gmo-order-id-erratum.md)、[量级实测](2026-08-06-gmo-data-scope-survey.md)、[打印口径实测](2026-08-07-gmo-trade-print-semantics.md) | 实测 |
+| GMO Coin 外国為替FX | 法币汇率实时旁路（TBD-32） | 2026-09-04 单次 GET 实测，响应样本存 `tests/fixtures/gmo_fx_ticker_2026-09-04.json`；数据域见第 10 节 `fx_rate` 行 | 实测 |
 | bitFlyer | 日元行情加衍生品信号 | [实测快照](2026-08-07-bitflyer-api-verification.md) | 实测 |
 | bitbank | 日元行情 | [多所调查](2026-08-07-multi-venue-api-survey.md)、[实测快照](2026-08-08-bitbank-api-verification.md)、[闭环验证](2026-08-11-multi-source-closure-validation.md) | 实测 |
 | Coincheck | 日元行情备用 | [闭环验证](2026-08-11-multi-source-closure-validation.md)、[2026-08-24 文档核实](2026-08-24-japan-api-survey.md) | 文档加实录 |
@@ -41,6 +42,7 @@ GMO、bitFlyer、bitbank 三行的实测结论不变；新补六行均未接入�
 | 来源 | 公开行情门槛 | 密钥形态 | 密钥正交性 | 等级门槛 |
 |---|---|---|---|---|
 | GMO Coin | 无 | 双密钥，权限交易所侧固定 | **完全正交**（实测） | 限速按前周取引高分两档 |
+| GMO Coin 外国為替FX | 无（`forex-api.coin.z.com/public/v1/ticker`） | 本仓库不使用其私有 API | 不适用 | 无 |
 | bitFlyer | 无 | 权限逐项勾选 | **不正交**：TRADE 密钥兼具全部读取，现含出金权限（实测，待人工收缩） | 无 |
 | bitbank | 无 | 权限逐项勾选 | 未核 | 无 |
 | Coincheck | 无 | 权限逐项勾选 | 未核 | 无 |
@@ -225,6 +227,7 @@ head，不做隐式 FX，也不等于回测级持久化聚合制品。
 | 实时 L2 | 同所 WS 快照或快照加差分 | REST/带内快照只用于重新锚定当前簿；断连窗口保持不可信 | 帧与价位分表，按完整性等级重建 | 以快照插值历史盘口；只存顶档后声称完整 L2 |
 | 历史 L2 | 仅来源官方历史产品或自建封口实时段 | 当前 OKX 产品只补 OKX 市场；Bybit 保持阻断；日元三所无官方回补 | 保留 snapshot/delta、深度、频率、可得时刻与 sequence/checksum 缺失事实 | 把百分比聚合深度当逐档订单簿 |
 | Ticker 与参考价 | 同所 ticker、顶档与最新成交 | ticker 缺失时由同所 book/trade 派生并标 `origin=derived` | 同报价币可做稳健中位数；异报价币先绑定 FX 制品 | 将 BTC/JPY 与 BTC/USDT 直接平均 |
+| 法币汇率 | `gmo_fx` 公共 `ticker` 每 60 秒轮询原文（`fx_rate` 域，EP-0076） | 无官方回补；轮询缺口保留，不以前值或别源填补；`status=CLOSE` 期间报价按原文保存 | 只作 PIT 换算输入：按 `available_time <= decision_time` 取最近一条，`mid=(bid+ask)/2` 随事实保存 | 用汇率反写来源事实；把与执行所同集团的旁路当独立审计腿；日本银行锚接入前声称跨币换算已闭环 |
 | 市场状态与熔断 | 同所 status/health/circuit-break 原文 | 无端点时只可由无帧、价差异常推断，标 `inferred` | 按有效区间关联事实 | 把推断状态写成交易所声明 |
 | 资金费率、OI、标记价 | 对应衍生合约原生端点 | 无同合约历史就留空；不得从现货价格伪造 | 先对齐合约种类、结算周期与计价币 | 现货与 leverage/perpetual 共用市场键 |
 | 私有账户、订单、成交回报 | 账户私有 REST/WS | REST 对账补私有 WS 缺口；密钥权限隔离 | 绑定 account、intent、order 与 execution | 混入公开 `market_*` 事实或使用公共 fallback |
@@ -259,6 +262,7 @@ head，不做隐式 FX，也不等于回测级持久化聚合制品。
 | 来源 | 主力场景 | 合法 fallback 角色 | 不可突破的有限度 |
 |---|---|---|---|
 | GMO | 日元现货官方历史广度、原生 K 线、30 档实时快照 | bitbank/bitFlyer 只可作为跨所指标参考 | 无官方历史盘口；快照无 sequence/checksum；历史已下架币精度可能未知 |
+| GMO 外国為替FX | 美元系对照的实时汇率旁路 | 不作任何独立审计腿 | 与执行所同集团；无历史回补；`CLOSE` 期间报价冻结；首批只登记 USD_JPY |
 | bitbank | 日元长历史逐笔与可重建实时 L2 主轴 | GMO/bitFlyer 作为研究服务降级 | 个别官方日期 404；sequence 单调但不要求连续；动态市场覆盖见日期快照 |
 | bitFlyer | 自有 JPY spot 近端成交、全簿与 leverage/CFD 信号 | bitbank/GMO 作为现货参考 | executions 官方边界约 31 日；无 K 线；L2 无序号且断连窗不可重放 |
 | Coincheck | 日元实时备用、市场广度旁路 | 只在主力实时源故障时返回降级指标 | 无 K 线、无历史闭环、盘口差分无序号且不补发 |
