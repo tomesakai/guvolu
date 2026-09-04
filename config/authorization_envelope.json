@@ -1,10 +1,11 @@
 {
   "schema_version": 1,
-  "issued_at": "2026-09-03T17:00:00Z",
-  "valid_from": "2026-09-03T17:00:00Z",
+  "issued_at": "2026-09-04T06:00:00Z",
+  "valid_from": "2026-09-04T06:00:00Z",
   "valid_until": "2026-09-18T00:00:00Z",
   "symbols": [
-    "BTC"
+    "BTC",
+    "ETH"
   ],
   "order_jpy_max": "5000",
   "day_jpy_max": "10000",
