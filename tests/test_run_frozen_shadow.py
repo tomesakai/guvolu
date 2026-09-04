@@ -350,3 +350,27 @@ def test_rerun_reuses_dry_run_and_paper_reports(chain: FakeChain) -> None:
     assert len(chain.scripts("run_dry_run_executor.py")) == 1
     assert len(chain.scripts("run_paper_executor.py")) == 1
     assert [record["status"] for record in _task_records(chain)] == ["completed", "reused"]
+
+
+def test_target_config_passes_through_to_adapter_and_paper(chain: FakeChain) -> None:
+    """第二市场目标配置透传给适配器与 paper 执行器，并记入摘要。"""
+    summary = _run_chain(
+        chain, symbol="ETH", target_config="config/paper_executor_eth.json",
+    )
+    expected = str((chain.execution / "config/paper_executor_eth.json").resolve())
+    adapt_configs = {
+        _option(call, "--config") for call in chain.scripts("adapt_frozen_target.py")
+    }
+    assert adapt_configs == {expected}
+    paper_call = chain.scripts("run_paper_executor.py")[0]
+    assert _option(paper_call, "--config") == expected
+    assert summary["target_config"] == "config/paper_executor_eth.json"
+    assert summary["symbol"] == "ETH"
+    assert summary["market_id"] == MARKET_ID
+
+
+def test_target_config_outside_config_directory_is_rejected(chain: FakeChain) -> None:
+    """目标配置越出执行仓 config 目录即拒绝，且不进入目标适配。"""
+    with pytest.raises(ValueError, match="config 目录"):
+        _run_chain(chain, target_config="../elsewhere/paper.json")
+    assert chain.scripts("adapt_frozen_target.py") == []

@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "issued_at": "2026-09-04T06:00:00Z",
+  "valid_from": "2026-09-04T06:00:00Z",
+  "valid_until": "2026-09-18T00:00:00Z",
+  "symbols": [
+    "BTC",
+    "ETH"
+  ],
+  "order_jpy_max": "5000",
+  "day_jpy_max": "10000",
+  "day_count_max": 20,
+  "envelope_jpy_total": "10000",
+  "max_position_jpy": "6000",
+  "max_cumulative_loss_jpy": "2000",
+  "day_loss_jpy_max": "1000",
+  "canary_first_order_jpy_max": "5000",
+  "max_prediction_age_minutes": 55,
+  "market_risk": {
+    "price_move_pause": {
+      "window_seconds": 3900,
+      "threshold_bp": "500",
+      "pause_seconds": 3600
+    },
+    "spread_skip_bp": "20",
+    "min_book_depth_ratio": "3",
+    "stream_gap_seconds": 90
+  },
+  "ops_breaker": {
+    "consecutive_failure_limit": 3,
+    "asset_deviation_ratio": "0.01",
+    "asset_deviation_floor_jpy": "100"
+  },
+  "on_trip": "cancel_and_flatten"
+}

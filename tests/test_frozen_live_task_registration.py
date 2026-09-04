@@ -310,3 +310,103 @@ def test_run_frozen_live_records_failure_without_raising(
     )
     assert live["status"] == "failed"
     assert "error" in live
+
+
+def test_live_registration_carries_second_market_arguments(tmp_path: Path) -> None:
+    """第二市场的市场、品种与目标配置固化进任务参数。"""
+    repository = tmp_path / "repository"
+    runtime = tmp_path / "runtime"
+    execution = tmp_path / "execution"
+    scripts = repository / "scripts"
+    scripts.mkdir(parents=True)
+    runtime.mkdir()
+    execution.mkdir()
+    (scripts / "run_frozen_live_task.ps1").write_text(
+        "exit 0\n", encoding="utf-8",
+    )
+    register = REPO / "scripts" / "register_frozen_live_task.ps1"
+    result = subprocess.run(
+        [
+            str(POWERSHELL), "-NoProfile", "-File", str(register),
+            "-PlanId", PLAN_ID,
+            "-StartUtc", "2026-09-05T00:00:00Z",
+            "-EndUtc", "2026-12-31T00:00:00Z",
+            "-RuntimeRoot", str(runtime),
+            "-ExecutionRepository", str(execution),
+            "-Repository", str(repository),
+            "-MarketId", "mkt__gmo__eth__r0", "-Symbol", "ETH",
+            "-TargetConfig", "config/paper_executor_eth.json",
+            "-MinuteOffset", "30", "-DescribeOnly",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    assert result.returncode == 0, result.stderr
+    definition = json.loads(result.stdout)
+    arguments = definition["arguments"]
+    assert '-MarketId "mkt__gmo__eth__r0"' in arguments
+    assert '-Symbol "ETH"' in arguments
+    assert '-TargetConfig "config/paper_executor_eth.json"' in arguments
+    assert definition["market_id"] == "mkt__gmo__eth__r0"
+    assert definition["symbol"] == "ETH"
+    assert definition["target_config"] == "config/paper_executor_eth.json"
+    assert definition["minute_offset"] == 30
+
+
+def test_run_frozen_live_passes_target_config_to_live_executor(
+    tmp_path: Path,
+) -> None:
+    """live 执行器收到执行仓内解析后的目标配置路径。"""
+    sys.path.insert(0, str(REPO / "scripts"))
+    try:
+        import run_frozen_live as module
+        from run_frozen_live import run_live_step
+    finally:
+        sys.path.pop(0)
+    execution = tmp_path / "execution"
+    execution.mkdir()
+    prediction_id = "prediction-live-0003"
+    prediction_path = tmp_path / "prediction.json"
+    prediction_path.write_text("{}", encoding="utf-8")
+    captured: list[list[str]] = []
+
+    def fake_run(
+        command: object, *, cwd: object = None, env: object = None,
+    ) -> subprocess.CompletedProcess[str]:
+        parts = [str(part) for part in command]  # type: ignore[union-attr]
+        captured.append(parts)
+        report_path = Path(parts[parts.index("--report") + 1])
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text(json.dumps({
+            "mode": "live",
+            "artifact": {"run_id": prediction_id},
+            "gate_verdict": "skip",
+            "resolution": None,
+            "final_order_status": None,
+            "endpoints": {"write_touched": []},
+            "envelope": {"sha256": "e" * 64},
+        }), encoding="utf-8")
+        return subprocess.CompletedProcess(parts, 0, "", "")
+
+    original_adapt = module._adapt_target
+    original_run = module._run
+    module._adapt_target = (  # type: ignore[assignment]
+        lambda *args, **kwargs: tmp_path / "target.json"
+    )
+    module._run = fake_run  # type: ignore[assignment]
+    try:
+        live = run_live_step(
+            execution, execution / "python.exe", prediction_path, prediction_id,
+            market_id="mkt__gmo__eth__r0", symbol="ETH",
+            prediction_sha="f" * 64,
+            target_config="config/paper_executor_eth.json",
+        )
+    finally:
+        module._adapt_target = original_adapt  # type: ignore[assignment]
+        module._run = original_run  # type: ignore[assignment]
+    assert live["status"] == "completed"
+    command = captured[0]
+    expected = str((execution / "config/paper_executor_eth.json").resolve())
+    assert command[command.index("--target-config") + 1] == expected

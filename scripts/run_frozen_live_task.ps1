@@ -7,7 +7,10 @@
     [string]$RuntimeRoot,
     [Parameter(Mandatory = $true)]
     [string]$ExecutionRepository,
-    [switch]$NoPaper
+    [switch]$NoPaper,
+    [string]$MarketId = "",
+    [string]$Symbol = "",
+    [string]$TargetConfig = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -26,6 +29,16 @@ $Output = @()
 $ExtraArguments = @()
 if ($NoPaper) {
     $ExtraArguments += "--no-paper"
+}
+# 第二市场参数按需透传，缺省沿用脚本内 BTC 缺省值。
+if ($MarketId) {
+    $ExtraArguments += @("--market-id", $MarketId)
+}
+if ($Symbol) {
+    $ExtraArguments += @("--symbol", $Symbol)
+}
+if ($TargetConfig) {
+    $ExtraArguments += @("--target-config", $TargetConfig)
 }
 [System.Management.Automation.ActionPreference]$PreviousErrorActionPreference =
     [System.Management.Automation.ActionPreference]$ErrorActionPreference
@@ -61,6 +74,9 @@ $Record = [ordered]@{
     resolved_runtime_root = $Runtime
     execution_repository = $ExecutionRepository
     no_paper = [bool]$NoPaper
+    market_id = $MarketId
+    symbol = $Symbol
+    target_config = $TargetConfig
     exit_code = $ExitCode
     output = ($Output -join "`n")
 }

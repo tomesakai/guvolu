@@ -415,6 +415,13 @@ head 到 `day/YYYY-MM-DD`；被合并段的物化 attempt 仍完成，常驻物�
 实测：分步带日志备份持锁约十三分钟，全部物化器随之写锁超时；单步无日志
 备份 3.2 GB 约十秒）；每小时缺省只校验新落地制品与外键
 闭合，复用件散列与整库 quick_check 由 `--verify-all` 承担，留给日常复核。
+第二市场 ETH 的冻结运行根为 `D:\dev\guvolu-frozen-runtime-eth-a42aac6`
+（来源运行 `research-run-6215f76b…` 同树 `a42aac6` 的 detached 工作树），
+治理注册库、输入收据与 ETH 物理面板复制自开发库，vintage
+`holdout-vintage-b078744b…`（2026-09-05T00:00Z 至 2026-12-31T00:00Z）与计划
+`frozen-forward-plan-5262e0a0…8986`（`zero_exposure`）在该根内冻结；其 -live 任务以
+`-MarketId mkt__gmo__eth__r0 -Symbol ETH -TargetConfig
+config/paper_executor_eth.json -MinuteOffset 30` 注册，与 BTC 任务错峰。
 重型研究运行避开每小时第 15 至 45 分钟的冻结前向
 执行窗，不与冻结预测器争用计算与磁盘（2026-08-30 实测：并发时预测耗时
 约翻倍并触发预测年龄门失败）。L2 质量遥测由独立进程

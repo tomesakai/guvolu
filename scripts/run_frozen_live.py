@@ -19,11 +19,13 @@ from typing import Sequence
 
 from run_frozen_shadow import (
     DEFAULT_MAX_PREDICTION_AGE_MINUTES,
+    PAPER_CONFIG,
     _adapt_target,
     _append_record,
     _object,
     _run,
     _text,
+    resolve_target_config,
     run_shadow,
 )
 
@@ -54,6 +56,7 @@ def run_live_step(
     market_id: str,
     symbol: str,
     prediction_sha: str,
+    target_config: str = PAPER_CONFIG,
 ) -> dict[str, object]:
     """适配 live 目标并调用执行仓 live 执行器。
 
@@ -67,7 +70,7 @@ def run_live_step(
         target_path = _adapt_target(
             execution, exec_python, prediction_path,
             market_id=market_id, symbol=symbol, mode=LIVE_MODE,
-            budget_jpy=None,
+            budget_jpy=None, target_config=target_config,
         )
         live["target_path"] = str(target_path)
         report_path = execution / LIVE_REPORT_ROOT / f"{prediction_id}.json"
@@ -84,6 +87,8 @@ def run_live_step(
                     str(exec_python),
                     str(execution / "scripts/run_live_executor.py"),
                     "--target", str(target_path),
+                    "--target-config",
+                    str(resolve_target_config(execution, target_config)),
                     "--source-prediction", str(prediction_path),
                     "--source-prediction-sha256", prediction_sha,
                     "--report", str(report_path),
@@ -144,6 +149,7 @@ def run_live(
     budget_jpy: str = "5000",
     max_prediction_age_minutes: int = DEFAULT_MAX_PREDICTION_AGE_MINUTES,
     paper_enabled: bool = True,
+    target_config: str = PAPER_CONFIG,
 ) -> dict[str, object]:
     """串联 shadow 全流程后执行信封约束下的 live 步骤。
 
@@ -156,7 +162,7 @@ def run_live(
         repository, runtime_root, execution_repository, plan_id, market_id,
         symbol=symbol, budget_jpy=budget_jpy,
         max_prediction_age_minutes=max_prediction_age_minutes,
-        paper_enabled=paper_enabled,
+        paper_enabled=paper_enabled, target_config=target_config,
     )
     prediction_id = _text(summary.get("prediction_id"), "prediction_id")
     prediction_path = Path(_text(
@@ -169,6 +175,7 @@ def run_live(
     live = run_live_step(
         execution, exec_python, prediction_path, prediction_id,
         market_id=market_id, symbol=symbol, prediction_sha=prediction_sha,
+        target_config=target_config,
     )
     summary["live"] = live
     _append_record(execution / LIVE_TASK_LOG, {
@@ -197,6 +204,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--no-paper", action="store_true", help="跳过 paper 执行步骤",
     )
+    parser.add_argument(
+        "--target-config", default=PAPER_CONFIG,
+        help="执行仓内目标配置相对路径；缺省 config/paper_executor.json",
+    )
     args = parser.parse_args(argv)
     summary = run_live(
         args.repository, args.runtime_root, args.execution_repository,
@@ -204,6 +215,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         budget_jpy=str(args.budget_jpy),
         max_prediction_age_minutes=int(args.max_prediction_age_minutes),
         paper_enabled=not bool(args.no_paper),
+        target_config=str(args.target_config),
     )
     print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
     exit_code = 0

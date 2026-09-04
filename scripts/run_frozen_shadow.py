@@ -102,6 +102,14 @@ def _validate_paper_report(path: Path, prediction_id: str) -> dict[str, object]:
     return report
 
 
+def resolve_target_config(execution: Path, target_config: str) -> Path:
+    """目标配置必须落在执行仓 config 目录内（存在性由适配器校验）。"""
+    path = (execution / target_config).resolve()
+    if not path.is_relative_to((execution / "config").resolve()):
+        raise ValueError("目标配置路径越出执行仓 config 目录")
+    return path
+
+
 def _adapt_target(
     execution: Path,
     exec_python: Path,
@@ -111,17 +119,19 @@ def _adapt_target(
     symbol: str,
     mode: str,
     budget_jpy: str | None,
+    target_config: str = PAPER_CONFIG,
 ) -> Path:
     """经执行仓适配器生成内容寻址目标快照。
 
     预算显式给出时覆盖 paper 配置；paper 模式不传预算，
-    预算以配置为准（G-06）。
+    预算以配置为准（G-06）。目标配置是执行仓内相对路径，
+    每个市场一份（第二市场见执行链设计第 14 节）。
     """
     command = [
         str(exec_python), str(execution / "scripts/adapt_frozen_target.py"),
         "--prediction", str(prediction_path),
         "--output-directory", str(execution / TARGET_DIRECTORY),
-        "--config", str(execution / PAPER_CONFIG),
+        "--config", str(resolve_target_config(execution, target_config)),
         "--market-id", market_id, "--symbol", symbol, "--mode", mode,
     ]
     if budget_jpy is not None:
@@ -173,6 +183,7 @@ def run_paper_step(
     market_id: str,
     symbol: str,
     prediction_sha: str,
+    target_config: str = PAPER_CONFIG,
 ) -> dict[str, object]:
     """以独立 paper 目标运行 paper 执行器并校验零写报告。
 
@@ -185,6 +196,7 @@ def run_paper_step(
         target_path = _adapt_target(
             execution, exec_python, prediction_path,
             market_id=market_id, symbol=symbol, mode=PAPER_MODE, budget_jpy=None,
+            target_config=target_config,
         )
         paper["target_path"] = str(target_path)
         report_path = execution / PAPER_ROOT / "reports" / f"{prediction_id}.json"
@@ -196,7 +208,7 @@ def run_paper_step(
                 (
                     str(exec_python), str(execution / "scripts/run_paper_executor.py"),
                     "--target", str(target_path),
-                    "--config", str(execution / PAPER_CONFIG),
+                    "--config", str(resolve_target_config(execution, target_config)),
                     "--ledger-root", str(execution / PAPER_LEDGER_ROOT),
                     "--report", str(report_path),
                     "--source-prediction", str(prediction_path),
@@ -236,6 +248,7 @@ def run_shadow(
     budget_jpy: str = "5000",
     max_prediction_age_minutes: int = DEFAULT_MAX_PREDICTION_AGE_MINUTES,
     paper_enabled: bool = True,
+    target_config: str = PAPER_CONFIG,
 ) -> dict[str, object]:
     """串联快照、冻结预测、目标适配、零写彩排与 paper 执行。
 
@@ -282,7 +295,7 @@ def run_shadow(
         target_path = _adapt_target(
             execution, exec_python, prediction_path,
             market_id=market_id, symbol=symbol, mode=DRY_RUN_MODE,
-            budget_jpy=budget_jpy,
+            budget_jpy=budget_jpy, target_config=target_config,
         )
         shadow_root = execution / "data/execution/shadow/frozen-forward"
         report_path = shadow_root / "reports" / f"{prediction_id}.json"
@@ -312,7 +325,7 @@ def run_shadow(
             paper = run_paper_step(
                 execution, exec_python, prediction_path, prediction_id,
                 market_id=market_id, symbol=symbol,
-                prediction_sha=prediction_sha,
+                prediction_sha=prediction_sha, target_config=target_config,
             )
         else:
             paper = {"status": "skipped", "reason": "--no-paper"}
@@ -329,6 +342,9 @@ def run_shadow(
             "aggregate_target": prediction.get("aggregate_target"),
             "target_path": str(target_path),
             "report_path": str(report_path),
+            "market_id": market_id,
+            "symbol": symbol,
+            "target_config": target_config,
             "intent_state": (
                 None if report.get("intent") is None
                 else _object(report["intent"], "intent").get("state")
@@ -367,6 +383,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--no-paper", action="store_true", help="跳过 paper 执行步骤",
     )
+    parser.add_argument(
+        "--target-config", default=PAPER_CONFIG,
+        help="执行仓内目标配置相对路径；缺省 config/paper_executor.json",
+    )
     args = parser.parse_args(argv)
     summary = run_shadow(
         args.repository, args.runtime_root, args.execution_repository,
@@ -374,6 +394,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         budget_jpy=str(args.budget_jpy),
         max_prediction_age_minutes=int(args.max_prediction_age_minutes),
         paper_enabled=not bool(args.no_paper),
+        target_config=str(args.target_config),
     )
     print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
     paper = summary.get("paper")

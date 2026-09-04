@@ -376,6 +376,24 @@ PowerShell 包装 `scripts/run_execution_soak.ps1`）把第 9 节的单轮逻辑
 测试全部代码，不代行上膛与首次启动。解除武装即注销 -live 任务并
 恢复 shadow 任务。
 
+第二市场（2026-09-04 起 ETH）不复制执行链：每个市场一个冻结运行根
+（与来源决策级运行同代码树）、一个冻结计划与一个执行仓目标配置
+（`config/paper_executor_<市场>.json`，含 `market_id`、`symbol` 与
+独立 `ledger_directory`），串联脚本经 `--target-config` 把该配置透传
+给目标适配器、paper 执行器与 live 执行器（路径必须落在执行仓
+`config/` 目录内）；注册脚本以 `-MarketId`、`-Symbol`、`-TargetConfig`
+固化进任务参数，任务名仍按计划号区分。信封、用量、状态与 live 意图
+账本跨市场共享：`symbols` 白名单须列出全部市场品种（并与执行仓
+`GUVOLU_SPOT_WHITELIST` 一致，T-09），额度门按合计计量。两个市场的
+每小时任务错峰（BTC 第 12 分、ETH 第 30 分），避免同时争用账本、
+READ_ONLY 限速与磁盘。
+
+实测成交成本由 `scripts/summarize_live_costs.py` 汇总：只读扫描
+live 账本与报告收集委托号，按 READ_ONLY 成交明细逐委托取成交，
+以名义额加权得费率、相对报告参考价的滑点与 maker 占比（GMO
+`fee` 为负即 maker 返还），报告落在
+`data/execution/live/cost-summary/`，用于校准成本模型假设。
+
 正当拒绝与崩溃可区分：执行器各拒绝启动路径把
 `kind=live_refusal_report` 报告写到 `--report` 目的地，串联层判读
 为 `status=refused`（退出 0），与 `failed` 严格区分；信封到期、

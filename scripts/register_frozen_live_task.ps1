@@ -14,6 +14,9 @@
     [ValidateRange(1, 59)]
     [int]$MinuteOffset = 25,
     [switch]$NoPaper,
+    [string]$MarketId = "",
+    [string]$Symbol = "",
+    [string]$TargetConfig = "",
     [switch]$DescribeOnly
 )
 
@@ -57,6 +60,16 @@ $Arguments = (
 if ($NoPaper) {
     $Arguments += " -NoPaper"
 }
+# 第二市场：市场、品种与目标配置随任务参数固化。
+if ($MarketId) {
+    $Arguments += " -MarketId `"$MarketId`""
+}
+if ($Symbol) {
+    $Arguments += " -Symbol `"$Symbol`""
+}
+if ($TargetConfig) {
+    $Arguments += " -TargetConfig `"$TargetConfig`""
+}
 $Definition = [ordered]@{
     task_name = $TaskName
     execute = "powershell.exe"
@@ -65,6 +78,9 @@ $Definition = [ordered]@{
     first_run_local = $FirstRunLocal.ToString("o")
     end_utc = $End.ToString("o")
     no_paper = [bool]$NoPaper
+    market_id = $MarketId
+    symbol = $Symbol
+    target_config = $TargetConfig
     minute_offset = $MinuteOffset
     start_when_available = $true
     allow_start_on_batteries = $true
