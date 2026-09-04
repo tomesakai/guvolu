@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -16,6 +17,9 @@ from guvolu.research.passive_grid_shadow import (
     PassiveFill,
     SimulationMetrics,
     TradeAtPrice,
+    _exclude_participant_side_buckets,
+    _participant_side_spans,
+    _trade_gates,
     _trade_quality,
     simulate_candidate,
     verify_passive_grid_shadow,
@@ -116,11 +120,7 @@ def test_gap_cancels_pending_quote_and_resets_segment() -> None:
     assert lower.terminal_excess_pnl_quote == 0
 
 
-def test_mirrored_trade_quality_detects_two_sided_public_feed(
-    tmp_path: Path,
-) -> None:
-    """同一成交键出现相反 side 时必须被质量门计为镜像行。"""
-    path = tmp_path / "trades.parquet"
+def _trade_snapshot(path: Path, rows: list[tuple[object, ...]]) -> ActiveOutputSnapshot:
     db = duckdb.connect(":memory:")
     try:
         db.execute("""
@@ -128,21 +128,17 @@ def test_mirrored_trade_quality_detects_two_sided_public_feed(
             observation_id VARCHAR,market_id VARCHAR,event_time TIMESTAMPTZ,
             available_time TIMESTAMPTZ,ingest_time TIMESTAMPTZ,
             source_artifact_id VARCHAR,price VARCHAR,size VARCHAR,side VARCHAR,
-            source_side_basis VARCHAR
+            source_side_basis VARCHAR,run_id VARCHAR,connection_id VARCHAR
           )
         """)
-        moment = datetime(2026, 1, 1, tzinfo=UTC)
-        db.executemany(
-            "INSERT INTO trades VALUES (?,?,?,?,?,?,?,?,?,?)",
-            [
-                ("a", "m", moment, moment, moment, "x", "100", "1", "buy", "taker"),
-                ("b", "m", moment, moment, moment, "x", "100", "1", "sell", "taker"),
-                ("c", "m", moment, moment, moment, "x", "101", "1", "buy", "taker"),
-            ],
-        )
+        if rows:
+            db.executemany(
+                "INSERT INTO trades VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", rows,
+            )
         db.execute("COPY trades TO ? (FORMAT PARQUET)", [str(path)])
     finally:
         db.close()
+    moment = datetime(2026, 1, 1, tzinfo=UTC)
     output = ActiveOutput(
         domain="trade_realtime",
         partition_key="p",
@@ -151,18 +147,126 @@ def test_mirrored_trade_quality_detects_two_sided_public_feed(
         dataset="trade_observation",
         artifact_id="sha256-" + "1" * 64,
         path=path,
-        row_count=3,
+        row_count=len(rows),
         min_event_time=moment,
         max_event_time=moment,
     )
-    quality = _trade_quality(ActiveOutputSnapshot(
+    return ActiveOutputSnapshot(
         market={"market_id": "m"},
         outputs=(output,),
         head_generation="sha256-" + "2" * 64,
-    ))
-    assert quality["rows"] == 3
+    )
+
+
+def test_mirrored_trade_quality_separates_feed_property_from_duplication(
+    tmp_path: Path,
+) -> None:
+    """双侧参与方行情按运行剔除，真实重复只数跨连接同键投递。"""
+    t0 = datetime(2026, 1, 1, tzinfo=UTC)
+    t1 = t0 + timedelta(seconds=30)
+    t2 = t0 + timedelta(seconds=40)
+    t3 = t0 + timedelta(seconds=50)
+
+    def row(
+        identity: str, moment: datetime, price: str, size: str, side: str,
+        run_id: str, connection_id: str, basis: str = "taker",
+    ) -> tuple[object, ...]:
+        return (
+            identity, "m", moment, moment, moment, "x", price, size, side,
+            basis, run_id, connection_id,
+        )
+
+    snapshot = _trade_snapshot(tmp_path / "trades.parquet", [
+        row("a", t0, "100", "1", "buy", "r0", "r0-c1"),
+        row("b", t0, "100", "1", "sell", "r0", "r0-c1"),
+        row("c", t0, "101", "1", "buy", "r0", "r0-c1"),
+        row("d", t1, "100", "1", "buy", "r1", "r1-c1"),
+        row("e", t1, "100", "1", "buy", "r1", "r1-c1"),
+        row("f", t1, "102", "1", "sell", "r1", "r1-c1"),
+        row("g", t1, "102", "1", "sell", "r1", "r1-c2"),
+        row("h", t2, "103", "2", "buy", "r1", "r1-c1"),
+        row("i", t3, "104", "1", "buy", "r2", "r2-c1", "participant_side_unfiltered"),
+    ])
+    quality = _trade_quality(snapshot, 0.5)
+    assert quality["rows"] == 9
     assert quality["mirrored_rows"] == 2
-    assert quality["mirrored_trade_ratio"] == 2 / 3
+    assert quality["mirrored_trade_ratio"] == 2 / 9
+    feed = quality["participant_side_feed"]
+    assert isinstance(feed, dict)
+    assert feed["rows"] == 4
+    assert set(feed["runs"]) == {"r0", "r2"}
+    assert feed["runs"]["r0"] == {
+        "rows": 3,
+        "mirrored_rows": 2,
+        "mirrored_trade_ratio": 2 / 3,
+        "non_taker_rows": 0,
+        "from": t0.isoformat(),
+        "to": t0.isoformat(),
+    }
+    assert feed["runs"]["r2"]["non_taker_rows"] == 1
+    assert quality["taker_rows"] == 5
+    assert quality["taker_mirrored_rows"] == 0
+    assert quality["duplicate_rows"] == 1
+    assert quality["duplicate_trade_ratio"] == 1 / 5
+    assert quality["repeated_key_rows"] == 1
+    assert quality["source_side_basis"] == {
+        "participant_side_unfiltered": 1, "taker": 8,
+    }
+    assert _trade_gates(quality, 0.01) == (
+        False, True, ["duplicate_trade_ratio_exceeded"],
+    )
+    assert _trade_gates(quality, 0.5) == (True, True, [])
+    assert _participant_side_spans(quality) == ((t0, t0), (t3, t3))
+
+
+def test_taker_only_feed_with_repeated_keys_passes_gates(
+    tmp_path: Path,
+) -> None:
+    """同连接同键复现是多笔撮合，不计为镜像或重复。"""
+    t0 = datetime(2026, 1, 1, tzinfo=UTC)
+    snapshot = _trade_snapshot(tmp_path / "trades.parquet", [
+        ("a", "m", t0, t0, t0, "x", "100", "1", "buy", "taker", "r1", "c1"),
+        ("b", "m", t0, t0, t0, "x", "100", "1", "buy", "taker", "r1", "c1"),
+        ("c", "m", t0, t0, t0, "x", "101", "1", "sell", "taker", "r1", "c1"),
+    ])
+    quality = _trade_quality(snapshot, 0.5)
+    assert quality["taker_rows"] == 3
+    feed = quality["participant_side_feed"]
+    assert isinstance(feed, dict)
+    assert feed["rows"] == 0
+    assert quality["duplicate_rows"] == 0
+    assert quality["repeated_key_rows"] == 1
+    assert _trade_gates(quality, 0.01) == (True, True, [])
+
+
+def test_empty_trade_snapshot_leaves_side_basis_unproven(
+    tmp_path: Path,
+) -> None:
+    """没有 taker 行时方向门不得通过。"""
+    snapshot = _trade_snapshot(tmp_path / "trades.parquet", [])
+    quality = _trade_quality(snapshot, 0.5)
+    assert quality["rows"] == 0
+    assert quality["taker_rows"] == 0
+    assert _trade_gates(quality, 0.01) == (
+        True, False, ["taker_side_basis_unproven"],
+    )
+    assert _participant_side_spans(quality) == ()
+
+
+def test_participant_side_spans_mark_overlapping_buckets_unclean() -> None:
+    """参与方行情跨度只把相交的桶标为不可信。"""
+    buckets = tuple(_bucket(index) for index in range(4))
+    start = buckets[0].bucket_start
+    spans = ((start + timedelta(seconds=7), start + timedelta(seconds=12)),)
+    excluded, count = _exclude_participant_side_buckets(buckets, spans)
+    assert count == 2
+    assert [item.clean for item in excluded] == [True, False, False, True]
+    assert excluded[0] == buckets[0]
+    assert _exclude_participant_side_buckets(buckets, ()) == (buckets, 0)
+    already_unclean = (replace(buckets[1], clean=False),)
+    assert _exclude_participant_side_buckets(already_unclean, spans) == (
+        already_unclean, 0,
+    )
 
 
 def test_verifier_recomputes_run_identity_and_checks_latest_hash(

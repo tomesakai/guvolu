@@ -934,6 +934,15 @@ DuckDB 同时固定为 4 GB、2 线程并启用自动清理的磁盘溢出目录
 冻结输入 manifest 逐文件记录外部数据根相对路径、字节数和 SHA-256；运行身份绑定完整输入
 文件集合，verifier 同时重算 tile、逐笔、summary 与 fills 字节散列，因此原地损坏或替换任何
 Parquet 都会使复核失败。
+
+逐笔质量门把三种同键现象分开记账。同一 `(event_time, price, size)` 出现相反 side，是来源把
+maker 与 taker 双方各发一条的参与方行情，不是重复投递；订阅选项按采集进程固定，因此按
+采集运行整体判定，镜像比例超过 `participant_side_run_ratio` 或方向标签不是 taker 的运行，
+其事件时间跨度内的桶一律标为不可信，从覆盖统计与成交回放中剔除。保留的 taker 行只以残余
+镜像比例和跨连接同键重复投递比例受 `maximum_mirrored_trade_ratio` 约束。同一连接内同键同
+side 的复现是同价同量的多笔撮合，官方归档同样存在，只登记不约束。GMO 2026-08-22 切换
+TAKER_ONLY 前的 r0 原件属于参与方行情，而旧 tile 依赖的 v3 逐笔仍标为 taker，所以该判定
+不能只依赖标签。
 5 秒 tile 的价格行宽为 2 tick；tile 的价格点是行下界，不是未经分桶的逐 tick 报价。因此候选
 偏移以 `quote_offset_rows` 表示，并同时披露精确的 tick 等价值；成交记录保留
 `[price_row_lower, price_row_upper_exclusive)`，防止把一行误解释为一个 tick。

@@ -25,6 +25,7 @@
   ],
   "quality": {
     "maximum_mirrored_trade_ratio": 0.01,
+    "participant_side_run_ratio": 0.5,
     "minimum_clean_buckets": 5000,
     "minimum_clean_hours": 12.0,
     "minimum_lower_fill_events": 30

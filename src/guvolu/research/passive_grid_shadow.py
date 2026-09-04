@@ -5,7 +5,7 @@ import hashlib
 import json
 import math
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -24,7 +24,7 @@ from guvolu.research.provenance import (
 )
 from guvolu.ui.query_catalog import ActiveOutput, ActiveOutputSnapshot, QueryCatalog
 
-METHOD_VERSION = "passive-grid-snapshot-bounds-v3"
+METHOD_VERSION = "passive-grid-snapshot-bounds-v4"
 ORDERFLOW_TILE_METHOD_VERSION = "orderflow-tile-sparse-v8"
 SCHEMA_VERSION = 1
 
@@ -318,13 +318,23 @@ def _tile_trade_inputs(
 
 def _trade_quality(
     snapshot: ActiveOutputSnapshot,
+    participant_side_run_ratio: float,
 ) -> dict[str, object]:
-    """检查会把 maker/taker 双方误作两笔主动成交的镜像模式。"""
+    """区分参与方双侧行情、真实重复投递与合法同键复现。
+
+    同一 ``(event_time, price, size)`` 出现相反 side 是来源把 maker 与
+    taker 双方各发一条的参与方行情，而不是重复投递。订阅选项按采集
+    进程固定，因此按 ``run_id`` 判定：镜像比例超过阈值或方向标签不是
+    taker 的运行整体视为参与方行情，其时间跨度供桶级排除。保留行只
+    统计真实重复：同键同 side 由多个连接各投递一次。
+    """
     files = _paths(snapshot, "trade_observation")
     db: Any = duckdb.connect(":memory:")
+    db.execute("SET TimeZone='UTC'")
     try:
-        row = db.execute(
+        db.execute(
             """
+            CREATE TABLE trade AS
             WITH deduplicated AS (
               SELECT *,row_number() OVER (
                 PARTITION BY observation_id
@@ -332,29 +342,83 @@ def _trade_quality(
               ) AS selected
               FROM read_parquet(?,union_by_name=true)
               WHERE market_id=?
-            ), grouped AS (
-              SELECT event_time,price,size,count(*) AS rows,
-                     count(DISTINCT side) AS sides
+            ), chosen AS (
+              SELECT event_time,price,size,side,source_side_basis,
+                     coalesce(run_id,source_artifact_id) AS run_id,
+                     coalesce(connection_id,run_id,source_artifact_id)
+                       AS feed_scope
               FROM deduplicated WHERE selected=1
-              GROUP BY event_time,price,size
+            ), keyed AS (
+              SELECT event_time,price,size,count(DISTINCT side) AS sides
+              FROM chosen GROUP BY 1,2,3
             )
-            SELECT coalesce(sum(rows),0),
-                   coalesce(sum(CASE WHEN sides>1 THEN rows ELSE 0 END),0)
-            FROM grouped
+            SELECT chosen.*,keyed.sides>1 AS two_sided
+            FROM chosen JOIN keyed USING(event_time,price,size)
             """,
             [files, snapshot.market["market_id"]],
+        )
+        run_rows = db.execute(
+            """
+            SELECT run_id,count(*),
+                   sum(CASE WHEN two_sided THEN 1 ELSE 0 END),
+                   sum(CASE WHEN source_side_basis LIKE 'taker%' THEN 0
+                       ELSE 1 END),
+                   min(event_time),max(event_time)
+            FROM trade GROUP BY run_id ORDER BY run_id
+            """
+        ).fetchall()
+        participant_runs: dict[str, dict[str, object]] = {}
+        rows = 0
+        mirrored = 0
+        for run_id, run_count, run_mirrored, unlabeled, first, last in run_rows:
+            count = int(run_count)
+            paired = int(run_mirrored)
+            rows += count
+            mirrored += paired
+            ratio = paired / count
+            if ratio > participant_side_run_ratio or int(unlabeled) > 0:
+                participant_runs[str(run_id)] = {
+                    "rows": count,
+                    "mirrored_rows": paired,
+                    "mirrored_trade_ratio": ratio,
+                    "non_taker_rows": int(unlabeled),
+                    "from": first.astimezone(UTC).isoformat(),
+                    "to": last.astimezone(UTC).isoformat(),
+                }
+        excluded = sorted(participant_runs)
+        condition = (
+            "run_id NOT IN (" + ",".join("?" for _ in excluded) + ")"
+            if excluded else "TRUE"
+        )
+        retained = db.execute(
+            f"""
+            WITH retained AS (
+              SELECT * FROM trade WHERE {condition}
+            ), keyed AS (
+              SELECT event_time,price,size,side,count(*) AS n,
+                     count(DISTINCT feed_scope) AS scopes
+              FROM retained GROUP BY 1,2,3,4
+            )
+            SELECT (SELECT count(*) FROM retained),
+                   (SELECT coalesce(sum(CASE WHEN two_sided THEN 1 ELSE 0 END),0)
+                    FROM retained),
+                   coalesce(sum(CASE WHEN scopes>1 THEN n-1 ELSE 0 END),0),
+                   coalesce(sum(CASE WHEN scopes=1 THEN n-1 ELSE 0 END),0)
+            FROM keyed
+            """,
+            excluded,
         ).fetchone()
-        if row is None:
+        if retained is None:
             raise ValueError("实时逐笔质量查询没有返回")
-        rows = int(row[0])
-        mirrored = int(row[1])
         basis_rows = db.execute(
-            "SELECT source_side_basis,count(*) FROM "
-            "read_parquet(?,union_by_name=true) GROUP BY 1 ORDER BY 1",
-            [files],
+            "SELECT source_side_basis,count(*) FROM trade GROUP BY 1 ORDER BY 1"
         ).fetchall()
     finally:
         db.close()
+    taker_rows = int(retained[0])
+    taker_mirrored = int(retained[1])
+    duplicates = int(retained[2])
+    repeated = int(retained[3])
     return {
         "rows": rows,
         "mirrored_rows": mirrored,
@@ -362,7 +426,74 @@ def _trade_quality(
         "source_side_basis": {
             str(basis): int(count) for basis, count in basis_rows
         },
+        "participant_side_feed": {
+            "run_ratio_threshold": participant_side_run_ratio,
+            "rows": sum(int(str(item["rows"])) for item in participant_runs.values()),
+            "runs": participant_runs,
+        },
+        "taker_rows": taker_rows,
+        "taker_mirrored_rows": taker_mirrored,
+        "taker_mirrored_trade_ratio": (
+            0.0 if taker_rows == 0 else taker_mirrored / taker_rows
+        ),
+        "duplicate_rows": duplicates,
+        "duplicate_trade_ratio": 0.0 if taker_rows == 0 else duplicates / taker_rows,
+        "repeated_key_rows": repeated,
     }
+
+
+def _participant_side_spans(
+    trade_quality: Mapping[str, object],
+) -> tuple[tuple[datetime, datetime], ...]:
+    """取参与方行情运行的事件时间跨度。"""
+    feed = _mapping(trade_quality.get("participant_side_feed"), "participant_side_feed")
+    runs = _mapping(feed.get("runs"), "runs")
+    spans = []
+    for record in runs.values():
+        item = _mapping(record, "participant_side_run")
+        spans.append((
+            datetime.fromisoformat(str(item["from"])),
+            datetime.fromisoformat(str(item["to"])),
+        ))
+    return tuple(sorted(spans))
+
+
+def _exclude_participant_side_buckets(
+    buckets: Sequence[PassiveBucket],
+    spans: Sequence[tuple[datetime, datetime]],
+) -> tuple[tuple[PassiveBucket, ...], int]:
+    """把参与方行情覆盖的桶标为不可信，返回被剔除的可信桶数。"""
+    if not spans:
+        return tuple(buckets), 0
+    excluded = 0
+    result: list[PassiveBucket] = []
+    for item in buckets:
+        covered = any(
+            item.bucket_start <= end and item.bucket_end > start
+            for start, end in spans
+        )
+        if covered and item.clean:
+            excluded += 1
+        result.append(replace(item, clean=False) if covered else item)
+    return tuple(result), excluded
+
+
+def _trade_gates(
+    trade_quality: Mapping[str, object], limit: float,
+) -> tuple[bool, bool, list[str]]:
+    """按保留的 taker 行评估镜像、重复与方向门。"""
+    residual = float(str(trade_quality["taker_mirrored_trade_ratio"]))
+    duplicate = float(str(trade_quality["duplicate_trade_ratio"]))
+    taker_rows = int(str(trade_quality["taker_rows"]))
+    reasons: list[str] = []
+    if residual > limit:
+        reasons.append("mirrored_trade_ratio_exceeded")
+    if duplicate > limit:
+        reasons.append("duplicate_trade_ratio_exceeded")
+    side_basis_ok = taker_rows > 0
+    if not side_basis_ok:
+        reasons.append("taker_side_basis_unproven")
+    return residual <= limit and duplicate <= limit, side_basis_ok, reasons
 
 
 def _load_buckets(
@@ -788,17 +919,22 @@ def run_passive_grid_shadow(
     price_row_ticks = price_row_size / tick_size
     if price_row_ticks != price_row_ticks.to_integral_value():
         raise ValueError("tile 价格格不是市场 tick 的整数倍")
-    trade_quality = _trade_quality(trade_snapshot)
+    trade_quality = _trade_quality(
+        trade_snapshot,
+        _number(
+            quality_config.get("participant_side_run_ratio"),
+            "participant_side_run_ratio",
+        ),
+    )
     mirrored_limit = _number(
         quality_config.get("maximum_mirrored_trade_ratio"),
         "maximum_mirrored_trade_ratio",
     )
-    mirrored_ok = float(str(trade_quality["mirrored_trade_ratio"])) <= mirrored_limit
-    side_basis = _mapping(
-        trade_quality.get("source_side_basis"), "source_side_basis",
+    mirrored_ok, side_basis_ok, trade_reasons = _trade_gates(
+        trade_quality, mirrored_limit,
     )
-    side_basis_ok = bool(side_basis) and all(
-        str(basis).startswith("taker") for basis in side_basis
+    buckets, excluded_buckets = _exclude_participant_side_buckets(
+        buckets, _participant_side_spans(trade_quality),
     )
     clean_buckets = sum(item.clean for item in buckets)
     bucket_seconds = int((buckets[0].bucket_end - buckets[0].bucket_start).total_seconds())
@@ -944,10 +1080,10 @@ def run_passive_grid_shadow(
         "clean_buckets": clean_buckets,
         "total_buckets": len(buckets),
         "clean_hours": clean_hours,
+        "excluded_participant_side_buckets": excluded_buckets,
         "trade_quality": trade_quality,
         "reasons": [
-            *([] if mirrored_ok else ["mirrored_trade_ratio_exceeded"]),
-            *([] if side_basis_ok else ["taker_side_basis_unproven"]),
+            *trade_reasons,
             *([] if coverage_ok else ["insufficient_clean_l2_coverage"]),
         ],
     }
