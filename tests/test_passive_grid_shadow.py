@@ -12,6 +12,7 @@ import duckdb
 import pytest
 
 from guvolu.research.passive_grid_shadow import (
+    _trade_gap_spans,
     PassiveBucket,
     PassiveCandidate,
     PassiveFill,
@@ -347,3 +348,21 @@ def test_verifier_recomputes_run_identity_and_checks_latest_hash(
     latest.write_text(canonical_json(latest_body) + "\n", encoding="utf-8")
     with pytest.raises(ValueError, match="运行身份"):
         verify_passive_grid_shadow(tmp_path, run_id, data_root)
+
+
+def test_trade_gap_tiles_map_to_hour_spans() -> None:
+    """无逐笔依赖的 tile 按分区键折成整小时跨度，其余 tile 不受影响。"""
+    from types import SimpleNamespace
+
+    tiles = SimpleNamespace(outputs=[
+        SimpleNamespace(attempt_id="a", partition_key="2026-08-22T01/5s"),
+        SimpleNamespace(attempt_id="a", partition_key="2026-08-22T01/5s"),
+        SimpleNamespace(attempt_id="b", partition_key="2026-08-22T02/5s"),
+    ])
+    spans = _trade_gap_spans(tiles, ("a",))  # type: ignore[arg-type]
+    assert spans == ((
+        datetime(2026, 8, 22, 1, tzinfo=UTC),
+        datetime(2026, 8, 22, 2, tzinfo=UTC),
+    ),)
+    assert _trade_gap_spans(tiles, ()) == ()  # type: ignore[arg-type]
+

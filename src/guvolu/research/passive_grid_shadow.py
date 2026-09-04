@@ -6,7 +6,7 @@ import json
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -221,6 +221,7 @@ def _paths(snapshot: ActiveOutputSnapshot, dataset: str) -> list[str]:
 
 def _freeze_inputs(data_root: Path, market_id: str) -> tuple[
     ActiveOutputSnapshot, ActiveOutputSnapshot,
+    tuple[tuple[datetime, datetime], ...],
 ]:
     catalog = QueryCatalog(data_root)
     tiles = catalog.active_outputs(
@@ -232,16 +233,20 @@ def _freeze_inputs(data_root: Path, market_id: str) -> tuple[
         "orderflow_tile_column", "orderflow_tile_cell",
     }:
         raise LookupError(f"市场缺少完整订单流 tile: {market_id}")
-    trades = _tile_trade_inputs(data_root, catalog, tiles)
-    return tiles, trades
+    trades, missing = _tile_trade_inputs(data_root, catalog, tiles)
+    return tiles, trades, _trade_gap_spans(tiles, missing)
 
 
 def _tile_trade_inputs(
     data_root: Path,
     catalog: QueryCatalog,
     tiles: ActiveOutputSnapshot,
-) -> ActiveOutputSnapshot:
-    """解析每个活动 tile 实际绑定的逐笔输出，不借用当前活动头。"""
+) -> tuple[ActiveOutputSnapshot, tuple[str, ...]]:
+    """解析每个活动 tile 实际绑定的逐笔输出，不借用当前活动头。
+
+    没有逐笔依赖的 tile attempt 一并返回：逐笔断流覆盖整小时时
+    tile 合法地不绑定任何逐笔件，运行只把该小时降级为不可信。
+    """
     tile_attempts = sorted({row.attempt_id for row in tiles.outputs})
     if not tile_attempts:
         raise LookupError("订单流 tile 没有活动 attempt")
@@ -274,9 +279,7 @@ def _tile_trade_inputs(
     finally:
         conn.close()
     covered = {str(row[0]) for row in rows}
-    missing = sorted(set(tile_attempts) - covered)
-    if missing:
-        raise ValueError(f"tile 缺少实际逐笔依赖: {','.join(missing)}")
+    missing = tuple(sorted(set(tile_attempts) - covered))
     outputs: dict[tuple[str, str, str], ActiveOutput] = {}
     for row in rows:
         tile_attempt = str(row[0])
@@ -313,7 +316,7 @@ def _tile_trade_inputs(
         (row.attempt_id, row.artifact_id, row.normalization_version)
         for row in frozen
     ])
-    return ActiveOutputSnapshot(tiles.market, frozen, generation)
+    return ActiveOutputSnapshot(tiles.market, frozen, generation), missing
 
 
 def _trade_quality(
@@ -455,6 +458,21 @@ def _participant_side_spans(
             datetime.fromisoformat(str(item["from"])),
             datetime.fromisoformat(str(item["to"])),
         ))
+    return tuple(sorted(spans))
+
+
+def _trade_gap_spans(
+    tiles: ActiveOutputSnapshot, attempts: Sequence[str],
+) -> tuple[tuple[datetime, datetime], ...]:
+    """无逐笔依赖的 tile 小时跨度（分区键形如 2026-08-22T01/5s）。"""
+    wanted = set(attempts)
+    spans: set[tuple[datetime, datetime]] = set()
+    for row in tiles.outputs:
+        if row.attempt_id not in wanted:
+            continue
+        hour_text = str(row.partition_key).split("/", 1)[0]
+        begin = datetime.strptime(hour_text, "%Y-%m-%dT%H").replace(tzinfo=UTC)
+        spans.add((begin, begin + timedelta(hours=1)))
     return tuple(sorted(spans))
 
 
@@ -909,7 +927,9 @@ def run_passive_grid_shadow(
         minimum=1,
     )
     quality_config = _mapping(config.get("quality"), "quality")
-    tile_snapshot, trade_snapshot = _freeze_inputs(selected_data, market_id)
+    tile_snapshot, trade_snapshot, trade_gap_spans = _freeze_inputs(
+        selected_data, market_id,
+    )
     buckets, price_row_size = _load_buckets(tile_snapshot, bucket)
     if not buckets:
         raise ValueError("订单流 tile 没有目标桶")
@@ -935,6 +955,9 @@ def run_passive_grid_shadow(
     )
     buckets, excluded_buckets = _exclude_participant_side_buckets(
         buckets, _participant_side_spans(trade_quality),
+    )
+    buckets, excluded_gap_buckets = _exclude_participant_side_buckets(
+        buckets, trade_gap_spans,
     )
     clean_buckets = sum(item.clean for item in buckets)
     bucket_seconds = int((buckets[0].bucket_end - buckets[0].bucket_start).total_seconds())
@@ -1081,6 +1104,10 @@ def run_passive_grid_shadow(
         "total_buckets": len(buckets),
         "clean_hours": clean_hours,
         "excluded_participant_side_buckets": excluded_buckets,
+        "excluded_trade_gap_buckets": excluded_gap_buckets,
+        "trade_gap_tile_hours": [
+            [begin.isoformat(), end.isoformat()] for begin, end in trade_gap_spans
+        ],
         "trade_quality": trade_quality,
         "reasons": [
             *trade_reasons,
