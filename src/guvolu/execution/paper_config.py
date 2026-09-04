@@ -65,6 +65,8 @@ class PaperExecutorConfig:
     taker_fee_cache_seconds: int
     overlay: OverlayThresholds
     ledger_directory: Path
+    # live 被动阶段等待秒数，零即直接吃单
+    passive_wait_seconds: int = 0
 
 
 def _text(payload: Mapping[str, object], key: str) -> str:
@@ -153,4 +155,8 @@ def load_paper_config(path: Path) -> PaperExecutorConfig:
             ),
         ),
         ledger_directory=Path(_text(raw, "ledger_directory")),
+        passive_wait_seconds=(
+            _integer(raw, "passive_wait_seconds")
+            if "passive_wait_seconds" in raw else 0
+        ),
     )

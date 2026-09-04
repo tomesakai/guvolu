@@ -13,5 +13,6 @@
     "minimum_top5_depth_base": "0.5",
     "maximum_anchor_age_seconds": 300
   },
-  "ledger_directory": "execution/paper"
+  "ledger_directory": "execution/paper",
+  "passive_wait_seconds": 150
 }

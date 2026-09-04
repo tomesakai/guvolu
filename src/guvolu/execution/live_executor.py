@@ -39,6 +39,7 @@ from guvolu.domain.enums import (
     RunMode,
     ServiceStatus,
     Side,
+    TimeInForce,
 )
 from guvolu.domain.errors import (
     ApiNetworkError,
@@ -215,6 +216,9 @@ class LiveRuntime:
     rule: MarketRule
     inflight_dir: Path
     max_wait_seconds: int = DEFAULT_MAX_WAIT_SECONDS
+    # 被动阶段等待秒数，零即直接吃单
+    passive_wait_seconds: int = 0
+    refresh_book: Callable[[], BookSnapshot | None] | None = None
     clock: Callable[[], float] = time.monotonic
     sleep: Callable[[float], None] = time.sleep
     read_touched: list[str] = field(default_factory=list)
@@ -421,20 +425,140 @@ class LiveOrderOutcome:
     cancel_requested: bool
     resolution: str
     terminal: bool
+    # 被动阶段留痕（吃单兜底时为第一阶段）
+    passive: Mapping[str, object] | None = None
 
 
 def execute_live_order(
-    runtime: LiveRuntime, plan: DryRunPlan, *, now: datetime
+    runtime: LiveRuntime,
+    plan: DryRunPlan,
+    *,
+    now: datetime,
+    book: BookSnapshot | None = None,
 ) -> LiveOrderOutcome:
-    """把计划折算为限价意图并走完发送、轮询与撤单闭环。
+    """被动优先、吃单兜底地完成一笔目标委托。
+
+    第一阶段以 Post-only（SOK）挂在同侧最优价，等待
+    `passive_wait_seconds`；成交即结束，被交易所因会立即成交而
+    作废（EXPIRED_SOK）或届满未成交则撤单，再以剩余数量按可立即
+    成交价发第二阶段委托。两阶段各自是独立意图（TBD-11 先撤后下），
+    同一 correlation_id。GMO 现物 Maker 返还 0.01%、Taker 收
+    0.05%，被动成交把单边成本从约 5.5 bp 降到约 0.7 bp（2026-09-04
+    影子测量）。`passive_wait_seconds` 为零或无盘口时直接吃单。
+    """
+    if plan.proposal is None:
+        raise LiveExecutorError("计划无委托，不应进入发送")
+    proposal = plan.proposal
+    passive_price = _passive_price(proposal.side, book, runtime.rule)
+    if runtime.passive_wait_seconds <= 0 or passive_price is None:
+        return _execute_single(
+            runtime, plan, size=proposal.size, price=proposal.price,
+            time_in_force=None, wait_seconds=float(runtime.max_wait_seconds),
+            now=now,
+        )
+    passive = _execute_single(
+        runtime, plan, size=proposal.size, price=passive_price,
+        time_in_force=TimeInForce.SOK,
+        wait_seconds=float(runtime.passive_wait_seconds), now=now,
+    )
+    passive_record = _phase_payload("passive", passive)
+    final = passive.final_order
+    executed = final.executed_size if final is not None else Decimal("0")
+    if passive.terminal and final is not None and (
+        final.status is OrderStatus.EXECUTED
+        or final.executed_size >= proposal.size
+    ):
+        return replace(passive, passive=passive_record)
+    if not passive.terminal:
+        # 被动单未到终态，不可再发第二阶段（T-05）
+        return replace(passive, passive=passive_record)
+    remaining = _floor_step(proposal.size - executed, runtime.rule.size_step)
+    if remaining < runtime.rule.min_order_size:
+        return replace(
+            passive, passive=passive_record,
+            resolution=passive.resolution + "；剩余低于最小委托量",
+        )
+    fresh = runtime.refresh_book() if runtime.refresh_book is not None else book
+    marketable = _marketable_price(proposal.side, fresh, runtime.rule)
+    price = marketable if marketable is not None else proposal.price
+    window = max(
+        float(runtime.max_wait_seconds) - float(runtime.passive_wait_seconds),
+        POLL_INTERVAL_SECONDS,
+    )
+    taker = _execute_single(
+        runtime, plan, size=remaining, price=price, time_in_force=None,
+        wait_seconds=window, now=datetime.now(UTC),
+    )
+    return replace(taker, passive=passive_record)
+
+
+def _passive_price(
+    side: Side, book: BookSnapshot | None, rule: MarketRule,
+) -> Decimal | None:
+    """同侧最优价（买挂最优买价、卖挂最优卖价）。"""
+    if book is None or not book.bids or not book.asks:
+        return None
+    if side is Side.BUY:
+        return _floor_step(book.best_bid, rule.tick_size)
+    return _ceil_step(book.best_ask, rule.tick_size)
+
+
+def _marketable_price(
+    side: Side, book: BookSnapshot | None, rule: MarketRule,
+) -> Decimal | None:
+    """对手侧最优价（买取最优卖价、卖取最优买价）。"""
+    if book is None or not book.bids or not book.asks:
+        return None
+    if side is Side.BUY:
+        return _ceil_step(book.best_ask, rule.tick_size)
+    return _floor_step(book.best_bid, rule.tick_size)
+
+
+def _phase_payload(name: str, outcome: LiveOrderOutcome) -> dict[str, object]:
+    final = outcome.final_order
+    return {
+        "phase": name,
+        "intent_id": outcome.intent.intent_id,
+        "time_in_force": (
+            None if outcome.intent.time_in_force is None
+            else outcome.intent.time_in_force.value
+        ),
+        "price": format(outcome.intent.price, "f")
+        if outcome.intent.price is not None else None,
+        "size": format(outcome.intent.size, "f"),
+        "state": outcome.dispatch.state.value,
+        "order_id": outcome.dispatch.order_id,
+        "final_order_status": None if final is None else final.status.value,
+        "executed_size": (
+            None if final is None else format(final.executed_size, "f")
+        ),
+        "cancel_type": (
+            None if final is None or final.cancel_type is None
+            else str(final.cancel_type)
+        ),
+        "resolution": outcome.resolution,
+        "terminal": outcome.terminal,
+    }
+
+
+def _execute_single(
+    runtime: LiveRuntime,
+    plan: DryRunPlan,
+    *,
+    size: Decimal,
+    price: Decimal,
+    time_in_force: TimeInForce | None,
+    wait_seconds: float,
+    now: datetime,
+) -> LiveOrderOutcome:
+    """把一笔限价意图走完发送、轮询与撤单闭环。
 
     发送经统一编排：意图先落盘、五道闸门、跨进程在途锁、写预算
     累计（T-05、T-11）；消耗写预算即追加信封用量行，保守计数。
     受理后轮询至终态或有界等待届满撤单确认（R-01、TBD-11 先撤
     方向）；超时经 READ_ONLY 查询后决策（T-06）。
     """
-    if plan.proposal is None:
-        raise LiveExecutorError("计划无委托，不应进入发送")
+    assert plan.proposal is not None
     proposal = plan.proposal
     intent = OrderIntent(
         intent_id=new_intent_id(),
@@ -442,9 +566,9 @@ def execute_live_order(
         symbol=proposal.symbol,
         side=proposal.side,
         execution_type=ExecutionType.LIMIT,
-        size=proposal.size,
-        price=proposal.price,
-        time_in_force=None,
+        size=size,
+        price=price,
+        time_in_force=time_in_force,
         created_at=now,
         prediction_id=plan.artifact.run_id,
         decision_time=plan.artifact.decision_time,
@@ -464,7 +588,7 @@ def execute_live_order(
         # 信封用量保守计数（T-11 口径）
         runtime.usage.append(
             intent_id=intent.intent_id,
-            notional_jpy=proposal.notional_jpy,
+            notional_jpy=size * price,
             at=now,
         )
     if result.state not in LOCAL_TERMINAL_STATES:
@@ -498,8 +622,7 @@ def execute_live_order(
             f"发送未受理: {result.reason}", False,
         )
     snapshot = poll_order(
-        runtime, result.order_id,
-        wait_seconds=float(runtime.max_wait_seconds),
+        runtime, result.order_id, wait_seconds=wait_seconds,
     )
     if snapshot is not None and snapshot.status in TERMINAL_ORDER_STATUSES:
         return LiveOrderOutcome(
@@ -1000,7 +1123,8 @@ def run_live_cycle(
     runtime.save_state()
     if plan.proposal is None:
         return EXIT_OK, fragment
-    outcome = execute_live_order(runtime, plan, now=now)
+    outcome = execute_live_order(runtime, plan, now=now, book=book)
+    fragment["passive"] = outcome.passive
     fragment["intent"] = {
         "intent_id": outcome.intent.intent_id,
         "correlation_id": outcome.intent.correlation_id,
@@ -1284,6 +1408,12 @@ def _run_live_main(
         rule=rule,
         inflight_dir=root / INFLIGHT_LOCK_RELATIVE_DIR,
         max_wait_seconds=int(args.max_wait_seconds),
+        passive_wait_seconds=int(target_config.passive_wait_seconds),
+        refresh_book=lambda: BookSnapshot.from_orderbook(
+            get_public().orderbooks(str(symbol)),
+            observed_at=datetime.now(UTC),
+            basis=PUBLIC_ORDERBOOK_BASIS,
+        ),
         read_touched=read_touched,
     )
     assets_before = reader.assets()
