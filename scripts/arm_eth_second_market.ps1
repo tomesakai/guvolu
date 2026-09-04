@@ -88,6 +88,8 @@ if ($Existing.Count -gt 0 -and $Existing[0].Trim() -eq $Desired) {
 }
 
 # 2. 签发信封（校验、提交主仓、快进执行仓、重启观察进程）。
+# 主仓校验器读主仓 .env，白名单改以进程环境变量传入（环境优先于文件）。
+$env:GUVOLU_SPOT_WHITELIST = ($Wanted -join ",")
 $IssueArguments = @("-Draft", $Draft, "-ExecutionRepository", $Execution)
 if ($Rehearsal) { $IssueArguments += "-DryRun" }
 & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $RepoRoot "scripts\issue_envelope.ps1") @IssueArguments
