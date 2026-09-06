@@ -419,11 +419,14 @@ head 到 `day/YYYY-MM-DD`；被合并段的物化 attempt 仍完成，常驻物�
 实测：分步带日志备份持锁约十三分钟，全部物化器随之写锁超时；单步无日志
 备份 3.2 GB 约十秒）；每小时缺省只校验新落地制品与外键
 闭合，复用件散列与整库 quick_check 由 `--verify-all` 承担，留给日常复核。
-第二市场 ETH 的冻结运行根为 `D:\dev\guvolu-frozen-runtime-eth-a42aac6`
-（来源运行 `research-run-6215f76b…` 同树 `a42aac6` 的 detached 工作树），
-治理注册库、输入收据与 ETH 物理面板复制自开发库，vintage
-`holdout-vintage-b078744b…`（2026-09-05T00:00Z 至 2026-12-31T00:00Z）与计划
-`frozen-forward-plan-5262e0a0…8986`（`zero_exposure`）在该根内冻结；其 -live 任务以
+第二市场 ETH 的冻结运行根为 `D:\dev\guvolu-frozen-runtime-eth-b-a42aac6`
+（`a42aac6` 的 detached 工作树；首个根 `guvolu-frozen-runtime-eth-a42aac6` 因计划
+继承快照绝对路径而退役，策略研究文档第 6.4 节）。决策级来源运行
+`research-run-3b88f63b…` 在该根内以仓库相对数据根、仅 `price_breakout` 与 `trend`
+两族运行（含 `breakout` 的候选集会因证据窗口含不合格经济成交被冻结拒绝）；
+vintage `holdout-vintage-b4f64a1b…`（2026-09-06T08:00Z 至 2026-12-31T00:00Z，
+前一段 `b078744b…` 已废弃）与计划 `frozen-forward-plan-01d6ae93…5b3f`
+（`zero_exposure`）在该根内冻结；其 -live 任务以
 `-MarketId mkt__gmo__eth__r0 -Symbol ETH -TargetConfig
 config/paper_executor_eth.json -MinuteOffset 30` 注册，与 BTC 任务错峰。
 冻结串联在预测过期且重试预算内时（缺省两次、每次等待 240 秒）重刷快照再
