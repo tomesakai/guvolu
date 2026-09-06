@@ -364,6 +364,8 @@ def test_target_config_passes_through_to_adapter_and_paper(chain: FakeChain) -> 
     assert adapt_configs == {expected}
     paper_call = chain.scripts("run_paper_executor.py")[0]
     assert _option(paper_call, "--config") == expected
+    dry_run_call = chain.scripts("run_dry_run_executor.py")[0]
+    assert _option(dry_run_call, "--target-config") == expected
     assert summary["target_config"] == "config/paper_executor_eth.json"
     assert summary["symbol"] == "ETH"
     assert summary["market_id"] == MARKET_ID

@@ -323,6 +323,8 @@ def run_shadow(
                 (
                     str(exec_python), str(execution / "scripts/run_dry_run_executor.py"),
                     "--target", str(target_path), "--symbol", symbol,
+                    "--target-config",
+                    str(resolve_target_config(execution, target_config)),
                     "--budget-jpy", budget_jpy, "--ledger", str(ledger_path),
                     "--dry-run-report", str(report_path),
                     "--source-prediction", str(prediction_path),
