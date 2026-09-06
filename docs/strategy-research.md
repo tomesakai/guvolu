@@ -554,6 +554,16 @@ blocker 降为 warning，状态最多为 `degraded`。
   --data-root <authoritative-data-root> --to-time 2026-08-23T09:00:00Z
 ```
 
+### 6.4 冻结计划的数据根定位
+
+冻结前向计划原样继承来源运行 `summary.json` 的 `source_data_root` 定位，预测器每小时
+按该定位读取输入收据。定位为 `repository_relative` 时随运行根一起被每小时刷新；定位为
+`absolute`（决策级研究在静态快照上运行的情形，第 8.2 节）时预测器只会读到封存时刻的
+快照，永远得到「vintage 尚未开始」（2026-09-05 至 06 ETH 实测 30 轮）。因此供冻结的
+决策级运行必须在运行根内以仓库相对数据根运行；快照上的运行只能作为准入证据，不能直接
+封存为计划。运行根内的数据以 `build_research_snapshot.py --snapshot-root <运行根>/data`
+补齐影子市场 L2 段并撤销未复制头，使跨所影子步骤自洽。
+
 ## 7. 当前策略生成方式
 
 当前版本是可解释的 CPU 小网格，不是自动发现系统。版本化 JSON 展开趋势、量价确认趋势、
