@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -21,6 +22,9 @@ TARGET_DIRECTORY = "data/execution/targets"
 PAPER_MODE = "paper"
 DRY_RUN_MODE = "dry-run"
 DEFAULT_MAX_PREDICTION_AGE_MINUTES = 55
+# 最新柱未落地时的重试：次数与每次等待秒数
+DEFAULT_STALE_RETRY_COUNT = 2
+DEFAULT_STALE_RETRY_WAIT_SECONDS = 240
 # 去重与待对账报告不含 mode
 PAPER_STATUSES_WITHOUT_ROW = frozenset({
     "duplicate_prediction", "needs_reconciliation",
@@ -249,11 +253,15 @@ def run_shadow(
     max_prediction_age_minutes: int = DEFAULT_MAX_PREDICTION_AGE_MINUTES,
     paper_enabled: bool = True,
     target_config: str = PAPER_CONFIG,
+    stale_retry_count: int = DEFAULT_STALE_RETRY_COUNT,
+    stale_retry_wait_seconds: float = DEFAULT_STALE_RETRY_WAIT_SECONDS,
 ) -> dict[str, object]:
     """串联快照、冻结预测、目标适配、零写彩排与 paper 执行。
 
     paper 步骤在 dry-run 报告校验通过后运行，结果记入 paper 字段；
     其失败不改变预测与 dry-run 的登记结果，但 CLI 必须返回非零码。
+    预测过期且仍在重试预算内时（最新柱尚未物化，2026-09-04 至 06 实测
+    三次，柱后 13 至 18 分钟才落地），等待后重刷快照再预测。
     """
     started = datetime.now(UTC)
     source_root = repository.resolve()
@@ -261,19 +269,32 @@ def run_shadow(
     execution = execution_repository.resolve()
     task_log = execution / "data/execution/shadow/frozen-forward/task.jsonl"
     try:
-        refresh = refresh_runtime(source_root / "data", runtime, market_id)
-        prediction_env = dict(os.environ)
-        prediction_env["PYTHONPATH"] = str(runtime / "src")
-        prediction = _json_stdout(_run(
-            (
-                sys.executable,
-                str(runtime / "scripts/manage_frozen_forward.py"),
-                "--root", str(runtime), "predict", plan_id,
-                "--registry", str(runtime / "data/research/governance.sqlite3"),
-            ),
-            cwd=runtime,
-            env=prediction_env,
-        ), "frozen prediction")
+        stale_retries = 0
+        while True:
+            refresh = refresh_runtime(source_root / "data", runtime, market_id)
+            prediction_env = dict(os.environ)
+            prediction_env["PYTHONPATH"] = str(runtime / "src")
+            prediction = _json_stdout(_run(
+                (
+                    sys.executable,
+                    str(runtime / "scripts/manage_frozen_forward.py"),
+                    "--root", str(runtime), "predict", plan_id,
+                    "--registry", str(runtime / "data/research/governance.sqlite3"),
+                ),
+                cwd=runtime,
+                env=prediction_env,
+            ), "frozen prediction")
+            decision_time = datetime.fromisoformat(_text(
+                prediction.get("decision_time"), "decision_time",
+            )).astimezone(UTC)
+            age = datetime.now(UTC) - decision_time
+            fresh = timedelta(0) <= age <= timedelta(minutes=max_prediction_age_minutes)
+            if fresh or stale_retries >= stale_retry_count:
+                break
+            stale_retries += 1
+            time.sleep(stale_retry_wait_seconds)
+        if not fresh:
+            raise ValueError(f"冻结预测过期: {age.total_seconds():.1f}s")
         prediction_id = _text(prediction.get("prediction_id"), "prediction_id")
         prediction_path = Path(_text(
             prediction.get("prediction_path"), "prediction_path",
@@ -284,12 +305,6 @@ def run_shadow(
         prediction_sha = hashlib.sha256(
             prediction_path.read_bytes()
         ).hexdigest()
-        decision_time = datetime.fromisoformat(_text(
-            prediction.get("decision_time"), "decision_time",
-        )).astimezone(UTC)
-        age = datetime.now(UTC) - decision_time
-        if age < timedelta(0) or age > timedelta(minutes=max_prediction_age_minutes):
-            raise ValueError(f"冻结预测过期: {age.total_seconds():.1f}s")
 
         exec_python = execution / ".venv/Scripts/python.exe"
         target_path = _adapt_target(
@@ -339,6 +354,7 @@ def run_shadow(
             "prediction_sha256": prediction_sha,
             "decision_time": decision_time.isoformat(),
             "prediction_age_seconds": round(age.total_seconds(), 3),
+            "stale_retries": stale_retries,
             "aggregate_target": prediction.get("aggregate_target"),
             "target_path": str(target_path),
             "report_path": str(report_path),
@@ -387,6 +403,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--target-config", default=PAPER_CONFIG,
         help="执行仓内目标配置相对路径；缺省 config/paper_executor.json",
     )
+    parser.add_argument(
+        "--stale-retry-count", type=int, default=DEFAULT_STALE_RETRY_COUNT,
+        help="预测过期时重刷重预测的次数；缺省 2",
+    )
+    parser.add_argument(
+        "--stale-retry-wait-seconds", type=float,
+        default=DEFAULT_STALE_RETRY_WAIT_SECONDS,
+        help="每次重试前等待秒数；缺省 240",
+    )
     args = parser.parse_args(argv)
     summary = run_shadow(
         args.repository, args.runtime_root, args.execution_repository,
@@ -395,6 +420,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_prediction_age_minutes=int(args.max_prediction_age_minutes),
         paper_enabled=not bool(args.no_paper),
         target_config=str(args.target_config),
+        stale_retry_count=int(args.stale_retry_count),
+        stale_retry_wait_seconds=float(args.stale_retry_wait_seconds),
     )
     print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
     paper = summary.get("paper")

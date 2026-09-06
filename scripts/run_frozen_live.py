@@ -19,6 +19,8 @@ from typing import Sequence
 
 from run_frozen_shadow import (
     DEFAULT_MAX_PREDICTION_AGE_MINUTES,
+    DEFAULT_STALE_RETRY_COUNT,
+    DEFAULT_STALE_RETRY_WAIT_SECONDS,
     PAPER_CONFIG,
     _adapt_target,
     _append_record,
@@ -150,6 +152,8 @@ def run_live(
     max_prediction_age_minutes: int = DEFAULT_MAX_PREDICTION_AGE_MINUTES,
     paper_enabled: bool = True,
     target_config: str = PAPER_CONFIG,
+    stale_retry_count: int = DEFAULT_STALE_RETRY_COUNT,
+    stale_retry_wait_seconds: float = DEFAULT_STALE_RETRY_WAIT_SECONDS,
 ) -> dict[str, object]:
     """串联 shadow 全流程后执行信封约束下的 live 步骤。
 
@@ -163,6 +167,8 @@ def run_live(
         symbol=symbol, budget_jpy=budget_jpy,
         max_prediction_age_minutes=max_prediction_age_minutes,
         paper_enabled=paper_enabled, target_config=target_config,
+        stale_retry_count=stale_retry_count,
+        stale_retry_wait_seconds=stale_retry_wait_seconds,
     )
     prediction_id = _text(summary.get("prediction_id"), "prediction_id")
     prediction_path = Path(_text(
@@ -208,6 +214,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--target-config", default=PAPER_CONFIG,
         help="执行仓内目标配置相对路径；缺省 config/paper_executor.json",
     )
+    parser.add_argument(
+        "--stale-retry-count", type=int, default=DEFAULT_STALE_RETRY_COUNT,
+        help="预测过期时重刷重预测的次数；缺省 2",
+    )
+    parser.add_argument(
+        "--stale-retry-wait-seconds", type=float,
+        default=DEFAULT_STALE_RETRY_WAIT_SECONDS,
+        help="每次重试前等待秒数；缺省 240",
+    )
     args = parser.parse_args(argv)
     summary = run_live(
         args.repository, args.runtime_root, args.execution_repository,
@@ -216,6 +231,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         max_prediction_age_minutes=int(args.max_prediction_age_minutes),
         paper_enabled=not bool(args.no_paper),
         target_config=str(args.target_config),
+        stale_retry_count=int(args.stale_retry_count),
+        stale_retry_wait_seconds=float(args.stale_retry_wait_seconds),
     )
     print(json.dumps(summary, ensure_ascii=False, sort_keys=True))
     exit_code = 0

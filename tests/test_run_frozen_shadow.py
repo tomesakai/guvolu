@@ -374,3 +374,39 @@ def test_target_config_outside_config_directory_is_rejected(chain: FakeChain) ->
     with pytest.raises(ValueError, match="config 目录"):
         _run_chain(chain, target_config="../elsewhere/paper.json")
     assert chain.scripts("adapt_frozen_target.py") == []
+
+
+def test_stale_prediction_retries_refresh_until_fresh(
+    chain: FakeChain, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """最新柱未落地时等待后重刷重预测，成功后记录重试次数。"""
+    stale = datetime.now(UTC) - timedelta(minutes=70)
+    fresh = datetime.now(UTC) - timedelta(minutes=5)
+    times = iter([stale, fresh])
+    original = chain._predict
+
+    def predict(parts: list[str]) -> subprocess.CompletedProcess[str]:
+        chain.prediction_decision_time = next(times)
+        return original(parts)
+
+    chain._predict = predict  # type: ignore[method-assign]
+    waits: list[float] = []
+    monkeypatch.setattr(shadow.time, "sleep", waits.append)
+    summary = _run_chain(chain, stale_retry_wait_seconds=1.5)
+    assert summary["status"] == "completed"
+    assert summary["stale_retries"] == 1
+    assert waits == [1.5]
+    assert len(chain.scripts("manage_frozen_forward.py")) == 2
+
+
+def test_stale_prediction_fails_after_retry_budget(
+    chain: FakeChain, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """重试预算耗尽仍过期即失败，不进入目标适配。"""
+    chain.prediction_decision_time = datetime.now(UTC) - timedelta(minutes=70)
+    monkeypatch.setattr(shadow.time, "sleep", lambda _seconds: None)
+    with pytest.raises(ValueError, match="冻结预测过期"):
+        _run_chain(chain, stale_retry_count=1)
+    assert len(chain.scripts("manage_frozen_forward.py")) == 2
+    assert chain.scripts("adapt_frozen_target.py") == []
+

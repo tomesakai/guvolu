@@ -426,6 +426,9 @@ head 到 `day/YYYY-MM-DD`；被合并段的物化 attempt 仍完成，常驻物�
 `frozen-forward-plan-5262e0a0…8986`（`zero_exposure`）在该根内冻结；其 -live 任务以
 `-MarketId mkt__gmo__eth__r0 -Symbol ETH -TargetConfig
 config/paper_executor_eth.json -MinuteOffset 30` 注册，与 BTC 任务错峰。
+冻结串联在预测过期且重试预算内时（缺省两次、每次等待 240 秒）重刷快照再
+预测：2026-09-04 至 06 实测三轮最新柱在整点后 13 至 18 分钟才物化，第 12 分
+起跑的任务拿到的是上一柱。
 重型研究运行避开每小时第 15 至 45 分钟的冻结前向
 执行窗，不与冻结预测器争用计算与磁盘（2026-08-30 实测：并发时预测耗时
 约翻倍并触发预测年龄门失败）。L2 质量遥测由独立进程
