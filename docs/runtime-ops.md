@@ -112,8 +112,11 @@ OKX live books 已完成有界真实隔离小样本，但尚未证明重连和�
   重复实例策略为 IgnoreNew，不以 TCP 端口替代采集 checkpoint。
 - 汇率腿（TBD-32）启动器 `scripts/run_fx_collector.ps1`（GMO 外国為替FX 公共
   `ticker` 每 60 秒轮询落 raw v3）与 `scripts/run_fx_materializer.ps1`（`fx_rate`
-  域物化）2026-09-04 交付，尚未纳入 `start_marketdata_pipeline.ps1` 的守护清单，
-  由维护者决定是否登记；缺口不回补，`CLOSE` 期间报价冻结只作旁路参考。
+  域物化）2026-09-04 交付，2026-09-06 起以计划任务 `guvolu-fx-collector` 与
+  `guvolu-fx-materializer` 常驻（`scripts/register_fx_tasks.ps1`：登录触发拉起、
+  每五分钟守护按 IgnoreNew 只在进程不在时重拉，隐藏窗口，日志在 `logs/`），
+  不纳入 `start_marketdata_pipeline.ps1` 清单，独立于 L2 单写边界；缺口不回补，
+  `CLOSE` 期间报价冻结只作旁路参考。
 - `start_marketdata_pipeline.ps1 -Profile ForwardMinimal -Repository <冻结仓库>`
   是磁盘余量低于 20% 时的冻结前向配置：六条不可回补 raw 采集保持运行，且仅
   保留冻结预测所需的实时逐笔物化；L2、book-state 与 OFL 派生物化暂停，之后可
