@@ -122,6 +122,11 @@ def test_fill_cost_attributes_maker_and_taker_and_signs_slippage() -> None:
     assert maker.liquidity == "maker"
     assert Decimal(maker.notional_jpy) == Decimal("10010")
     assert Decimal(maker.fee_bps) == Decimal("-0.999")
+    # 名义 -1.001 取整 -1
+    assert Decimal(maker.nominal_fee_jpy) == Decimal("-1.001")
+    assert Decimal(maker.rounding_residual_jpy) == Decimal("0.001")
+    # 次日 06:00 JST 返还
+    assert maker.refund_day == "2026-09-04"
     # 卖得高于参考价即有利，滑点为负
     assert Decimal(maker.slippage_bps) == Decimal("-10")
     taker = costs.fill_cost(
@@ -152,19 +157,43 @@ def test_summary_weights_by_notional_and_reports_unfilled_orders() -> None:
     }
     fills = [
         costs.fill_cost(_execution(2, 2, "SELL", "0.003", "10000000", "-3"), orders[2]),
-        costs.fill_cost(_execution(1, 1, "BUY", "0.001", "10010000", "5"), orders[1]),
+        costs.fill_cost(_execution(1, 1, "BUY", "0.001", "10010000", "6"), orders[1]),
     ]
     summary = costs.summarize(fills, orders)
     overall = summary["overall"]
     assert overall["fill_count"] == 2
     assert overall["order_count"] == 2
     assert Decimal(overall["notional_jpy"]) == Decimal("40010")
+    # 残差 0.995 不足一元无返还
+    assert Decimal(overall["rounding_residual_jpy"]) == Decimal("0.995")
+    assert summary["refund_estimate"] == {"BTC/2026-09-04": "0"}
+    assert Decimal(overall["fee_effective_jpy"]) == Decimal("3")
+    assert Decimal(overall["fee_bps_effective_weighted"]) == Decimal("0.7498")
+    assert summary["by_side"]["BUY"]["fee_effective_jpy"] is None
     assert Decimal(overall["maker_notional_share"]) == Decimal("0.7498")
-    # 加权费率 2/40010
-    assert Decimal(overall["fee_bps_weighted"]) == Decimal("0.4999")
+    # 加权费率 3/40010
+    assert Decimal(overall["fee_bps_weighted"]) == Decimal("0.7498")
     assert Decimal(summary["by_side"]["BUY"]["slippage_bps_weighted"]) == Decimal("10")
     assert Decimal(summary["by_side"]["SELL"]["slippage_bps_weighted"]) == Decimal("0")
     assert summary["orders_without_fill"] == [3]
     # 同时刻按成交号升序
     assert [row["execution_id"] for row in summary["fills"]] == [1, 2]
     assert datetime.fromisoformat(summary["generated_at"]).tzinfo is UTC
+
+
+def test_micro_fills_refund_matches_observed_balance_trail() -> None:
+    """两笔 252 JPY 名义各扣 1 JPY，残差合算 1.748 → 次日返还 1 JPY。"""
+    fills = [
+        costs.fill_cost(_execution(1, 1, "BUY", "0.00002", "12591999", "1"), None),
+        costs.fill_cost(_execution(2, 2, "SELL", "0.00002", "12609280", "1"), None),
+    ]
+    summary = costs.summarize(fills, {})
+    assert summary["refund_estimate"] == {"BTC/2026-09-04": "1"}
+    overall = summary["overall"]
+    assert Decimal(overall["fee_jpy"]) == Decimal("2")
+    assert Decimal(overall["fee_effective_jpy"]) == Decimal("1")
+    expected = (Decimal(1) / Decimal(overall["notional_jpy"]) * 10000).quantize(
+        Decimal("0.0001")
+    )
+    assert Decimal(overall["fee_bps_effective_weighted"]) == expected
+

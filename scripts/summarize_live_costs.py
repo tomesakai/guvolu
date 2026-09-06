@@ -8,8 +8,15 @@ READ_ONLY 成交明细（GET /v1/executions）逐委托取成交，按名义额
 固定假设（策略研究文档第 3 节）。
 
 归因口径：GMO 成交明细 `fee` 为正即支付 taker 手续费，为负即
-maker 返还；零值记为 unknown。滑点以报告 `reference_price` 为基
-准，买入高于参考、卖出低于参考记正（不利）。
+maker 返还；零值记为 unknown（maker 返还逐笔向下取整后也可能为零）。
+滑点以报告 `reference_price` 为基准，买入高于参考、卖出低于参考记正
+（不利）。
+
+取整口径（2026-09-06 依 GMO 支持页与余额轨迹确认）：taker 费按约定逐笔
+向上取整到整数日元，maker 返还逐笔向下取整，被取整的小数部分按品种逐日
+合算，每个营业日 06:00 JST 返还或支付整数部分。因此逐笔 `fee` 高于名义，
+有效费率须扣除逐日返还：以 06:00 JST 为日界按品种合算残差，取整数部分为
+返还估计。
 """
 from __future__ import annotations
 
@@ -18,7 +25,7 @@ import json
 import sys
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 
@@ -26,6 +33,13 @@ from guvolu.api.read_client import ReadClient
 from guvolu.domain.config import load_config
 from guvolu.domain.models import Execution
 
+# GMO 现物名义费率两档（bp）
+NOMINAL_TAKER_BPS = {"BTC": Decimal("5"), "ETH": Decimal("5"), "XRP": Decimal("5"), "DAI": Decimal("5")}
+NOMINAL_MAKER_BPS = {"BTC": Decimal("-1"), "ETH": Decimal("-1"), "XRP": Decimal("-1"), "DAI": Decimal("-1")}
+DEFAULT_TAKER_BPS = Decimal("9")
+DEFAULT_MAKER_BPS = Decimal("-3")
+# 返还日界：每个营业日 06:00 JST
+REFUND_BOUNDARY = timedelta(hours=9) - timedelta(hours=6)
 LIVE_DIRECTORY = Path("data/execution/live")
 CANARY_DIRECTORY = Path("data/execution/canary")
 SUMMARY_DIRECTORY = LIVE_DIRECTORY / "cost-summary"
@@ -62,6 +76,9 @@ class FillCost:
     fee_jpy: str
     fee_bps: str
     liquidity: str
+    nominal_fee_jpy: str
+    rounding_residual_jpy: str
+    refund_day: str
     reference_price: str | None
     slippage_bps: str | None
     timestamp: str
@@ -178,10 +195,29 @@ def _liquidity(fee: Decimal) -> str:
     return "unknown"
 
 
+def _nominal_fee(symbol: str, notional: Decimal, liquidity: str) -> Decimal:
+    """按名义费率的应收费用；未知流动性按 taker 保守计。"""
+    if liquidity == "maker":
+        rate = NOMINAL_MAKER_BPS.get(symbol, DEFAULT_MAKER_BPS)
+    else:
+        rate = NOMINAL_TAKER_BPS.get(symbol, DEFAULT_TAKER_BPS)
+    return notional * rate / BPS
+
+
+def refund_day(timestamp: datetime) -> str:
+    """返还日：成交所属 06:00 JST 窗口结束的那个早晨（JST 日期）。"""
+    window_start = (timestamp.astimezone(UTC) + REFUND_BOUNDARY).date()
+    return (window_start + timedelta(days=1)).isoformat()
+
+
 def fill_cost(fill: Execution, context: OrderContext | None) -> FillCost:
     """把一笔成交折算为名义、费率与滑点。"""
     notional = fill.price * fill.size
     fee_bps = (fill.fee / notional * BPS) if notional else Decimal(0)
+    liquidity = _liquidity(fill.fee)
+    nominal = _nominal_fee(str(fill.symbol), notional, liquidity)
+    # 取整总在交易所一侧，残差非负
+    residual = fill.fee - nominal
     reference = (
         Decimal(context.reference_price)
         if context is not None and context.reference_price is not None
@@ -203,7 +239,10 @@ def fill_cost(fill: Execution, context: OrderContext | None) -> FillCost:
         notional_jpy=str(notional),
         fee_jpy=str(fill.fee),
         fee_bps=str(fee_bps.quantize(Decimal("0.0001"))),
-        liquidity=_liquidity(fill.fee),
+        liquidity=liquidity,
+        nominal_fee_jpy=str(nominal.quantize(Decimal("0.000001"))),
+        rounding_residual_jpy=str(residual.quantize(Decimal("0.000001"))),
+        refund_day=refund_day(fill.timestamp),
         reference_price=None if reference is None else str(reference),
         slippage_bps=(
             None if slippage is None
@@ -225,8 +264,24 @@ def _weighted(rows: Sequence[FillCost], field: str) -> str | None:
     return str(value.quantize(Decimal("0.0001")))
 
 
-def _bucket(rows: Sequence[FillCost]) -> dict[str, object]:
+def refund_estimate(rows: Sequence[FillCost]) -> dict[str, str]:
+    """按品种与返还日合算取整残差，整数部分即次日返还估计。"""
+    residual: dict[tuple[str, str], Decimal] = {}
+    for row in rows:
+        key = (row.symbol, row.refund_day)
+        residual[key] = residual.get(key, Decimal(0)) + Decimal(row.rounding_residual_jpy)
+    return {
+        f"{symbol}/{day}": str(int(value.to_integral_value(rounding="ROUND_FLOOR")))
+        for (symbol, day), value in sorted(residual.items())
+    }
+
+
+def _bucket(rows: Sequence[FillCost], *, refund: bool = True) -> dict[str, object]:
     total = sum((Decimal(row.notional_jpy) for row in rows), Decimal(0))
+    fee_total = sum((Decimal(row.fee_jpy) for row in rows), Decimal(0))
+    refunds = refund_estimate(rows) if refund else {}
+    refund_total = sum((Decimal(value) for value in refunds.values()), Decimal(0))
+    effective = fee_total - refund_total
     maker = sum(
         (Decimal(row.notional_jpy) for row in rows if row.liquidity == "maker"),
         Decimal(0),
@@ -240,8 +295,18 @@ def _bucket(rows: Sequence[FillCost]) -> dict[str, object]:
         "fill_count": len(rows),
         "order_count": len({row.order_id for row in rows}),
         "notional_jpy": str(total),
-        "fee_jpy": str(sum((Decimal(row.fee_jpy) for row in rows), Decimal(0))),
+        "fee_jpy": str(fee_total),
         "fee_bps_weighted": fee_bps,
+        "nominal_fee_jpy": str(sum((Decimal(row.nominal_fee_jpy) for row in rows), Decimal(0))),
+        "rounding_residual_jpy": str(
+            sum((Decimal(row.rounding_residual_jpy) for row in rows), Decimal(0))
+        ),
+        "refund_estimate_jpy": str(refund_total) if refund else None,
+        "fee_effective_jpy": str(effective) if refund else None,
+        "fee_bps_effective_weighted": (
+            None if not refund or total == 0
+            else str((effective / total * BPS).quantize(Decimal("0.0001")))
+        ),
         "slippage_bps_weighted": slippage_bps,
         "total_cost_bps_weighted": total_cost,
         "maker_notional_share": (
@@ -259,8 +324,9 @@ def summarize(
         symbol: _bucket([row for row in rows if row.symbol == symbol])
         for symbol in sorted({row.symbol for row in rows})
     }
+    # 返还按品种逐日合算，按方向拆分无法归属
     by_side = {
-        side: _bucket([row for row in rows if row.side == side])
+        side: _bucket([row for row in rows if row.side == side], refund=False)
         for side in sorted({row.side for row in rows})
     }
     filled_orders = {row.order_id for row in rows}
@@ -273,6 +339,11 @@ def summarize(
         "overall": _bucket(rows),
         "by_symbol": by_symbol,
         "by_side": by_side,
+        "refund_estimate": refund_estimate(rows),
+        "rounding_rule": (
+            "taker 逐笔向上取整、maker 逐笔向下取整；小数部分按品种逐日合算，"
+            "每营业日 06:00 JST 返还或支付整数部分"
+        ),
         "fills": [asdict(row) for row in rows],
     }
 
