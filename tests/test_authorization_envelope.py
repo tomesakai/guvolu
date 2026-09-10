@@ -43,7 +43,8 @@ from guvolu.execution.authorization_envelope import (
 
 REPO = Path(__file__).resolve().parents[1]
 BTC = SpotSymbol("BTC")
-WHITELIST = frozenset({BTC})
+ETH = SpotSymbol("ETH")
+WHITELIST = frozenset({BTC, ETH})
 NOW = datetime(2026, 9, 2, 12, 0, tzinfo=UTC)
 
 
@@ -102,7 +103,7 @@ def test_load_issued_envelope_and_identity() -> None:
     envelope = load_envelope(path, whitelist=WHITELIST)
     assert envelope.sha256 == hashlib.sha256(path.read_bytes()).hexdigest()
     assert envelope.sha12 == envelope.sha256[:12]
-    assert envelope.symbols == frozenset({BTC})
+    assert envelope.symbols == frozenset({BTC, ETH})
     # 额度只核与文件一致（T-11）
     assert envelope.order_jpy_max == Decimal(issued["order_jpy_max"])
     assert envelope.order_jpy_max <= Decimal("10000")
@@ -126,12 +127,12 @@ def test_load_issued_envelope_and_identity() -> None:
         (lambda b: b.update(schema_version=2), "schema_version"),
         (lambda b: b.update(order_jpy_max=10000), "字符串数值"),
         (lambda b: b.update(order_jpy_max="20000"), "硬顶"),
-        (lambda b: b.update(day_jpy_max="10001"), "硬顶"),
+        (lambda b: b.update(day_jpy_max="30001"), "硬顶"),
         (lambda b: b.update(day_count_max=51), "硬顶"),
         (lambda b: b.update(day_count_max=0), "正整数"),
         (lambda b: b.update(envelope_jpy_total="-1"), "必须为正"),
         (lambda b: b.update(symbols=[]), "非空列表"),
-        (lambda b: b.update(symbols=["ETH"]), "白名单"),
+        (lambda b: b.update(symbols=["XRP"]), "白名单"),
         (lambda b: b.update(symbols=["BTC_JPY"]), "现物"),
         (lambda b: b.update(symbols=["BTC", "BTC"]), "重复"),
         (lambda b: b.update(valid_until="2026-08-01T00:00:00Z"), "有效期"),
@@ -426,6 +427,52 @@ def test_within_threshold_move_does_not_pause(tmp_path: Path) -> None:
     paused, move = apply_price_move_gate(envelope, state, now=NOW)
     assert move == Decimal("500")
     assert paused.paused_until is None
+
+
+def test_price_move_gate_compares_same_symbol_only(tmp_path: Path) -> None:
+    """急变门只比较同品种观测：跨市场共享状态不得互相触发。"""
+    envelope = _load(tmp_path, _body())
+    state = _cleared_state()
+    state = observe_price(
+        state, price=Decimal("12000000"), at=NOW - timedelta(seconds=60),
+        symbol="BTC",
+    )
+    state = observe_price(
+        state, price=Decimal("380000"), at=NOW, symbol="ETH"
+    )
+    paused, move = apply_price_move_gate(
+        envelope, state, now=NOW, symbol="ETH"
+    )
+    assert move is None
+    assert paused.paused_until is None
+    decision, new_state = evaluate_envelope_gates(
+        envelope, state, _inputs(symbol="ETH")
+    )
+    assert decision.verdict == VERDICT_ALLOW
+    assert new_state.paused_until is None
+    # 同品种急变仍触发
+    state = observe_price(
+        state, price=Decimal("400000"), at=NOW, symbol="ETH"
+    )
+    paused2, move2 = apply_price_move_gate(
+        envelope, state, now=NOW, symbol="ETH"
+    )
+    assert move2 is not None and move2 > Decimal("500")
+    assert paused2.paused_until == NOW + timedelta(seconds=3600)
+    # 往返保留品种，旧行可装载
+    store = EnvelopeStateStore(tmp_path / "state.json")
+    store.save(state)
+    loaded = store.load()
+    assert [row.symbol for row in loaded.price_history] == [
+        "BTC", "ETH", "ETH",
+    ]
+    legacy = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+    for row in legacy["price_history"]:
+        del row["symbol"]
+    (tmp_path / "state.json").write_text(
+        json.dumps(legacy), encoding="utf-8"
+    )
+    assert all(row.symbol is None for row in store.load().price_history)
 
 
 def test_loss_gates_and_precedence(tmp_path: Path) -> None:

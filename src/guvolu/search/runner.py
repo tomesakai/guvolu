@@ -359,9 +359,9 @@ def evaluate_bundle(
         trial_evidence: dict[str, object] | None = None
         if standardized_chunks:
             # 流派级有效试验数按收益相关性
-            sharpes = torch.cat([tensor for tensor in family_oos_sharpes])  # type: ignore[list-item]
+            sharpes = torch.cat([tensor for tensor in family_oos_sharpes])
             estimates = effective_trial_count_from_standardized(
-                standardized_chunks, constant_rows,  # type: ignore[arg-type]
+                standardized_chunks, constant_rows,
             )
             trial_evidence = {
                 "method_version": EFFECTIVE_TRIAL_METHOD_VERSION,

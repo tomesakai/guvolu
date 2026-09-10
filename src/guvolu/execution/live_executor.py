@@ -54,7 +54,6 @@ from guvolu.domain.intent import (
     OrderIntent,
 )
 from guvolu.domain.models import Asset, Execution, Order
-from guvolu.domain.symbols import SpotSymbol
 from guvolu.execution.authorization_envelope import (
     DEFAULT_ENVELOPE_PATH,
     VERDICT_ALLOW,
@@ -81,7 +80,6 @@ from guvolu.execution.dry_run_executor import (
     ExecutorError,
     TargetArtifact,
     build_delta_plan,
-    build_plan,
     fetch_market_rule,
     load_market_rule,
     load_target_artifact,
@@ -106,6 +104,7 @@ from guvolu.execution.paper_fill_model import (
 from guvolu.execution.reconcile import (
     ReadOnlyOrderReader,
     ReconcileAmbiguity,
+    TimeoutResolution,
     resolve_send_timeout,
 )
 from guvolu.execution.trade_sender import TradeClientSender
@@ -340,7 +339,10 @@ def refresh_baselines(
     day = trading_day(now)
     if state.day_baseline_day != day:
         state = replace(state, day_baseline=snapshot, day_baseline_day=day)
-    runtime.state = observe_price(state, price=reference_price, at=now)
+    runtime.state = observe_price(
+        state, price=reference_price, at=now,
+        symbol=str(runtime.rule.symbol),
+    )
 
 
 def evaluate_gates_for_plan(
@@ -386,6 +388,7 @@ def evaluate_gates_for_plan(
         spread_bp=spread_bp,
         opposite_depth_jpy=opposite_depth,
         decision_time=decision_time,
+        symbol=str(runtime.rule.symbol),
     )
     decision, new_state = evaluate_envelope_gates(
         runtime.envelope, runtime.state, inputs
@@ -662,11 +665,8 @@ def _execute_single(
 
 def resolve_send_timeout_settled(
     runtime: LiveRuntime, intent: OrderIntent,
-) -> "TimeoutResolution":
+) -> TimeoutResolution:
     """先等交易所落账再对账；零候选时再等一次复查后才判 FAILED。"""
-    from guvolu.execution.reconcile import TimeoutResolution as _Resolution
-
-    del _Resolution
     runtime.sleep(SEND_TIMEOUT_SETTLE_SECONDS)
     probe = _timeout_candidates(runtime, intent)
     if not probe:

@@ -367,7 +367,7 @@ def test_public_main_rejects_unknown_target_semantics_before_side_effect(
             [
                 "--target", str(tampered),
                 *source_prediction_arguments(tampered),
-                "--target-config", str(ROOT / "config" / "paper_executor.json"),
+                "--target-config", str(write_target_config(tmp_path, budget="5000")),
                 "--rules", str(tmp_path / "must-not-read-rules.json"),
                 "--reference-price", "1000000",
                 "--service-status", "OPEN",
@@ -414,7 +414,7 @@ def test_public_main_rebuilds_v2_identity_from_source_prediction(
             [
                 "--target", str(tampered),
                 *source_prediction_arguments(tampered),
-                "--target-config", str(ROOT / "config" / "paper_executor.json"),
+                "--target-config", str(write_target_config(tmp_path, budget="5000")),
                 "--rules", str(tmp_path / "must-not-read-rules.json"),
                 "--reference-price", "1000000",
                 "--service-status", "OPEN",
@@ -464,7 +464,7 @@ def test_public_main_reuses_adapter_source_contract_validation(
             [
                 "--target", str(tampered),
                 *source_prediction_arguments(tampered),
-                "--target-config", str(ROOT / "config" / "paper_executor.json"),
+                "--target-config", str(write_target_config(tmp_path, budget="5000")),
                 "--rules", str(tmp_path / "must-not-read-rules.json"),
                 "--reference-price", "1000000",
                 "--service-status", "OPEN",
@@ -579,7 +579,7 @@ def test_adapter_v2_target_reaches_ledger_with_exact_lineage(
         [
             "--target", str(target_path),
             *source_prediction_arguments(target_path),
-            "--target-config", str(ROOT / "config" / "paper_executor.json"),
+            "--target-config", str(write_target_config(tmp_path, budget="5000")),
             "--rules", str(write_rules(tmp_path)),
             "--reference-price", "1000000",
             "--service-status", "OPEN",
@@ -622,7 +622,7 @@ def test_public_main_rejects_live_mode_before_any_side_effect(
         main(
             [
                 "--target", str(target_path),
-                "--target-config", str(ROOT / "config" / "paper_executor.json"),
+                "--target-config", str(write_target_config(tmp_path, budget="5000")),
                 "--rules", str(tmp_path / "must-not-read-rules.json"),
                 "--reference-price", "1000000",
                 "--service-status", "OPEN",
@@ -688,7 +688,7 @@ def test_public_main_rejects_expired_v2_before_any_side_effect(
             [
                 "--target", str(target_path),
                 *source_prediction_arguments(target_path),
-                "--target-config", str(ROOT / "config" / "paper_executor.json"),
+                "--target-config", str(write_target_config(tmp_path, budget="5000")),
                 "--rules", str(tmp_path / "must-not-read-rules.json"),
                 "--reference-price", "1000000",
                 "--service-status", "OPEN",
@@ -721,7 +721,7 @@ def test_public_main_rejects_v2_market_mismatch_before_any_side_effect(
             [
                 "--target", str(target_path),
                 *source_prediction_arguments(target_path),
-                "--target-config", str(ROOT / "config" / "paper_executor.json"),
+                "--target-config", str(write_target_config(tmp_path, budget="5000")),
                 "--rules", str(tmp_path / "must-not-read-rules.json"),
                 "--reference-price", "1000000",
                 "--service-status", "OPEN",
@@ -755,7 +755,7 @@ def test_cli_dry_run_offline(
         [
             "--target", str(target),
             *source_prediction_arguments(target),
-            "--target-config", str(ROOT / "config" / "paper_executor.json"),
+            "--target-config", str(write_target_config(tmp_path, budget="5000")),
             "--rules", str(rules),
             "--reference-price", "1000000",
             "--service-status", "OPEN",
@@ -940,7 +940,7 @@ def test_cli_zero_target_skips_intent(
         [
             "--target", str(target),
             *source_prediction_arguments(target),
-            "--target-config", str(ROOT / "config" / "paper_executor.json"),
+            "--target-config", str(write_target_config(tmp_path, budget="5000")),
             "--rules", str(write_rules(tmp_path)),
             "--reference-price", "1000000",
             "--service-status", "OPEN",
@@ -977,7 +977,7 @@ def test_cli_zero_target_does_not_repair_existing_partial_ledger(
         [
             "--target", str(target),
             *source_prediction_arguments(target),
-            "--target-config", str(ROOT / "config" / "paper_executor.json"),
+            "--target-config", str(write_target_config(tmp_path, budget="5000")),
             "--rules", str(write_rules(tmp_path)),
             "--reference-price", "1000000",
             "--service-status", "OPEN",

@@ -1,9 +1,9 @@
 ﻿param(
     [string]$ExecutionRepository = "C:\Users\wu_zh\dev\guvolu-exec",
-    [string]$RuntimeRoot = "D:\dev\guvolu-frozen-runtime-eth-a42aac6",
+    [string]$RuntimeRoot = "D:\dev\guvolu-frozen-runtime-eth-b-a42aac6",
     [ValidatePattern('^frozen-forward-plan-[0-9a-f]{64}$')]
-    [string]$PlanId = "frozen-forward-plan-5262e0a0139ccfd43365ef5a8266abe321f5c44c12409a9fe8828fc159ab8986",
-    [string]$Draft = "config\authorization_envelope.draft-5.json",
+    [string]$PlanId = "frozen-forward-plan-01d6ae93e571d537017be6f525d3ecddb62ff04d346e93a86f85421394425b3f",
+    [string]$Draft = "config\authorization_envelope.draft-8.json",
     [datetime]$StartUtc = "2026-09-05T00:00:00Z",
     [datetime]$EndUtc = "2026-12-31T00:00:00Z",
     [ValidateRange(1, 59)]

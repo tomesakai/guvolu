@@ -684,6 +684,10 @@ def run_search_loop(
         canonical_json(candidates.registry_payload()) + "\n",
     )
     stage_counts = _stage_counts(trial_rows, parity_rows)
+    families_raw = manifest.get("families")
+    families: Sequence[object] = (
+        families_raw if isinstance(families_raw, Sequence) else ()
+    )
     body: dict[str, object] = {
         "schema_version": LOOP_SCHEMA_VERSION,
         "loop_method_version": LOOP_METHOD_VERSION,
@@ -710,7 +714,7 @@ def run_search_loop(
         "search_result_id": manifest.get("search_result_id"),
         "family_trial_evidence": {
             str(item.get("family")): item.get("trial_evidence")
-            for item in manifest.get("families", ())
+            for item in families
             if isinstance(item, Mapping) and item.get("trial_evidence")
         },
         "cost_model": dict(cost_model),

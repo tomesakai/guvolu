@@ -13,7 +13,8 @@ from guvolu.domain.symbols import SpotSymbol
 # 绝对硬顶（T-11），修改须重启进程
 # 2026-09-01 维护者确认上调
 MAX_ORDER_JPY_CEILING = Decimal("10000")
-MAX_DAY_JPY_CEILING = Decimal("10000")
+# 2026-09-11 维护者确认单日上调
+MAX_DAY_JPY_CEILING = Decimal("30000")
 MAX_DAY_COUNT_CEILING = 50
 
 

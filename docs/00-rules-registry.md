@@ -63,6 +63,7 @@
 | docs/2026-08-27-industry-evidence-in-pipeline.md | 时效快照 | 行业稳健性证据接入研究管线：接入点、注册窗口、开关、失败关闭语义与独立审计入口定位 |
 | docs/2026-09-01-cross-venue-replication-snapshot.md | 时效快照 | 跨所与跨品种复现证据：price_breakout 同构复现、trend 场所噪声判读、XRP 反转与 median_rank 对照 |
 | docs/2026-09-03-eth-cross-symbol-replication.md | 时效快照 | ETH、XRP、SOL 跨品种预注册复现：冻结参数在 ETH 复现，trend 三品种通过统计门；搜索循环提案计入搜索试验后 DSR 不合格 |
+| docs/2026-09-11-price-gate-symbol-isolation-and-eighth-envelope.md | 时效快照 | 急变门跨品种互比误暂停的实测与修复、第八封信封取值、单日硬顶上调至 30,000 与预算 10,000 的依据 |
 | docs/2026-08-11-account-assets-capability.md | 时效快照 | GMO Coin 与 bitFlyer 私有资产接口复核 |
 | docs/2026-08-10-persistence-audit.md | 时效快照 | 持久化完整性、恢复探针与历史损坏边界审计 |
 | docs/2026-08-22-paper-executor-phase1.md | 时效快照 | paper 执行器阶段一：第 2 版执行目标、paper 成交模型、差异账与覆盖层门控记录 |

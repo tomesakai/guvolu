@@ -481,6 +481,8 @@ class PriceObservation:
 
     at: datetime
     price: Decimal
+    # 观测品种，旧状态行为空
+    symbol: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -570,9 +572,11 @@ class EnvelopeStateStore:
                 if not isinstance(item, Mapping):
                     raise EnvelopeError("price_history 项非对象")
                 try:
+                    symbol_raw = item.get("symbol")
                     history.append(PriceObservation(
                         at=datetime.fromisoformat(str(item["at"])),
                         price=Decimal(str(item["price"])),
+                        symbol=None if symbol_raw is None else str(symbol_raw),
                     ))
                 except (KeyError, ValueError, InvalidOperation) as exc:
                     raise EnvelopeError("price_history 项非法") from exc
@@ -628,7 +632,11 @@ class EnvelopeStateStore:
                 else state.day_baseline_day.isoformat()
             ),
             "price_history": [
-                {"at": row.at.isoformat(), "price": format(row.price, "f")}
+                {
+                    "at": row.at.isoformat(),
+                    "price": format(row.price, "f"),
+                    "symbol": row.symbol,
+                }
                 for row in state.price_history
             ],
             "paused_until": (
@@ -655,6 +663,7 @@ def observe_price(
     *,
     price: Decimal,
     at: datetime,
+    symbol: str | None = None,
     window_seconds: int = PRICE_HISTORY_WINDOW_SECONDS,
 ) -> EnvelopeState:
     """追加一次参考价观测并裁剪保留窗口（纯函数，C-02）。"""
@@ -663,7 +672,7 @@ def observe_price(
     horizon = at - timedelta(seconds=window_seconds)
     kept = tuple(
         row for row in state.price_history if row.at >= horizon
-    ) + (PriceObservation(at=at, price=price),)
+    ) + (PriceObservation(at=at, price=price, symbol=symbol),)
     return replace(state, price_history=kept)
 
 
@@ -672,10 +681,18 @@ def price_move_bp(
     *,
     now: datetime,
     window_seconds: int,
+    symbol: str | None = None,
 ) -> Decimal | None:
-    """窗口内参考价最大涨跌幅（基点）；观测不足返回空。"""
+    """窗口内参考价最大涨跌幅（基点）；观测不足返回空。
+
+    给出 symbol 时只比较同品种观测。信封状态跨市场共享，不同
+    品种的参考价不可互比（2026-09-11 实测 ETH 与 BTC 互比误暂停）。
+    """
     horizon = now - timedelta(seconds=window_seconds)
-    window = [row.price for row in history if row.at >= horizon]
+    window = [
+        row.price for row in history
+        if row.at >= horizon and (symbol is None or row.symbol == symbol)
+    ]
     if len(window) < 2:
         return None
     low = min(window)
@@ -690,15 +707,17 @@ def apply_price_move_gate(
     state: EnvelopeState,
     *,
     now: datetime,
+    symbol: str | None = None,
 ) -> tuple[EnvelopeState, Decimal | None]:
     """急变门：涨跌幅超阈即设定暂停截止（纯函数，C-02）。
 
     暂停期内拒发新单、允许撤单；届满自动解除，不需人工复位。
-    返回新状态与本次测得的涨跌幅。
+    返回新状态与本次测得的涨跌幅。涨跌幅只在同品种观测间计算。
     """
     pause = envelope.market_risk.price_move_pause
     move = price_move_bp(
-        state.price_history, now=now, window_seconds=pause.window_seconds
+        state.price_history, now=now, window_seconds=pause.window_seconds,
+        symbol=symbol,
     )
     if move is not None and move > pause.threshold_bp:
         return (
@@ -752,6 +771,8 @@ class GateInputs:
     spread_bp: Decimal | None = None
     opposite_depth_jpy: Decimal | None = None
     decision_time: datetime | None = None
+    # 本轮品种，急变门只比较同品种
+    symbol: str | None = None
 
 
 def _gate(
@@ -1025,7 +1046,7 @@ def evaluate_envelope_gates(
     裁决语义生效；新委托相关门仅在本轮有委托时评估。
     """
     new_state, move = apply_price_move_gate(
-        envelope, state, now=inputs.now
+        envelope, state, now=inputs.now, symbol=inputs.symbol
     )
     records: list[GateRecord] = [
         check_validity(envelope, inputs.now),
