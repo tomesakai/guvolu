@@ -28,8 +28,14 @@ if ($ExecDirty) {
     throw "执行仓工作树不干净:`n$ExecDirty"
 }
 Write-Host "== 1/6 校验草案（主仓）"
-& $Python $Verifier --envelope $DraftPath
-if ($LASTEXITCODE -ne 0) { throw "草案校验失败" }
+# 校验器按当前目录找 .env 与脚本，须在主仓内执行（与第 4 步同）
+Push-Location $RepoRoot
+try {
+    & $Python $Verifier --envelope $DraftPath
+    if ($LASTEXITCODE -ne 0) { throw "草案校验失败" }
+} finally {
+    Pop-Location
+}
 $Sha = (Get-FileHash -LiteralPath $DraftPath -Algorithm SHA256).Hash.ToLowerInvariant()
 $Sha12 = $Sha.Substring(0, 12)
 if ($DryRun) {
