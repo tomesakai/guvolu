@@ -339,9 +339,13 @@ def refresh_baselines(
     day = trading_day(now)
     if state.day_baseline_day != day:
         state = replace(state, day_baseline=snapshot, day_baseline_day=day)
+    # 保留窗口取信封急变门窗口
     runtime.state = observe_price(
         state, price=reference_price, at=now,
         symbol=str(runtime.rule.symbol),
+        window_seconds=(
+            runtime.envelope.market_risk.price_move_pause.window_seconds
+        ),
     )
 
 

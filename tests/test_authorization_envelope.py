@@ -475,6 +475,29 @@ def test_price_move_gate_compares_same_symbol_only(tmp_path: Path) -> None:
     assert all(row.symbol is None for row in store.load().price_history)
 
 
+def test_observe_price_retention_follows_window() -> None:
+    """保留窗口按调用方给出的急变门窗口裁剪，默认窗口不足一小时。"""
+    state = _cleared_state()
+    earlier = NOW - timedelta(minutes=58)
+    state = observe_price(
+        state, price=Decimal("12000000"), at=earlier, symbol="BTC",
+        window_seconds=3900,
+    )
+    kept = observe_price(
+        state, price=Decimal("12100000"), at=NOW, symbol="BTC",
+        window_seconds=3900,
+    )
+    assert [row.price for row in kept.price_history] == [
+        Decimal("12000000"), Decimal("12100000"),
+    ]
+    dropped = observe_price(
+        state, price=Decimal("12100000"), at=NOW, symbol="BTC",
+    )
+    assert [row.price for row in dropped.price_history] == [
+        Decimal("12100000"),
+    ]
+
+
 def test_loss_gates_and_precedence(tmp_path: Path) -> None:
     """亏损门语义与裁决次序：熔断优先于跳过。"""
     envelope = _load(tmp_path, _body())
