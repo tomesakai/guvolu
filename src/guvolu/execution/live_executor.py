@@ -54,6 +54,7 @@ from guvolu.domain.intent import (
     OrderIntent,
 )
 from guvolu.domain.models import Asset, Execution, Order
+from guvolu.domain.symbols import SpotSymbol
 from guvolu.execution.authorization_envelope import (
     DEFAULT_ENVELOPE_PATH,
     VERDICT_ALLOW,
@@ -65,6 +66,7 @@ from guvolu.execution.authorization_envelope import (
     EnvelopeStateStore,
     EnvelopeUsage,
     GateInputs,
+    HoldingValuation,
     OnTrip,
     ValuationBaseline,
     evaluate_envelope_gates,
@@ -222,6 +224,9 @@ class LiveRuntime:
     sleep: Callable[[float], None] = time.sleep
     read_touched: list[str] = field(default_factory=list)
     write_touched: list[str] = field(default_factory=list)
+    # 其余信封品种的最新レート与取引ルール
+    other_symbol_price: Callable[[str], Decimal] | None = None
+    other_symbol_rule: Callable[[str], MarketRule] | None = None
 
     def save_state(self) -> None:
         """状态原子覆写落盘。"""
@@ -315,6 +320,43 @@ def _asset_available(assets: Sequence[Asset], symbol: str) -> Decimal:
     return Decimal("0")
 
 
+def envelope_holdings(
+    runtime: LiveRuntime,
+    assets: Sequence[Asset],
+    reference_price: Decimal,
+) -> tuple[HoldingValuation, ...]:
+    """信封全部品种的持仓折算：主品种按参考价，其余按最新レート。
+
+    信封状态跨市场共享，亏损与持仓门必须看全部品种；其余品种有
+    持仓而取不到レート时中止本轮（不发单、不熔断）。
+    """
+    own = str(runtime.rule.symbol)
+    rows = [HoldingValuation(own, _asset_amount(assets, own), reference_price)]
+    for symbol in sorted(str(item) for item in runtime.envelope.symbols):
+        if symbol == own:
+            continue
+        amount = _asset_amount(assets, symbol)
+        if amount <= 0:
+            continue
+        if runtime.other_symbol_price is None:
+            raise LiveExecutorError(
+                f"持有 {symbol} 但无其最新レート来源，估值不可用"
+            )
+        rows.append(HoldingValuation(
+            symbol, amount, runtime.other_symbol_price(symbol)
+        ))
+    return tuple(rows)
+
+
+def holdings_value_jpy(
+    assets: Sequence[Asset], holdings: Sequence[HoldingValuation]
+) -> Decimal:
+    """JPY 加全部持仓折算。"""
+    return _asset_amount(assets, _JPY) + sum(
+        (row.amount * row.price for row in holdings), Decimal("0")
+    )
+
+
 def refresh_baselines(
     runtime: LiveRuntime,
     *,
@@ -332,6 +374,7 @@ def refresh_baselines(
         jpy_amount=_asset_amount(assets, _JPY),
         btc_amount=_asset_amount(assets, str(runtime.rule.symbol)),
         reference_price=reference_price,
+        holdings=envelope_holdings(runtime, assets, reference_price),
     )
     state = runtime.state
     if state.loss_baseline is None:
@@ -361,9 +404,11 @@ def evaluate_gates_for_plan(
 ) -> EnvelopeDecision:
     """组装门禁输入并评估，新状态写回运行时。"""
     reference_price = plan.reference_price
-    btc_amount = _asset_amount(assets, str(runtime.rule.symbol))
-    current_value = (
-        _asset_amount(assets, _JPY) + btc_amount * reference_price
+    holdings = envelope_holdings(runtime, assets, reference_price)
+    current_value = holdings_value_jpy(assets, holdings)
+    # 持仓名义按信封全部品种合计
+    position_notional = sum(
+        (row.amount * row.price for row in holdings), Decimal("0")
     )
     order_side: Side | None = None
     order_notional: Decimal | None = None
@@ -386,7 +431,7 @@ def evaluate_gates_for_plan(
         day_used_jpy=runtime.usage.day_jpy(day),
         day_order_count=runtime.usage.day_count(day),
         current_value_jpy=current_value,
-        position_notional_jpy=btc_amount * reference_price,
+        position_notional_jpy=position_notional,
         order_side=order_side,
         order_notional_jpy=order_notional,
         spread_bp=spread_bp,
@@ -726,23 +771,28 @@ def flatten_position(
     *,
     reference_price: Decimal,
     now: datetime,
+    rule: MarketRule | None = None,
 ) -> dict[str, object]:
     """市价卖出全部现物持仓（cancel_and_flatten 的清仓步）。
 
     清仓豁免信封额度门但仍记录用量与证据；意图同样先落盘
     （T-05），发送异常按 T-06 分类落账，绝不重发。数量取撤单后
     可用量向下取整到 sizeStep；服务状态非 OPEN 时不发送市价单
-    （R-03 清仓非撤单，无 T-07 豁免），留待人工处置。
+    （R-03 清仓非撤单，无 T-07 豁免），留待人工处置。rule 缺省
+    为本轮品种，其余信封品种由 execute_on_trip 逐个传入。
     """
+    if rule is None:
+        rule = runtime.rule
     assets = runtime.reader.assets()
     runtime.read_touched.append(ASSETS_ENDPOINT)
-    available = _asset_available(assets, str(runtime.rule.symbol))
-    size = (available // runtime.rule.size_step) * runtime.rule.size_step
+    available = _asset_available(assets, str(rule.symbol))
+    size = (available // rule.size_step) * rule.size_step
     payload: dict[str, object] = {
+        "symbol": str(rule.symbol),
         "available": format(available, "f"),
         "size": format(size, "f"),
     }
-    if size < runtime.rule.min_order_size:
+    if size < rule.min_order_size:
         payload["status"] = "skipped"
         payload["reason"] = "持仓低于最小委托量，无需清仓"
         return payload
@@ -754,7 +804,7 @@ def flatten_position(
         )
         return payload
     lock = acquire_symbol_inflight_lock(
-        runtime.rule.symbol, directory=runtime.inflight_dir
+        rule.symbol, directory=runtime.inflight_dir
     )
     if lock is None:
         payload["status"] = "lock_unavailable"
@@ -763,7 +813,7 @@ def flatten_position(
     intent = OrderIntent(
         intent_id=new_intent_id(),
         correlation_id=new_correlation_id(),
-        symbol=runtime.rule.symbol,
+        symbol=rule.symbol,
         side=Side.SELL,
         execution_type=ExecutionType.MARKET,
         size=size,
@@ -886,6 +936,31 @@ def execute_on_trip(
         payload["flatten"] = flatten_position(
             runtime, reference_price=reference_price, now=now
         )
+        # 信封是风险单元，其余品种持仓一并清仓
+        others: dict[str, object] = {}
+        own = str(runtime.rule.symbol)
+        assets = runtime.reader.assets()
+        runtime.read_touched.append(ASSETS_ENDPOINT)
+        for symbol in sorted(str(item) for item in runtime.envelope.symbols):
+            if symbol == own or _asset_available(assets, symbol) <= 0:
+                continue
+            if (
+                runtime.other_symbol_rule is None
+                or runtime.other_symbol_price is None
+            ):
+                others[symbol] = {
+                    "status": "skipped",
+                    "reason": "无该品种取引ルール或レート来源，留待人工处置",
+                }
+                continue
+            others[symbol] = flatten_position(
+                runtime,
+                reference_price=runtime.other_symbol_price(symbol),
+                now=now,
+                rule=runtime.other_symbol_rule(symbol),
+            )
+        if others:
+            payload["flatten_others"] = others
     runtime.state = replace(
         runtime.state, tripped_at=now, trip_reason=reason
     )
@@ -1397,6 +1472,24 @@ def _run_live_main(
         """全量撤单动作（T-07）。"""
         return kill_switch.cancel_all(get_public(), trade)
 
+    price_cache: dict[str, Decimal] = {}
+
+    def other_symbol_price(other: str) -> Decimal:
+        """其余信封品种最新レート，一轮内只取一次。"""
+        if other not in price_cache:
+            rows = get_public().ticker(other)
+            read_touched.append(TICKER_ENDPOINT)
+            if not rows:
+                raise LiveExecutorError(f"公开端点无品种 {other} 的最新レート")
+            price_cache[other] = rows[0].last
+        return price_cache[other]
+
+    def other_symbol_rule(other: str) -> MarketRule:
+        """其余信封品种取引ルール（清仓用）。"""
+        found = fetch_market_rule(get_public(), SpotSymbol(other))
+        read_touched.append(SYMBOLS_ENDPOINT)
+        return found
+
     runtime = LiveRuntime(
         config=config,
         envelope=envelope,
@@ -1419,6 +1512,8 @@ def _run_live_main(
             basis=PUBLIC_ORDERBOOK_BASIS,
         ),
         read_touched=read_touched,
+        other_symbol_price=other_symbol_price,
+        other_symbol_rule=other_symbol_rule,
     )
     assets_before = reader.assets()
     runtime.read_touched.append(ASSETS_ENDPOINT)
@@ -1445,10 +1540,17 @@ def _run_live_main(
     )
     assets_after = reader.assets()
     runtime.read_touched.append(ASSETS_ENDPOINT)
-    after_value = (
-        _asset_amount(assets_after, _JPY)
-        + _asset_amount(assets_after, str(symbol)) * reference_price
-    )
+    try:
+        after_value = holdings_value_jpy(
+            assets_after,
+            envelope_holdings(runtime, assets_after, reference_price),
+        )
+    except (LiveExecutorError, GmoApiError, ApiNetworkError):
+        # 取价失败时退回主品种口径
+        after_value = (
+            _asset_amount(assets_after, _JPY)
+            + _asset_amount(assets_after, str(symbol)) * reference_price
+        )
     report: dict[str, object] = {
         "schema_version": 1,
         "kind": "live_execution_report",

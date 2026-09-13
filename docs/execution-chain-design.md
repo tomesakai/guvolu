@@ -352,10 +352,10 @@ PowerShell 包装 `scripts/run_execution_soak.ps1`）把第 9 节的单轮逻辑
 | `order_jpy_max` | 单笔名义上限，不得超过 T-11 硬顶 | 拒单 |
 | `day_jpy_max` / `day_count_max` | 当日累计额与笔数，不得超过 T-11 硬顶 | 熔断（T-11） |
 | `envelope_jpy_total` | 信封生命周期累计下单总额 | 耗尽即停机 |
-| `max_position_jpy` | 多头持仓名义上限 | 拒绝加仓 |
-| `max_cumulative_loss_jpy` | 信封内已实现加浮动亏损熔断线 | 熔断并执行 `on_trip` |
+| `max_position_jpy` | 多头持仓名义上限，按信封全部品种合计（2026-09-13 起） | 拒绝加仓 |
+| `max_cumulative_loss_jpy` | 信封内已实现加浮动亏损熔断线；估值计入信封全部品种持仓，其余品种按公开端点最新レート折算（2026-09-13 起，见[当日快照](2026-09-13-cross-market-valuation-trip-and-empty-head-recovery.md)） | 熔断并执行 `on_trip` |
 | `breaker` | 连续写失败、断流秒数、资产异动比例与下限 | 熔断（R-02） |
-| `on_trip` | `cancel_only` 或 `cancel_and_flatten` | 熔断动作 |
+| `on_trip` | `cancel_only` 或 `cancel_and_flatten`；清仓覆盖信封全部有持仓的品种（2026-09-13 起） | 熔断动作 |
 | `day_loss_jpy_max` | 当日已实现加浮动亏损熔断线 | 当日停机 |
 | `canary_first_order_jpy_max` | 信封首单名义上限（T-12 最小手数级），首单终态且双通道对账通过后解除 | 首单拒超 |
 | 减仓豁免 | 卖出减仓单豁免 `envelope_total`、`day_jpy_max`、`day_count_max`、`order_jpy_max` 与首单 canary 四类额度门（退出永远可达，R-01）；点差、深度、亏损与陈旧门仍生效，T-11 硬顶仍在发送编排内计量 | 不适用 |

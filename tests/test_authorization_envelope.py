@@ -475,6 +475,34 @@ def test_price_move_gate_compares_same_symbol_only(tmp_path: Path) -> None:
     assert all(row.symbol is None for row in store.load().price_history)
 
 
+def test_baseline_holdings_round_trip_and_legacy(tmp_path: Path) -> None:
+    """基线持仓明细往返保留；旧状态文件无明细时按主品种折算。"""
+    from guvolu.execution.authorization_envelope import HoldingValuation
+
+    baseline = ValuationBaseline(
+        at=NOW, jpy_amount=Decimal("1000"), btc_amount=Decimal("0.0001"),
+        reference_price=Decimal("12000000"),
+        holdings=(
+            HoldingValuation("BTC", Decimal("0.0001"), Decimal("12000000")),
+            HoldingValuation("ETH", Decimal("0.01"), Decimal("400000")),
+        ),
+    )
+    assert baseline.value_jpy() == Decimal("1000") + Decimal("1200") + Decimal("4000")
+    store = EnvelopeStateStore(tmp_path / "state.json")
+    store.save(EnvelopeState(loss_baseline=baseline))
+    loaded = store.load().loss_baseline
+    assert loaded is not None
+    assert loaded.holdings == baseline.holdings
+    assert loaded.value_jpy() == baseline.value_jpy()
+    legacy = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+    del legacy["loss_baseline"]["holdings"]
+    (tmp_path / "state.json").write_text(json.dumps(legacy), encoding="utf-8")
+    old = store.load().loss_baseline
+    assert old is not None
+    assert old.holdings == ()
+    assert old.value_jpy() == Decimal("1000") + Decimal("1200")
+
+
 def test_observe_price_retention_follows_window() -> None:
     """保留窗口按调用方给出的急变门窗口裁剪，默认窗口不足一小时。"""
     state = _cleared_state()

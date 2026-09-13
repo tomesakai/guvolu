@@ -241,6 +241,33 @@ def run_paper_step(
     return paper
 
 
+def retire_empty_heads(data_root: Path, market_id: str) -> int | None:
+    """撤销本轮市场零行实时段的活动指针，使冻结路径唯一。
+
+    零行 Parquet 内容寻址后共用同一制品，两个以上零行段头会使
+    面板冻结的逐文件控制合同失败（2026-09-12 实测）。生产采集链
+    的运维副本没有合并步，这里在刷新运行根前自愈。控制库缺失或
+    取不到写锁时返回空，不中断本轮。
+    """
+    if not (data_root / "guvolu.sqlite3").is_file():
+        return None
+    from guvolu.data import store
+    from guvolu.data.sqlite_writer_lock import sqlite_writer_lock
+    from guvolu.data.trade_realtime_compact import retire_empty_segment_heads
+
+    try:
+        conn = store.connect(data_root)
+    except TimeoutError:
+        return None
+    try:
+        with sqlite_writer_lock(data_root, timeout_seconds=30.0):
+            return retire_empty_segment_heads(conn, market_id)
+    except TimeoutError:
+        return None
+    finally:
+        conn.close()
+
+
 def run_shadow(
     repository: Path,
     runtime_root: Path,
@@ -269,6 +296,7 @@ def run_shadow(
     execution = execution_repository.resolve()
     task_log = execution / "data/execution/shadow/frozen-forward/task.jsonl"
     try:
+        retired_empty_heads = retire_empty_heads(source_root / "data", market_id)
         stale_retries = 0
         while True:
             refresh = refresh_runtime(source_root / "data", runtime, market_id)
@@ -363,6 +391,7 @@ def run_shadow(
             "market_id": market_id,
             "symbol": symbol,
             "target_config": target_config,
+            "retired_empty_heads": retired_empty_heads,
             "intent_state": (
                 None if report.get("intent") is None
                 else _object(report["intent"], "intent").get("state")

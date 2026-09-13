@@ -144,7 +144,7 @@ mixed 与 unavailable 六桶。桶内只发布成本后 log-return 贡献、观�
 vintage 起点；合格候选是否进入后继冻结计划仍由维护者决定（A-05）。静态快照的做法
 见 [runtime-ops.md](runtime-ops.md) 第 8 节。
 
-仍未修正、列为后续工作的项：embargo（24 柱）小于最长特征回看窗且无测试后清洗；
+仍未修正、列为后续工作的项：embargo（24 柱）小于最长特征回看窗且无测试后清洗（提到 168 柱的四品种消融见 [2026-09-11 快照](2026-09-11-embargo-168-ablation-and-cross-symbol-admission.md)，影响很小，基线配置未改）；
 PSR 与 FDR 把小时收益按独立样本计数；成本模型未由真实成交校准，冲击不随名义额
 变化；`median_rank` 模式弱于 PBO 硬门且在密网格失败后引入；奇偶校验子集按 Sharpe
 截取前 256 名存在选择偏差。

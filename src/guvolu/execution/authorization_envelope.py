@@ -457,16 +457,36 @@ class EnvelopeUsage:
 
 
 @dataclass(frozen=True, slots=True)
+class HoldingValuation:
+    """一个品种的持仓数量与折算价。"""
+
+    symbol: str
+    amount: Decimal
+    price: Decimal
+
+
+@dataclass(frozen=True, slots=True)
 class ValuationBaseline:
-    """资产估值快照：JPY 与 BTC 数量及当时参考价。"""
+    """资产估值快照：JPY、主品种数量、参考价与全部品种持仓折算。
+
+    信封状态跨市场共享，估值必须计入信封全部品种的持仓；只计
+    主品种会把另一市场的买入误判为亏损（2026-09-11 实测误熔断）。
+    holdings 为空时退回主品种口径，兼容旧状态文件。
+    """
 
     at: datetime
     jpy_amount: Decimal
     btc_amount: Decimal
     reference_price: Decimal
+    holdings: tuple[HoldingValuation, ...] = ()
 
     def value_jpy(self, reference_price: Decimal | None = None) -> Decimal:
-        """按参考价折算估值，缺省用快照当时参考价。"""
+        """按持仓折算估值；无持仓明细时按主品种参考价折算。"""
+        if self.holdings:
+            return self.jpy_amount + sum(
+                (row.amount * row.price for row in self.holdings),
+                Decimal("0"),
+            )
         price = (
             reference_price
             if reference_price is not None
@@ -503,7 +523,7 @@ class EnvelopeState:
 
 def _baseline_payload(
     baseline: ValuationBaseline | None,
-) -> dict[str, str] | None:
+) -> dict[str, object] | None:
     if baseline is None:
         return None
     return {
@@ -511,6 +531,14 @@ def _baseline_payload(
         "jpy_amount": format(baseline.jpy_amount, "f"),
         "btc_amount": format(baseline.btc_amount, "f"),
         "reference_price": format(baseline.reference_price, "f"),
+        "holdings": [
+            {
+                "symbol": row.symbol,
+                "amount": format(row.amount, "f"),
+                "price": format(row.price, "f"),
+            }
+            for row in baseline.holdings
+        ],
     }
 
 
@@ -520,11 +548,25 @@ def _baseline_from(value: object, name: str) -> ValuationBaseline | None:
     if not isinstance(value, Mapping):
         raise EnvelopeError(f"状态字段 {name} 非对象")
     try:
+        holdings_raw = value.get("holdings")
+        holdings: list[HoldingValuation] = []
+        if holdings_raw is not None:
+            if not isinstance(holdings_raw, list):
+                raise EnvelopeError(f"状态字段 {name}.holdings 非列表")
+            for item in holdings_raw:
+                if not isinstance(item, Mapping):
+                    raise EnvelopeError(f"状态字段 {name}.holdings 项非对象")
+                holdings.append(HoldingValuation(
+                    symbol=str(item["symbol"]),
+                    amount=Decimal(str(item["amount"])),
+                    price=Decimal(str(item["price"])),
+                ))
         return ValuationBaseline(
             at=datetime.fromisoformat(str(value["at"])),
             jpy_amount=Decimal(str(value["jpy_amount"])),
             btc_amount=Decimal(str(value["btc_amount"])),
             reference_price=Decimal(str(value["reference_price"])),
+            holdings=tuple(holdings),
         )
     except (KeyError, ValueError, InvalidOperation) as exc:
         raise EnvelopeError(f"状态字段 {name} 取值非法") from exc

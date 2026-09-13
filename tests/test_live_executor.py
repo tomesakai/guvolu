@@ -56,6 +56,15 @@ RULE = MarketRule(
     min_order_size=Decimal("0.00001"),
     max_order_size=Decimal("5"),
 )
+ETH = SpotSymbol("ETH")
+ETH_PRICE = Decimal("400000")
+RULE_ETH = MarketRule(
+    symbol=ETH,
+    tick_size=Decimal("1"),
+    size_step=Decimal("0.0001"),
+    min_order_size=Decimal("0.0001"),
+    max_order_size=Decimal("100"),
+)
 
 
 def _envelope_body() -> dict[str, object]:
@@ -199,9 +208,9 @@ def _execution(order_id: int, size: Decimal) -> Execution:
 
 
 def _assets(
-    jpy: str = "100000", btc: str = "0"
+    jpy: str = "100000", btc: str = "0", eth: str | None = None
 ) -> tuple[Asset, ...]:
-    return (
+    rows = [
         Asset(
             amount=Decimal(jpy),
             available=Decimal(jpy),
@@ -214,7 +223,15 @@ def _assets(
             conversion_rate=PRICE,
             symbol="BTC",
         ),
-    )
+    ]
+    if eth is not None:
+        rows.append(Asset(
+            amount=Decimal(eth),
+            available=Decimal(eth),
+            conversion_rate=ETH_PRICE,
+            symbol="ETH",
+        ))
+    return tuple(rows)
 
 
 class _Reader:
@@ -544,6 +561,105 @@ def test_trip_cancel_and_flatten_order(tmp_path: Path) -> None:
     persisted = runtime.state_store.load()
     assert persisted.tripped_at is not None
     assert "POST /v1/cancelBulkOrder" in runtime.write_touched
+
+
+def test_cross_symbol_holdings_enter_loss_valuation(tmp_path: Path) -> None:
+    """亏损估值计入信封全部品种持仓：另一市场买入不算亏损。"""
+    from dataclasses import replace
+
+    reader = _Reader(assets=_assets(jpy="100000", btc="0", eth="0.01"))
+    sender = _Sender([])
+    runtime = _runtime(
+        tmp_path, reader=reader, sender=sender, state=_cleared_state()
+    )
+    runtime.envelope = replace(
+        runtime.envelope, symbols=frozenset({BTC, ETH})
+    )
+    runtime.other_symbol_price = lambda symbol: ETH_PRICE
+    plan = build_plan(
+        _artifact(0.0), rule=RULE, reference_price=PRICE,
+        budget_jpy=Decimal("500"),
+    )
+    exit_code, _ = run_live_cycle(
+        runtime, plan,
+        assets=reader.assets(),
+        price_observed_at=NOW,
+        book=_book(),
+        cancel_all=lambda: 0,
+        now=NOW,
+    )
+    assert exit_code == EXIT_OK
+    baseline = runtime.state.loss_baseline
+    assert baseline is not None
+    assert baseline.value_jpy() == Decimal("100000") + Decimal("0.01") * ETH_PRICE
+    # 另一市场买入，估值不变
+    later = NOW + timedelta(hours=1)
+    reader._assets = _assets(jpy="88000", btc="0", eth="0.04")
+    exit_code, fragment = run_live_cycle(
+        runtime, plan,
+        assets=reader.assets(),
+        price_observed_at=later,
+        book=_book(),
+        cancel_all=lambda: 0,
+        now=later,
+    )
+    assert exit_code == EXIT_OK
+    # 目标为零本轮跳过，但亏损门必须通过
+    assert fragment["gate_verdict"] == "skip"
+    gates = {row["name"]: row for row in fragment["gates"]}
+    assert gates["cumulative_loss"]["passed"] is True
+    assert gates["day_loss"]["passed"] is True
+    assert runtime.state.tripped_at is None
+    # 状态文件保留持仓明细
+    persisted = runtime.state_store.load().loss_baseline
+    assert persisted is not None
+    assert [row.symbol for row in persisted.holdings] == ["BTC", "ETH"]
+
+
+def test_trip_flattens_every_envelope_symbol(tmp_path: Path) -> None:
+    """熔断清仓覆盖信封全部品种，不只本轮品种。"""
+    from dataclasses import replace
+
+    events: list[str] = []
+    reader = _Reader(
+        assets=_assets(jpy="1000", btc="0.000216", eth="0.01234")
+    )
+    sender = _Sender(events)
+    runtime = _runtime(
+        tmp_path, reader=reader, sender=sender, state=_cleared_state()
+    )
+    runtime.envelope = replace(
+        runtime.envelope, symbols=frozenset({BTC, ETH})
+    )
+    runtime.other_symbol_price = lambda symbol: ETH_PRICE
+    runtime.other_symbol_rule = lambda symbol: RULE_ETH
+    plan = build_plan(
+        _artifact(), rule=RULE, reference_price=PRICE,
+        budget_jpy=Decimal("500"),
+    )
+    exit_code, fragment = run_live_cycle(
+        runtime, plan,
+        assets=reader.assets(),
+        price_observed_at=NOW - timedelta(seconds=120),
+        book=_book(),
+        cancel_all=lambda: events.append("cancel_all") or 0,
+        now=NOW,
+    )
+    assert exit_code == EXIT_ANOMALY
+    assert events == ["cancel_all", "send:MARKET", "send:MARKET"]
+    trip = fragment["trip"]
+    assert isinstance(trip, dict)
+    flatten = trip["flatten"]
+    assert isinstance(flatten, dict)
+    assert flatten["symbol"] == "BTC" and flatten["size"] == "0.00021"
+    others = trip["flatten_others"]
+    assert isinstance(others, dict)
+    eth_result = others["ETH"]
+    assert isinstance(eth_result, dict)
+    assert eth_result["status"] == "accepted"
+    assert eth_result["size"] == "0.0123"
+    assert {str(intent.symbol) for intent in sender.sent} == {"BTC", "ETH"}
+    assert all(intent.side is Side.SELL for intent in sender.sent)
 
 
 def test_trip_cancel_only_skips_flatten(tmp_path: Path) -> None:
