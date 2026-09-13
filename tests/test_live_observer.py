@@ -228,6 +228,17 @@ def test_scheduler_health_flags_consecutive_failures_and_silence(
     assert none_health == {} and none_alerts == []
 
 
+def test_toast_script_escapes_markup_and_quotes() -> None:
+    """通知脚本把标记与单引号转义后嵌入，不会破坏 XML 或 PowerShell 串。"""
+    from guvolu.execution.live_observer import toast_script
+
+    script = toast_script("a<b & c'd", "line 'x' > y")
+    assert "&lt;b &amp; c''d" in script
+    assert "line ''x'' &gt; y" in script
+    assert script.count("LoadXml('") == 1
+    assert "CreateToastNotifier('{1AC14E77" in script
+
+
 def test_quiet_cycle_reports_ok(tmp_path: Path) -> None:
     """无挂单、无在途、无持仓超限时零告警。"""
     cycle = observe_once(

@@ -47,7 +47,7 @@
 
 ## 5. 同日补记：链路健康告警
 
-观察进程新增每小时链路健康监视：给出 `--scheduler-log`（主仓 `logs/research/frozen-forward/live-scheduler.jsonl`）时，按市场统计最近轮次，同一市场连续 3 轮未完成（进程失败或 live 拒绝）或超过 130 分钟无轮次即告警；告警集合变化时经 `msg.exe` 向当前登录会话弹出一次桌面消息，启动时弹出一次确认。观察任务已以 `-SchedulerLog` 重新登记并重启。阈值为命令行参数（G-06）。
+观察进程新增每小时链路健康监视：给出 `--scheduler-log`（主仓 `logs/research/frozen-forward/live-scheduler.jsonl`）时，按市场统计最近轮次，同一市场连续 3 轮未完成（进程失败或 live 拒绝）或超过 130 分钟无轮次即告警；告警集合变化时弹出一次系统通知（经 Windows PowerShell 5.1 的 WinRT toast，进通知中心，用户离开后仍可见；失败退回 `msg.exe` 发给当前用户会话，发给 Console 会话会被拒绝），启动时弹出一次确认。观察任务已以 `-SchedulerLog` 重新登记并重启。阈值为命令行参数（G-06）。
 
 ## 6. 教训
 

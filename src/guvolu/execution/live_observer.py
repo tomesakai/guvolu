@@ -18,6 +18,7 @@ SEND_TIMEOUT）、持仓名义超信封上限、信封熔断或暂停状态，�
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
 import shutil
@@ -169,24 +170,89 @@ def scan_scheduler_health(
     return health, alerts
 
 
+# 通知应用标识
+_TOAST_APP_ID = (
+    "{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}"
+    "\\WindowsPowerShell\\v1.0\\powershell.exe"
+)
+
+
+def _xml_text(text: str) -> str:
+    """转义为 XML 文本节点，并把单引号加倍以嵌入 PowerShell 单引号串。"""
+    return (
+        text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        .replace("'", "''")
+    )
+
+
+def toast_script(title: str, body: str) -> str:
+    """生成经 WinRT 弹出系统通知的 Windows PowerShell 脚本。"""
+    xml = (
+        '<toast duration="long"><visual><binding template="ToastGeneric">'
+        f"<text>{_xml_text(title)}</text><text>{_xml_text(body)}</text>"
+        "</binding></visual></toast>"
+    )
+    return "\n".join((
+        "$ErrorActionPreference = 'Stop'",
+        "[Windows.UI.Notifications.ToastNotificationManager, "
+        "Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null",
+        "[Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, "
+        "ContentType = WindowsRuntime] | Out-Null",
+        "$xml = New-Object Windows.Data.Xml.Dom.XmlDocument",
+        f"$xml.LoadXml('{xml}')",
+        "$toast = New-Object Windows.UI.Notifications.ToastNotification $xml",
+        "[Windows.UI.Notifications.ToastNotificationManager]"
+        f"::CreateToastNotifier('{_TOAST_APP_ID}').Show($toast)",
+    ))
+
+
+def _windows_powershell() -> str | None:
+    """Windows PowerShell 5.1 路径；WinRT 投影只在该版本可用。"""
+    candidate = (
+        Path(os.environ.get("SystemRoot", ""))
+        / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    )
+    if candidate.is_file():
+        return str(candidate)
+    return shutil.which("powershell")
+
+
 def notify_desktop(text: str, *, seconds: int = DESKTOP_NOTICE_SECONDS) -> bool:
-    """经 msg.exe 向当前登录会话弹出消息；失败只返回假，不抛出。"""
+    """向当前用户弹出系统通知；失败只返回假，不抛出。
+
+    首选 WinRT toast（进通知中心，用户离开时也能事后看到），
+    退回 msg.exe 发给当前用户会话（发给 Console 会话会被拒绝）。
+    """
+    title, _, body = text.partition("\n")
+    powershell = _windows_powershell()
+    if powershell is not None:
+        encoded = base64.b64encode(
+            toast_script(title[:120], (body or title)[:900]).encode("utf-16-le")
+        ).decode("ascii")
+        try:
+            result = subprocess.run(
+                [
+                    powershell, "-NoProfile", "-NonInteractive",
+                    "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded,
+                ],
+                check=False, capture_output=True, timeout=30,
+            )
+            if result.returncode == 0:
+                return True
+        except (OSError, subprocess.SubprocessError):
+            pass
     executable = shutil.which("msg")
-    if executable is None:
-        candidate = (
-            Path(os.environ.get("SystemRoot", "")) / "System32" / "msg.exe"
-        )
-        if not candidate.is_file():
-            return False
-        executable = str(candidate)
+    user = os.environ.get("USERNAME")
+    if executable is None or not user:
+        return False
     try:
         result = subprocess.run(
-            [executable, "*", f"/TIME:{seconds}", text[:900]],
+            [executable, user, f"/TIME:{seconds}", text[:900]],
             check=False, capture_output=True, timeout=15,
         )
     except (OSError, subprocess.SubprocessError):
         return False
-    return result.returncode == 0
+    return result.returncode == 0 and not result.stderr
 
 
 def _btc_amount(assets: Sequence[Asset], symbol: str) -> Decimal:
