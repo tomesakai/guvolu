@@ -11,10 +11,9 @@ from guvolu.domain.errors import ConfigError
 from guvolu.domain.symbols import SpotSymbol
 
 # 绝对硬顶（T-11），修改须重启进程
-# 2026-09-01 维护者确认上调
-MAX_ORDER_JPY_CEILING = Decimal("10000")
-# 2026-09-11 维护者确认单日上调
-MAX_DAY_JPY_CEILING = Decimal("30000")
+# 2026-09-14 维护者确认按本金线性放量
+MAX_ORDER_JPY_CEILING = Decimal("15000")
+MAX_DAY_JPY_CEILING = Decimal("45000")
 MAX_DAY_COUNT_CEILING = 50
 
 

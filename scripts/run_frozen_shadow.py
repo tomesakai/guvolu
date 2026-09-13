@@ -276,7 +276,7 @@ def run_shadow(
     market_id: str,
     *,
     symbol: str = "BTC",
-    budget_jpy: str = "10000",
+    budget_jpy: str = "15000",
     max_prediction_age_minutes: int = DEFAULT_MAX_PREDICTION_AGE_MINUTES,
     paper_enabled: bool = True,
     target_config: str = PAPER_CONFIG,
@@ -421,7 +421,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--plan-id", required=True)
     parser.add_argument("--market-id", default="mkt__gmo__btc__r0")
     parser.add_argument("--symbol", default="BTC")
-    parser.add_argument("--budget-jpy", default="10000")
+    parser.add_argument("--budget-jpy", default="15000")
     parser.add_argument(
         "--max-prediction-age-minutes", type=int,
         default=DEFAULT_MAX_PREDICTION_AGE_MINUTES,

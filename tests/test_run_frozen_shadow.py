@@ -174,7 +174,7 @@ def test_chain_runs_paper_after_dry_run_and_records_fields(chain: FakeChain) -> 
     assert [_option(call, "--mode") for call in adapters] == ["dry-run", "paper"]
     config = str(chain.execution / "config/paper_executor.json")
     assert all(_option(call, "--config") == config for call in adapters)
-    assert _option(adapters[0], "--risk-budget-jpy") == "10000"
+    assert _option(adapters[0], "--risk-budget-jpy") == "15000"
     assert _option(adapters[1], "--risk-budget-jpy") is None
     assert paper["target_path"] != summary["target_path"]
     assert Path(str(paper["target_path"])).name == "target-paper.json"

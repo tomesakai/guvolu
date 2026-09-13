@@ -66,6 +66,7 @@
 | docs/2026-09-11-price-gate-symbol-isolation-and-eighth-envelope.md | 时效快照 | 急变门跨品种互比误暂停的实测与修复、第八封信封取值、单日硬顶上调至 30,000 与预算 10,000 的依据 |
 | docs/2026-09-11-embargo-168-ablation-and-cross-symbol-admission.md | 时效快照 | embargo 由 24 提到 168 的四品种消融、全流派范围下 breakout 家族在 BTC 与 ETH 通过、多品种联合准入汇总脚本与每周成本汇总任务 |
 | docs/2026-09-13-cross-market-valuation-trip-and-empty-head-recovery.md | 时效快照 | 首两笔 ETH 实盘成交、估值只计本轮品种导致的误熔断与修复、零行实时段头共用制品导致 ETH 预测失败的根因与恢复、第十封信封 |
+| docs/2026-09-14-stage-one-scaling-admission-grid-and-funding-plan.md | 时效快照 | 第一阶段按本金线性放量（硬顶 15,000 / 45,000、预算 15,000、第十一封）、四市场两成本模型的一次性准入网格、分阶段入金计划 |
 | docs/2026-08-11-account-assets-capability.md | 时效快照 | GMO Coin 与 bitFlyer 私有资产接口复核 |
 | docs/2026-08-10-persistence-audit.md | 时效快照 | 持久化完整性、恢复探针与历史损坏边界审计 |
 | docs/2026-08-22-paper-executor-phase1.md | 时效快照 | paper 执行器阶段一：第 2 版执行目标、paper 成交模型、差异账与覆盖层门控记录 |
