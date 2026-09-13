@@ -5,6 +5,7 @@
     [int]$IntervalSeconds = 60,
     [ValidateRange(1, 60)]
     [int]$GuardMinutes = 5,
+    [string]$SchedulerLog = "",
     [switch]$DescribeOnly
 )
 # 上膛协议（执行链设计第 14 节）：本脚本由维护者亲自执行注册，
@@ -24,12 +25,18 @@ $Arguments = (
     "-File `"$Runner`" -Repository `"$Execution`" " +
     "-IntervalSeconds $IntervalSeconds"
 )
+# 每小时链路健康监视：调度日志绝对路径随任务参数固化
+if ($SchedulerLog) {
+    $ResolvedLog = (Resolve-Path -LiteralPath $SchedulerLog).Path
+    $Arguments += " -SchedulerLog `"$ResolvedLog`""
+}
 $Definition = [ordered]@{
     task_names = $TaskNames
     execute = "powershell.exe"
     arguments = $Arguments
     working_directory = $Execution
     interval_seconds = $IntervalSeconds
+    scheduler_log = $SchedulerLog
     guard_minutes = $GuardMinutes
     multiple_instances = "IgnoreNew"
     execution_time_limit_minutes = 0

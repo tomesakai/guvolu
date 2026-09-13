@@ -7,15 +7,21 @@ live 执行器每小时一轮 REST 闭环，两轮之间没有进程监视在途
 行、绝不隔离或截断，避免与执行器的单写边界冲突（T-05）。
 
 每轮告警判定：超龄在途挂单、卡滞在途意图（SENDING 或
-SEND_TIMEOUT）、持仓名义超信封上限、信封熔断或暂停状态。
-观察逐轮追加 JSONL 并写心跳文件；发现告警只留痕与提示，
-处置动作留给人工（kill-switch 见 scripts/run_kill_switch.ps1）。
+SEND_TIMEOUT）、持仓名义超信封上限、信封熔断或暂停状态，以及
+每小时链路健康（给出调度日志时：某市场连续多轮未完成或长时间
+无轮次，2026-09-12 至 13 实测 ETH 链静默失败 83 轮无人知晓）。
+观察逐轮追加 JSONL 并写心跳文件；发现告警只留痕与提示，并在
+告警集合变化时经桌面消息（msg.exe）通知一次，处置动作留给人工
+（kill-switch 见 scripts/run_kill_switch.ps1）。
 命令行入口即本模块；--once 单轮运行，有告警退出码 1。
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
+import subprocess
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -52,8 +58,135 @@ STOP_FILE_RELATIVE_PATH = LIVE_RELATIVE_DIR / "observer.stop"
 # 执行器一轮的等待与撤单确认加余量
 DEFAULT_STALE_AGE_SECONDS = 420.0
 DEFAULT_INTERVAL_SECONDS = 60.0
+# 链路健康阈值
+DEFAULT_SCHEDULER_FAILURE_LIMIT = 3
+DEFAULT_SCHEDULER_SILENCE_SECONDS = 7800.0
+# 桌面消息显示秒数
+DESKTOP_NOTICE_SECONDS = 600
 # JPY 资产键名
 _JPY = "JPY"
+# 无市场标识时的主市场标签
+_PRIMARY_MARKET = "primary"
+
+
+def _scheduler_rows(log_path: Path) -> list[Mapping[str, object]]:
+    """宽容读取调度日志：只取完整 JSON 行，忽略 BOM 与坏行。"""
+    if not log_path.is_file():
+        return []
+    rows: list[Mapping[str, object]] = []
+    with log_path.open("r", encoding="utf-8-sig", errors="replace") as handle:
+        for line in handle:
+            text = line.strip().lstrip("﻿")
+            if not text:
+                continue
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, Mapping):
+                rows.append(parsed)
+    return rows
+
+
+def _round_outcome(row: Mapping[str, object]) -> tuple[bool, str]:
+    """一轮调度记录归类为完成或未完成，附简短原因。"""
+    output = str(row.get("output") or "")
+    summary: Mapping[str, object] = {}
+    for line in reversed(output.strip().splitlines()):
+        text = line.strip()
+        if text.startswith("{"):
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, Mapping):
+                summary = parsed
+            break
+    live = summary.get("live")
+    live_status = (
+        str(live.get("status")) if isinstance(live, Mapping) else None
+    )
+    exit_code = row.get("exit_code")
+    if exit_code == 0 and live_status in ("completed", "reused"):
+        return True, live_status
+    if live_status is not None:
+        return False, f"live {live_status}"
+    tail = [line for line in output.strip().splitlines() if line.strip()]
+    reason = tail[-1].strip() if tail else f"exit {exit_code}"
+    return False, reason[:80]
+
+
+def scan_scheduler_health(
+    log_path: Path,
+    *,
+    now: datetime,
+    failure_limit: int = DEFAULT_SCHEDULER_FAILURE_LIMIT,
+    silence_seconds: float = DEFAULT_SCHEDULER_SILENCE_SECONDS,
+) -> tuple[dict[str, dict[str, object]], list[str]]:
+    """按市场检查每小时链路：连续未完成或长时间无轮次即告警（纯函数）。"""
+    by_market: dict[str, list[Mapping[str, object]]] = {}
+    for row in _scheduler_rows(log_path):
+        market = str(row.get("market_id") or "") or _PRIMARY_MARKET
+        by_market.setdefault(market, []).append(row)
+    health: dict[str, dict[str, object]] = {}
+    alerts: list[str] = []
+    for market, rows in sorted(by_market.items()):
+        rows.sort(key=lambda item: str(item.get("started_at") or ""))
+        recent = rows[-failure_limit:]
+        outcomes = [_round_outcome(row) for row in recent]
+        consecutive = 0
+        for completed, _reason in reversed(outcomes):
+            if completed:
+                break
+            consecutive += 1
+        last_started_raw = str(rows[-1].get("started_at") or "")
+        age_seconds: float | None = None
+        try:
+            last_started = datetime.fromisoformat(
+                last_started_raw.replace("Z", "+00:00")
+            )
+            if last_started.tzinfo is not None:
+                age_seconds = (now - last_started).total_seconds()
+        except ValueError:
+            age_seconds = None
+        health[market] = {
+            "rounds": len(rows),
+            "last_started_at": last_started_raw or None,
+            "last_round_age_seconds": age_seconds,
+            "consecutive_incomplete": consecutive,
+            "last_reason": outcomes[-1][1] if outcomes else None,
+        }
+        label = market.split("__")[2].upper() if market.count("__") >= 2 else market
+        if len(recent) >= failure_limit and consecutive >= failure_limit:
+            alerts.append(
+                f"市场 {label} 每小时链连续 {consecutive} 轮未完成:"
+                f" {outcomes[-1][1]}"
+            )
+        if age_seconds is not None and age_seconds > silence_seconds:
+            alerts.append(
+                f"市场 {label} 已 {age_seconds / 3600:.1f} 小时无调度轮次"
+            )
+    return health, alerts
+
+
+def notify_desktop(text: str, *, seconds: int = DESKTOP_NOTICE_SECONDS) -> bool:
+    """经 msg.exe 向当前登录会话弹出消息；失败只返回假，不抛出。"""
+    executable = shutil.which("msg")
+    if executable is None:
+        candidate = (
+            Path(os.environ.get("SystemRoot", "")) / "System32" / "msg.exe"
+        )
+        if not candidate.is_file():
+            return False
+        executable = str(candidate)
+    try:
+        result = subprocess.run(
+            [executable, "*", f"/TIME:{seconds}", text[:900]],
+            check=False, capture_output=True, timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
 
 
 def _btc_amount(assets: Sequence[Asset], symbol: str) -> Decimal:
@@ -132,9 +265,17 @@ def observe_once(
     ledger_path: Path,
     now: datetime,
     stale_age_seconds: float = DEFAULT_STALE_AGE_SECONDS,
+    scheduler_log: Path | None = None,
+    scheduler_failure_limit: int = DEFAULT_SCHEDULER_FAILURE_LIMIT,
 ) -> ObservationCycle:
     """执行一轮零写观察，产出记录与告警。"""
     alerts: list[str] = []
+    scheduler_health: dict[str, dict[str, object]] = {}
+    if scheduler_log is not None:
+        scheduler_health, scheduler_alerts = scan_scheduler_health(
+            scheduler_log, now=now, failure_limit=scheduler_failure_limit,
+        )
+        alerts.extend(scheduler_alerts)
     symbols = sorted(str(symbol) for symbol in envelope.symbols)
     active_view: list[dict[str, object]] = []
     position_view: dict[str, str] = {}
@@ -198,6 +339,7 @@ def observe_once(
             None if state.paused_until is None
             else state.paused_until.isoformat()
         ),
+        "scheduler_health": scheduler_health,
         "alerts": alerts,
         "status": "alert" if alerts else "ok",
     }
@@ -245,6 +387,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--once", action="store_true",
         help="只跑一轮；有告警退出码 1",
     )
+    parser.add_argument(
+        "--scheduler-log", type=Path, default=None,
+        help="每小时 live 调度日志（live-scheduler.jsonl）；给出即监视链路健康",
+    )
+    parser.add_argument(
+        "--scheduler-failure-limit", type=int,
+        default=DEFAULT_SCHEDULER_FAILURE_LIMIT,
+        help="同一市场连续未完成轮数达此值即告警",
+    )
+    parser.add_argument(
+        "--no-desktop-notify", action="store_true",
+        help="不经 msg.exe 弹出桌面消息",
+    )
     parser.add_argument("--env-file", type=Path, default=None)
     return parser
 
@@ -269,6 +424,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     observation_path = root / OBSERVATION_RELATIVE_PATH
     heartbeat_path = root / HEARTBEAT_RELATIVE_PATH
     stop_path = root / STOP_FILE_RELATIVE_PATH
+    scheduler_log: Path | None = args.scheduler_log
+    notify = not bool(args.no_desktop_notify)
+    # 告警集合变化时只通知一次
+    notified: tuple[str, ...] = ()
+    if notify:
+        notify_desktop(
+            "guvolu 观察进程已启动，信封 "
+            f"{envelope.sha12}，链路健康监视"
+            f"{'开启' if scheduler_log is not None else '未配置'}。",
+            seconds=60,
+        )
     while True:
         now = datetime.now(UTC)
         try:
@@ -280,6 +446,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ledger_path=ledger_path,
                 now=now,
                 stale_age_seconds=float(args.stale_age_seconds),
+                scheduler_log=scheduler_log,
+                scheduler_failure_limit=int(args.scheduler_failure_limit),
             )
         except GuvoluError as exc:
             # 单轮读取失败：记错误心跳，下轮再试
@@ -302,6 +470,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         for alert in cycle.alerts:
             print(f"告警: {alert}")
+        current = tuple(sorted(cycle.alerts))
+        if notify and current and current != notified:
+            notify_desktop(
+                "guvolu 告警 "
+                f"{now.astimezone().strftime('%m-%d %H:%M')}\n"
+                + "\n".join(cycle.alerts)
+            )
+        notified = current
         if args.once:
             return 1 if cycle.alerts else 0
         if stop_path.exists():

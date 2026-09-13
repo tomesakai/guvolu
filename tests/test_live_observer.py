@@ -163,6 +163,71 @@ def _assets(btc: str = "0") -> tuple[Asset, ...]:
     )
 
 
+def _scheduler_row(
+    started: datetime, market: str, *, exit_code: int, live_status: str | None,
+    tail: str = "",
+) -> str:
+    # 失败轮只有回溯文本
+    if live_status is not None:
+        output = json.dumps({
+            "status": "completed",
+            "live": {"status": live_status, "returncode": 0},
+        })
+    else:
+        output = "Traceback (most recent call last):\n  ...\n" + tail
+    return json.dumps({
+        "started_at": started.isoformat(),
+        "completed_at": (started + timedelta(minutes=15)).isoformat(),
+        "market_id": market,
+        "exit_code": exit_code,
+        "output": output,
+    })
+
+
+def test_scheduler_health_flags_consecutive_failures_and_silence(
+    tmp_path: Path,
+) -> None:
+    """连续三轮未完成的市场告警；正常市场不告警；长时间无轮次告警。"""
+    from guvolu.execution.live_observer import scan_scheduler_health
+
+    now = datetime(2026, 9, 13, 12, 0, tzinfo=UTC)
+    lines = [
+        _scheduler_row(now - timedelta(hours=3), "", exit_code=0, live_status="completed"),
+        _scheduler_row(now - timedelta(hours=2), "", exit_code=0, live_status="reused"),
+        _scheduler_row(now - timedelta(hours=1), "", exit_code=0, live_status="completed"),
+        _scheduler_row(
+            now - timedelta(hours=3), "mkt__gmo__eth__r0", exit_code=1,
+            live_status=None, tail="ValueError: GMO panel 输入缺少逐文件控制合同",
+        ),
+        _scheduler_row(
+            now - timedelta(hours=2), "mkt__gmo__eth__r0", exit_code=0,
+            live_status="refused",
+        ),
+        _scheduler_row(
+            now - timedelta(hours=1), "mkt__gmo__eth__r0", exit_code=1,
+            live_status=None, tail="ValueError: 冻结预测过期: 6443.7s",
+        ),
+        _scheduler_row(
+            now - timedelta(hours=9), "mkt__gmo__xrp__r0", exit_code=0,
+            live_status="completed",
+        ),
+    ]
+    log = tmp_path / "live-scheduler.jsonl"
+    log.write_text("﻿" + "\n".join(lines) + "\n坏行\n", encoding="utf-8")
+    health, alerts = scan_scheduler_health(log, now=now)
+    assert health["primary"]["consecutive_incomplete"] == 0
+    assert health["mkt__gmo__eth__r0"]["consecutive_incomplete"] == 3
+    assert health["mkt__gmo__eth__r0"]["last_reason"] == "ValueError: 冻结预测过期: 6443.7s"
+    assert any("ETH" in text and "连续 3 轮" in text for text in alerts)
+    assert any("XRP" in text and "无调度轮次" in text for text in alerts)
+    assert not any("primary" in text for text in alerts)
+    # 缺日志文件不告警
+    none_health, none_alerts = scan_scheduler_health(
+        tmp_path / "missing.jsonl", now=now
+    )
+    assert none_health == {} and none_alerts == []
+
+
 def test_quiet_cycle_reports_ok(tmp_path: Path) -> None:
     """无挂单、无在途、无持仓超限时零告警。"""
     cycle = observe_once(

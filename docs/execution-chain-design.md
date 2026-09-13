@@ -412,7 +412,9 @@ taker 手续费按约定逐笔向上取整到整数日元，被取整的小数�
 卡滞在途意图、持仓名义超限与信封熔断状态，逐轮 JSONL 留痕并写
 心跳。它全程零写——不持 TRADE 密钥、不写意图账本（账本只做宽容
 只读扫描，不隔离不截断），处置动作留给人工（kill-switch 单命令
-包装为 `scripts/run_kill_switch.ps1`）。浸泡进程仍限模拟运行，
+包装为 `scripts/run_kill_switch.ps1`）。2026-09-13 起它还读取主仓的
+每小时调度日志，同一市场连续三轮未完成或长时间无轮次即告警，告警
+集合变化时经 `msg.exe` 弹出一次桌面消息（见[当日快照](2026-09-13-cross-market-valuation-trip-and-empty-head-recovery.md)第 5 节）。浸泡进程仍限模拟运行，
 live 下的实时监视仅由本观察进程承担。观察进程必须从执行仓启动
 （`-Repository` 指向执行仓），账本、心跳与观察记录才与 live 执行器
 同一数据根；由维护者用 `scripts/register_live_observer_task.ps1`

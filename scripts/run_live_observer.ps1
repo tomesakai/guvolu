@@ -1,6 +1,7 @@
 ﻿param(
     [int]$IntervalSeconds = 60,
-    [string]$Repository
+    [string]$Repository,
+    [string]$SchedulerLog = ""
 )
 
 $ErrorActionPreference = 'Stop'
@@ -36,9 +37,13 @@ function Write-VisibleLog {
         $Line | Out-File -LiteralPath $LogPath -Append -Encoding utf8
     }
 }
-"$(Get-Date -Format o) guvolu live-observer started; interval=${IntervalSeconds}s." |
+"$(Get-Date -Format o) guvolu live-observer started; interval=${IntervalSeconds}s; scheduler-log=${SchedulerLog}." |
     Write-VisibleLog
-& $PythonPath -m guvolu.execution.live_observer `
-    --interval-seconds $IntervalSeconds 2>&1 |
+# 调度日志在主仓 logs 下，由注册脚本以绝对路径传入
+$ObserverArguments = @('-m', 'guvolu.execution.live_observer', '--interval-seconds', $IntervalSeconds)
+if ($SchedulerLog) {
+    $ObserverArguments += @('--scheduler-log', $SchedulerLog)
+}
+& $PythonPath @ObserverArguments 2>&1 |
     Write-VisibleLog
 exit $LASTEXITCODE
