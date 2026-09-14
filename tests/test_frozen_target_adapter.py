@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from guvolu.domain.config import MAX_ORDER_JPY_CEILING
 from guvolu.domain.symbols import SpotSymbol
 from guvolu.execution.dry_run_executor import load_target_artifact
 from guvolu.execution.frozen_target_adapter import (
@@ -174,7 +175,7 @@ def test_adapter_rejects_budget_over_ceiling_and_bad_mode(tmp_path: Path) -> Non
     _prediction(source)
 
     with pytest.raises(FrozenTargetError, match="risk_budget_jpy"):
-        _build(source, risk_budget_jpy=Decimal("10001"))
+        _build(source, risk_budget_jpy=MAX_ORDER_JPY_CEILING + Decimal("1"))
     with pytest.raises(FrozenTargetError, match="risk_budget_jpy"):
         _build(source, risk_budget_jpy=Decimal("0"))
     for value in ("NaN", "Infinity", "-Infinity"):
