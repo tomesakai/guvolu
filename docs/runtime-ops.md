@@ -117,6 +117,12 @@ OKX live books 已完成有界真实隔离小样本，但尚未证明重连和�
   每五分钟守护按 IgnoreNew 只在进程不在时重拉，隐藏窗口，日志在 `logs/`），
   不纳入 `start_marketdata_pipeline.ps1` 清单，独立于 L2 单写边界；缺口不回补，
   `CLOSE` 期间报价冻结只作旁路参考。
+- 实盘成交成本汇总以计划任务 `guvolu-live-cost-summary` 每周日 07:00 运行
+  （`scripts/register_live_cost_summary_task.ps1`，启动器 `scripts/run_live_cost_summary.ps1`），
+  只读扫描执行仓账本并以 READ_ONLY 密钥取成交明细，报告落在执行仓
+  `data/execution/live/cost-summary/`（2026-09-11 起）。伴随观察进程的任务经
+  `scripts/register_live_observer_task.ps1 -SchedulerLog <主仓 live-scheduler.jsonl>`
+  登记后同时监视每小时链路健康（2026-09-13 起，执行链设计第 14 节）。
 - `start_marketdata_pipeline.ps1 -Profile ForwardMinimal -Repository <冻结仓库>`
   是磁盘余量低于 20% 时的冻结前向配置：六条不可回补 raw 采集保持运行，且仅
   保留冻结预测所需的实时逐笔物化；L2、book-state 与 OFL 派生物化暂停，之后可

@@ -766,19 +766,19 @@ def create_app(
             "source": "REST",
             "asks": [
                 {
-                    "price": format(l.price, "f"),
-                    "size": format(l.size, "f"),
-                    "notional": format(l.price * l.size, "f"),
+                    "price": format(level.price, "f"),
+                    "size": format(level.size, "f"),
+                    "notional": format(level.price * level.size, "f"),
                 }
-                for l in asks
+                for level in asks
             ],
             "bids": [
                 {
-                    "price": format(l.price, "f"),
-                    "size": format(l.size, "f"),
-                    "notional": format(l.price * l.size, "f"),
+                    "price": format(level.price, "f"),
+                    "size": format(level.size, "f"),
+                    "notional": format(level.price * level.size, "f"),
                 }
-                for l in bids
+                for level in bids
             ],
             "best_ask": format(metrics.best_ask, "f"),
             "best_bid": format(metrics.best_bid, "f"),

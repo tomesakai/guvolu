@@ -140,7 +140,8 @@ def _completed(
     if details and details[0]:
         try:
             loaded = json.loads(str(details[0]))
-            if isinstance(loaded, dict): metadata = loaded
+            if isinstance(loaded, dict):
+                metadata = loaded
         except json.JSONDecodeError:
             pass
     symbol_row = conn.execute(
@@ -202,7 +203,8 @@ def _write_stage(
                         ))
                         total += 1
                         by_artifact_symbol[(item.artifact_id, symbol)] += 1
-        handle.flush(); os.fsync(handle.fileno())
+        handle.flush()
+        os.fsync(handle.fileno())
     return total, dict(by_artifact_symbol)
 
 
@@ -228,7 +230,8 @@ def _sql_string(value: str) -> str:
 
 
 def _derived_sql(symbol: str, market_id: str) -> str:
-    s = _sql_string(symbol); market = _sql_string(market_id)
+    s = _sql_string(symbol)
+    market = _sql_string(market_id)
     version = _sql_string(KLINE_NORMALIZATION_VERSION)
     return f"""
       WITH source AS (
@@ -307,7 +310,8 @@ def _copy_query(db: Any, query: str, path: Path, order: str) -> tuple[Path, str]
         f"TO '{escaped}' (FORMAT PARQUET, COMPRESSION ZSTD, ROW_GROUP_SIZE 122880)"
     )
     with temp.open("rb+") as handle:
-        handle.flush(); os.fsync(handle.fileno())
+        handle.flush()
+        os.fsync(handle.fileno())
     sha = sha256_file(temp)
     final = path.with_name(f"part-{sha[:12]}.parquet")
     if final.exists():
@@ -364,7 +368,8 @@ def _materialize_symbol(
          KLINE_NORMALIZATION_VERSION, input_hash, source_items,
          utc_now(), config_hash),
     )
-    _bind_capability(conn, attempt_id); conn.commit()
+    _bind_capability(conn, attempt_id)
+    conn.commit()
     output_dir = (
         root / "materialized" / "market_kline"
         / f"schema_version={KLINE_SCHEMA_VERSION}"
@@ -388,7 +393,8 @@ def _materialize_symbol(
         if metrics is None:
             raise ValueError("GMO K 线统计不可读")
         fact_rows, evidence_rows = int(metrics[0]), int(metrics[1])
-        provisional = int(metrics[2]); conflicts = int(metrics[3] or 0)
+        provisional = int(metrics[2])
+        conflicts = int(metrics[3] or 0)
         if evidence_rows != source_items or int(metrics[4] or 0):
             raise ValueError("GMO K 线来源计数或 PIT 契约不符")
         evidence_unique = db.execute(
@@ -497,14 +503,17 @@ def _materialize_symbol(
             "UPDATE partition_attempt SET status='failed',finished_at=?,"
             "failure_detail=? WHERE attempt_id=? AND status='running'",
             (utc_now(), str(exc)[:2000], attempt_id),
-        ); conn.commit()
+        )
+        conn.commit()
         raise
 
 
 def materialize_all(root: Path, conn: sqlite3.Connection) -> list[KlineResult]:
     """断点复用地物化本地四份 GMO K 线原件。"""
-    registry.register_all(conn); ensure_markets(conn)
-    inputs = _raw_inputs(root); _register_inputs(conn, inputs)
+    registry.register_all(conn)
+    ensure_markets(conn)
+    inputs = _raw_inputs(root)
+    _register_inputs(conn, inputs)
     input_hash = _input_set_hash(inputs)
     counts = _symbols_and_counts(inputs)
     symbols = sorted(counts)
@@ -512,7 +521,8 @@ def materialize_all(root: Path, conn: sqlite3.Connection) -> list[KlineResult]:
     for symbol in symbols:
         market_id, _, _ = _market_row(conn, "gmo", symbol, None)
         result = _completed(conn, market_id, input_hash)
-        if result is not None: reusable[symbol] = result
+        if result is not None:
+            reusable[symbol] = result
     if len(reusable) == len(symbols):
         return [reusable[symbol] for symbol in symbols]
     staging = root / "materialized" / ".staging"
@@ -524,8 +534,10 @@ def materialize_all(root: Path, conn: sqlite3.Connection) -> list[KlineResult]:
         raise ValueError("K 线预扫与 stage 数组项计数不符")
     print(f"STAGE COMPLETE source_items={total:,}", flush=True)
     db_path = staging / f"gmo-kline-{input_hash[:12]}.duckdb"
-    if db_path.exists(): db_path.unlink()
-    db: Any = duckdb.connect(str(db_path)); db.execute("SET TimeZone='UTC'")
+    if db_path.exists():
+        db_path.unlink()
+    db: Any = duckdb.connect(str(db_path))
+    db.execute("SET TimeZone='UTC'")
     try:
         _load_stage(db, stage_path)
         db.execute("CREATE INDEX idx_raw_kline_symbol ON raw_kline_observation(venue_symbol)")
@@ -549,10 +561,13 @@ def materialize_all(root: Path, conn: sqlite3.Connection) -> list[KlineResult]:
         return results
     finally:
         db.close()
-        if stage_path.exists(): stage_path.unlink()
-        if db_path.exists(): db_path.unlink()
+        if stage_path.exists():
+            stage_path.unlink()
+        if db_path.exists():
+            db_path.unlink()
         wal = db_path.with_suffix(db_path.suffix + ".wal")
-        if wal.exists(): wal.unlink()
+        if wal.exists():
+            wal.unlink()
 
 
 def audit_klines(root: Path, conn: sqlite3.Connection) -> dict[str, object]:
@@ -569,12 +584,15 @@ def audit_klines(root: Path, conn: sqlite3.Connection) -> dict[str, object]:
         (KLINE_DATASET, EVIDENCE_DATASET),
     ).fetchall()
     total_facts = total_evidence = conflicts = provisional = 0
-    db: Any = duckdb.connect(":memory:"); db.execute("SET TimeZone='UTC'")
+    db: Any = duckdb.connect(":memory:")
+    db.execute("SET TimeZone='UTC'")
     try:
         for attempt, market, normalized, fact_storage, evidence_storage in rows:
             if not fact_storage or not evidence_storage:
-                errors.append(f"K 线双输出缺失: {attempt}"); continue
-            facts = root / str(fact_storage); evidence = root / str(evidence_storage)
+                errors.append(f"K 线双输出缺失: {attempt}")
+                continue
+            facts = root / str(fact_storage)
+            evidence = root / str(evidence_storage)
             fact = db.execute(
                 "SELECT COUNT(*),COUNT(*)-COUNT(DISTINCT kline_id),"
                 "SUM(available_time<open_time),"
@@ -589,9 +607,13 @@ def audit_klines(root: Path, conn: sqlite3.Connection) -> dict[str, object]:
                 "COUNT(DISTINCT market_id),MIN(market_id) FROM read_parquet(?)",
                 [str(evidence)],
             ).fetchone()
-            if fact is None or ev is None: errors.append(f"K 线输出不可读: {attempt}"); continue
-            total_facts += int(fact[0]); total_evidence += int(ev[0])
-            provisional += int(fact[4] or 0); conflicts += int(fact[6] or 0)
+            if fact is None or ev is None:
+                errors.append(f"K 线输出不可读: {attempt}")
+                continue
+            total_facts += int(fact[0])
+            total_evidence += int(ev[0])
+            provisional += int(fact[4] or 0)
+            conflicts += int(fact[6] or 0)
             if int(fact[1] or 0) or int(fact[2] or 0) or int(fact[3] or 0):
                 errors.append(f"K 线键/PIT 失败: {attempt}")
             if int(ev[0]) != int(normalized) or int(ev[1] or 0):

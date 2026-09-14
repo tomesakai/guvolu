@@ -15,10 +15,10 @@ from pathlib import Path
 SCRIPTS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from fetch_full_snapshot import RAW_ROOT, Fetcher, RawWriter, rows_of
+from fetch_full_snapshot import RAW_ROOT, Fetcher, RawWriter, rows_of  # noqa: E402
 
-from guvolu.domain.config import load_config
-from guvolu.domain.ids import new_run_id
+from guvolu.domain.config import load_config  # noqa: E402
+from guvolu.domain.ids import new_run_id  # noqa: E402
 
 REPO_ROOT = SCRIPTS_DIR.parent
 

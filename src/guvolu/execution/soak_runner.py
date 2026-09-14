@@ -54,7 +54,6 @@ from guvolu.domain.enums import RunMode, ServiceStatus, WsChannel
 from guvolu.domain.errors import GmoApiError, GuvoluError
 from guvolu.domain.intent import (
     LOCAL_TERMINAL_STATES,
-    IntentState,
     OrderIntent,
 )
 from guvolu.domain.models import Asset, Execution, Order

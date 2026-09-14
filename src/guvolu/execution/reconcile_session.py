@@ -30,7 +30,6 @@ from guvolu.domain.errors import ConfigError
 from guvolu.domain.ids import new_correlation_id, new_intent_id
 from guvolu.domain.intent import (
     LOCAL_TERMINAL_STATES,
-    IntentState,
     OrderIntent,
 )
 from guvolu.domain.symbols import SpotSymbol

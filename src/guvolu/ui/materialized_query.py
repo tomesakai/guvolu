@@ -111,9 +111,11 @@ def _value_area(levels: list[dict[str, Any]]) -> tuple[str | None, str | None, s
         below = sizes[low - 1] if low > 0 else Decimal("-1")
         above = sizes[high + 1] if high + 1 < len(levels) else Decimal("-1")
         if above > below:
-            high += 1; covered += sizes[high]
+            high += 1
+            covered += sizes[high]
         else:
-            low -= 1; covered += sizes[low]
+            low -= 1
+            covered += sizes[low]
     return levels[poc_at]["price"], levels[high]["price"], levels[low]["price"]
 
 
@@ -382,7 +384,8 @@ class MaterializedQuery:
         by_bar: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for row in levels:
             price = _decimal_text(row[1])
-            buy_volume = _decimal_text(row[2]); sell_volume = _decimal_text(row[3])
+            buy_volume = _decimal_text(row[2])
+            sell_volume = _decimal_text(row[3])
             by_bar[_iso(row[0])].append({
                 "price": price, "price_bin": price,
                 "buy_volume": buy_volume, "sell_volume": sell_volume,
@@ -394,7 +397,8 @@ class MaterializedQuery:
         items: list[dict[str, Any]] = []
         for row in bars:
             key = _iso(row[0])
-            buy = Decimal(str(row[7] or 0)); sell = Decimal(str(row[8] or 0))
+            buy = Decimal(str(row[7] or 0))
+            sell = Decimal(str(row[8] or 0))
             buy_notional = Decimal(str(row[9] or 0))
             sell_notional = Decimal(str(row[10] or 0))
             bar_levels = by_bar.get(key, [])
@@ -499,7 +503,8 @@ class MaterializedQuery:
         best_bid = Decimal(full_bids[0]["price"])
         ask_best_size = Decimal(full_asks[0]["size"])
         bid_best_size = Decimal(full_bids[0]["size"])
-        spread = best_ask - best_bid; mid = (best_ask + best_bid) / 2
+        spread = best_ask - best_bid
+        mid = (best_ask + best_bid) / 2
         microprice = (
             best_ask * bid_best_size + best_bid * ask_best_size
         ) / (ask_best_size + bid_best_size)
@@ -521,7 +526,8 @@ class MaterializedQuery:
             bid_size = sum((Decimal(row["size"]) for row in bid_band), Decimal(0))
             ask_notional = sum((Decimal(row["notional"]) for row in ask_band), Decimal(0))
             bid_notional = sum((Decimal(row["notional"]) for row in bid_band), Decimal(0))
-            size_sum = ask_size + bid_size; notional_sum = ask_notional + bid_notional
+            size_sum = ask_size + bid_size
+            notional_sum = ask_notional + bid_notional
             ask_complete = source_ask_bp >= width
             bid_complete = source_bid_bp >= width
             complete = ask_complete and bid_complete
@@ -994,13 +1000,16 @@ class MaterializedQuery:
             if sequence is None or previous is None:
                 raise MaterializedQueryError("OKX 尾部缺少原生序列")
             if kind == "snapshot":
-                asks.clear(); bids.clear()
-                snapshot_frame = str(frame[0]); snapshot_event = frame[2]
+                asks.clear()
+                bids.clear()
+                snapshot_frame = str(frame[0])
+                snapshot_event = frame[2]
             elif current_sequence is None or previous != current_sequence:
                 raise MaterializedQueryError("OKX 终态尾部序列不连续")
             for level in levels_by_frame.get(str(frame[0]), []):
                 book = asks if str(level[1]) == "ask" else bids
-                price = Decimal(str(level[2])); size = Decimal(str(level[3]))
+                price = Decimal(str(level[2]))
+                size = Decimal(str(level[3]))
                 if str(level[4]) == "delete" or size == 0:
                     book.pop(price, None)
                 else:
@@ -1291,10 +1300,12 @@ class MaterializedQuery:
         def apply_frame(frame: tuple[Any, ...], *, reset: bool) -> None:
             applied_frame_paths.add(_path_key(frame[11]))
             if reset:
-                ask.clear(); bid.clear()
+                ask.clear()
+                bid.clear()
             for level in levels_by_frame.get(str(frame[0]), []):
                 book = ask if str(level[1]) == "ask" else bid
-                price = Decimal(str(level[2])); size = Decimal(str(level[3]))
+                price = Decimal(str(level[2]))
+                size = Decimal(str(level[3]))
                 if str(level[4]) == "delete" or size == 0:
                     book.pop(price, None)
                 else:

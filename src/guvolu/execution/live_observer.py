@@ -11,8 +11,8 @@ SEND_TIMEOUT）、持仓名义超信封上限、信封熔断或暂停状态，�
 每小时链路健康（给出调度日志时：某市场连续多轮未完成或长时间
 无轮次，2026-09-12 至 13 实测 ETH 链静默失败 83 轮无人知晓）。
 观察逐轮追加 JSONL 并写心跳文件；发现告警只留痕与提示，并在
-告警集合变化时经桌面消息（msg.exe）通知一次，处置动作留给人工
-（kill-switch 见 scripts/run_kill_switch.ps1）。
+告警集合变化时弹出一次系统通知（WinRT toast，退回 msg.exe），
+处置动作留给人工（kill-switch 见 scripts/run_kill_switch.ps1）。
 命令行入口即本模块；--once 单轮运行，有告警退出码 1。
 """
 from __future__ import annotations
@@ -255,7 +255,7 @@ def notify_desktop(text: str, *, seconds: int = DESKTOP_NOTICE_SECONDS) -> bool:
     return result.returncode == 0 and not result.stderr
 
 
-def _btc_amount(assets: Sequence[Asset], symbol: str) -> Decimal:
+def _asset_amount(assets: Sequence[Asset], symbol: str) -> Decimal:
     for asset in assets:
         if asset.symbol == symbol:
             return asset.amount
@@ -366,7 +366,7 @@ def observe_once(
         tickers = public.ticker(symbol)
         if tickers:
             price = tickers[0].last
-            notional = _btc_amount(assets, symbol) * price
+            notional = _asset_amount(assets, symbol) * price
             position_view[symbol] = format(notional, "f")
             if notional > envelope.max_position_jpy:
                 alerts.append(

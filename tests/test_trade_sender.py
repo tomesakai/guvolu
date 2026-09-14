@@ -1,7 +1,7 @@
 """发送适配器单测：三分类翻译，绝不触发真实端点（C-13、C-14）。"""
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from guvolu.data.durable_io import atomic_write_text
-from guvolu.research.allocator import allocate, allocation_payload, flat_allocation
+from guvolu.research.allocator import allocate, allocation_payload
 from guvolu.research.artifact_contracts import (
     INTERVAL_SECONDS as _INTERVAL_SECONDS,
     PIPELINE_SCHEMA_VERSION,

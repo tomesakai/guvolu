@@ -29,7 +29,6 @@ from guvolu.execution.live_canary import (
     build_plan,
     confirm_plan,
     main,
-    poll_until_terminal,
     render_banner,
     run_canary,
 )

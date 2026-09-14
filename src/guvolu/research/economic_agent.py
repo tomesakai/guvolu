@@ -2075,7 +2075,7 @@ def write_content_addressed_artifact(
                 if _read_pinned_bytes(artifact, kind) != content:
                     raise OSError("已提交制品内容发生变化")
                 transaction_state.committed = True
-            except BaseException as error:
+            except BaseException:
                 if installed:
                     try:
                         if _read_pinned_bytes(artifact, kind) != content:

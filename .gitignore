@@ -40,3 +40,6 @@ Thumbs.db
 .idea/
 .vscode/
 .venv-gpu/
+
+# 研究配置锁文件为进程产物
+config/*.json.lock

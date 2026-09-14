@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Mapping, Sequence
@@ -24,7 +24,6 @@ from guvolu.research.governance import (
     DEFAULT_MISSING_POLICY,
     GOVERNANCE_METHOD_VERSION,
     MISSING_POLICIES,
-    FrozenForwardPlan,
     frozen_forward_plan_identity,
     get_active_head_receipt,
     get_frozen_forward_plan,

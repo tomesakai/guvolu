@@ -103,7 +103,7 @@ RESEARCH = {
 
 def test_one_axis_neighbors_follow_validation_rule() -> None:
     """邻居为其他参数不变时各轴最近的上下取值。"""
-    items = [_candidate(l, e) for l in (24, 48, 72) for e in (0.5, 1.0)]
+    items = [_candidate(lookback, e) for lookback in (24, 48, 72) for e in (0.5, 1.0)]
     selected = _candidate(48, 0.5)
     neighbors = one_axis_neighbors(selected, items)
     pairs = sorted((c.parameters["lookback"], c.parameters["entry_score"]) for c in neighbors)
@@ -114,7 +114,7 @@ def test_build_proposal_constrained_grid_and_budget() -> None:
     """提案取锚点一轴切片上的正向取值，受 constraints 与研究预算约束。"""
     lookbacks = (24, 48, 72, 96, 240)
     entries = (0.5, 1.0, 1.5)
-    items = [_candidate(l, e) for l in lookbacks for e in entries]
+    items = [_candidate(lookback, e) for lookback in lookbacks for e in entries]
     sharpes = {
         item.candidate_id: (
             2.0 if item.parameters["lookback"] == 48 and item.parameters["entry_score"] == 1.0
