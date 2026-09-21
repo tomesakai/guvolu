@@ -13,6 +13,9 @@
 # 先撤销零行段头。生产补漏任务运行自冻结运维副本，没有合并步；段头只增不减
 # 会让每小时冻结前向链逐日变慢（2026-09-21 实测每市场 4,400 个头、单轮 45 分钟）。
 $ErrorActionPreference = "Stop"
+# -File 调用无法传数组，逗号连写的市场在此拆开。
+$Markets = @($Markets | ForEach-Object { $_ -split "," } |
+    ForEach-Object { $_.Trim() } | Where-Object { $_ })
 $RepoRoot = if ($Repository) {
     (Resolve-Path -LiteralPath $Repository).Path
 } else {
