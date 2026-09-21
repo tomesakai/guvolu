@@ -14,7 +14,7 @@ import os
 import sqlite3
 import time
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -61,6 +61,8 @@ SUPPORTED_RAW_SCHEMA_VERSIONS = frozenset({3})
 ALLOWED_ENDPOINT_REVISIONS = frozenset({0})
 FAILED_RETRY_SECONDS = 3600
 MIN_WATCH_INTERVAL_SECONDS = 10.0
+# 常驻循环每隔多少轮全量复核
+FULL_SCAN_EVERY_CYCLES = 288
 _MID_DIVISOR = Decimal(2)
 _RAW_V3_QUALITY_FLAGS = (
     "connection_channel_identity_verified",
@@ -97,6 +99,7 @@ class FxScanStats:
     hash_recomputed: int
     hash_reused: int
     elapsed_scan_seconds: float
+    skipped_completed: int = 0
 
 
 @dataclass(frozen=True)
@@ -167,6 +170,20 @@ def _registered_input_hashes(
     return {str(row[0]): (str(row[1]), int(row[2])) for row in rows}
 
 
+def _completed_input_paths(conn: sqlite3.Connection) -> frozenset[str]:
+    """取现行规范化版本下已完成物化的原件登记路径。"""
+    rows = conn.execute(
+        "SELECT DISTINCT r.storage_path FROM artifact r "
+        "JOIN partition_input i ON i.artifact_id=r.artifact_id "
+        "JOIN partition_attempt a ON a.attempt_id=i.attempt_id "
+        "WHERE a.domain=? AND a.normalization_version=? "
+        "AND a.status IN ('complete','complete_with_rejections') "
+        "AND r.artifact_kind='raw_realtime_segment'",
+        (FX_RATE_DOMAIN, FX_RATE_NORMALIZATION_VERSION),
+    ).fetchall()
+    return frozenset(str(row[0]) for row in rows)
+
+
 def _sealed_inputs(
     root: Path, *,
     registered_hashes: Mapping[str, tuple[str, int]] | None = None,
@@ -177,16 +194,28 @@ def _sealed_inputs(
 def _scan_sealed_inputs(
     root: Path, *,
     registered_hashes: Mapping[str, tuple[str, int]] | None = None,
+    skip_paths: Collection[str] | None = None,
 ) -> tuple[list[FxSegmentInput], FxScanStats]:
-    """选择封口 fx_rate segment；登记散列命中时复用，不一致即失败。"""
+    """选择封口 fx_rate segment；登记散列命中时复用，不一致即失败。
+
+    `skip_paths` 内的原件不读 manifest 直接跳过，供常驻循环把单轮
+    成本限制在新封口段；全量复核不传该参数。
+    """
     started = time.monotonic()
     inputs: list[FxSegmentInput] = []
-    scanned = recomputed = reused = 0
+    scanned = recomputed = reused = skipped = 0
     base = root / "raw" / "realtime" / FX_RATE_DOMAIN
     if not base.is_dir():
         return [], FxScanStats(0, 0, 0, round(time.monotonic() - started, 3))
     endpoint_id, _ = ENDPOINT_BINDING
     for manifest_path in sorted(base.rglob("segment-*.manifest.json")):
+        if skip_paths is not None:
+            candidate = manifest_path.with_name(
+                manifest_path.name.removesuffix(".manifest.json") + ".jsonl"
+            ).relative_to(root).as_posix()
+            if candidate in skip_paths:
+                skipped += 1
+                continue
         scanned += 1
         body = json.loads(manifest_path.read_text(encoding="utf-8"))
         if not isinstance(body, Mapping):
@@ -264,6 +293,7 @@ def _scan_sealed_inputs(
         ))
     return inputs, FxScanStats(
         scanned, recomputed, reused, round(time.monotonic() - started, 3),
+        skipped,
     )
 
 
@@ -815,6 +845,16 @@ def _materialize_cycle(
             None if verify_all_hashes else _registered_input_hashes(conn)
         ),
     )
+    return _materialize_inputs(
+        root, conn, inputs, report_reused=report_reused,
+    ), stats
+
+
+def _materialize_inputs(
+    root: Path, conn: sqlite3.Connection, inputs: Sequence[FxSegmentInput],
+    *, report_reused: bool,
+) -> list[FxRateResult]:
+    """逐个物化已选输入；单段失败只报告，不中断其余。"""
     results: list[FxRateResult] = []
     for index, item in enumerate(inputs, start=1):
         try:
@@ -844,7 +884,7 @@ def _materialize_cycle(
                 f"ignored={result.ignored_rows} rejected={result.rejected_rows}",
                 flush=True,
             )
-    return results, stats
+    return results
 
 
 def audit_fx_rates(root: Path, conn: sqlite3.Connection) -> dict[str, object]:
@@ -938,19 +978,43 @@ def _watch(root: Path, interval: float, *, verify_all_hashes: bool) -> int:
             connector=store.connect,
             report_error=report_connect_error,
         )
+        cycle_index = 0
         while True:
             started = time.monotonic()
             try:
-                with sqlite_writer_lock(root):
-                    cycle, stats = _materialize_cycle(
-                        root, conn, report_reused=False,
-                        verify_all_hashes=verify_all_hashes,
-                    )
+                # 定期全量复核，其余只看新段
+                full_scan = (
+                    verify_all_hashes
+                    or cycle_index % FULL_SCAN_EVERY_CYCLES == 0
+                )
+                cycle_index += 1
+                completed = _completed_input_paths(conn)
+                inputs, stats = _scan_sealed_inputs(
+                    root,
+                    registered_hashes=(
+                        None if verify_all_hashes
+                        else _registered_input_hashes(conn)
+                    ),
+                    skip_paths=None if full_scan else completed,
+                )
+                pending = [
+                    item for item in inputs
+                    if item.artifact.storage_path not in completed
+                ]
+                cycle: list[FxRateResult] = []
+                if pending:
+                    # 扫描不持写锁，只锁写入
+                    with sqlite_writer_lock(root):
+                        cycle = _materialize_inputs(
+                            root, conn, pending, report_reused=False,
+                        )
                 created = [item for item in cycle if not item.reused]
                 print(json.dumps({
                     "event": "fx_rate_materialization_cycle",
                     "verify_all_hashes": verify_all_hashes,
-                    "sealed_segments": len(cycle),
+                    "full_scan": full_scan,
+                    "sealed_segments": len(inputs),
+                    "skipped_completed": stats.skipped_completed,
                     "materialized_now": len(created),
                     "rate_rows_now": sum(item.rate_rows for item in created),
                     "scanned_manifests": stats.scanned_manifests,

@@ -62,6 +62,7 @@ DEFAULT_INTERVAL_SECONDS = 60.0
 # 链路健康阈值
 DEFAULT_SCHEDULER_FAILURE_LIMIT = 3
 DEFAULT_SCHEDULER_SILENCE_SECONDS = 7800.0
+DEFAULT_ROUND_TIMEOUT_SECONDS = 3600.0
 # 桌面消息显示秒数
 DESKTOP_NOTICE_SECONDS = 600
 # JPY 资产键名
@@ -123,12 +124,51 @@ def scan_scheduler_health(
     now: datetime,
     failure_limit: int = DEFAULT_SCHEDULER_FAILURE_LIMIT,
     silence_seconds: float = DEFAULT_SCHEDULER_SILENCE_SECONDS,
+    round_timeout_seconds: float = DEFAULT_ROUND_TIMEOUT_SECONDS,
 ) -> tuple[dict[str, dict[str, object]], list[str]]:
-    """按市场检查每小时链路：连续未完成或长时间无轮次即告警（纯函数）。"""
+    """按市场检查每小时链路：连续未完成或长时间无轮次即告警（纯函数）。
+
+    包装脚本在轮次开始时写 phase=started 记录、结束时写完成记录；
+    被任务时限终止的轮次只有开始记录，超过 round_timeout_seconds
+    仍无完成记录即计为未完成（2026-09-21 实测此类轮次此前无痕）。
+    """
     by_market: dict[str, list[Mapping[str, object]]] = {}
+    started: dict[str, list[Mapping[str, object]]] = {}
     for row in _scheduler_rows(log_path):
         market = str(row.get("market_id") or "") or _PRIMARY_MARKET
-        by_market.setdefault(market, []).append(row)
+        if row.get("phase") == "started":
+            started.setdefault(market, []).append(row)
+        else:
+            by_market.setdefault(market, []).append(row)
+    running_since: dict[str, datetime] = {}
+    # 超时且无完成记录按未完成计
+    for market, markers in started.items():
+        finished = {
+            str(row.get("started_at") or "") for row in by_market.get(market, [])
+        }
+        for marker in markers:
+            stamp = str(marker.get("started_at") or "")
+            if stamp in finished:
+                continue
+            try:
+                began = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if began.tzinfo is None:
+                continue
+            if (now - began).total_seconds() <= round_timeout_seconds:
+                # 仍在运行：不计结果，只算作最近活动
+                previous = running_since.get(market)
+                if previous is None or began > previous:
+                    running_since[market] = began
+                by_market.setdefault(market, [])
+                continue
+            by_market.setdefault(market, []).append({
+                "started_at": stamp,
+                "market_id": marker.get("market_id"),
+                "exit_code": -1,
+                "output": "轮次超时被终止，无完成记录",
+            })
     health: dict[str, dict[str, object]] = {}
     alerts: list[str] = []
     for market, rows in sorted(by_market.items()):
@@ -140,20 +180,26 @@ def scan_scheduler_health(
             if completed:
                 break
             consecutive += 1
-        last_started_raw = str(rows[-1].get("started_at") or "")
-        age_seconds: float | None = None
+        last_started_raw = str(rows[-1].get("started_at") or "") if rows else ""
+        latest: datetime | None = running_since.get(market)
         try:
             last_started = datetime.fromisoformat(
                 last_started_raw.replace("Z", "+00:00")
             )
-            if last_started.tzinfo is not None:
-                age_seconds = (now - last_started).total_seconds()
+            if last_started.tzinfo is not None and (
+                latest is None or last_started > latest
+            ):
+                latest = last_started
         except ValueError:
-            age_seconds = None
+            pass
+        age_seconds = (
+            None if latest is None else (now - latest).total_seconds()
+        )
         health[market] = {
             "rounds": len(rows),
             "last_started_at": last_started_raw or None,
             "last_round_age_seconds": age_seconds,
+            "running": market in running_since,
             "consecutive_incomplete": consecutive,
             "last_reason": outcomes[-1][1] if outcomes else None,
         }

@@ -228,6 +228,43 @@ def test_scheduler_health_flags_consecutive_failures_and_silence(
     assert none_health == {} and none_alerts == []
 
 
+def test_scheduler_health_counts_killed_rounds_from_start_markers(
+    tmp_path: Path,
+) -> None:
+    """只有开始记录的超时轮次计为未完成；仍在运行的轮次不告警。"""
+    from guvolu.execution.live_observer import scan_scheduler_health
+
+    now = datetime(2026, 9, 21, 0, 0, tzinfo=UTC)
+
+    def marker(started: datetime, market: str) -> str:
+        return json.dumps({
+            "phase": "started", "started_at": started.isoformat(),
+            "market_id": market,
+        })
+
+    eth = "mkt__gmo__eth__r0"
+    lines = [
+        # 完成轮：开始记录与完成记录成对
+        marker(now - timedelta(hours=4), eth),
+        _scheduler_row(now - timedelta(hours=4), eth, exit_code=0, live_status="completed"),
+        # 三轮只有开始记录且已超时
+        marker(now - timedelta(hours=3), eth),
+        marker(now - timedelta(hours=2), eth),
+        marker(now - timedelta(hours=1, minutes=5), eth),
+        # 主市场：一轮仍在运行
+        _scheduler_row(now - timedelta(hours=1), "", exit_code=0, live_status="completed"),
+        marker(now - timedelta(minutes=10), ""),
+    ]
+    log = tmp_path / "live-scheduler.jsonl"
+    log.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    health, alerts = scan_scheduler_health(log, now=now)
+    assert health[eth]["consecutive_incomplete"] == 3
+    assert health[eth]["last_reason"] == "轮次超时被终止，无完成记录"
+    assert any("ETH" in text and "连续 3 轮" in text for text in alerts)
+    assert health["primary"]["consecutive_incomplete"] == 0
+    assert not any("primary" in text for text in alerts)
+
+
 def test_toast_script_escapes_markup_and_quotes() -> None:
     """通知脚本把标记与单引号转义后嵌入，不会破坏 XML 或 PowerShell 串。"""
     from guvolu.execution.live_observer import toast_script

@@ -123,6 +123,19 @@ OKX live books 已完成有界真实隔离小样本，但尚未证明重连和�
   `data/execution/live/cost-summary/`（2026-09-11 起）。伴随观察进程的任务经
   `scripts/register_live_observer_task.ps1 -SchedulerLog <主仓 live-scheduler.jsonl>`
   登记后同时监视每小时链路健康（2026-09-13 起，执行链设计第 14 节）。
+- 逐笔实时段头每日合并以计划任务 `guvolu-trade-compaction` 在 03:53 运行
+  （`scripts/register_trade_compaction_task.ps1`，启动器
+  `scripts/run_trade_compaction.ps1`，日志 `logs/trade-compaction.log`）：七个市场
+  逐个执行 `trade_realtime_compact`，写锁超时逐市场重试三次。生产补漏运行自
+  冻结运维副本，没有合并步；不合并则活动段头每日增加约 288 个，每小时冻结
+  前向链随之线性变慢（2026-09-21 快照）。
+- 每小时 live 任务的包装脚本 `scripts/run_frozen_live_task.ps1` 自带 50 分钟
+  轮次超时（`-RoundTimeoutSeconds`，须短于任务 55 分钟时限）：先写
+  `phase=started` 记录，超时即 `taskkill /T` 整树终止并写 `exit_code=4` 的完成
+  记录。任务计划程序的时限只终止包装脚本自身，Python 子进程会成为孤儿并与
+  下一轮重叠，故不得依赖它来限定轮次。
+- `fx_materialize watch` 的扫描不持主写锁，只在有新封口段时加锁写入；已完成
+  段按登记路径跳过，每 288 轮全量复核一次（2026-09-21 起）。
 - `start_marketdata_pipeline.ps1 -Profile ForwardMinimal -Repository <冻结仓库>`
   是磁盘余量低于 20% 时的冻结前向配置：六条不可回补 raw 采集保持运行，且仅
   保留冻结预测所需的实时逐笔物化；L2、book-state 与 OFL 派生物化暂停，之后可

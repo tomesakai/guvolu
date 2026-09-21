@@ -13,6 +13,8 @@ from guvolu.data import store
 from guvolu.data.fx_capture import fx_channel_id
 from guvolu.data.fx_materialize import (
     FX_RATE_NORMALIZATION_VERSION,
+    _completed_input_paths,
+    _scan_sealed_inputs,
     _sealed_inputs,
     audit_fx_rates,
     materialize_all,
@@ -225,3 +227,28 @@ def test_manifest_revision_must_be_json_integer(tmp_path: Path) -> None:
     manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
     with pytest.raises(ValueError, match="endpoint_revision 非整数"):
         _sealed_inputs(tmp_path)
+
+
+def test_watch_scan_skips_completed_segments(tmp_path: Path) -> None:
+    """常驻循环跳过已完成段不读其 manifest，新封口段照常入选。"""
+    first = _write_segment(tmp_path, [SAMPLE], "run-fx-first")
+    conn = store.connect(tmp_path)
+    try:
+        assert _completed_input_paths(conn) == frozenset()
+        assert len(materialize_all(tmp_path, conn, report_reused=False)) == 1
+        completed = _completed_input_paths(conn)
+        assert len(completed) == 1
+        # 已完成段的清单损坏也不读取
+        first.write_text("{", encoding="utf-8")
+        inputs, stats = _scan_sealed_inputs(tmp_path, skip_paths=completed)
+        assert inputs == []
+        assert (stats.scanned_manifests, stats.skipped_completed) == (0, 1)
+        _write_segment(tmp_path, [SAMPLE], "run-fx-second")
+        inputs, stats = _scan_sealed_inputs(tmp_path, skip_paths=completed)
+        assert [item.run_id for item in inputs] == ["run-fx-second"]
+        assert (stats.scanned_manifests, stats.skipped_completed) == (1, 1)
+        # 全量复核不跳过，损坏清单响亮失败
+        with pytest.raises(json.JSONDecodeError):
+            _scan_sealed_inputs(tmp_path)
+    finally:
+        conn.close()

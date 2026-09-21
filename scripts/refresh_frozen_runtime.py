@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import sqlite3
+import time
 from pathlib import Path
 from typing import Sequence
 
@@ -133,10 +134,17 @@ def refresh_runtime(
     counters = {"copied": 0, "hardlinked": 0, "reused": 0}
     total_bytes = 0
     quick_check = "skipped"
+    # 分步耗时随结果留痕
+    elapsed: dict[str, float] = {}
+    lock_requested = time.monotonic()
     with sqlite_writer_lock(runtime_data, timeout_seconds=120.0):
         try:
+            mark = time.monotonic()
+            elapsed["lock_wait"] = round(mark - lock_requested, 3)
             # 单步备份不持生产写锁
             _backup(source_db, temporary_db)
+            elapsed["backup"] = round(time.monotonic() - mark, 3)
+            mark = time.monotonic()
             inputs = _active_inputs(temporary_db, market_id)
             if not inputs:
                 raise LookupError(f"市场没有活动成交输出: {market_id}")
@@ -163,6 +171,8 @@ def refresh_runtime(
                 )
                 counters[method] += 1
                 total_bytes += expected_bytes
+            elapsed["inputs"] = round(time.monotonic() - mark, 3)
+            mark = time.monotonic()
             check = sqlite3.connect(f"file:{temporary_db}?mode=ro", uri=True)
             try:
                 if verify_all:
@@ -176,6 +186,7 @@ def refresh_runtime(
                 check.close()
             if quick_check not in ("ok", "skipped") or foreign_key_errors:
                 raise ValueError("冻结控制库完整性校验失败")
+            elapsed["integrity_check"] = round(time.monotonic() - mark, 3)
             os.replace(temporary_db, final_db)
         except BaseException:
             temporary_db.unlink(missing_ok=True)
@@ -190,6 +201,7 @@ def refresh_runtime(
         "methods": counters,
         "quick_check": quick_check,
         "foreign_key_errors": 0,
+        "elapsed_seconds": elapsed,
     }
 
 
