@@ -43,6 +43,23 @@ def _backup(source: Path, destination: Path) -> None:
         source_conn.close()
 
 
+def _prewarm(database: Path) -> int:
+    """顺序读一遍源库与 WAL，把文件装入系统缓存。
+
+    在线备份按 4 KiB 页随机读；缓存冷时（重启后、内存吃紧后）5.3 GB 的库
+    只有约 10 MB/s，单轮备份要七分钟以上，顺序预读则是 NVMe 的顺序吞吐
+    （2026-09-21 实测）。缓存已热时这一遍只是内存拷贝。
+    """
+    total = 0
+    for path in (database, database.with_name(database.name + "-wal")):
+        if not path.is_file():
+            continue
+        with path.open("rb", buffering=0) as stream:
+            while block := stream.read(8 * 1024 * 1024):
+                total += len(block)
+    return total
+
+
 def _remove_sidecars(database: Path) -> None:
     """清理备份临时库遗留的 WAL 伴随文件。"""
     for suffix in ("-shm", "-wal", "-journal"):
@@ -141,6 +158,9 @@ def refresh_runtime(
         try:
             mark = time.monotonic()
             elapsed["lock_wait"] = round(mark - lock_requested, 3)
+            _prewarm(source_db)
+            elapsed["prewarm"] = round(time.monotonic() - mark, 3)
+            mark = time.monotonic()
             # 单步备份不持生产写锁
             _backup(source_db, temporary_db)
             elapsed["backup"] = round(time.monotonic() - mark, 3)
