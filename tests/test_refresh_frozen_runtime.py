@@ -81,3 +81,28 @@ def test_refresh_runtime_rejects_tampered_reused_input_on_verify_all(
     refresh_runtime(source, runtime, "market-one")
     with pytest.raises(ValueError, match="散列不符"):
         refresh_runtime(source, runtime, "market-one", verify_all=True)
+
+
+def test_refresh_runtime_removes_stale_temporaries_and_times_steps(
+    tmp_path: Path,
+) -> None:
+    """被终止轮次遗留的临时库在下一轮持锁后清掉，分步耗时随结果返回。"""
+    source = _source(tmp_path)
+    runtime = tmp_path / "runtime"
+    data = runtime / "data"
+    data.mkdir(parents=True)
+    stale = data / ".guvolu.refresh.99999.sqlite3"
+    stale.write_bytes(b"partial")
+    (data / ".guvolu.refresh.99999.sqlite3-wal").write_bytes(b"")
+    keep = data / "unrelated.sqlite3"
+    keep.write_bytes(b"keep")
+    result = refresh_runtime(source, runtime, "market-one")
+    assert not stale.exists()
+    assert not (data / ".guvolu.refresh.99999.sqlite3-wal").exists()
+    assert keep.read_bytes() == b"keep"
+    elapsed = result["elapsed_seconds"]
+    assert isinstance(elapsed, dict)
+    assert set(elapsed) == {
+        "lock_wait", "prewarm", "backup", "inputs", "integrity_check",
+    }
+

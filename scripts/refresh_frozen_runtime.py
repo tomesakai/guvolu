@@ -158,6 +158,10 @@ def refresh_runtime(
         try:
             mark = time.monotonic()
             elapsed["lock_wait"] = round(mark - lock_requested, 3)
+            # 持锁即独占，他人临时库必为残留
+            for stale in runtime_data.glob(".guvolu.refresh.*.sqlite3*"):
+                if not stale.name.startswith(temporary_db.name):
+                    stale.unlink(missing_ok=True)
             _prewarm(source_db)
             elapsed["prewarm"] = round(time.monotonic() - mark, 3)
             mark = time.monotonic()
