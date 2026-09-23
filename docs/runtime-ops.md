@@ -123,12 +123,17 @@ OKX live books 已完成有界真实隔离小样本，但尚未证明重连和�
   `data/execution/live/cost-summary/`（2026-09-11 起）。伴随观察进程的任务经
   `scripts/register_live_observer_task.ps1 -SchedulerLog <主仓 live-scheduler.jsonl>`
   登记后同时监视每小时链路健康（2026-09-13 起，执行链设计第 14 节）。
-- 逐笔实时段头每日合并以计划任务 `guvolu-trade-compaction` 在 03:53 运行
+- 逐笔实时段头每日合并以计划任务 `guvolu-trade-compaction` 在 04:53 运行
   （`scripts/register_trade_compaction_task.ps1`，启动器
   `scripts/run_trade_compaction.ps1`，日志 `logs/trade-compaction.log`）：七个市场
-  逐个执行 `trade_realtime_compact`，写锁超时逐市场重试三次。生产补漏运行自
-  冻结运维副本，没有合并步；不合并则活动段头每日增加约 288 个，每小时冻结
-  前向链随之线性变慢（2026-09-21 快照）。
+  逐个执行 `trade_realtime_compact`，写锁超时逐市场重试三次、间隔 60 秒。生产
+  补漏运行自冻结运维副本，没有合并步；不合并则活动段头每日增加约 288 个，
+  每小时冻结前向链随之线性变慢（2026-09-21 快照）。`ForwardMinimal` 下 03:16 的
+  每日补漏要补做整日 L2 派生物化，约 50 分钟并持主写锁，合并任务须排在其后
+  （2026-09-23 快照）。
+- 每个冻结运行根各登记一条只读预检任务（`register_holdout_preflight_task.ps1
+  -TaskName guvolu-holdout-preflight-<后缀>`）；只预检一个运行根时，另一个的
+  制品损坏无人知晓（2026-09-23 快照）。
 - 每小时 live 任务的包装脚本 `scripts/run_frozen_live_task.ps1` 自带 50 分钟
   轮次超时（`-RoundTimeoutSeconds`，须短于任务 55 分钟时限）：先写
   `phase=started` 记录，超时即 `taskkill /T` 整树终止并写 `exit_code=4` 的完成

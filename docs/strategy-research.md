@@ -510,6 +510,20 @@ blocker 降为 warning，状态最多为 `degraded`。
 补回冻结前向缺口，也会重复占用完整复核资源。预检仍只读取治理身份、计数、散列与制品状态，
 不消费封存段。
 
+### 6.1.1 制品与登记的一致性（2026-09-23 补节）
+
+`run_frozen_forward_prediction` 先原子写入预测制品，再向登记表登记；登记表的不可改写约束
+只保护登记行。两个编排进程在同一运行根交错时，后来者会以更新一代活动头改写同名制品，
+随后登记被拒绝，制品与登记散列不符，`verify_frozen_forward` 与每日预检因此报
+`would_burn`（2026-09-17 BTC、09-18 ETH 实测，见 [09-23 快照](2026-09-23-compaction-task-failure-and-prediction-artifact-repair.md)）。
+冻结代码树不可改动，防线放在编排侧：`scripts/run_frozen_shadow.py` 在整轮期间持有运行根
+`data/.locks/frozen-round` 独占锁，被占用即快速失败。
+
+被改写制品的修复只承认一种证据：按登记身份重建的字节其 SHA-256 等于登记散列。重建材料是
+内容寻址保留的输入收据（`head_generation` 等于登记世代）与制品中不随输入世代变化的其余字段；
+改写后的字节与修复记录另存于主仓 `logs/research/frozen-forward/artifact-repair/`，登记表不改。
+预检为每个冻结运行根各登记一条任务（`-TaskName guvolu-holdout-preflight-<后缀>`）。
+
 ### 6.2 废弃 vintage
 
 `abandoned` 是 sealed vintage 的显式终态，用于冻结前向运行根失效、预测永久中断等从未开始
