@@ -79,7 +79,8 @@ def test_wrapper_records_start_and_completion(tmp_path: Path) -> None:
     assert completed["timed_out"] is False
     output = str(completed["output"])
     assert "标准错误也保留" in output
-    payload = json.loads(output.splitlines()[0])
+    # 摘要 JSON 在末行，标准错误在前
+    payload = json.loads(output.splitlines()[-1])
     assert payload["note"] == "冻结预测过期"
     argv = payload["argv"]
     assert argv[argv.index("--repository") + 1] == str(repository.resolve())

@@ -112,7 +112,8 @@ try {
         $ExitCode = 4
     }
     $Captured = @()
-    foreach ($Reader in @($StdOut, $StdErr)) {
+    # 标准错误在前，摘要 JSON 保持在输出末行供观察进程解析
+    foreach ($Reader in @($StdErr, $StdOut)) {
         if ($Reader.Wait(15000) -and $Reader.Result) {
             $Captured += $Reader.Result.TrimEnd()
         }

@@ -101,6 +101,9 @@ def _round_outcome(row: Mapping[str, object]) -> tuple[bool, str]:
                 parsed = json.loads(text)
             except json.JSONDecodeError:
                 continue
+            # 分步进度行不是轮次摘要
+            if isinstance(parsed, Mapping) and "progress" in parsed:
+                continue
             if isinstance(parsed, Mapping):
                 summary = parsed
             break

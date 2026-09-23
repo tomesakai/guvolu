@@ -228,6 +228,24 @@ def test_scheduler_health_flags_consecutive_failures_and_silence(
     assert none_health == {} and none_alerts == []
 
 
+def test_round_outcome_ignores_trailing_progress_lines() -> None:
+    """包装脚本把分步进度并入输出时，摘要 JSON 之后的进度行不改变归类。"""
+    from guvolu.execution.live_observer import _round_outcome
+
+    summary = json.dumps({
+        "status": "completed", "live": {"status": "completed", "returncode": 0},
+    })
+    progress = json.dumps({"progress": "done", "at": "2026-09-23T05:41:24+00:00"})
+    completed, reason = _round_outcome({
+        "exit_code": 0,
+        "output": chr(10).join([progress, summary, progress]),
+    })
+    assert (completed, reason) == (True, "completed")
+    # 只有进度行而无摘要时按未完成处理
+    incomplete, tail = _round_outcome({"exit_code": 1, "output": progress})
+    assert incomplete is False and tail.startswith('{"progress"')
+
+
 def test_scheduler_health_counts_killed_rounds_from_start_markers(
     tmp_path: Path,
 ) -> None:
