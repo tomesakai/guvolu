@@ -8,10 +8,12 @@ import os
 import subprocess
 import sys
 import time
+from contextlib import ExitStack
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Mapping, Sequence
 
+from guvolu.data.durable_io import exclusive_path_lock
 from refresh_frozen_runtime import refresh_runtime
 
 # 执行仓内 paper 相对路径
@@ -42,6 +44,26 @@ def _text(value: object, name: str) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError(f"{name} 缺失")
     return value
+
+
+def _progress(stage: str) -> None:
+    """分步进度写标准错误，轮次被终止时仍可见最后阶段。"""
+    print(json.dumps({
+        "progress": stage, "at": datetime.now(UTC).isoformat(),
+    }, ensure_ascii=False), file=sys.stderr, flush=True)
+
+
+def _enter_round_lock(stack: ExitStack, runtime: Path) -> None:
+    """同一运行根同时只许一轮；被占用即快速失败而不排队。
+
+    两轮在同一运行根交错时，后来者的预测会先改写制品再被登记拒绝
+    （2026-09-17 BTC 13:00Z、09-18 ETH 21:00Z 实测），致登记散列不符。
+    """
+    lock_target = runtime / "data" / ".locks" / "frozen-round"
+    try:
+        stack.enter_context(exclusive_path_lock(lock_target))
+    except OSError as exc:
+        raise RuntimeError(f"冻结运行根被另一轮占用: {runtime}") from exc
 
 
 def _json_stdout(result: subprocess.CompletedProcess[str], name: str) -> dict[str, object]:
@@ -296,112 +318,122 @@ def run_shadow(
     execution = execution_repository.resolve()
     task_log = execution / "data/execution/shadow/frozen-forward/task.jsonl"
     try:
-        retired_empty_heads = retire_empty_heads(source_root / "data", market_id)
-        stale_retries = 0
-        while True:
-            refresh = refresh_runtime(source_root / "data", runtime, market_id)
-            prediction_env = dict(os.environ)
-            prediction_env["PYTHONPATH"] = str(runtime / "src")
-            prediction = _json_stdout(_run(
-                (
-                    sys.executable,
-                    str(runtime / "scripts/manage_frozen_forward.py"),
-                    "--root", str(runtime), "predict", plan_id,
-                    "--registry", str(runtime / "data/research/governance.sqlite3"),
-                ),
-                cwd=runtime,
-                env=prediction_env,
-            ), "frozen prediction")
-            decision_time = datetime.fromisoformat(_text(
-                prediction.get("decision_time"), "decision_time",
-            )).astimezone(UTC)
-            age = datetime.now(UTC) - decision_time
-            fresh = timedelta(0) <= age <= timedelta(minutes=max_prediction_age_minutes)
-            if fresh or stale_retries >= stale_retry_count:
-                break
-            stale_retries += 1
-            time.sleep(stale_retry_wait_seconds)
-        if not fresh:
-            raise ValueError(f"冻结预测过期: {age.total_seconds():.1f}s")
-        prediction_id = _text(prediction.get("prediction_id"), "prediction_id")
-        prediction_path = Path(_text(
-            prediction.get("prediction_path"), "prediction_path",
-        )).resolve()
-        if not prediction_path.is_relative_to(runtime) or not prediction_path.is_file():
-            raise ValueError("预测路径越出冻结运行根")
-        # 编排侧固定来源预测散列（v2 血缘）
-        prediction_sha = hashlib.sha256(
-            prediction_path.read_bytes()
-        ).hexdigest()
+        with ExitStack() as stack:
+            _progress("round_lock")
+            _enter_round_lock(stack, runtime)
+            _progress("retire_empty_heads")
+            retired_empty_heads = retire_empty_heads(source_root / "data", market_id)
+            stale_retries = 0
+            while True:
+                _progress("refresh_runtime")
+                refresh = refresh_runtime(source_root / "data", runtime, market_id)
+                _progress("predict")
+                prediction_env = dict(os.environ)
+                prediction_env["PYTHONPATH"] = str(runtime / "src")
+                prediction = _json_stdout(_run(
+                    (
+                        sys.executable,
+                        str(runtime / "scripts/manage_frozen_forward.py"),
+                        "--root", str(runtime), "predict", plan_id,
+                        "--registry", str(runtime / "data/research/governance.sqlite3"),
+                    ),
+                    cwd=runtime,
+                    env=prediction_env,
+                ), "frozen prediction")
+                decision_time = datetime.fromisoformat(_text(
+                    prediction.get("decision_time"), "decision_time",
+                )).astimezone(UTC)
+                age = datetime.now(UTC) - decision_time
+                fresh = timedelta(0) <= age <= timedelta(minutes=max_prediction_age_minutes)
+                if fresh or stale_retries >= stale_retry_count:
+                    break
+                stale_retries += 1
+                time.sleep(stale_retry_wait_seconds)
+            if not fresh:
+                raise ValueError(f"冻结预测过期: {age.total_seconds():.1f}s")
+            prediction_id = _text(prediction.get("prediction_id"), "prediction_id")
+            prediction_path = Path(_text(
+                prediction.get("prediction_path"), "prediction_path",
+            )).resolve()
+            if not prediction_path.is_relative_to(runtime) or not prediction_path.is_file():
+                raise ValueError("预测路径越出冻结运行根")
+            # 编排侧固定来源预测散列（v2 血缘）
+            prediction_sha = hashlib.sha256(
+                prediction_path.read_bytes()
+            ).hexdigest()
 
-        exec_python = execution / ".venv/Scripts/python.exe"
-        target_path = _adapt_target(
-            execution, exec_python, prediction_path,
-            market_id=market_id, symbol=symbol, mode=DRY_RUN_MODE,
-            budget_jpy=budget_jpy, target_config=target_config,
-        )
-        shadow_root = execution / "data/execution/shadow/frozen-forward"
-        report_path = shadow_root / "reports" / f"{prediction_id}.json"
-        ledger_path = shadow_root / "intent_ledger.jsonl"
-        reused = report_path.is_file()
-        if reused:
-            report = _validate_report(report_path, prediction_id)
-        else:
-            result = _run(
-                (
-                    str(exec_python), str(execution / "scripts/run_dry_run_executor.py"),
-                    "--target", str(target_path), "--symbol", symbol,
-                    "--target-config",
-                    str(resolve_target_config(execution, target_config)),
-                    "--budget-jpy", budget_jpy, "--ledger", str(ledger_path),
-                    "--dry-run-report", str(report_path),
-                    "--source-prediction", str(prediction_path),
-                    "--source-prediction-sha256", prediction_sha,
+            exec_python = execution / ".venv/Scripts/python.exe"
+            _progress("target_adapter")
+            target_path = _adapt_target(
+                execution, exec_python, prediction_path,
+                market_id=market_id, symbol=symbol, mode=DRY_RUN_MODE,
+                budget_jpy=budget_jpy, target_config=target_config,
+            )
+            shadow_root = execution / "data/execution/shadow/frozen-forward"
+            report_path = shadow_root / "reports" / f"{prediction_id}.json"
+            ledger_path = shadow_root / "intent_ledger.jsonl"
+            reused = report_path.is_file()
+            if reused:
+                report = _validate_report(report_path, prediction_id)
+            else:
+                _progress("dry_run")
+                result = _run(
+                    (
+                        str(exec_python), str(execution / "scripts/run_dry_run_executor.py"),
+                        "--target", str(target_path), "--symbol", symbol,
+                        "--target-config",
+                        str(resolve_target_config(execution, target_config)),
+                        "--budget-jpy", budget_jpy, "--ledger", str(ledger_path),
+                        "--dry-run-report", str(report_path),
+                        "--source-prediction", str(prediction_path),
+                        "--source-prediction-sha256", prediction_sha,
+                    ),
+                    cwd=execution,
+                )
+                if result.returncode != 0:
+                    detail = (result.stderr or result.stdout).strip()
+                    raise RuntimeError(f"dry-run 失败({result.returncode}): {detail}")
+                report = _validate_report(report_path, prediction_id)
+            # paper 步骤失败不外抛
+            paper: dict[str, object]
+            if paper_enabled:
+                _progress("paper")
+                paper = run_paper_step(
+                    execution, exec_python, prediction_path, prediction_id,
+                    market_id=market_id, symbol=symbol,
+                    prediction_sha=prediction_sha, target_config=target_config,
+                )
+            else:
+                paper = {"status": "skipped", "reason": "--no-paper"}
+            summary: dict[str, object] = {
+                "status": "reused" if reused else "completed",
+                "started_at": started.isoformat(),
+                "completed_at": datetime.now(UTC).isoformat(),
+                "plan_id": plan_id,
+                "prediction_id": prediction_id,
+                "prediction_path": str(prediction_path),
+                "prediction_sha256": prediction_sha,
+                "decision_time": decision_time.isoformat(),
+                "prediction_age_seconds": round(age.total_seconds(), 3),
+                "stale_retries": stale_retries,
+                "aggregate_target": prediction.get("aggregate_target"),
+                "target_path": str(target_path),
+                "report_path": str(report_path),
+                "market_id": market_id,
+                "symbol": symbol,
+                "target_config": target_config,
+                "retired_empty_heads": retired_empty_heads,
+                "intent_state": (
+                    None if report.get("intent") is None
+                    else _object(report["intent"], "intent").get("state")
                 ),
-                cwd=execution,
-            )
-            if result.returncode != 0:
-                detail = (result.stderr or result.stdout).strip()
-                raise RuntimeError(f"dry-run 失败({result.returncode}): {detail}")
-            report = _validate_report(report_path, prediction_id)
-        # paper 步骤失败不外抛
-        paper: dict[str, object]
-        if paper_enabled:
-            paper = run_paper_step(
-                execution, exec_python, prediction_path, prediction_id,
-                market_id=market_id, symbol=symbol,
-                prediction_sha=prediction_sha, target_config=target_config,
-            )
-        else:
-            paper = {"status": "skipped", "reason": "--no-paper"}
-        summary: dict[str, object] = {
-            "status": "reused" if reused else "completed",
-            "started_at": started.isoformat(),
-            "completed_at": datetime.now(UTC).isoformat(),
-            "plan_id": plan_id,
-            "prediction_id": prediction_id,
-            "prediction_path": str(prediction_path),
-            "prediction_sha256": prediction_sha,
-            "decision_time": decision_time.isoformat(),
-            "prediction_age_seconds": round(age.total_seconds(), 3),
-            "stale_retries": stale_retries,
-            "aggregate_target": prediction.get("aggregate_target"),
-            "target_path": str(target_path),
-            "report_path": str(report_path),
-            "market_id": market_id,
-            "symbol": symbol,
-            "target_config": target_config,
-            "retired_empty_heads": retired_empty_heads,
-            "intent_state": (
-                None if report.get("intent") is None
-                else _object(report["intent"], "intent").get("state")
-            ),
-            "write_touched": _object(
-                report["endpoints"], "endpoints",
-            ).get("write_touched"),
-            "paper": paper,
-            "refresh": refresh,
-        }
+                "write_touched": _object(
+                    report["endpoints"], "endpoints",
+                ).get("write_touched"),
+                "paper": paper,
+                "refresh": refresh,
+            }
+        _progress("done")
         _append_record(task_log, summary)
         return summary
     except BaseException as exc:

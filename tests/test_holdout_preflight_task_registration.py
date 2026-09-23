@@ -116,6 +116,35 @@ def test_preflight_registration_rejects_malformed_vintage_first(
         capture_output=True,
         text=True,
         encoding="utf-8",
+        errors="replace",
     )
     assert result.returncode != 0
     assert "canonical holdout vintage identifier" in result.stderr
+
+
+@pytest.mark.skipif(POWERSHELL is None, reason="需要 Windows PowerShell")
+def test_preflight_registration_accepts_second_task_name(tmp_path: Path) -> None:
+    """第二个冻结运行根可用带后缀的任务名并存登记；非法任务名拒绝。"""
+    repository, runtime = _repository(tmp_path)
+    register = Path("scripts/register_holdout_preflight_task.ps1").resolve()
+    base = [
+        str(POWERSHELL), "-NoProfile", "-File", str(register),
+        "-Repository", str(repository), "-RuntimeRoot", str(runtime),
+        "-VintageId", VINTAGE_ID, "-DescribeOnly",
+    ]
+    result = subprocess.run(
+        [*base, "-TaskName", "guvolu-holdout-preflight-eth"],
+        check=False, capture_output=True, text=True, encoding="utf-8",
+        errors="replace",
+    )
+    assert result.returncode == 0, result.stderr
+    definition = json.loads(result.stdout)
+    assert definition["task_name"] == "guvolu-holdout-preflight-eth"
+    assert f'-RuntimeRoot "{runtime.resolve()}"' in definition["arguments"]
+    rejected = subprocess.run(
+        [*base, "-TaskName", "other-task"],
+        check=False, capture_output=True, text=True, encoding="utf-8",
+        errors="replace",
+    )
+    assert rejected.returncode != 0
+

@@ -1,9 +1,12 @@
-param(
+﻿param(
     [string]$Repository = "",
     [string]$RuntimeRoot = "",
     [string]$VintageId = "",
     [ValidatePattern('^(?:[01][0-9]|2[0-3]):[0-5][0-9]$')]
     [string]$DailyAt = "09:35",
+    # 第二个冻结运行根的预检用不同任务名并存
+    [ValidatePattern('^guvolu-holdout-preflight(?:-[a-z0-9]+)?$')]
+    [string]$TaskName = "guvolu-holdout-preflight",
     [switch]$DescribeOnly
 )
 
@@ -31,7 +34,6 @@ $Time = [datetime]::ParseExact(
     [System.Globalization.CultureInfo]::InvariantCulture
 )
 $FirstRunLocal = [datetime]::Today.Add($Time.TimeOfDay)
-$TaskName = "guvolu-holdout-preflight"
 $Arguments = (
     '-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden ' +
     "-File `"$TaskRunner`" -Repository `"$RepoRoot`" " +

@@ -412,3 +412,40 @@ def test_stale_prediction_fails_after_retry_budget(
     assert len(chain.scripts("manage_frozen_forward.py")) == 2
     assert chain.scripts("adapt_frozen_target.py") == []
 
+
+def test_busy_runtime_root_fails_fast_and_records_failure(
+    chain: FakeChain, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """运行根被另一轮占用时快速失败，不刷新、不预测，并留下失败记录。"""
+    from contextlib import contextmanager
+
+    @contextmanager
+    def busy(_path: Path):  # type: ignore[no-untyped-def]
+        raise OSError("locked")
+        yield
+
+    monkeypatch.setattr(shadow, "exclusive_path_lock", busy)
+    with pytest.raises(RuntimeError, match="被另一轮占用"):
+        _run_chain(chain)
+    # 未启动任何子进程
+    assert chain.calls == []
+    records = _task_records(chain)
+    assert records[-1]["status"] == "failed"
+    assert "被另一轮占用" in str(records[-1]["error"])
+
+
+def test_progress_markers_go_to_stderr_in_step_order(
+    chain: FakeChain, capsys: pytest.CaptureFixture[str],
+) -> None:
+    """分步进度按顺序写标准错误，供包装脚本在超时终止后诊断。"""
+    _run_chain(chain)
+    stages = [
+        json.loads(line)["progress"]
+        for line in capsys.readouterr().err.splitlines()
+        if line.startswith("{")
+    ]
+    assert stages == [
+        "round_lock", "retire_empty_heads", "refresh_runtime", "predict",
+        "target_adapter", "dry_run", "paper", "done",
+    ]
+
