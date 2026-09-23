@@ -32,16 +32,21 @@ $Failed = 0
 foreach ($Market in $Markets) {
     # 写锁被物化器占用时单次等待 120 秒即超时，逐市场重试。
     foreach ($Attempt in 1..$AttemptsPerMarket) {
+        # Windows PowerShell 下 Stop 会把子进程的标准错误当作终止错误
+        $ErrorActionPreference = "Continue"
         $Output = & $Python -m guvolu.data.trade_realtime_compact `
             --data-root $DataRoot --market-id $Market 2>&1
         $Code = $LASTEXITCODE
-        $Summary = ($Output | Select-Object -Last 1)
+        $ErrorActionPreference = "Stop"
+        $Summary = ($Output | ForEach-Object { $_.ToString() } | Select-Object -Last 1)
         if ($Summary -and $Summary.ToString().Length -gt 300) {
             $Summary = $Summary.ToString().Substring(0, 300)
         }
         "$(Get-Date -Format o) $Market attempt $Attempt exit $Code $Summary" |
             Out-File -LiteralPath $LogPath -Append -Encoding utf8
         if ($Code -eq 0) { break }
+        # 重试前让出写锁竞争窗口
+        Start-Sleep -Seconds 60
     }
     if ($Code -ne 0) { $Failed += 1 }
 }

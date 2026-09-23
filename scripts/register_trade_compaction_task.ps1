@@ -1,10 +1,11 @@
 ﻿param(
     [string]$Repository = "",
-    [string]$At = "03:53",
+    [string]$At = "04:53",
     [switch]$DescribeOnly
 )
 # 登记每日一次的逐笔实时段合并任务（TBD-40）。时刻避开每小时第 12 分与
-# 第 30 分起跑的冻结前向链，也在 03:16 每日补漏之后。-DescribeOnly 只打印定义。
+# 第 30 分起跑的冻结前向链，也在 03:16 起约 50 分钟的每日补漏结束之后
+# （补漏持主写锁，03:53 与之相撞连日失败）。-DescribeOnly 只打印定义。
 $ErrorActionPreference = "Stop"
 $RepoRoot = if ($Repository) {
     (Resolve-Path -LiteralPath $Repository).Path
