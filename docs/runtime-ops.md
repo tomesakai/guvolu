@@ -123,7 +123,7 @@ OKX live books 已完成有界真实隔离小样本，但尚未证明重连和�
   `data/execution/live/cost-summary/`（2026-09-11 起）。伴随观察进程的任务经
   `scripts/register_live_observer_task.ps1 -SchedulerLog <主仓 live-scheduler.jsonl>`
   登记后同时监视每小时链路健康（2026-09-13 起，执行链设计第 14 节）。
-- 逐笔实时段头每日合并以计划任务 `guvolu-trade-compaction` 在 04:53 运行
+- 逐笔实时段头每日合并以计划任务 `guvolu-trade-compaction` 在 10:53 运行
   （`scripts/register_trade_compaction_task.ps1`，启动器
   `scripts/run_trade_compaction.ps1`，日志 `logs/trade-compaction.log`）：七个市场
   逐个执行 `trade_realtime_compact`，写锁超时逐市场重试三次、间隔 60 秒。生产
