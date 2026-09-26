@@ -10,10 +10,12 @@ import sys
 import time
 from contextlib import ExitStack
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Mapping, Sequence
 
 from guvolu.data.durable_io import exclusive_path_lock
+from guvolu.execution.paper_config import load_paper_config
 from refresh_frozen_runtime import refresh_runtime
 
 # 执行仓内 paper 相对路径
@@ -134,6 +136,26 @@ def resolve_target_config(execution: Path, target_config: str) -> Path:
     if not path.is_relative_to((execution / "config").resolve()):
         raise ValueError("目标配置路径越出执行仓 config 目录")
     return path
+
+
+def resolve_budget(
+    execution: Path, target_config: str, budget_jpy: str | None,
+) -> str:
+    """风险预算只有一处来源：执行仓目标配置；显式给出时须与之相等。
+
+    预算曾在编排缺省值、live 缺省值与两份目标配置四处重复，改一处漏一处
+    即整轮以「与执行配置不一致」失败（2026-09-14 实测）。
+    """
+    configured = load_paper_config(
+        resolve_target_config(execution, target_config),
+    ).risk_budget_jpy
+    if budget_jpy is None:
+        return format(configured, "f")
+    if Decimal(budget_jpy) != configured:
+        raise ValueError(
+            f"显式预算 {budget_jpy} 与目标配置 {configured} 不一致"
+        )
+    return budget_jpy
 
 
 def _adapt_target(
@@ -298,7 +320,7 @@ def run_shadow(
     market_id: str,
     *,
     symbol: str = "BTC",
-    budget_jpy: str = "15000",
+    budget_jpy: str | None = None,
     max_prediction_age_minutes: int = DEFAULT_MAX_PREDICTION_AGE_MINUTES,
     paper_enabled: bool = True,
     target_config: str = PAPER_CONFIG,
@@ -321,6 +343,7 @@ def run_shadow(
         with ExitStack() as stack:
             _progress("round_lock")
             _enter_round_lock(stack, runtime)
+            budget_jpy = resolve_budget(execution, target_config, budget_jpy)
             _progress("retire_empty_heads")
             retired_empty_heads = retire_empty_heads(source_root / "data", market_id)
             stale_retries = 0
@@ -422,6 +445,7 @@ def run_shadow(
                 "market_id": market_id,
                 "symbol": symbol,
                 "target_config": target_config,
+                "budget_jpy": budget_jpy,
                 "retired_empty_heads": retired_empty_heads,
                 "intent_state": (
                     None if report.get("intent") is None
@@ -453,7 +477,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--plan-id", required=True)
     parser.add_argument("--market-id", default="mkt__gmo__btc__r0")
     parser.add_argument("--symbol", default="BTC")
-    parser.add_argument("--budget-jpy", default="15000")
+    parser.add_argument(
+        "--budget-jpy", default=None,
+        help="缺省取执行仓目标配置 risk_budget_jpy；给出时须与之相等",
+    )
     parser.add_argument(
         "--max-prediction-age-minutes", type=int,
         default=DEFAULT_MAX_PREDICTION_AGE_MINUTES,
@@ -479,7 +506,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     summary = run_shadow(
         args.repository, args.runtime_root, args.execution_repository,
         str(args.plan_id), str(args.market_id), symbol=str(args.symbol),
-        budget_jpy=str(args.budget_jpy),
+        budget_jpy=None if args.budget_jpy is None else str(args.budget_jpy),
         max_prediction_age_minutes=int(args.max_prediction_age_minutes),
         paper_enabled=not bool(args.no_paper),
         target_config=str(args.target_config),

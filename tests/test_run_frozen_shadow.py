@@ -56,6 +56,12 @@ class FakeChain:
         self.execution = tmp_path / "execution"
         for root in (self.repository / "data", self.runtime, self.execution):
             root.mkdir(parents=True)
+        # 预算唯一来源是执行仓目标配置
+        (self.execution / "config").mkdir()
+        for name in ("paper_executor.json", "paper_executor_eth.json"):
+            (self.execution / "config" / name).write_bytes(
+                (SCRIPTS.parent / "config" / name).read_bytes(),
+            )
         self.calls: list[list[str]] = []
         self.paper_report: dict[str, object] | None = _paper_filled_report()
         self.paper_returncode = 0
@@ -449,3 +455,24 @@ def test_progress_markers_go_to_stderr_in_step_order(
         "target_adapter", "dry_run", "paper", "done",
     ]
 
+
+def test_budget_comes_from_target_config(chain: FakeChain) -> None:
+    """未显式给出预算时取目标配置；dry-run 目标与报告摘要同值。"""
+    path = chain.execution / "config/paper_executor.json"
+    config = json.loads(path.read_text(encoding="utf-8"))
+    config["risk_budget_jpy"] = "20000"
+    path.write_text(json.dumps(config), encoding="utf-8")
+    summary = _run_chain(chain)
+    adapters = chain.scripts("adapt_frozen_target.py")
+    assert _option(adapters[0], "--risk-budget-jpy") == "20000"
+    dry_run_call = chain.scripts("run_dry_run_executor.py")[0]
+    assert _option(dry_run_call, "--budget-jpy") == "20000"
+    assert summary["budget_jpy"] == "20000"
+
+
+def test_explicit_budget_must_match_target_config(chain: FakeChain) -> None:
+    """显式预算与目标配置不等即在任何子进程前拒绝并留失败记录。"""
+    with pytest.raises(ValueError, match="不一致"):
+        _run_chain(chain, budget_jpy="16000")
+    assert chain.calls == []
+    assert _task_records(chain)[-1]["status"] == "failed"

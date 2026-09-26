@@ -1,7 +1,8 @@
 ﻿param(
     [string]$Draft = "config\authorization_envelope.draft-2.json",
     [string]$ExecutionRepository = "C:\Users\wu_zh\dev\guvolu-exec",
-    [switch]$DryRun
+    [switch]$DryRun,
+    [switch]$AnyMinute
 )
 # 签发授权信封（执行链设计第 14 节）：由维护者亲自运行（A-01）。
 # 步骤：校验草案；把草案写为正式信封并提交主仓；执行仓快进到主仓
@@ -18,6 +19,12 @@ $Target = Join-Path $RepoRoot "config\authorization_envelope.json"
 $Verifier = "scripts\verify_envelope.py"
 if (-not (Test-Path -LiteralPath $DraftPath -PathType Leaf)) {
     throw "草案不存在: $DraftPath"
+}
+# 快进执行仓会同时切换信封与目标配置预算；在每小时轮次运行中切换，
+# 该轮适配器与执行器会读到不同预算而失败。只在 :45 至 :10 之间签发。
+$Minute = (Get-Date).Minute
+if (-not $DryRun -and -not $AnyMinute -and $Minute -ge 10 -and $Minute -lt 45) {
+    throw "当前第 $Minute 分处于每小时轮次运行窗（:10 至 :45），请在 :45 至 :10 之间签发，或以 -AnyMinute 显式放行"
 }
 $MainDirty = git -C $RepoRoot status --porcelain
 if ($MainDirty) {

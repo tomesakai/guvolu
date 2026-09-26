@@ -148,7 +148,7 @@ def run_live(
     market_id: str,
     *,
     symbol: str = "BTC",
-    budget_jpy: str = "15000",
+    budget_jpy: str | None = None,
     max_prediction_age_minutes: int = DEFAULT_MAX_PREDICTION_AGE_MINUTES,
     paper_enabled: bool = True,
     target_config: str = PAPER_CONFIG,
@@ -201,7 +201,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--plan-id", required=True)
     parser.add_argument("--market-id", default="mkt__gmo__btc__r0")
     parser.add_argument("--symbol", default="BTC")
-    parser.add_argument("--budget-jpy", default="15000")
+    parser.add_argument(
+        "--budget-jpy", default=None,
+        help="缺省取执行仓目标配置 risk_budget_jpy；给出时须与之相等",
+    )
     parser.add_argument(
         "--max-prediction-age-minutes", type=int,
         default=DEFAULT_MAX_PREDICTION_AGE_MINUTES,
@@ -227,7 +230,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     summary = run_live(
         args.repository, args.runtime_root, args.execution_repository,
         str(args.plan_id), str(args.market_id), symbol=str(args.symbol),
-        budget_jpy=str(args.budget_jpy),
+        budget_jpy=None if args.budget_jpy is None else str(args.budget_jpy),
         max_prediction_age_minutes=int(args.max_prediction_age_minutes),
         paper_enabled=not bool(args.no_paper),
         target_config=str(args.target_config),

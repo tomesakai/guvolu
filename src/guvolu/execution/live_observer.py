@@ -22,6 +22,7 @@ import base64
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import time
 from collections.abc import Mapping, Sequence
@@ -63,6 +64,11 @@ DEFAULT_INTERVAL_SECONDS = 60.0
 DEFAULT_SCHEDULER_FAILURE_LIMIT = 3
 DEFAULT_SCHEDULER_SILENCE_SECONDS = 7800.0
 DEFAULT_ROUND_TIMEOUT_SECONDS = 3600.0
+# 到期预警：信封剩余小时与封存段剩余天数
+DEFAULT_ENVELOPE_EXPIRY_WARNING_HOURS = 72.0
+DEFAULT_PLAN_END_WARNING_DAYS = 14.0
+# 冻结运行根内治理注册库相对路径
+_GOVERNANCE_REGISTRY = Path("data") / "research" / "governance.sqlite3"
 # 桌面消息显示秒数
 DESKTOP_NOTICE_SECONDS = 600
 # JPY 资产键名
@@ -206,7 +212,7 @@ def scan_scheduler_health(
             "consecutive_incomplete": consecutive,
             "last_reason": outcomes[-1][1] if outcomes else None,
         }
-        label = market.split("__")[2].upper() if market.count("__") >= 2 else market
+        label = _market_label(market)
         if len(recent) >= failure_limit and consecutive >= failure_limit:
             alerts.append(
                 f"市场 {label} 每小时链连续 {consecutive} 轮未完成:"
@@ -217,6 +223,100 @@ def scan_scheduler_health(
                 f"市场 {label} 已 {age_seconds / 3600:.1f} 小时无调度轮次"
             )
     return health, alerts
+
+
+def _market_label(market: str) -> str:
+    """市场标识转为简短品种标签。"""
+    return market.split("__")[2].upper() if market.count("__") >= 2 else market
+
+
+def _vintage_end(runtime_root: Path, plan_id: str) -> datetime | None:
+    """只读查询冻结计划绑定封存段的结束时刻；取不到即 None。"""
+    registry = runtime_root / _GOVERNANCE_REGISTRY
+    if not registry.is_file():
+        return None
+    try:
+        connection = sqlite3.connect(f"file:{registry.as_posix()}?mode=ro", uri=True)
+        try:
+            row = connection.execute(
+                "SELECT v.end_time FROM frozen_forward_plan p "
+                "JOIN holdout_vintage v ON v.vintage_id=p.vintage_id "
+                "WHERE p.plan_id=?",
+                (plan_id,),
+            ).fetchone()
+        finally:
+            connection.close()
+        if row is None:
+            return None
+        end = datetime.fromisoformat(str(row[0]).replace("Z", "+00:00"))
+    except (sqlite3.Error, ValueError):
+        return None
+    return end if end.tzinfo is not None else None
+
+
+def scan_plan_deadlines(
+    log_path: Path,
+    *,
+    now: datetime,
+    warning_days: float = DEFAULT_PLAN_END_WARNING_DAYS,
+    lookback_seconds: float = 7 * 86400.0,
+) -> tuple[dict[str, dict[str, object]], list[str]]:
+    """近七日在跑的冻结计划，其封存段临近结束即预警。
+
+    封存段结束后计划不能再追加预测，该市场的每小时链随即中断、持仓无人
+    管理；后继计划与其 -live 任务须在此前就位（2026-09-26 快照）。
+    """
+    latest: dict[str, Mapping[str, object]] = {}
+    for row in _scheduler_rows(log_path):
+        plan_id = str(row.get("plan_id") or "")
+        runtime = str(row.get("resolved_runtime_root") or "")
+        if row.get("phase") == "started" or not plan_id or not runtime:
+            continue
+        try:
+            began = datetime.fromisoformat(
+                str(row.get("started_at") or "").replace("Z", "+00:00")
+            )
+        except ValueError:
+            continue
+        if began.tzinfo is None or (now - began).total_seconds() > lookback_seconds:
+            continue
+        latest[plan_id] = row
+    deadlines: dict[str, dict[str, object]] = {}
+    alerts: list[str] = []
+    for plan_id, row in sorted(latest.items()):
+        end = _vintage_end(Path(str(row["resolved_runtime_root"])), plan_id)
+        label = _market_label(str(row.get("market_id") or "") or _PRIMARY_MARKET)
+        days_left = None if end is None else (end - now).total_seconds() / 86400
+        deadlines[plan_id[-12:]] = {
+            "market": label,
+            "vintage_end": None if end is None else end.isoformat(),
+            "days_left": days_left,
+        }
+        if end is not None and days_left is not None and 0 < days_left <= warning_days:
+            alerts.append(
+                f"计划 {plan_id[-12:]}（{label}）封存段于 "
+                f"{end:%Y-%m-%d %H:%M}Z 结束，剩 {days_left:.1f} 天，"
+                "须备好后继计划与 -live 任务"
+            )
+    return deadlines, alerts
+
+
+def envelope_expiry_alert(
+    envelope: AuthorizationEnvelope,
+    *,
+    now: datetime,
+    warning_hours: float = DEFAULT_ENVELOPE_EXPIRY_WARNING_HOURS,
+) -> str | None:
+    """信封过期即全部 live 轮次被有效期门拒绝；提前预警换封。"""
+    remaining = (envelope.valid_until - now).total_seconds() / 3600
+    if remaining <= 0:
+        return f"信封 {envelope.sha12} 已于 {envelope.valid_until.isoformat()} 过期"
+    if remaining <= warning_hours:
+        return (
+            f"信封 {envelope.sha12} 将于 {envelope.valid_until:%Y-%m-%d %H:%M}Z"
+            f" 到期，剩 {remaining:.0f} 小时，须换封"
+        )
+    return None
 
 
 # 通知应用标识
@@ -382,15 +482,27 @@ def observe_once(
     stale_age_seconds: float = DEFAULT_STALE_AGE_SECONDS,
     scheduler_log: Path | None = None,
     scheduler_failure_limit: int = DEFAULT_SCHEDULER_FAILURE_LIMIT,
+    envelope_expiry_warning_hours: float = DEFAULT_ENVELOPE_EXPIRY_WARNING_HOURS,
+    plan_end_warning_days: float = DEFAULT_PLAN_END_WARNING_DAYS,
 ) -> ObservationCycle:
     """执行一轮零写观察，产出记录与告警。"""
     alerts: list[str] = []
     scheduler_health: dict[str, dict[str, object]] = {}
+    plan_deadlines: dict[str, dict[str, object]] = {}
+    expiry = envelope_expiry_alert(
+        envelope, now=now, warning_hours=envelope_expiry_warning_hours,
+    )
+    if expiry is not None:
+        alerts.append(expiry)
     if scheduler_log is not None:
         scheduler_health, scheduler_alerts = scan_scheduler_health(
             scheduler_log, now=now, failure_limit=scheduler_failure_limit,
         )
         alerts.extend(scheduler_alerts)
+        plan_deadlines, deadline_alerts = scan_plan_deadlines(
+            scheduler_log, now=now, warning_days=plan_end_warning_days,
+        )
+        alerts.extend(deadline_alerts)
     symbols = sorted(str(symbol) for symbol in envelope.symbols)
     active_view: list[dict[str, object]] = []
     position_view: dict[str, str] = {}
@@ -455,6 +567,8 @@ def observe_once(
             else state.paused_until.isoformat()
         ),
         "scheduler_health": scheduler_health,
+        "plan_deadlines": plan_deadlines,
+        "envelope_valid_until": envelope.valid_until.isoformat(),
         "alerts": alerts,
         "status": "alert" if alerts else "ok",
     }
@@ -512,6 +626,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="同一市场连续未完成轮数达此值即告警",
     )
     parser.add_argument(
+        "--envelope-expiry-warning-hours", type=float,
+        default=DEFAULT_ENVELOPE_EXPIRY_WARNING_HOURS,
+        help="信封剩余小时不超过此值即告警",
+    )
+    parser.add_argument(
+        "--plan-end-warning-days", type=float,
+        default=DEFAULT_PLAN_END_WARNING_DAYS,
+        help="冻结计划封存段剩余天数不超过此值即告警",
+    )
+    parser.add_argument(
         "--no-desktop-notify", action="store_true",
         help="不经 msg.exe 弹出桌面消息",
     )
@@ -563,6 +687,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 stale_age_seconds=float(args.stale_age_seconds),
                 scheduler_log=scheduler_log,
                 scheduler_failure_limit=int(args.scheduler_failure_limit),
+                envelope_expiry_warning_hours=float(
+                    args.envelope_expiry_warning_hours
+                ),
+                plan_end_warning_days=float(args.plan_end_warning_days),
             )
         except GuvoluError as exc:
             # 单轮读取失败：记错误心跳，下轮再试

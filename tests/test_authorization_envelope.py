@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from guvolu.domain.config import MAX_DAY_JPY_CEILING, MAX_ORDER_JPY_CEILING
 from guvolu.domain.enums import Side
 from guvolu.domain.symbols import SpotSymbol
 from guvolu.execution.authorization_envelope import (
@@ -106,7 +107,7 @@ def test_load_issued_envelope_and_identity() -> None:
     assert envelope.symbols == frozenset({BTC, ETH})
     # 额度只核与文件一致（T-11）
     assert envelope.order_jpy_max == Decimal(issued["order_jpy_max"])
-    assert envelope.order_jpy_max <= Decimal("15000")
+    assert envelope.order_jpy_max <= MAX_ORDER_JPY_CEILING
     assert envelope.canary_first_order_jpy_max == Decimal(
         issued["canary_first_order_jpy_max"]
     )
@@ -126,8 +127,8 @@ def test_load_issued_envelope_and_identity() -> None:
         (lambda b: b.update(extra=1), "字段集合"),
         (lambda b: b.update(schema_version=2), "schema_version"),
         (lambda b: b.update(order_jpy_max=10000), "字符串数值"),
-        (lambda b: b.update(order_jpy_max="20000"), "硬顶"),
-        (lambda b: b.update(day_jpy_max="45001"), "硬顶"),
+        (lambda b: b.update(order_jpy_max=str(MAX_ORDER_JPY_CEILING + 1)), "硬顶"),
+        (lambda b: b.update(day_jpy_max=str(MAX_DAY_JPY_CEILING + 1)), "硬顶"),
         (lambda b: b.update(day_count_max=51), "硬顶"),
         (lambda b: b.update(day_count_max=0), "正整数"),
         (lambda b: b.update(envelope_jpy_total="-1"), "必须为正"),

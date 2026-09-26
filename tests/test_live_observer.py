@@ -387,3 +387,74 @@ def test_ledger_scan_flags_stale_inflight_without_mutation(
     # 不隔离不截断
     assert path.read_bytes() == before
     assert not list(tmp_path.glob("*.partial-*"))
+
+
+def _registry(root: Path, plan_id: str, end: str) -> None:
+    """最小治理注册库：计划绑定一个封存段。"""
+    import sqlite3
+
+    path = root / "data" / "research" / "governance.sqlite3"
+    path.parent.mkdir(parents=True)
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        "CREATE TABLE holdout_vintage(vintage_id TEXT, end_time TEXT);"
+        "CREATE TABLE frozen_forward_plan(plan_id TEXT, vintage_id TEXT);"
+    )
+    connection.execute("INSERT INTO holdout_vintage VALUES('v1', ?)", (end,))
+    connection.execute(
+        "INSERT INTO frozen_forward_plan VALUES(?, 'v1')", (plan_id,)
+    )
+    connection.commit()
+    connection.close()
+
+
+def test_plan_deadline_alert_only_inside_warning_window(tmp_path: Path) -> None:
+    """近七日在跑的计划，封存段剩余天数进入预警窗才告警；已结束不再重复。"""
+    from guvolu.execution.live_observer import scan_plan_deadlines
+
+    plan = "frozen-forward-plan-" + "a" * 52 + "f8981e8826b4"
+    runtime = tmp_path / "runtime"
+    _registry(runtime, plan, "2026-12-02T00:00:00.000000+00:00")
+    log = tmp_path / "live-scheduler.jsonl"
+    log.write_text(json.dumps({
+        "started_at": "2026-11-20T00:12:00Z", "plan_id": plan,
+        "resolved_runtime_root": str(runtime), "market_id": "", "exit_code": 0,
+    }) + "\n", encoding="utf-8")
+    early = datetime(2026, 11, 10, tzinfo=UTC)
+    quiet, none = scan_plan_deadlines(
+        log, now=early, lookback_seconds=30 * 86400,
+    )
+    assert none == [] and quiet["f8981e8826b4"]["market"] == "primary"
+    near = datetime(2026, 11, 21, tzinfo=UTC)
+    deadlines, alerts = scan_plan_deadlines(log, now=near)
+    assert deadlines["f8981e8826b4"]["days_left"] == 11.0
+    assert len(alerts) == 1 and "2026-12-02 00:00Z" in alerts[0]
+    after = datetime(2026, 12, 3, tzinfo=UTC)
+    assert scan_plan_deadlines(log, now=after)[1] == []
+    # 注册库缺失时不告警也不抛错
+    (runtime / "data" / "research" / "governance.sqlite3").unlink()
+    missing, silent = scan_plan_deadlines(log, now=near)
+    assert silent == [] and missing["f8981e8826b4"]["vintage_end"] is None
+
+
+def test_envelope_expiry_alert_window() -> None:
+    """信封剩余不超过预警小时即告警，过期另有措辞。"""
+    from types import SimpleNamespace
+
+    from guvolu.execution.live_observer import envelope_expiry_alert
+
+    envelope = SimpleNamespace(
+        sha12="f6a337900ace", valid_until=datetime(2026, 10, 5, tzinfo=UTC),
+    )
+    far = envelope_expiry_alert(
+        envelope, now=datetime(2026, 9, 30, tzinfo=UTC),  # type: ignore[arg-type]
+    )
+    assert far is None
+    near = envelope_expiry_alert(
+        envelope, now=datetime(2026, 10, 3, tzinfo=UTC),  # type: ignore[arg-type]
+    )
+    assert near is not None and "剩 48 小时" in near
+    gone = envelope_expiry_alert(
+        envelope, now=datetime(2026, 10, 6, tzinfo=UTC),  # type: ignore[arg-type]
+    )
+    assert gone is not None and "已于" in gone

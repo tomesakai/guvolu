@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "rules": {
+    "order_jpy_max": "1",
+    "day_jpy_max": "4",
+    "max_position_jpy": "1.5",
+    "max_cumulative_loss_jpy": "0.55",
+    "day_loss_jpy_max": "0.15",
+    "envelope_jpy_total": "30",
+    "canary_first_order_jpy_max": "0.6"
+  },
+  "day_count_max": 30,
+  "validity_days": 28,
+  "stages": [
+    {
+      "stage": "S1",
+      "risk_budget_jpy": "15000",
+      "minimum_valuation_jpy": "25000",
+      "gate": "现行本金约 3.4 万 JPY"
+    },
+    {
+      "stage": "T1",
+      "risk_budget_jpy": "50000",
+      "minimum_valuation_jpy": "90000",
+      "gate": "入金使估值达 9 万 JPY 以上"
+    },
+    {
+      "stage": "S2",
+      "risk_budget_jpy": "150000",
+      "minimum_valuation_jpy": "280000",
+      "gate": "12-02 BTC 封存段裁决 PASS；后继计划实盘至少两周且无误熔断、无对账差异；硬顶先升至 150,000 / 600,000"
+    }
+  ]
+}
