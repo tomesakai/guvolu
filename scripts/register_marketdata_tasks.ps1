@@ -1,4 +1,4 @@
-param(
+﻿param(
     [switch]$Unregister,
     [ValidateSet('Full', 'ForwardMinimal')]
     [string]$Profile = 'Full',
@@ -67,9 +67,13 @@ Register-ScheduledTask -TaskName $TaskNames[0] -Action $Action `
     -Description 'Start the guvolu public market-data pipeline at logon.' `
     -Force | Out-Null
 
+# 守护每五分钟启动一次，以 headless 控制台承载，避免默认终端委托泄漏；
+# 其退出码不被使用（set_task_console_host.ps1 说明）。
+$GuardAction = New-ScheduledTaskAction -Execute 'conhost.exe' `
+    -Argument ('--headless powershell.exe ' + $Argument) -WorkingDirectory $RepoRoot
 $GuardTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
     -RepetitionInterval (New-TimeSpan -Minutes 5)
-Register-ScheduledTask -TaskName $TaskNames[1] -Action $Action `
+Register-ScheduledTask -TaskName $TaskNames[1] -Action $GuardAction `
     -Trigger $GuardTrigger -Principal $Principal -Settings $Settings `
     -Description 'Idempotently guard guvolu public market-data writers.' `
     -Force | Out-Null

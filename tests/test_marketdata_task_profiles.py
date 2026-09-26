@@ -162,6 +162,7 @@ def test_l2_bounded_modes_fail_before_repository_or_process_side_effects(
         capture_output=True,
         text=True,
         encoding="utf-8",
+        errors="replace",
         timeout=10,
     )
     assert completed.returncode != 0
@@ -320,6 +321,7 @@ def _pid_is_running(pid: int) -> bool:
         capture_output=True,
         text=True,
         encoding="utf-8",
+        errors="replace",
     )
     return f'"{pid}"' in completed.stdout
 
@@ -424,6 +426,7 @@ $Result | ConvertTo-Json -Compress
         capture_output=True,
         text=True,
         encoding="utf-8",
+        errors="replace",
         env=environment,
         timeout=10,
     )
@@ -523,6 +526,7 @@ $Result | ConvertTo-Json -Compress
         capture_output=True,
         text=True,
         encoding="utf-8",
+        errors="replace",
         env=environment,
         timeout=10,
     )
@@ -862,6 +866,7 @@ def test_python_l2_selection_conflict_fails_before_recovery_or_collectors(
             capture_output=True,
             text=True,
             encoding="utf-8",
+            errors="replace",
             env=environment,
             timeout=40,
         )
@@ -943,6 +948,7 @@ while ($true) { Start-Sleep -Seconds 1 }
             capture_output=True,
             text=True,
             encoding="utf-8",
+            errors="replace",
             env=environment,
             timeout=20,
         )
@@ -984,6 +990,7 @@ def test_public_l2_runner_rejects_abbreviated_switch_before_python(
         capture_output=True,
         text=True,
         encoding="utf-8",
+        errors="replace",
         env=environment,
         timeout=10,
     )
@@ -1097,6 +1104,7 @@ def test_full_junction_alias_reentry_reuses_all_marketdata_processes(
             capture_output=True,
             text=True,
             encoding="utf-8",
+            errors="replace",
             env=environment,
             timeout=60,
         )
@@ -1232,6 +1240,7 @@ Start-Sleep -Seconds 60
             capture_output=True,
             text=True,
             encoding="utf-8",
+            errors="replace",
             env=environment,
             timeout=45,
         )
@@ -1300,6 +1309,7 @@ def test_locked_owner_executable_mismatch_fails_before_recovery(
             capture_output=True,
             text=True,
             encoding="utf-8",
+            errors="replace",
             env=environment,
             timeout=30,
         )
@@ -1360,6 +1370,7 @@ def test_forward_minimal_retries_when_direct_watch_wins_suppression_race(
         stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
+        errors="replace",
     )
     watcher: subprocess.Popen[bytes] | None = None
     owner_path = repository / "data/.locks/l2-materializer-owner.json"
@@ -1440,6 +1451,7 @@ def test_forward_minimal_clears_unlocked_stale_owner_before_recovery(
         capture_output=True,
         text=True,
         encoding="utf-8",
+        errors="replace",
         env=environment,
         timeout=30,
     )
@@ -1485,6 +1497,7 @@ def test_full_replaces_unlocked_stale_owner_before_handshake(
             capture_output=True,
             text=True,
             encoding="utf-8",
+            errors="replace",
             env=environment,
             timeout=45,
         )
@@ -1565,6 +1578,7 @@ def test_forward_minimal_executes_quoted_repository_scoped_processes(
             capture_output=True,
             text=True,
             encoding="utf-8",
+            errors="replace",
             env=environment,
             timeout=30,
         )
