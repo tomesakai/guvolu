@@ -38,7 +38,7 @@ def test_committed_table_derives_documented_limits() -> None:
     s1 = stage_module.derive_limits(TABLE, TABLE.stage("S1"))
     assert s1["max_cumulative_loss_jpy"] == Decimal("8250")
     assert s1["max_position_jpy"] == Decimal("22500")
-    # 现行硬顶容得下 S1 与 T1，S2 需先升硬顶
+    # S2 须先升硬顶
     for name in ("S1", "T1"):
         limits = stage_module.derive_limits(TABLE, TABLE.stage(name))
         assert limits["order_jpy_max"] <= MAX_ORDER_JPY_CEILING
