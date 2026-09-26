@@ -59,7 +59,7 @@
 
 维护者 09-26 确认 T1 至 S2 的路径（A-01）。当日落地：硬顶升至 T1（单笔 50,000、单日 200,000，两仓 `.env` 同步）；风险预算改为只取执行仓目标配置，编排与 live 缺省值不再各自硬编码；`issue_envelope.ps1` 只在每小时 :45 至 :10 之间签发，因为执行仓快进同时切换信封与预算，轮次中途切换会使同一轮前后读到不同预算。第十三封按 S1 签发，修正累计亏损熔断过紧的问题（5,000 对研究最坏回撤约 5,400），有效期延至 10-24。
 
-入金到账后的切换：`prepare_stage.py draft --stage T1 --output config/authorization_envelope.draft-N.json` 改两份目标配置预算并写草案，提交后在 :45 至 :10 之间运行 `issue_envelope.ps1 -Draft ...`。后继计划（储备 0.15，单市场最大部署 0.85 B）上线后两市场最大部署升至约 1.7 B，持仓与累计亏损倍数须按其冻结权重重新推导，届时更新放量表。
+入金到账后的切换：`prepare_stage.py draft --stage T1 --output config/authorization_envelope.draft-N.json` 改两份目标配置预算并写草案，提交后在 :45 至 :10 之间运行 `issue_envelope.ps1 -Draft ...`。后继计划的冻结权重（第 4 节）使两市场最大部署约 1.23 B、研究最坏回撤约 0.37 B，现行倍数（持仓 1.5 B、累计亏损 0.55 B）仍然成立，放量表不需改。
 
 ## 4. 封存段到期后的连续性
 
@@ -67,12 +67,24 @@
 
 | 序 | 步骤 | 时点 |
 |---|---|---|
-| 1 | 以当前干净提交建一个后继运行根（BTC 与 ETH 后继计划共用，按运行根锁串行），`build_research_snapshot.py --snapshot-root <根>/data --market-id` BTC 与 ETH 备齐数据，治理注册库复制自 ETH 运行根（含全部四个封存段） | 10 月上旬 |
-| 2 | 根内以仓库相对数据根跑决策级研究：`--config config/strategy_research_v3_<市场>.json --data-root data --to-time 2026-08-23T09:00:00Z --family price_breakout --family trend`，避开每小时 :15 至 :45 | 同上 |
-| 3 | 封存新段：BTC 2026-12-02 至 2027-03-12，ETH 2026-12-31 至 2027-04-10（不短于 2,160 根小时柱），冻结计划 `--missing-policy zero_exposure`，`verify` 全部通过 | 10 月中旬 |
-| 4 | 为后继运行根登记两条只读预检任务 | 同上 |
+| 1 | 以当前干净提交建一个后继运行根（BTC 与 ETH 后继计划共用，按运行根锁串行），`build_research_snapshot.py --snapshot-root <根>/data --market-id` BTC 与 ETH 备齐数据，治理注册库复制自 ETH 运行根（含全部四个封存段） | 09-26 完成 |
+| 2 | 根内以仓库相对数据根跑决策级研究：`--config config/strategy_research_v3_<市场>.json --data-root data --to-time 2026-08-23T09:00:00Z --family price_breakout --family trend`，避开每小时 :15 至 :45 | 09-26 完成 |
+| 3 | 封存新段：BTC 2026-12-02 至 2027-03-12，ETH 2026-12-31 至 2027-04-10（不短于 2,160 根小时柱），冻结计划 `--missing-policy zero_exposure`，`verify` 全部通过 | 09-26 完成 |
+| 4 | 为后继运行根登记两条只读预检任务 | 09-26 完成 |
 | 5 | 维护者以 `register_frozen_live_task.ps1 -StartUtc` 预先登记后继 -live 任务：BTC 2026-12-02T00:00Z 起（第 12 分），ETH 2026-12-31T00:00Z 起（第 30 分），旧任务到点自然结束，持仓由新计划的首轮目标接管 | 11 月中旬前 |
 | 6 | 12-02 以 `run_holdout_validation.py` 消费 BTC 旧封存段并得出裁决；PASS 且后继计划实盘两周无异常即进入 S2 | 12-02 至 12-16 |
+
+09-26 落地结果（运行根 `D:\dev\guvolu-frozen-runtime-succ-df70691`，提交 `df70691` 的独立克隆，干净树）：
+
+| 项 | BTC 后继 | ETH 后继 |
+|---|---|---|
+| 来源研究运行 | `research-run-ec3b3900…`（311 秒，决策级） | `research-run-4515ee8e…`（225 秒，决策级） |
+| 封存段 | `holdout-vintage-b4356e5c…`，2026-12-02 至 2027-03-12 | `holdout-vintage-f590f6a8…`，2026-12-31 至 2027-04-10 |
+| 冻结计划 | `frozen-forward-plan-8af60690…0925cf7` | `frozen-forward-plan-ee343748…e827e921` |
+| 冻结权重 | `price_breakout` 0.615、`trend` 0.031、储备 0.354 | `price_breakout` 0.300、`trend` 0.288、储备 0.412 |
+| 预检任务 | `guvolu-holdout-preflight-succbtc`（09:55） | `guvolu-holdout-preflight-succeth`（10:05） |
+
+BTC 后继来源运行（嵌入期 168）：`price_breakout` Sharpe 1.02、最大回撤 26.8%、PBO 0.008；`trend` Sharpe 0.73、最大回撤 43.2%、PBO 0.346，两族均为纸面合格。v3 配置把 `trend_breakout_cap` 放宽到 0.85，但分配器按风险厌恶与不确定性惩罚给出的权重并未触及上限，后继计划的最大部署（BTC 0.646 B、ETH 0.588 B）与现行计划（0.600 B、0.577 B）相近；此前按储备 0.15 估算的部署放大不成立，收益放大只能来自本金。
 
 后继计划与现行计划的信号与参数相同（同一候选身份），只有权重与储备不同，因此不另设纸面期：后继计划每轮本就串行 shadow、dry-run 与 paper，前两周在 T1 预算下实盘即是比纸面更强的验收证据。裁决 FAIL 时退回 S1 预算，后继计划照常运行作为下一个封存段。
 
