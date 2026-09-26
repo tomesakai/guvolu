@@ -131,6 +131,15 @@ OKX live books 已完成有界真实隔离小样本，但尚未证明重连和�
   每小时冻结前向链随之线性变慢（2026-09-21 快照）。`ForwardMinimal` 下 03:16 的
   每日补漏要补做整日 L2 派生物化，约 50 分钟并持主写锁，合并任务须排在其后
   （2026-09-23 快照）。
+- 每五分钟运行后即退出的守护任务以 `conhost.exe --headless` 承载（`scripts/set_task_console_host.ps1`
+  改写已登记任务，`-ConsoleHost console` 还原）：默认终端委托给 Windows Terminal 时，
+  每次隐藏启动 `powershell.exe` 在其进程内泄漏约 2 MB。headless 宿主不传回子进程
+  退出码，只用于不依赖退出码的守护；-live、每日与每周任务保持直接启动。冻结运维
+  副本或仓外脚本重新登记守护任务后须再运行一次该脚本（2026-09-26 快照）。
+- 风险预算只有一处来源：执行仓每市场目标配置的 `risk_budget_jpy`；信封金额按
+  `config/stage_scaling.json` 的倍数由预算推导（`scripts/prepare_stage.py`）。
+  `issue_envelope.ps1` 只在每小时 :45 至 :10 之间签发：执行仓快进同时切换信封与
+  预算，轮次中途切换会使同一轮前后读到不同预算。
 - 每个冻结运行根各登记一条只读预检任务（`register_holdout_preflight_task.ps1
   -TaskName guvolu-holdout-preflight-<后缀>`）；只预检一个运行根时，另一个的
   制品损坏无人知晓（2026-09-23 快照）。

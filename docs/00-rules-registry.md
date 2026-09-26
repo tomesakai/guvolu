@@ -69,6 +69,7 @@
 | docs/2026-09-14-stage-one-scaling-admission-grid-and-funding-plan.md | 时效快照 | 第一阶段按本金线性放量（硬顶 15,000 / 45,000、预算 15,000、第十一封）、四市场两成本模型的一次性准入网格、分阶段入金计划 |
 | docs/2026-09-21-hourly-chain-slowdown-and-recovery.md | 时效快照 | 每小时链由 11 分钟退化到 50 分钟与“无调度轮次”告警的根因（段头不合并、孤儿轮次、汇率物化器持锁扫描、宿主内存）、当日处置、包装脚本超时整树终止与每日合并任务 |
 | docs/2026-09-23-compaction-task-failure-and-prediction-artifact-repair.md | 时效快照 | 每日合并任务与每日补漏相撞且被 Stop 偏好终止的根因、两轮交错改写冻结预测制品致预检 would_burn 的根因、按登记身份重建制品、编排侧运行根锁与 ETH 预检任务 |
+| docs/2026-09-26-staged-scaling-successor-plans-and-continuity.md | 时效快照 | 维护者确认的分档放量 T1 至 S2 与倍数推导规则、现行策略与研究证据、不再生成新策略的理由、12-02 与 12-31 封存段到期的后继计划上膛步骤、守护任务控制台泄漏与 headless 承载 |
 | docs/2026-08-11-account-assets-capability.md | 时效快照 | GMO Coin 与 bitFlyer 私有资产接口复核 |
 | docs/2026-08-10-persistence-audit.md | 时效快照 | 持久化完整性、恢复探针与历史损坏边界审计 |
 | docs/2026-08-22-paper-executor-phase1.md | 时效快照 | paper 执行器阶段一：第 2 版执行目标、paper 成交模型、差异账与覆盖层门控记录 |
