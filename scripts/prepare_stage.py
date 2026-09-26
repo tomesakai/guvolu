@@ -209,7 +209,11 @@ def _write_budget(path: Path, budget: Decimal) -> bool:
     if body.get("risk_budget_jpy") == text:
         return False
     body["risk_budget_jpy"] = text
-    path.write_text(json.dumps(body, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    # 信封身份即字节，统一 LF 换行
+    path.write_text(
+        json.dumps(body, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8", newline="\n",
+    )
     return True
 
 
@@ -256,7 +260,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     output = args.output if args.output.is_absolute() else repository / args.output
     if output.exists():
         raise SystemExit(f"草案已存在，拒绝覆盖: {output}")
-    output.write_text(json.dumps(body, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    output.write_text(
+        json.dumps(body, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8", newline="\n",
+    )
     changed = [
         name for name in TARGET_CONFIGS
         if _write_budget(repository / name, stage.risk_budget_jpy)
